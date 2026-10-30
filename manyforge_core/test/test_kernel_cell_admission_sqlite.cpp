@@ -1132,7 +1132,7 @@ TEST(KernelCellAdmissionSqlite, SameOwnerCapacityPlusOneCyclesRetireReleasedResu
 }
 
 TEST(KernelCellAdmissionSqlite,
-     ReplacementGenerationMakesPredecessorReadinessGenerationStaleWithoutHeldClaim) {
+     ReplacementGenerationAdvancesAndPredecessorGenerationIsOnlyClaimEvidence) {
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   FixedClock clock;
@@ -1167,11 +1167,24 @@ TEST(KernelCellAdmissionSqlite,
   ASSERT_TRUE(recovery.ok());
   EXPECT_GT(recovery.value().cell_admission_generation_high_water.value(),
             predecessor_public.value());
-  KernelCellAdmissionOwner owner(RequestOwnerEpoch("kernel.2"), 4U, clock, replacement, {},
-                                 recovery.value().cell_admission_generation_high_water);
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 4U, clock, replacement,
+      recovery.value().recovered_cell_admission_claims,
+      recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
+      recovery.value().recovered_cell_admission_membership,
+      recovery.value().recovered_cell_admission_current_owners, EmptyLivenessSet());
   auto stale = Claim().intent;
   stale.expected_admission_generation = predecessor_public;
-  EXPECT_EQ(owner.AcquireCellAdmissionClaim(stale).error().code, "stale_generation");
+  // Without current readiness the replacement refuses on that fact.
+  EXPECT_EQ(owner.AcquireCellAdmissionClaim(stale).error().code, "authoring_not_ready");
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  // The predecessor's generation is claim evidence only: once the cell is
+  // ready the claim is accepted and durably records both generations.
+  const auto accepted = owner.AcquireCellAdmissionClaim(stale);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(accepted.value().intent.expected_admission_generation, predecessor_public);
+  EXPECT_GT(accepted.value().acquired_admission_generation.value(), predecessor_public.value());
 }
 
 TEST(KernelCellAdmissionSqlite, RepeatedCleanOwnerRotationsKeepMembershipRowsBounded) {

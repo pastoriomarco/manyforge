@@ -109,7 +109,7 @@ TEST(RetainedLifecycleProductTest,
   const deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
       root.path());
   auto product = RetainedHostLifecycleProduct::Create(
-      fixture.bundle, manifests, {binding}, {handle}, clock, 1000);
+      fixture.bundle, manifests, {binding}, {handle}, clock, 1000, 1'000'000);
   ASSERT_TRUE(product.ok()) << product.error().message;
   ASSERT_EQ(product.value()->brand_ports().size(), 1U);
   const auto occurrence =

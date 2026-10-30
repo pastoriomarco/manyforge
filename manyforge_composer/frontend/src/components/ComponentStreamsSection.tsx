@@ -3,6 +3,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { JsonValue } from '../types/api';
 import type { CCLCStreamRecovery, CCLCStreamSeverity } from '../types/cclc';
 import { streamLabel } from '../state/componentStreamHealthPresentation';
+import type { FocusedEditorScope } from './DeploymentFocusedEditor';
 
 const SEVERITIES: readonly CCLCStreamSeverity[] = ['fault', 'blocking', 'warning'];
 const RECOVERIES: readonly CCLCStreamRecovery[] = ['ack', 'auto'];
@@ -202,37 +203,35 @@ function BudgetOverride({ label, value, placeholder, disabled, onCommit }: {
 
 /**
  * CP9 component streams: each component's declared streams with their profile
- * defaults, and the Deployment `policies.component_streams` overrides.
+ * defaults, and the Deployment `policies.component_streams` overrides. One
+ * component's page shows only its streams; the cell settings only the
+ * overrides whose stream no component declares.
  */
-export function ComponentStreamsSection({ controller }: { controller: DeploymentWorkspaceController }) {
+export function ComponentStreamsSection({ controller, scope = 'all' }: {
+  controller: DeploymentWorkspaceController;
+  scope?: FocusedEditorScope;
+}) {
   const document = controller.workspace?.draft.document ?? null;
   const policies = object(document?.policies) ?? {};
   const overrides = rows(policies.component_streams);
-  const components = componentStreams(document);
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const declared = componentStreams(document);
   // Override rows whose stream no component declares.
-  const orphans = overrides.filter((row) => !components.some(({ componentId, streams }) => (
+  const orphans = typeof scope === 'object' ? [] : overrides.filter((row) => !declared.some(({ componentId, streams }) => (
     row.controllable_component_id === componentId
     && streams.some((stream) => stream.streamId === row.stream_id))));
+  const components = scope === 'cell' ? [] : declared.filter(({ componentId }) => (
+    typeof scope !== 'object' || componentId === scope.componentId));
   if (components.length === 0 && orphans.length === 0) return null;
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const key = (componentId: string, streamId: string) => JSON.stringify([componentId, streamId]);
-  const setError = (id: string, message: string | null) => setErrors((current) => {
-    const next = { ...current };
-    if (message === null) delete next[id];
-    else next[id] = message;
-    return next;
-  });
-  const write = async (id: string, next: Row[]) => {
+  // A refusal shows once, in the yellow Deployment notice row.
+  const write = async (next: Row[]) => {
     const updated = { ...policies };
     if (next.length) updated.component_streams = next;
     else delete updated.component_streams;
-    const result = await controller.mutate(['policies'], 'set', updated);
-    setError(id, result === null ? 'Value was rejected.' : null);
-    return result;
+    return controller.mutate(['policies'], 'set', updated);
   };
   const save = async (componentId: string, streamId: string, field: OverrideField, value: JsonValue | null) => {
-    const id = key(componentId, streamId);
     const isRow = (row: Row) => row.controllable_component_id === componentId && row.stream_id === streamId;
     const row: Row = { ...(overrides.find(isRow)
       ?? { controllable_component_id: componentId, stream_id: streamId }) };
@@ -245,7 +244,7 @@ export function ComponentStreamsSection({ controller }: { controller: Deployment
       compare(String(a.controllable_component_id), String(b.controllable_component_id))
       || compare(String(a.stream_id), String(b.stream_id))
     ));
-    return write(id, next);
+    return write(next);
   };
   return (
     <details className="dcard">
@@ -260,7 +259,6 @@ export function ComponentStreamsSection({ controller }: { controller: Deployment
               const override = overrides.find((row) => (
                 row.controllable_component_id === componentId && row.stream_id === stream.streamId));
               const budgetNs = finite(override?.budget_ns);
-              const error = errors[key(componentId, stream.streamId)];
               return (
                 <fieldset key={stream.streamId} className="deployment-focused-form-grid">
                   <legend>{label}</legend>
@@ -292,7 +290,6 @@ export function ComponentStreamsSection({ controller }: { controller: Deployment
                       {RECOVERIES.map((value) => <option key={value} value={value}>{value}</option>)}
                     </select>
                   </label>
-                  {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
                 </fieldset>
               );
             })}
@@ -310,16 +307,13 @@ export function ComponentStreamsSection({ controller }: { controller: Deployment
                 ...(typeof row.severity === 'string' ? [`severity ${row.severity}`] : []),
                 ...(typeof row.recovery === 'string' ? [`recovery ${row.recovery}`] : []),
               ];
-              const error = errors[key(componentId, streamId)];
               return (
                 <div key={key(componentId, streamId)}>
                   <p>{`${componentId} · ${streamId}: ${values.join(' · ') || 'no values'}`}</p>
-                  {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
                   <div className="button-row">
                     <button type="button" disabled={disabled}
                       aria-label={`Remove ${streamId} override for ${componentId}`}
-                      onClick={() => { void write(key(componentId, streamId),
-                        overrides.filter((candidate) => candidate !== row)); }}>Remove</button>
+                      onClick={() => { void write(overrides.filter((candidate) => candidate !== row)); }}>Remove</button>
                   </div>
                 </div>
               );

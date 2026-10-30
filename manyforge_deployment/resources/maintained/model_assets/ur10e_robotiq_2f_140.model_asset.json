@@ -193,7 +193,7 @@
     },
     {
       "frame_role_id": "flange",
-      "source_link_name": "flange"
+      "source_link_name": "tool0"
     },
     {
       "frame_role_id": "gripper_tcp",
@@ -220,7 +220,7 @@
       "source_group_name": "gripper"
     }
   ],
-  "model_revision": "sha256:b36edcfdcfba75fbb32e85b2e4fc7b4af933808f7e47567ef0882f58169178f4",
+  "model_revision": "sha256:a8e491ac28560bb42805214953c81f08ba3b031d0e95e8dde1b7e10da4907f9b",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

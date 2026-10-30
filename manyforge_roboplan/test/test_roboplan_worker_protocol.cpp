@@ -3,6 +3,7 @@
 #include "roboplan_worker_protocol.hpp"
 
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -135,7 +136,7 @@ TEST(RoboPlanWorkerProtocolTest,
                            "2222222222222222222222222222222222222222222222222"
                            "222222222222222")}},
           {{"body-a", "body-b"}, {"body-c", "body-d"}}},
-      binding(), RoboPlanCandidateComputerConfig{0x1234U, 4096U, 0.02}};
+      binding(), RoboPlanCandidateComputerConfig{0x1234U, 4096U, 0.02, 0.0075}};
 
   const auto decoded = decode_initialization(encode_initialization(input));
 
@@ -172,6 +173,8 @@ TEST(RoboPlanWorkerProtocolTest,
             input.candidate_config.maximum_trajectory_samples);
   EXPECT_DOUBLE_EQ(decoded.candidate_config.trajectory_sample_period_s,
                    input.candidate_config.trajectory_sample_period_s);
+  // The Deployment's collision-check step reaches the worker's planner.
+  EXPECT_DOUBLE_EQ(decoded.candidate_config.collision_check_step_rad, 0.0075);
 }
 
 TEST(RoboPlanWorkerProtocolTest,
@@ -211,6 +214,33 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded_ik.tcp_frame, ik.tcp_frame);
   EXPECT_EQ(decoded_ik.seed_state, ik.seed_state);
   EXPECT_DOUBLE_EQ(decoded_ik.timeout_s, ik.timeout_s);
+}
+
+TEST(RoboPlanWorkerProtocolTest, CandidateRequestCarriesPerPairClearanceMargins) {
+  auto input = candidate_request();
+  input.collision_pair_margins = {
+      RoboPlanPairMarginDTO{"link4", "scene-wall-shape-0", 0.003},
+      RoboPlanPairMarginDTO{"link6", "scene-wall-shape-0", 0.0015}};
+  const auto bytes = encode_candidate_request(input);
+  const auto decoded = decode_candidate_request(bytes);
+  EXPECT_EQ(decoded.collision_pair_margins, input.collision_pair_margins);
+  EXPECT_EQ(encode_candidate_request(decoded), bytes);
+  EXPECT_TRUE(decode_candidate_request(encode_candidate_request(candidate_request()))
+                  .collision_pair_margins.empty());
+
+  for (const auto &invalid :
+       {RoboPlanPairMarginDTO{"link6", "link4", 0.003},
+        RoboPlanPairMarginDTO{"link4", "link4", 0.003},
+        RoboPlanPairMarginDTO{"", "link4", 0.003},
+        RoboPlanPairMarginDTO{"link4", "link6", -0.001},
+        RoboPlanPairMarginDTO{"link4", "link6",
+                              std::numeric_limits<double>::quiet_NaN()}}) {
+    auto malformed = candidate_request();
+    malformed.collision_pair_margins = {invalid};
+    EXPECT_THROW(static_cast<void>(decode_candidate_request(
+                     encode_candidate_request(malformed))),
+                 std::invalid_argument);
+  }
 }
 
 TEST(RoboPlanWorkerProtocolTest,
@@ -308,6 +338,48 @@ TEST(RoboPlanWorkerProtocolTest,
   malformed.push_back('\0');
   EXPECT_THROW(static_cast<void>(decode_candidate_request(malformed)),
                std::invalid_argument);
+}
+
+TEST(RoboPlanWorkerProtocolTest, SpeedCheckFrameSetsRoundTrip) {
+  auto input = candidate_request();
+  const ResolvedFrameDTO flange = ResolvedComponentModelFrameDTO{
+      binding().controllable_component_id, binding().model_instance_id,
+      FrameRoleId("flange"), "compiled-flange", binding().model_revision};
+  input.speed_check_frames = {input.tcp_frame, flange};
+  const auto ordinary_bytes = encode_candidate_request(input);
+  const auto decoded = decode_candidate_request(ordinary_bytes);
+  EXPECT_EQ(decoded.speed_check_frames, input.speed_check_frames);
+  EXPECT_FALSE(decoded.moving_replacement);
+  EXPECT_EQ(encode_candidate_request(decoded), ordinary_bytes);
+
+  auto suffix_seed = state();
+  suffix_seed.velocities.reset();
+  input.moving_replacement = MovingReplacementInputDTO{
+      ExecutionGoalKey{ControllerGoalId("source-goal-a"),
+                       ControllerGoalGeneration(3U)},
+      ExecutionBindingEpoch(4U),
+      0.5,
+      TrajectoryDTO{binding().resources,
+                    binding().compiled_joint_names,
+                    {{0.0, {0.25, 0.012}, {0.5, 0.02}, {0.2, -0.03}},
+                     {0.375, {0.45, 0.02}, {0.4, 0.015}, {-0.1, 0.02}}}},
+      0.875,
+      suffix_seed,
+      input.base_frame,
+      input.tcp_frame,
+      SpeedProfileDTO{0.9, 0.8, 0.25},
+      {},
+      1.75};
+  // The retained prefix keeps its own (here one-point) set.
+  input.moving_replacement->source_speed_check_frames = {input.tcp_frame};
+  const auto moving_bytes = encode_candidate_request(input);
+  EXPECT_EQ(moving_bytes.substr(0U, ordinary_bytes.size()), ordinary_bytes);
+  const auto moving = decode_candidate_request(moving_bytes);
+  ASSERT_TRUE(moving.moving_replacement);
+  EXPECT_EQ(moving.speed_check_frames, input.speed_check_frames);
+  EXPECT_EQ(moving.moving_replacement->source_speed_check_frames,
+            std::vector<ResolvedFrameDTO>{input.tcp_frame});
+  EXPECT_EQ(encode_candidate_request(moving), moving_bytes);
 }
 
 TEST(RoboPlanWorkerProtocolTest,

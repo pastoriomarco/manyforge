@@ -96,6 +96,10 @@ Current limits are explicit:
   planning/collision `Scene`, including the semantic cell frame, zero
   coordinates, zero geometry/pairs, collision-query behavior, and
   deterministic reopen;
+- the cell kinematic index is a read-only view built from the verified
+  retained graph and frame paths. It answers mount, owner, child and
+  frame-path queries, holds no state or identity, and moves no authority. See
+  `docs/reference/ARCHITECTURE.md` (Cell kinematic index and TCP terms);
 - I3 and the current C1 exit are qualified at implementation freeze
   `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`. The closed current subset covers
   planning/collision and composed-model maps, a distinct viewer projection,

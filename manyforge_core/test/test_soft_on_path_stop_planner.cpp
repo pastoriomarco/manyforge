@@ -1643,12 +1643,14 @@ TEST(SoftOnPathInitialStateTest, CommandCursorKeepsExactOccurrenceAndCanonicalJo
 TEST(SoftOnPathInitialStateTest, MeasuredAuthorityRetainsProjectionAndVelocityDeviation) {
   SoftOnPathInitialStateDTO state;
   state.state = {{"joint_2", "joint_1"}, {0.05, 0.2}, {1.0, 0.5}};
-  // Measured authority keeps its projection even when a different cursor and
-  // factor were supplied. Those facts must not become a new authority rule.
+  // A kMeasured lead-in anchor keeps the measured projection even when a
+  // different cursor and factor were supplied.
   state.trajectory_time_from_start_s = 0.7;
   state.runtime_velocity_scale_at_trip = 0.9;
-  const auto result =
-      resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(), soft_profile(), state);
+  SoftOnPathPlannerConfig config;
+  config.lead_in_anchor = StopLeadInAnchor::kMeasured;
+  const auto result = resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(),
+                                                              soft_profile(), state, config);
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_FALSE(result.value().used_model_velocity);
   EXPECT_NEAR(result.value().command_path_time_s, 0.2, 1e-12);
@@ -1657,6 +1659,77 @@ TEST(SoftOnPathInitialStateTest, MeasuredAuthorityRetainsProjectionAndVelocityDe
   EXPECT_DOUBLE_EQ(result.value().runtime_velocity_scale_at_trip, 0.9);
   EXPECT_NEAR(result.value().spring_back_return_point.positions_rad[0], 0.2, 1e-12);
   EXPECT_DOUBLE_EQ(result.value().spring_back_return_point.positions_rad[1], 0.0);
+}
+
+TEST(SoftOnPathInitialStateTest, MeasuredStateAnchorsAtTheCommandCursorByDefault) {
+  // The same measured trip state with the default (kCommanded) lead-in
+  // anchor: the seam is the command cursor at the frozen factor; the measured
+  // state stays the drift and velocity guard.
+  SoftOnPathInitialStateDTO state;
+  state.state = {{"joint_2", "joint_1"}, {0.05, 0.2}, {1.0, 0.5}};
+  state.trajectory_time_from_start_s = 0.7;
+  state.runtime_velocity_scale_at_trip = 0.9;
+  ASSERT_EQ(SoftOnPathPlannerConfig{}.lead_in_anchor, StopLeadInAnchor::kCommanded);
+  const auto result =
+      resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(), soft_profile(), state);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_FALSE(result.value().used_model_velocity);
+  EXPECT_DOUBLE_EQ(result.value().command_path_time_s, 0.7);
+  EXPECT_NEAR(result.value().projected_time_from_start_s, 0.2, 1e-12);
+  EXPECT_DOUBLE_EQ(result.value().path_time_rate, 0.9);
+  EXPECT_NEAR(result.value().initial_velocity_deviation_rad_s, 1.0, 1e-12);
+  EXPECT_NEAR(result.value().spring_back_return_point.positions_rad[0], 0.7, 1e-12);
+  EXPECT_DOUBLE_EQ(result.value().spring_back_return_point.positions_rad[1], 0.0);
+
+  // A command cursor outside the trajectory is refused like model authority.
+  state.trajectory_time_from_start_s = 1.1;
+  const auto outside =
+      resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(), soft_profile(), state);
+  ASSERT_FALSE(outside.ok());
+  EXPECT_EQ(outside.error().details.at("reason"), "command_cursor_out_of_range");
+
+  // Without a command cursor the measured projection is the only anchor.
+  state.trajectory_time_from_start_s.reset();
+  const auto no_cursor =
+      resolve_soft_on_path_stop_initial_state(linear_trajectory_2d(), soft_profile(), state);
+  ASSERT_TRUE(no_cursor.ok()) << no_cursor.error().message;
+  EXPECT_NEAR(no_cursor.value().command_path_time_s, 0.2, 1e-12);
+  EXPECT_NEAR(no_cursor.value().path_time_rate, 0.5, 1e-12);
+}
+
+TEST(SoftOnPathStopPlannerTest, LeadInAnchorSelectsCommandCursorOrLaggingMeasuredPosition) {
+  // Real-lane shape: the measured position (0.2) trails the command cursor
+  // (0.3) on q(t) = t. kCommanded opens the lead-in at the command, kMeasured
+  // at the measured projection; both report the anchor used.
+  SoftOnPathInitialStateDTO state;
+  state.state.joint_names = {"joint_1"};
+  state.state.positions_rad = {0.2};
+  state.state.velocities_rad_s = {1.0};
+  state.trajectory_time_from_start_s = 0.3;
+  state.runtime_velocity_scale_at_trip = 1.0;
+  for (const auto anchor : {StopLeadInAnchor::kCommanded, StopLeadInAnchor::kMeasured}) {
+    const bool commanded = anchor == StopLeadInAnchor::kCommanded;
+    SCOPED_TRACE(commanded ? "commanded" : "measured");
+    SoftOnPathPlannerConfig config;
+    config.stop_traj_delta_s = 0.05;
+    config.sample_period_s = 0.05;
+    config.lead_in_anchor = anchor;
+    const auto planned = plan_soft_on_path_stop(linear_trajectory_1d(), soft_profile(0.5), state,
+                                                config);
+    ASSERT_TRUE(planned.ok()) << planned.error().message;
+    const auto& plan = planned.value();
+    const double seam = commanded ? 0.3 : 0.2;
+    EXPECT_NEAR(plan.command_path_time_s, seam, 1e-9);
+    EXPECT_NEAR(plan.replacement_trajectory.waypoints.front().positions_rad.at(0), seam, 1e-9);
+    EXPECT_NEAR(plan.projected_time_from_start_s, 0.2, 1e-9);
+    EXPECT_EQ(plan.velocity_source, "measured_feedback");
+    EXPECT_EQ(interrupt_structured_scalar_text(plan.diagnostics.at("lead_in_anchor")),
+              commanded ? "commanded" : "measured");
+    // The lead-in never runs faster than the command it continues.
+    for (const auto& point : plan.replacement_trajectory.waypoints) {
+      EXPECT_LE(std::abs(point.velocities_rad_s.at(0)), 1.0 + 1e-9);
+    }
+  }
 }
 
 TEST(SoftOnPathInitialStateTest, ReturnPointMatchesBothSpringShapesAtTheExactOccurrence) {

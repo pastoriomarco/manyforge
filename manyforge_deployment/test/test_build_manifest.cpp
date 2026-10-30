@@ -1609,11 +1609,11 @@ TEST(BuildManifestAuthority, RejectsPreviousCatalogContentVersion) {
   const auto current = detail::BuildManifestTestAccess::current_candidate(
       BuildManifestKind::kNodeEnvironment);
   const CanonicalValue catalog = member(current, "catalog");
-  EXPECT_EQ(text_member(catalog, "content_version"), "2.8.0");
+  EXPECT_EQ(text_member(catalog, "content_version"), "2.9.0");
   const CanonicalValue candidate = reidentify(
       replace_member(current, "catalog",
                      replace_member(catalog, "content_version",
-                                    CanonicalValue(std::string("2.7.0")))),
+                                    CanonicalValue(std::string("2.8.0")))),
       BuildManifestKind::kNodeEnvironment);
   EXPECT_THROW(
       static_cast<void>(detail::BuildManifestTestAccess::qualify_candidate(

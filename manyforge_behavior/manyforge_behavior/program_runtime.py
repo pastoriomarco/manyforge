@@ -19,6 +19,7 @@ import rfc8785
 from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.executable_node_resolver import (
     NodeAdapterBuildContext,
+    _derived_active_tcp_key,
     build_executable_node_resolver,
 )
 from manyforge_behavior.node_availability import (
@@ -575,7 +576,7 @@ class ExecutableProgramRun:
         self,
         node_instance_id: str,
         proposed: Sequence[tuple[str, Any]],
-    ) -> tuple[str, Mapping[str, Any]]:
+    ) -> tuple[str, Mapping[str, Any], Mapping[str, Any]]:
         """Resolve one node's inputs as a fresh attempt would, with proposals.
 
         Effect-free: one atomic read through the run's own input resolver. It
@@ -674,6 +675,7 @@ class ExecutableProgramRun:
             node_instance_id=node.instance_id,
             parameters=parameters,
             value_sources=value_sources,
+            derived_active_tcp_key=_derived_active_tcp_key(node.node_id, node.parameters),
         )
         resolved = deepcopy(dict(snapshot.parameters))
         for path, segments, value in proposals:
@@ -696,7 +698,7 @@ class ExecutableProgramRun:
                     )
                 except (KeyError, ValueError) as error:
                     raise NodeInputProposalError(str(error)) from error
-        return node.node_id, MappingProxyType(resolved)
+        return node.node_id, MappingProxyType(resolved), snapshot.blackboard
 
     @property
     def status(self) -> py_trees.common.Status:

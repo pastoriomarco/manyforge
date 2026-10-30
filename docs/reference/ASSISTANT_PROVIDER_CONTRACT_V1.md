@@ -55,7 +55,9 @@ closed request contains:
 
 Composer captures that backend admission generation and that composite
 workspace identity when it accepts the assistant request. Every callback
-rechecks them through the normal authoring owner, and a mutating callback
+rechecks the workspace identity and the current admission through the normal
+authoring owner; the admission generation is carried as claim evidence and is
+not compared. A mutating callback
 commits under the same composite fence an ordinary edit uses. Browser snapshot
 fields are deliberately absent: the GUI is a disposable presentation client,
 so its disconnect or snapshot expiry cannot become assistant authority or

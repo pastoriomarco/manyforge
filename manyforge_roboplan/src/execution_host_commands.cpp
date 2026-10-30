@@ -1,6 +1,7 @@
 #include "execution_host_commands.hpp"
 #include "execution_host_posix.hpp"
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_core/tcp_selector_codec.hpp>
 #include <algorithm>
 #include <cmath>
 #include <charconv>
@@ -368,19 +369,22 @@ DecodeMotionPayload(const CanonicalValue &value) {
   const bool has_goal_frame_member =
       value.is_object() &&
       value.find_object_member("goal_frame_reference") != nullptr;
+  // Optional nullable member; absent or null means the Deployment clearance.
+  const bool has_clearance_member =
+      value.is_object() && value.find_object_member("clearance_m") != nullptr;
   Require(value.is_object() &&
               value.as_object().size() ==
                   16U + (has_runtime_object_bindings ? 1U : 0U) +
-                      (has_goal_frame_member ? 1U : 0U),
+                      (has_goal_frame_member ? 1U : 0U) +
+                      (has_clearance_member ? 1U : 0U),
           "motion payload has an unknown or missing field");
   Require(Text(value, "kind") == "motion",
           "operation payload kind is unsupported");
 
-  const auto &selected = Member(value, "tcp_endpoint");
-  RequireExactObjectSize(selected, 2U, "motion TCP endpoint");
-  core::MotionEndpointReferenceDTO endpoint{
-      core::TargetRoleId(Text(selected, "target_role_id")),
-      core::FrameRoleId(Text(selected, "frame_role_id"))};
+  // Active TCP (M7, T-MQ17): the three-form selector; the pre-M7
+  // `{target_role_id, frame_role_id}` endpoint is refused typed.
+  auto endpoint = core::DecodeTcpSelector(Member(value, "tcp_endpoint"));
+  Require(endpoint.ok(), endpoint.ok() ? std::string{} : endpoint.error().message);
 
   const auto &tolerances = Member(value, "tolerances");
   RequireExactObjectSize(tolerances, 3U, "motion tolerances");
@@ -496,7 +500,7 @@ DecodeMotionPayload(const CanonicalValue &value) {
   return core::MotionParticipantIntentDTO{
       core::MoveId(Text(value, "move_id")),
       core::FrameRoleId(Text(value, "base_frame_role_id")),
-      std::move(endpoint),
+      std::move(endpoint.value()),
       core::TolerancesDTO{Number(tolerances, "joint_position_tol_rad"),
                           Number(tolerances, "translation_tol_m"),
                           Number(tolerances, "rotation_tol_rad")},
@@ -515,7 +519,8 @@ DecodeMotionPayload(const CanonicalValue &value) {
       std::move(limits),
       {},
       std::move(runtime_objects),
-      std::move(goal_frame_reference)};
+      std::move(goal_frame_reference),
+      has_clearance_member ? OptionalNumber(value, "clearance_m") : std::nullopt};
 }
 
 [[nodiscard]] core::CoordinatePositionDTO
@@ -606,6 +611,13 @@ DecodeParticipantPayload(const CanonicalValue &value) {
   }
   if (kind == "capability_command") {
     return DecodeCapabilityCommandPayload(value);
+  }
+  if (kind == "set_tcp") {
+    // Active TCP (M7, T-MQ15): `{"kind": "set_tcp", "tcp": <selector>}`.
+    RequireExactObjectSize(value, 2U, "Set TCP payload");
+    auto tcp = core::DecodeTcpSelector(Member(value, "tcp"));
+    Require(tcp.ok(), tcp.ok() ? std::string{} : tcp.error().message);
+    return core::SetTcpParticipantIntentDTO{std::move(tcp.value())};
   }
   Fail("operation payload kind is unsupported");
 }
@@ -1072,7 +1084,7 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// Commands whose addressed-Kernel entry takes its submission ordering. A
 /// motion-preview session (and pick/place planning built on one) retains that
 /// ordering for its whole planning transaction, so these commands run on the
-/// submission-ordered lane, FIFO in accept order, and never occupy the
+/// submission-ordered lane, FIFO in host enqueue order, and never occupy the
 /// ordinary lane that serves Stop status, Reset, events, cell admission and
 /// operator-alarm attention.
 [[nodiscard]] bool IsSubmissionOrdered(const CommandKind kind) noexcept {
@@ -1085,6 +1097,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   case CommandKind::kSubmit:
   case CommandKind::kSetRuntimeScaleControl:
   case CommandKind::kResetRobotPosition:
+  case CommandKind::kResetActiveTcp:
+  case CommandKind::kReadActiveTcpOrdered:
     return true;
   default:
     return false;
@@ -1679,6 +1693,30 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     RequireExactObjectSize(root, 2U, "targets command");
     return Command{CommandKind::kTargets};
   }
+  if (command == "resolve_attach_active_tcp") {
+    RequireExactObjectSize(root, 4U, "attach Active TCP query");
+    Command decoded{CommandKind::kResolveAttachActiveTcp};
+    decoded.attach_binding_id = core::ProgramBindingId(Text(root, "program_binding_id"));
+    decoded.attach_holder_role = core::TargetRoleId(Text(root, "target_role_id"));
+    return decoded;
+  }
+  if (command == "read_active_tcp") {
+    const bool has_ordered = root.find_object_member("ordered") != nullptr;
+    RequireExactObjectSize(root, has_ordered ? 3U : 2U, "Active TCP read command");
+    const bool ordered = has_ordered && Boolean(root, "ordered");
+    return Command{ordered ? CommandKind::kReadActiveTcpOrdered
+                           : CommandKind::kReadActiveTcp};
+  }
+  if (command == "reset_active_tcp") {
+    RequireExactObjectSize(root, 3U, "Active TCP reset command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "Active TCP reset requires internal unverified attribution");
+    return Command{CommandKind::kResetActiveTcp};
+  }
   if (command == "query_target") {
     RequireExactObjectSize(root, 3U, "target observation command");
     const auto &query = Member(root, "query");
@@ -1957,6 +1995,19 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         Text(root, "reason")};
     return decoded;
   }
+  if (command == "force_close") {
+    // Item 37: `arm` names the operator's Full Stop; `close_operations` none.
+    const auto step = Text(root, "step");
+    Require(step == "arm" || step == "close_operations",
+            "Force close step is unsupported");
+    RequireExactObjectSize(root, step == "arm" ? 4U : 3U, "Force close command");
+    Command decoded{CommandKind::kForceClose};
+    decoded.force_close_step = step;
+    if (step == "arm")
+      decoded.stop_generation =
+          core::StopGeneration(Counter(root, "stop_generation", 1U));
+    return decoded;
+  }
   if (command == "get_stop_fault") {
     RequireExactObjectSize(root, 2U, "Stop-fault query command");
     return Command{CommandKind::kGetStopFault};
@@ -2029,13 +2080,19 @@ DecodeProjectionRevision(const CanonicalValue &value) {
 }
 
 [[nodiscard]] core::ErrorDTO DecodeManagerError(const CanonicalValue &value) {
-  Require(value.is_object() && (value.as_object().size() == 2U ||
-                                value.as_object().size() == 3U),
+  // `{code, message}` plus optional `details` and `producer`; the producer
+  // is presentation provenance and is not carried further.
+  const auto *producer = value.is_object() ? value.find_object_member("producer") : nullptr;
+  const auto *encoded_details = value.is_object() ? value.find_object_member("details") : nullptr;
+  Require(value.is_object() &&
+              value.as_object().size() ==
+                  2U + (producer != nullptr ? 1U : 0U) + (encoded_details != nullptr ? 1U : 0U) &&
+              (producer == nullptr || producer->is_string()),
           "Manager error has an unknown or missing field");
   const auto code = Text(value, "code");
   const auto message = Text(value, "message");
   std::map<std::string, std::string> details;
-  if (const auto *encoded_details = value.find_object_member("details")) {
+  if (encoded_details != nullptr) {
     Require(encoded_details->is_object(),
             "Manager error details must be an object");
     for (const auto &[key, encoded_value] : encoded_details->as_object()) {

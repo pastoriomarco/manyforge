@@ -1,4 +1,5 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_core/component_lifecycle_budget.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,10 @@
 
 namespace manyforge::deployment {
 namespace {
+
+// The default component lifecycle budget, in the field's seconds.
+constexpr double kDefaultDeviceLifecycleTimeoutS =
+    static_cast<double>(core::kDefaultLifecycleBudgetNs) / 1'000'000'000.0;
 
 struct InvalidConfiguration final : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -156,6 +161,8 @@ void xarm_address(const Object &provider, IoSignalProviderConfiguration &address
   address.pin = static_cast<std::size_t>(counter(provider, "pin", maximum));
 }
 
+// V-B4: an xArm-family robot is one whose compiled controller profile names
+// the `xarm` adapter family (robot data, never implied by the profile id).
 bool has_xarm_robot(const core::CellGraphDTO &graph,
                     const core::ControllableComponentId &robot) {
   const auto component = std::find_if(
@@ -178,13 +185,13 @@ bool has_xarm_robot(const core::CellGraphDTO &graph,
       if (!row)
         continue;
       const auto id = row->find("controllable_component_id");
-      const auto profile = row->find("real_profile");
-      if (id == row->end() || profile == row->end())
+      const auto family = row->find("adapter_family");
+      if (id == row->end() || family == row->end())
         continue;
       const auto *selected_id = std::get_if<std::string>(&id->second.value);
-      const auto *selected_profile = std::get_if<std::string>(&profile->second.value);
-      if (selected_id && *selected_id == robot.value() && selected_profile &&
-          *selected_profile == "lite6_real")
+      const auto *selected_family = std::get_if<std::string>(&family->second.value);
+      if (selected_id && *selected_id == robot.value() && selected_family &&
+          *selected_family == "xarm")
         return true;
     }
   }
@@ -210,8 +217,6 @@ ResolveRetainedIoSignalCatalog(
                         std::optional<std::string>,
                         std::optional<std::string>,
                         std::optional<core::IoSignalLivenessMode>,
-                        std::optional<IoSignalProviderConfiguration::
-                                          GeometricContactEndpoint>,
                         std::optional<core::SceneResourceId>,
                         std::optional<core::ControllableComponentId>,
                         std::optional<std::string>>>
@@ -309,7 +314,7 @@ ResolveRetainedIoSignalCatalog(
           const auto owner = std::tuple{
               unit.runtime_unit_id,  address.profile, address.topic,
               address.ingress_depth, address.service, address.channel,
-              descriptor.liveness,  address.endpoint,
+              descriptor.liveness,
               address.target_scene_resource_id, address.robot_component_id,
               address.bank};
           const auto [source, inserted] =
@@ -423,19 +428,10 @@ ResolveRetainedIoSignalCatalog(
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
         } else if (address.profile == "geometric_contact") {
           fields(provider,
-                 {"profile", "ingress_depth", "endpoint",
+                 {"profile", "ingress_depth", "robot_component_id",
                   "target_scene_resource_id"});
-          const auto &endpoint = value<Object>(member(provider, "endpoint"));
-          fields(endpoint, {"controllable_component_id", "command_target_id",
-                            "frame_role_id"});
-          address.endpoint =
-              IoSignalProviderConfiguration::GeometricContactEndpoint{
-                  core::ControllableComponentId(provider_selector(
-                      endpoint, "controllable_component_id")),
-                  core::CommandTargetId(
-                      provider_selector(endpoint, "command_target_id")),
-                  core::FrameRoleId(
-                      provider_selector(endpoint, "frame_role_id"))};
+          address.robot_component_id = core::ControllableComponentId(
+              text(provider, "robot_component_id"));
           address.target_scene_resource_id = core::SceneResourceId(
               provider_selector(provider, "target_scene_resource_id"));
           if (freshness_mode != "sample_age")
@@ -468,7 +464,7 @@ ResolveRetainedIoSignalCatalog(
         const auto owner = std::tuple{
             unit.runtime_unit_id,  address.profile, address.topic,
             address.ingress_depth, address.service, address.channel,
-            descriptor.liveness,  address.endpoint,
+            descriptor.liveness,
             address.target_scene_resource_id, address.robot_component_id,
             address.bank};
         const auto [source, inserted] =
@@ -647,7 +643,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
             throw InvalidConfiguration(
                 "io_provider_device_output_budget_unused");
           row.try_emplace("lifecycle_command_timeout_s",
-                          core::JsonValueDTO{30.0});
+                          core::JsonValueDTO{kDefaultDeviceLifecycleTimeoutS});
           if (!devices.emplace(component, std::move(row)).second)
             throw InvalidConfiguration(
                 "io_provider_device_configuration_invalid");
@@ -658,7 +654,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
             component,
             Object{{"controllable_component_id",
                     core::JsonValueDTO{component.value()}},
-                   {"lifecycle_command_timeout_s", core::JsonValueDTO{30.0}}});
+                   {"lifecycle_command_timeout_s", core::JsonValueDTO{kDefaultDeviceLifecycleTimeoutS}}});
       if (!generic_devices.empty() || declared != unit.configuration.end()) {
         Array normalized;
         for (auto &[component, row] : devices) {

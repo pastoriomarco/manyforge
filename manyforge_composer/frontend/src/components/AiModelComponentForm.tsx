@@ -5,6 +5,8 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { JsonValue } from '../types/api';
 import { jsonObject, type JsonObject } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
+import type { FocusedEditorScope } from './DeploymentFocusedEditor';
+import { LifecycleBudgetField } from './LifecycleBudgetField';
 
 /**
  * Deployment authoring of AI model components (`runtime_kind` `ai_model`): an
@@ -59,13 +61,12 @@ function AiModelComponentForm({ controller, component }: {
 }) {
   const configuration = component.runtimeConfiguration;
   const prefix = component.componentId;
-  const [error, setError] = useState<string | null>(null);
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const write = async (name: string, value: JsonValue) => {
-    const result = await controller.mutate(
+    // A refusal shows once, in the yellow Deployment notice row.
+    await controller.mutate(
       ['components', component.index, 'configuration', 'runtime_configuration'], 'set',
       { ...configuration, [name]: value });
-    setError(result === null ? 'The Deployment owner rejected this AI model change.' : null);
   };
   const field = (label: string, name: string, validate: (value: string) => string | null,
     toValue: (value: string) => JsonValue) => (
@@ -79,13 +80,14 @@ function AiModelComponentForm({ controller, component }: {
   return (
     <section className="deployment-pose-source" aria-label={`${prefix} AI model`}>
       <header><strong>{prefix}</strong></header>
+      <LifecycleBudgetField controller={controller} componentIndex={component.index}
+        componentId={component.componentId} disabled={disabled} />
       {field('Base URL', 'base_url', validBaseUrl, (value) => value.trim())}
       {field('Model', 'model', (value) => (value.trim() ? null : 'Enter the served model name.'),
         (value) => value.trim())}
       {field('Token environment variable', 'api_key_env', envNameProblem,
         (value) => (value.trim() === '' ? null : value.trim()))}
       <p className="field-help">Optional; must start with MANYFORGE_AI_. Export it with the token before starting the workbench.</p>
-      {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
       <div className="button-row">
         <button type="button" disabled={disabled}
           onClick={() => { void controller.mutate(['components', component.index], 'remove'); }}>Remove AI model</button>
@@ -121,7 +123,7 @@ export function aiModelComponentValue(
   };
 }
 
-function AddAiModelForm({ controller, existing, onDone }: {
+export function AddAiModelForm({ controller, existing, onDone }: {
   controller: DeploymentWorkspaceController;
   existing: string[];
   onDone: () => void;
@@ -143,10 +145,11 @@ function AddAiModelForm({ controller, existing, onDone }: {
       setError(problem);
       return;
     }
+    setError(null);
+    // A refusal shows once, in the yellow Deployment notice row.
     const result = await controller.mutate(['components'], 'append',
       aiModelComponentValue(componentId, baseUrl, model, apiKeyEnv));
-    if (result === null) setError('The Deployment owner rejected this AI model.');
-    else onDone();
+    if (result !== null) onDone();
   };
   const input = (label: string, value: string, set: (value: string) => void) => (
     <label className="deployment-focused-field">
@@ -201,11 +204,11 @@ function AssistantModelAliases({ controller, profileId, components }: {
     const next: JsonObject = { ...mapping };
     if (componentId === '') delete next[alias];
     else next[alias] = componentId;
-    const result = Object.keys(next).length === 0
-      ? ('assistant_model_components' in (document ?? {})
-        ? await controller.mutate(['assistant_model_components'], 'remove') : {})
-      : await controller.mutate(['assistant_model_components'], 'set', next);
-    setError(result === null ? 'The Deployment owner rejected this model assignment.' : null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    if (Object.keys(next).length > 0) await controller.mutate(['assistant_model_components'], 'set', next);
+    else if ('assistant_model_components' in (document ?? {})) {
+      await controller.mutate(['assistant_model_components'], 'remove');
+    }
   };
   return (
     <div className="deployment-pose-source" aria-label="Assistant model aliases">
@@ -232,18 +235,39 @@ function AssistantModelAliases({ controller, profileId, components }: {
           </label>
         );
       })}
-      {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
+      {/* Yellow: a failed read blocks nothing (notice rule). */}
+      {error && <p className="deployment-field-error inline-message severity-warning" role="alert">{error}</p>}
     </div>
   );
 }
 
-/** The Deployment's AI model components (OpenAI-compatible endpoints). */
-export function AiModelComponentSection({ controller }: { controller: DeploymentWorkspaceController }) {
+/**
+ * The Deployment's AI model components (OpenAI-compatible endpoints). One
+ * component's page shows only its form; the cell settings show only the
+ * assistant's model aliases, which choose among the components.
+ */
+export function AiModelComponentSection({ controller, scope = 'all' }: {
+  controller: DeploymentWorkspaceController;
+  scope?: FocusedEditorScope;
+}) {
   const document = controller.workspace?.draft.document ?? null;
-  const components = aiModelComponents(document);
+  const allComponents = aiModelComponents(document);
+  const components = typeof scope === 'object'
+    ? allComponents.filter((component) => component.componentId === scope.componentId) : allComponents;
   const [adding, setAdding] = useState(false);
   const profileId = typeof document?.assistant_profile_id === 'string' ? document.assistant_profile_id : null;
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
+  if (typeof scope === 'object' && components.length === 0) return null;
+  if (scope === 'cell') {
+    return profileId === null || allComponents.length === 0 ? null : (
+      <details className="dcard">
+        <summary>AI model aliases</summary>
+        <div className="deployment-focused-body">
+          <AssistantModelAliases controller={controller} profileId={profileId} components={allComponents} />
+        </div>
+      </details>
+    );
+  }
   return (
     <details className="dcard" open={components.length > 0 || adding}>
       <summary>AI models</summary>
@@ -252,15 +276,15 @@ export function AiModelComponentSection({ controller }: { controller: Deployment
         {components.map((component) => (
           <AiModelComponentForm key={component.componentId} controller={controller} component={component} />
         ))}
-        {adding ? (
+        {scope === 'all' && (adding ? (
           <AddAiModelForm controller={controller} existing={componentIds(document)}
             onDone={() => setAdding(false)} />
         ) : (
           <div className="button-row">
             <button type="button" disabled={disabled} onClick={() => setAdding(true)}>Add AI model</button>
           </div>
-        )}
-        {profileId !== null && (
+        ))}
+        {scope === 'all' && profileId !== null && (
           <AssistantModelAliases controller={controller} profileId={profileId} components={components} />
         )}
         <p className="field-help">An AI model is a model-free component that names an OpenAI-compatible server you run: its base URL (for example <code>http://127.0.0.1:8000/v1</code>), the served model name, and optionally the name of the environment variable that holds its token. ManyForge never starts the server and never refuses Prepare or Enable because of it; its reachability is shown as the <code>endpoint</code> stream warning.</p>

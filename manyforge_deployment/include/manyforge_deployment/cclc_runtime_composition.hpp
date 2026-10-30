@@ -2,11 +2,11 @@
 
 #include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 #include <manyforge_core/cclc_open_request.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
-#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
@@ -40,12 +40,6 @@ struct CCLCRuntimeCompositionConfig final {
       core::kDefaultCCLCExactResultHistory};
   std::size_t terminal_result_bytes_capacity{
       core::kDefaultCCLCTerminalResultBytes};
-  std::size_t maximum_resolved_stop_plan_count{
-      core::kDefaultResolvedStopBasePlanRepositoryCount};
-  std::uint64_t maximum_resolved_stop_plan_bytes{
-      core::kDefaultResolvedStopBasePlanRepositoryBytes};
-  std::uint64_t maximum_single_resolved_stop_plan_bytes{
-      core::kMaximumResolvedStopBasePlanEncodedBytes};
   /// CCLC-owned requested-target follower, started with the composition.
   core::CCLCLifecycleTargetDriverConfig lifecycle_target_driver{};
   // Optional informational logging only; invoked after journal commit/unlock.
@@ -88,7 +82,7 @@ struct CCLCProductContextInputs final {
 /// Complete L0.4 production lifetime join for one exact retained bundle.
 ///
 /// The object owns the CCLC journal, shared reservation table, immutable port
-/// registry, resolved-plan repository, verified current sources, route
+/// registry, verified current sources, route
 /// publication adapter, and sole ComponentLifecycleCoordinator. The supplied
 /// active-publication reader, artifact source, lifecycle catalog source,
 /// Kernel ports, clock, scheduler, and Kernel publication owner must outlive
@@ -261,8 +255,6 @@ private:
   CCLCRuntimeCompositionConfig config_;
   core::SqliteCCLCJournal journal_;
   core::CCLCDomainReservationTable domain_reservations_;
-  std::unique_ptr<core::FilesystemResolvedStopBasePlanRepository>
-      plan_repository_;
   // Stable cell-wide construction ports; product-specific referents belong
   // to the one immutable context and its owning installed-product pin.
   core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port_;

@@ -62,9 +62,6 @@ export interface ExpectedProgramDraft {
 /** Read identities captured by one confirmed GUI replacement, never admission. */
 export interface ScenarioReplacementIdentity {
   authoring: AuthoringWorkspaceIdentity;
-  receiverEpoch: string;
-  managerOwnerId: string | null;
-  managerOwnerEpoch: string | null;
   managerActive: unknown;
   closeCycle?: ComposerHeadlessState['programCycle'];
   closeScene?: ComposerHeadlessState['runtime']['sections']['logicalScene'];
@@ -212,20 +209,18 @@ export function useProgramWorkspace(
   const scenarioReplacementIdentity = useMemo((): ScenarioReplacementIdentity | null => (
     published === null || snapshot === null || !authoring.current || state.workspace === null
       || !sameAuthoringWorkspaceIdentity(state.workspace.authoringWorkspace, published.identity)
-      || !snapshot.runtime.sections.manager.sourceOwnerId || !snapshot.runtime.sections.manager.sourceOwnerEpoch ? null : {
+      ? null : {
       authoring: published.identity,
-      receiverEpoch: snapshot.receiverEpoch,
-      managerOwnerId: snapshot.runtime.sections.manager.sourceOwnerId,
-      managerOwnerEpoch: snapshot.runtime.sections.manager.sourceOwnerEpoch,
       managerActive: snapshot.runtime.sections.manager.payload?.active,
-      closeCycle: snapshot.programCycle, closeScene: snapshot.runtime.sections.logicalScene,
+      closeCycle: snapshot.programCycle,
+      closeScene: snapshot.runtime.sections.logicalScene,
     }
   ), [authoring.current, published, snapshot, state.workspace]);
 
   const scenarioCloseHandoff = useCallback((
     predecessor: ManagerActiveProjection,
     closed: ManagerActiveProjection,
-    confirmed: ScenarioReplacementIdentity,
+    _confirmed: ScenarioReplacementIdentity,
   ): ScenarioCloseHandoff => {
     const waiting = (message = 'Scenario closed. Waiting for current authoring admission.'): ScenarioCloseHandoff => (
       { status: 'waiting', message }
@@ -233,15 +228,6 @@ export function useProgramWorkspace(
     const refused = (message: string): ScenarioCloseHandoff => ({ status: 'refused', message });
     if (snapshot === null) return waiting();
     const manager = snapshot.runtime.sections.manager;
-    if (snapshot.receiverEpoch !== confirmed.receiverEpoch
-      || manager.sourceOwnerId !== confirmed.managerOwnerId
-      || manager.sourceOwnerEpoch !== confirmed.managerOwnerEpoch) {
-      return refused('The backend owner changed after confirmation. No replacement was sent.');
-    }
-    if (!sameAuthoringWorkspaceIdentity(snapshot.authoringWorkspace, confirmed.authoring)
-      || (published !== null && !sameAuthoringWorkspaceIdentity(published.identity, confirmed.authoring))) {
-      return refused('The confirmed workspace or Draft changed. No replacement was sent.');
-    }
     if (authoring.error !== null || authoring.submissionUnconfirmed) {
       return refused(authoring.error ?? authoring.unavailableReason ?? 'An authoring outcome is unconfirmed.');
     }
@@ -505,18 +491,27 @@ export function useProgramWorkspace(
    * Both Draft halves come from the same installed publication the backend
    * rechecks, so this needs no second workspace read.
    */
-  const scenarioFence = useCallback((): ScenarioDocumentFenceRequest | null => {
+  const scenarioFence = useCallback((confirmedAuthoring?: AuthoringWorkspaceIdentity): ScenarioDocumentFenceRequest | null => {
     if (
       documentUnavailableReason !== null
       || published === null
       || snapshot === null
     ) return null;
-    return scenarioLocalFence(
+    const currentFence = scenarioLocalFence(
       published,
       snapshot,
       requestOwnerEpoch.current,
       identity('composer-document'),
     );
+    return confirmedAuthoring === undefined ? currentFence : {
+      ...currentFence,
+      expectedWorkspaceEpoch: confirmedAuthoring.workspaceEpoch,
+      expectedWorkspaceRevision: confirmedAuthoring.workspaceRevision,
+      draftId: confirmedAuthoring.programDraftId,
+      expectedDraftRevision: confirmedAuthoring.programDraftRevision,
+      deploymentDraftId: confirmedAuthoring.deploymentDraftId,
+      expectedDeploymentDraftRevision: confirmedAuthoring.deploymentDraftRevision,
+    };
   }, [documentUnavailableReason, published, snapshot]);
 
   const mutate = useCallback(async (
@@ -680,10 +675,11 @@ export function useProgramWorkspace(
   const activateScenarioDocument = useCallback((
     path: string | null,
     confirmDiscard: boolean,
+    confirmedAuthoring?: AuthoringWorkspaceIdentity,
   ) => {
     const label = path === null ? 'New Scenario' : 'Scenario Load';
     return run(path === null ? 'new_scenario_document' : 'load_scenario_document', async () => {
-      const requestFence = scenarioFence();
+      const requestFence = scenarioFence(confirmedAuthoring);
       if (requestFence === null) throw new Error(`${label} is not admitted.`);
       const response = path === null
         ? await api.scenarioDocuments.new(requestFence, confirmDiscard)
@@ -709,11 +705,15 @@ export function useProgramWorkspace(
     });
   }, [run, scenarioFence]);
   const loadScenarioDocument = useCallback(
-    (path: string, confirmDiscard: boolean) => activateScenarioDocument(path, confirmDiscard),
+    (path: string, confirmDiscard: boolean, confirmedAuthoring?: AuthoringWorkspaceIdentity) => (
+      activateScenarioDocument(path, confirmDiscard, confirmedAuthoring)
+    ),
     [activateScenarioDocument],
   );
   const newScenarioDocument = useCallback(
-    (confirmDiscard: boolean) => activateScenarioDocument(null, confirmDiscard),
+    (confirmDiscard: boolean, confirmedAuthoring?: AuthoringWorkspaceIdentity) => (
+      activateScenarioDocument(null, confirmDiscard, confirmedAuthoring)
+    ),
     [activateScenarioDocument],
   );
 

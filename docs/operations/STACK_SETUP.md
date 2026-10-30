@@ -42,6 +42,12 @@ Deployment's `ai_model` component and never changes motion authority,
 controller binding, or robot-state precedence. All lanes run in the same
 workbench image and container.
 
+When the Program Runner has no Manager liveness stream, it reads the Active
+TCP at registration and before work resumes. If the execution owner is replaced
+while reads overlap, a delayed answer from the old owner can arrive after the
+new owner's answer and restore the old Active TCP value in the Runner. This
+accepted limitation can make a Program's Current TCP selection stale.
+
 ### Robot execution lanes
 
 #### Mock
@@ -80,6 +86,11 @@ and requires attended robot sessions. Put the robot address in the site
 settings (`device_addresses`, see
 [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#project-folders)) and
 start a Real Scenario such as `examples/lite6_real_arm_observation.scenario`.
+A Real robot component names its vendor adapter explicitly in
+`runtime_configuration.adapter_family` (`xarm` for UFACTORY arms; the Real
+examples set it). ManyForge does not infer the family from the model. Apply
+refuses a Real robot without a supported family
+(`real_adapter_family_unknown`).
 **Run**, Resume, retry/replan, and Robot Control approval stay disabled until
 the robot is reported enabled and motion admission is open. Browser state is
 only an operator aid: the backend and execution adapter enforce the same
@@ -94,6 +105,66 @@ not ManyForge-authored state:
 - any external safe-state request is an integration hook to the cell's
   independent safety chain; ManyForge is not a certified safety controller.
 
+**TCP offset on the robot's controller.** A Real robot component has a
+**Send TCP offset to controller** checkbox in the Deployment editor
+(`controller_tcp_offset_sync`, selected by default; Save and Apply). When to
+turn it off is in [TCPs](../authoring/TCPS.md#the-controllers-tcp-offset).
+ManyForge tells the controller only on events, never by comparing before each
+move:
+
+- **A change of the robot's Active TCP** (a move to another TCP, Set TCP, a
+  Robot Control selection) sends the TCP offset when offset sync is selected
+  and the controller can take it. The xArm settles at rest, re-engages the
+  controller and checks the reported offset against the one sent; a mismatch
+  fails with `tcp_offset_not_applied` ("The robot controller did not apply the
+  TCP offset"). The move that needs the TCP is sent only after this step. A
+  Stop during the step lets it finish (a vendor call
+  cannot be cancelled), and the pending move is then not sent. A move that
+  changed the TCP and then failed still finishes the TCP change. Set TCP is
+  allowed while the robot is not enabled; Enable then re-syncs the configured
+  offset target.
+- **A reset of the Active TCP** sends the End-effector TCP's offset at once,
+  or offset 0 if there is no End-effector TCP, when offset sync is selected
+  and the controller can take it
+  ([TCPs](../authoring/TCPS.md#the-active-tcp)). If the controller is disabled,
+  not prepared, in error or not connected, Reset still completes and the next
+  Enable re-syncs it. With offset sync off, Reset changes ManyForge's
+  selection only; Enable sends offset 0 if the controller reports another
+  offset.
+- **Enable** reads the controller's offset and sends the configured target if
+  it differs: the Active TCP's offset with sync selected, or offset 0 (the
+  flange) with sync off. It then sends the total payload before switching the
+  controllers on. This is part of the Enable transition and its budget. A
+  robot without an End-effector TCP still enables; its offset target is zero.
+- **Scene projection changes** update the total payload, including Program,
+  direct and automatic grasp-loss detach, also while the robot moves. A
+  successful host projection transaction or rebuild prompts the update. When
+  the total changes on an enabled robot, it uses `set_tcp_load` only; it does
+  not send an offset or re-arm. An object without a declared payload or with
+  payload 0 changes nothing. The controller provides no payload readback, so
+  external payload edits are not detected. A composition failure or an
+  unconfirmed update can fault the robot. Enable and each new motion goal also
+  check the host's current projection; see
+  [TCPs](../authoring/TCPS.md#attach-to-the-active-tcp).
+  After a Manager restart, a previously published physical Scene may have no
+  initialized projection in the new host. Enable and physical motion remain
+  unavailable until the projection is established; restart does not itself
+  reconstruct it.
+
+An ordinary move, or one with the robot's current Active TCP, sends no TCP
+offset and reads no offset report. A replacement that takes over a moving robot sends
+nothing; one that resolves to a different TCP is refused. With the checkbox
+off, changing TCP only changes ManyForge's selection; no offset is sent. The
+configured controller offset target is 0 (the flange), and Enable re-syncs
+zero if the controller reports another offset. Payload updates are still sent
+as above. Controller-side TCP features then refer to the flange. The adapter's
+`enable_only` mode never sends offsets. If a sent offset is not confirmed (no
+answer, a failed re-engage, or the mismatch above), the arm reports a
+component fault; Recover clears this persistent fault, and the subsequent
+Enable re-syncs the Active TCP, sending its offset if the report differs. An
+offset changed in UFACTORY Studio is corrected at the next Enable. The accepted
+late-request residual is described in [TCPs](../authoring/TCPS.md#the-controllers-tcp-offset).
+
 **Disabled does not power down the motors.** On a UFACTORY arm, **Disable
 robot** (and the state **Disabled**) switches off the trajectory controller
 and the ros2_control hardware interface, so ManyForge sends no more commands.
@@ -105,11 +176,42 @@ enables the motors again through the vendor activation. An error the
 controller still reports after an emergency stop has been released (for
 example C2) is shown on the component and cleared by the next **Prepare**. If
 the emergency stop (or its input) is still engaged, that Prepare fails with
-`xarm_error_persists_after_clear` and the error code; nothing else changes,
-and you can try again after releasing it. An emergency stop while the arm is
+`xarm_error_persists_after_clear` and the error code. You can try again after
+releasing it. An emergency stop while the arm is
 working is an incident that stops the cell; **Recover cell** then tries to
 enable the arm again (Recover, Prepare, Enable) in the same press, and can be
-pressed again if it fails. Prepare also reactivates the joint
+pressed again if it fails. Its Recover clears the error first. Before sending
+`clean_error`, the adapter reads `get_err_warn_code` and `get_state` on demand,
+each under the remaining step budget and the 10 s call cap. An answered service
+read error refuses the clear without sending it; an unanswered read leaves the
+clear unsent and reports `robot_controller_unresponsive`. After `clean_error`
+answers, it schedules three on-demand `get_err_warn_code` reads at 0, 150 and
+300 ms; when those services answer promptly, verification usually takes about
+0.3 s. A read with error code 0 proves the clear immediately, without another
+state read. When an error remains after polling, the adapter reads `get_state`
+once and compares the final on-demand error, warning and state values before
+and after.
+If the step expires before that state read can complete, the step fails with
+`component_lifecycle_deadline_expired`. A completed persistence
+result uses `xarm_error_persists_after_clear` and includes the latest error
+code. The clear is judged only on those three values (error, warning, state)
+before and after; the mode and motion enable are set and checked by Prepare
+and Enable. As for every lifecycle step, the result is succeeded, failed or
+connection lost, and what comes next is decided from the arm's current status.
+No answer within a call's allowed time reports the controller unresponsive; the clear request is never repeated. The
+full Recover can take longer because it also performs baseline, status and
+proof calls within the component budget; measure the complete path on the live
+controller. If the robot controller or its controller
+manager does not answer in time, the step ends at once with
+`robot_controller_unresponsive` or `controller_manager_unresponsive` and the
+arm reports a component fault (an incident) until a Recover finds both
+answering again. A Recover press acknowledges only the incidents it
+showed: if a newer incident replaced one, the press is refused
+(`cclc_incident_changed`, nothing acknowledged) and shows the new incident;
+review it and press again. If the incident was closed meanwhile and nothing
+else is open, the press proceeds as an ordinary Recover. API clients may send the same check
+(`expected_incident_ids` on `POST /api/execution/cell-recover`,
+`expected_incident_id` on a lifecycle Recover) or omit it. Prepare also reactivates the joint
 state broadcaster if the hardware plugin left it inactive, and waits for a
 broadcaster sample after the activation; **Enable** activates the trajectory
 controller. Each of these steps is bounded at 10 s on a UFACTORY arm.
@@ -118,22 +220,26 @@ controller. Each of these steps is bounded at 10 s on a UFACTORY arm.
 ManyForge motion or operation holds the cell, a move or mode change from
 UFACTORY Studio is a warning on the component
 (`moved_externally:rearm_at_next_motion`), not an error. Press Run, Execute,
-jog or Move to as usual: Composer first re-arms only that arm ("Re-arming
-robot…", with Cancel: its component Recover, then Prepare and Enable: servo
-mode and ready state, holding the new pose; about 5 s). A Program Run is then
-sent. A Robot Control jog, Move to or Execute was computed before the manual
-move, so Composer stops after the re-arm and asks you to preview again. In
-this browser, Cancel, Stop, Full Stop, Reset, Close or a newer command during
-the re-arm cancels the waiting command; a Stop from another client does not
-(a latching Stop still blocks the Run at admission). If anything else needs attention (an incident, a Stop latch), use
-**Recover cell**. While the arm
-is still moving under Studio the command is refused (`component_rearm_required`,
-still moving) and nothing moves; press again once it has stopped. API clients
-do the same: a motion command refused `component_rearm_required` → `POST
-/api/execution/cell-recover` → wait until the component is `active` → re-send
-the command with fresh fences. While a Program or ManyForge motion is in progress the
-same move is an `external_control` incident: the cell stops, and only the
-operator's **Recover** re-arms the arm.
+jog or Move to as usual. During the Studio move the
+3D view and joint values follow the arm from the driver's own joint states
+(display only); those samples also keep the arm's joint stream fresh, so a
+lost joint-state broadcaster is not reported until they stop. Once the motion
+is admitted, and before it is planned, the arm's vendor adapter puts the robot
+back into joint-servo mode and the ready state (`set_mode(1)`, `set_state(0)`);
+the driver then switches its controllers back on, the trajectory controller
+holding the current pose, and the motion starts from there (about 2 s more).
+While the arm counts as moved, a jog or Move to preview starts from its live
+pose (the driver's joint states). Executing a preview made before the manual
+move plans the motion again from the current pose after the re-engage; only if
+the arm moves between that planning and the motion's start is it refused
+(`start_state_mismatch`, "preview again"), and nothing moves. While the arm is
+still moving under Studio, or the robot reports an error (an emergency stop is
+never re-enabled automatically), the motion fails typed
+(`motion_reengage_failed` with the cause) and nothing moves. **Recover cell**
+still re-arms a moved arm explicitly, and is the way back when the re-engage
+fails. While a Program or ManyForge motion is in progress the same move is an
+`external_control` incident: the cell stops, and only the operator's
+**Recover** re-arms the arm.
 
 ### Optional model and assistant surfaces
 

@@ -22,11 +22,12 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.source_model_projection.v2"
+_PROJECTION_VERSION = "manyforge.source_model_projection.v3"
 _CONTEXT_VERSION = "manyforge.source_model_context.v1"
 _PROJECTION_IDENTITY_DOMAIN = "manyforge-source-model-projection-semantic"
 _PROJECTION_FIELDS = {
     "cell_id",
+    "components",
     "graph_revision",
     "model_map_contract",
     "model_map_product_id",
@@ -529,6 +530,30 @@ def _occurrences(value: Any) -> dict[str, dict[str, Any]]:
     return by_id
 
 
+def _components(value: Any) -> None:
+    """One row per applied component, sorted by id; a mount names a listed parent."""
+    component_ids: list[str] = []
+    parent_ids: list[str] = []
+    for index, raw in enumerate(_array(value, "components", maximum=4096)):
+        path = f"components[{index}]"
+        row = _object(raw, path)
+        _closed(row, {"component_id", "mounted_on"}, path)
+        component_id = _text(row["component_id"], f"{path}.component_id")
+        assert component_id is not None
+        component_ids.append(component_id)
+        if row["mounted_on"] is not None:
+            mount = _object(row["mounted_on"], f"{path}.mounted_on")
+            _closed(mount, {"component_id", "interface_id"}, f"{path}.mounted_on")
+            parent_id = _text(mount["component_id"], f"{path}.mounted_on.component_id")
+            assert parent_id is not None
+            parent_ids.append(parent_id)
+            _text(mount["interface_id"], f"{path}.mounted_on.interface_id")
+    if component_ids != sorted(set(component_ids)):
+        raise _invalid("components are not canonical unique rows")
+    if not set(parent_ids).issubset(component_ids):
+        raise _invalid("components[].mounted_on names an unknown component")
+
+
 def _targets(value: Any, occurrences: dict[str, dict[str, Any]]) -> None:
     identities: set[tuple[str, str]] = set()
     for index, raw in enumerate(_array(value, "targets", maximum=4096)):
@@ -727,6 +752,7 @@ def verify_active_source_model(
         if source.get(field) != node_source.get(field):
             raise _invalid("source model and node environment selection epochs disagree")
 
+    _components(projection["components"])
     occurrences = _occurrences(projection["occurrences"])
     _targets(projection["targets"], occurrences)
     contract = projection["model_map_contract"]

@@ -228,6 +228,13 @@ TEST_F(TrajectoryCacheTest, LookupReturnsStoredTrajectoryForSameIntent) {
   EXPECT_EQ(cache.size(), 1u);
 }
 
+TEST_F(TrajectoryCacheTest, LookupReturnsThePlanningAttemptStoredWithTheTrajectory) {
+  cache.store(key("move_1"), make_trajectory("t1"), "intent-a", 1U);
+  EXPECT_EQ(cache.lookup(key("move_1"), "intent-a").planning_attempt_index, 1U);
+  cache.store(key("move_1"), make_trajectory("t2"), "intent-a");
+  EXPECT_EQ(cache.lookup(key("move_1"), "intent-a").planning_attempt_index, 0U);
+}
+
 TEST_F(TrajectoryCacheTest, LookupMissLeavesOtherSlots) {
   store("move_1", make_trajectory("t1"));
   const auto result = cache.lookup(key("move_2"), "intent-a");

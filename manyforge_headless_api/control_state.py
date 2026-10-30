@@ -21,6 +21,7 @@ import threading
 from typing import Any, Callable, Iterable
 
 import rfc8785
+from pydantic import ValidationError
 from watchfiles import awatch
 from websockets.asyncio.client import connect as connect_websocket
 from websockets.exceptions import ConnectionClosed
@@ -32,6 +33,7 @@ from .control_protocol import (
     EXECUTION_CONTROL_PROJECTION_SCHEMA,
     ExecutionControlProjectionDTO,
 )
+from . import error_codes
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .held_run_authoring import held_run_draft_edit_allowed
@@ -48,6 +50,11 @@ from .service import HeadlessService
 _MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
 _SOURCE_RETRY_INITIAL_SECONDS = 0.05
 _SOURCE_RETRY_MAX_SECONDS = 1.0
+_SOURCE_FAILURE_LOG_INTERVAL_NS = 5_000_000_000
+_ERROR_CODES = frozenset(
+    value for name, value in vars(error_codes).items()
+    if name.isupper() and isinstance(value, str)
+)
 _LOGGER = logging.getLogger(__name__)
 _PROGRAM_FAILURE_CONDITION_SCHEMA = "manyforge.program_failure_condition.v1"
 # Run states holding an unresolved failure: held for it, ended failed, or
@@ -214,7 +221,7 @@ def _meaningful_execution_control_key(control_response: Any) -> str:
     if isinstance(state, dict):
         state = dict(state)
         # execution_control_state.v6: samples live only in observed_targets;
-        # keep the row identities, drop the Viewer-only observation values.
+        # keep row identities and the Active TCP, drop Viewer-only samples.
         rows = state.get("observed_targets")
         if isinstance(rows, list):
             state["observed_targets"] = [
@@ -467,6 +474,7 @@ class HeadlessControlStateSource:
         self._cold_wake: asyncio.Event | None = None
         self._program_wake: asyncio.Event | None = None
         self._program_source_current = False
+        self._program_source_log_ns: int | None = None
         self._watch_source_current = True
         self._source_incidents: dict[str, tuple[int, int]] = {}
         self._incident_recording_failed = False
@@ -1206,6 +1214,31 @@ class HeadlessControlStateSource:
         self._program_failure_observer_failed = False
         return True
 
+    def _log_program_source_failure(self, error: Exception | None) -> None:
+        now = time.monotonic_ns()
+        if (
+            self._program_source_log_ns is not None
+            and now - self._program_source_log_ns < _SOURCE_FAILURE_LOG_INTERVAL_NS
+        ):
+            return
+        self._program_source_log_ns = now
+        if error is None:
+            kind, code = "peer_closed", None
+        elif isinstance(error, HeadlessApiError):
+            kind = "HeadlessApiError"
+            code = error.code if error.code in _ERROR_CODES else "unknown"
+        elif isinstance(error, ValidationError):
+            kind, code = "ValidationError", None
+        elif isinstance(error, ConnectionClosed):
+            kind, code = "ConnectionClosed", None
+        elif isinstance(error, TimeoutError):
+            kind, code = "TimeoutError", None
+        elif isinstance(error, OSError):
+            kind, code = "OSError", None
+        else:
+            kind, code = "ValueError", None
+        _LOGGER.warning("Program control source failure: type=%s code=%s", kind, code)
+
     async def _run_program_source(self) -> None:
         if self._runner_url is None:
             assert self._program_wake is not None
@@ -1274,6 +1307,7 @@ class HeadlessControlStateSource:
                         self._accept_cycle(cycle, event_class)
                         retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
                 # A clean peer close also invalidates the cached authority.
+                self._log_program_source_failure(None)
                 self._invalidate_source("program")
             except asyncio.CancelledError:
                 raise
@@ -1283,10 +1317,11 @@ class HeadlessControlStateSource:
                 TimeoutError,
                 ValueError,
                 HeadlessApiError,
-            ):
+            ) as error:
                 # Reconnection is source recovery, never command replay. Keep
                 # the newest visual state but stop issuing new frames until a
                 # current owner snapshot arrives.
+                self._log_program_source_failure(error)
                 self._invalidate_source("program")
             except Exception:
                 self._invalidate_source("program")

@@ -14,6 +14,7 @@
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/runtime_object_binding.hpp>
 #include <manyforge_core/types/speed_profile.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 #include <manyforge_core/types/timeouts.hpp>
 #include <manyforge_core/types/tolerances.hpp>
 #include <map>
@@ -62,18 +63,14 @@ struct CapabilityCommandIntentDTO final {
                          const CapabilityCommandIntentDTO&) = default;
 };
 
-/// Portable owner-qualified selection of an existing modeled TCP frame.
-struct MotionEndpointReferenceDTO final {
-  TargetRoleId target_role_id;
-  FrameRoleId frame_role_id;
-  friend bool operator==(const MotionEndpointReferenceDTO&,
-                         const MotionEndpointReferenceDTO&) = default;
-};
-
 struct MotionParticipantIntentDTO final {
   MoveId move_id;
   FrameRoleId base_frame_role_id;
-  MotionEndpointReferenceDTO tcp_endpoint;
+  /// Active TCP (M7, T-MQ17): which TCP the move uses. Current is resolved
+  /// to the robot's Active TCP, form 2 through the Program binding; the
+  /// resolved entry is the binding's `motion_endpoint.entry`. Forms 2 and 3
+  /// set the Active TCP to that entry before the move is sent.
+  TcpSelectorDTO tcp_endpoint;
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   TimeoutsDTO timeouts;
@@ -96,12 +93,27 @@ struct MotionParticipantIntentDTO final {
   /// cell reference resolver as relative targets. Forbidden for relative or
   /// joint/named motion and for inline poses.
   std::optional<ReferenceDTO> goal_frame_reference{};
+  /// Collision clearance for this move, in [0, kMaxCollisionClearanceM] m.
+  /// Absent means the Deployment's `collision_clearance_m`; 0 turns the
+  /// clearance off for this move.
+  std::optional<double> clearance_m{};
   friend bool operator==(const MotionParticipantIntentDTO&,
                          const MotionParticipantIntentDTO&) = default;
 };
 
+/// Active TCP (M7, T-MQ15): set the robot's Active TCP. One participant on
+/// the robot's motion target and capability, never Current. The Kernel runs
+/// it as an atomic step that a Stop does not end; see
+/// `ResourceAddressedExecutionKernel::execute`.
+struct SetTcpParticipantIntentDTO final {
+  TcpSelectorDTO tcp;
+  friend bool operator==(const SetTcpParticipantIntentDTO&,
+                         const SetTcpParticipantIntentDTO&) = default;
+};
+
 using OperationParticipantPayloadDTO =
-    std::variant<MotionParticipantIntentDTO, CapabilityCommandIntentDTO>;
+    std::variant<MotionParticipantIntentDTO, CapabilityCommandIntentDTO,
+                 SetTcpParticipantIntentDTO>;
 
 struct OperationParticipantIntentDTO final {
   ComponentRoleId component_role_id;

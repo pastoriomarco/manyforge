@@ -2290,8 +2290,8 @@ def _commit_authoring_scene_object(
                 expected_allowed=True
             )["admission_generation"]
         else:
-            assert operation["kind"] == "attach_carried_object", operation
-            # Runtime Attach uses the actual owner/projection CAS, without authoring authorization.
+            assert operation["kind"] in {"attach_carried_object", "detach_carried_object"}, operation
+            # Runtime Attach and Detach use the actual owner/projection CAS.
         committed = headless.commit_scene_transaction(request)
         assert committed["ok"] is True, committed
         deadline = time.monotonic() + 20.0
@@ -2445,7 +2445,7 @@ def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
                      "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
             "frame_ref": {"kind": "cell_frame", "cell_id": stack.cell_id},
         }, resource)
-    preserved = _commit_authoring_scene_object(stack, {
+    attachment = {
         "kind": "attach_carried_object", "carried_object_attachment_id": "authoring_marker_attachment",
         "scene_resource_id": "authoring_carried_marker", "controllable_component_id": "lite6_robot",
         "command_target_id": motion["command_target_id"],
@@ -2453,7 +2453,8 @@ def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
         # Both real Scenario inputs have no structural component attachments;
         # the installed arm's base path crosses none. No touch exemptions.
         "touch_body_roles": [], "expected_component_attachment_revisions": [],
-    }, "attach")
+    }
+    preserved = _commit_authoring_scene_object(stack, attachment, "attach")
     assert {row["scene_resource_id"] for row in preserved["objects"]} == {
         "authoring_world_marker", "authoring_carried_marker"
     }, preserved
@@ -2469,6 +2470,27 @@ def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
         _observe_authoring_mock_controllers(stack, component, "active", "reload-activate")
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         assert headless.scene()["logical_scene"]["payload"]["snapshot"] == preserved
+
+    # Direct Headless attach/detach uses the committed revision and the
+    # attachment's actual revision after the replacement composition.
+    for index in range(2):
+        (carried,) = preserved["carried_object_attachments"]
+        detached = _commit_authoring_scene_object(stack, {
+            "kind": "detach_carried_object",
+            "carried_object_attachment_id": carried["carried_object_attachment_id"],
+            "expected_carried_object_attachment_revision": carried["carried_object_attachment_revision"],
+            "pose": {"position_m": {"x_m": 3.2, "y_m": 0.0, "z_m": 0.0},
+                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
+            "frame_ref": {"kind": "cell_frame", "cell_id": stack.cell_id},
+        }, f"detach-{index}")
+        assert detached["carried_object_attachments"] == [], detached
+        assert detached["revision"] != preserved["revision"]
+        if index == 0:
+            preserved = _commit_authoring_scene_object(stack, attachment, "reattach")
+            assert len(preserved["carried_object_attachments"]) == 1, preserved
+        else:
+            with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+                assert headless.scene()["logical_scene"]["payload"]["snapshot"] == detached
 
 
 def test_authoring_single_mock_apply_preserves_scene_and_stays_inactive_until_activate() -> None:

@@ -705,6 +705,7 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
             raise ProgramRunnerError(
                 "program_run_not_found",
                 f"unknown Program run {program_run_id}",
+                producer="kernel",
             )
 
     client = TestClient(create_app(FailingRuntime()))
@@ -717,6 +718,7 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
             "code": "program_run_not_found",
             "details": {},
             "message": "unknown Program run missing",
+            "producer": "kernel",
         }
     }
 
@@ -903,4 +905,5 @@ def test_started_then_failed_response_preserves_actual_identity_and_native_detai
             "expected_applied_record_digest": _DIGEST_B, "draft_program_revision": _DIGEST_A})
     assert response.status_code == status
     assert response.json() == {"detail": {"code": code,
-        "message": "Owner outcome", "details": details}}
+        "message": "Owner outcome", "details": details,
+        "producer": "program_runner"}}

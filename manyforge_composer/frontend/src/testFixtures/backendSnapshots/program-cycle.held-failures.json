@@ -269,13 +269,12 @@
     "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
     "retries_used": 0,
     "scene_admission_epoch": 1,
-    "schema_version": "manyforge.cycle_recovery_offer.v4",
+    "schema_version": "manyforge.cycle_recovery_offer.v5",
     "status": "action_required",
     "stop_certificate_id": null,
     "stop_certificate_revision": null,
     "stop_generation": null,
-    "stop_id": null,
-    "valid_until_ns": null
+    "stop_id": null
   },
   "reset_options": null,
   "reset_phase": null,
@@ -513,13 +512,12 @@
       "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
       "retries_used": 0,
       "scene_admission_epoch": 1,
-      "schema_version": "manyforge.cycle_recovery_offer.v4",
+      "schema_version": "manyforge.cycle_recovery_offer.v5",
       "status": "action_required",
       "stop_certificate_id": null,
       "stop_certificate_revision": null,
       "stop_generation": null,
-      "stop_id": null,
-      "valid_until_ns": null
+      "stop_id": null
     },
     "recovery_offers": [
       {
@@ -584,13 +582,12 @@
           "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
           "retries_used": 0,
           "scene_admission_epoch": 1,
-          "schema_version": "manyforge.cycle_recovery_offer.v4",
+          "schema_version": "manyforge.cycle_recovery_offer.v5",
           "status": "action_required",
           "stop_certificate_id": null,
           "stop_certificate_revision": null,
           "stop_generation": null,
-          "stop_id": null,
-          "valid_until_ns": null
+          "stop_id": null
         }
       },
       {
@@ -655,13 +652,12 @@
           "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
           "retries_used": 0,
           "scene_admission_epoch": 1,
-          "schema_version": "manyforge.cycle_recovery_offer.v4",
+          "schema_version": "manyforge.cycle_recovery_offer.v5",
           "status": "action_required",
           "stop_certificate_id": null,
           "stop_certificate_revision": null,
           "stop_generation": null,
-          "stop_id": null,
-          "valid_until_ns": null
+          "stop_id": null
         }
       }
     ],

@@ -7,6 +7,7 @@ import { authoringWorkspaceIdentity } from '../state/authoringWorkspace';
 import { managerApplyRecord } from '../test/managerApplyRecord';
 import { useAuthoringWorkspace } from '../hooks/useAuthoringWorkspace';
 import { useProgramWorkspace } from '../hooks/useProgramWorkspace';
+import { ApiError } from '../api/client';
 import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 import { prepareSceneForClose } from '../state/scenarioClose';
 import type { ScenarioReplacementIdentity } from '../hooks/useProgramWorkspace';
@@ -259,15 +260,39 @@ it.each([true, false])('New opens Untitled once after the completed Close is adm
   expect(apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
 });
 
-it.each(['draft', 'deployment', 'epoch', 'owner', 'publication', 'fault'])('refuses intervening %s without loading', async (change) => {
+it.each(['draft', 'deployment', 'epoch'] as const)(
+  'sends the confirmed fence and shows the server refusal after an intervening %s change', async (change) => {
+    const test = await mount(false);
+    await test.openLoad();
+    await act(async () => { test.close.resolve(test.closed); });
+    const changed = structuredClone(test.published);
+    changed.workspaceRevision += 1;
+    if (change === 'draft') changed.program.draft.draftRevision += 1;
+    if (change === 'deployment') changed.deployment.draftRevision += 1;
+    if (change === 'epoch') changed.workspaceEpoch = 'another';
+    apiMock.authoringWorkspace.get.mockResolvedValue(changed);
+    apiMock.programWorkspace.get.mockResolvedValue(workspace(changed));
+    apiMock.scenarioDocuments.load.mockRejectedValueOnce(new ApiError('The confirmed workspace changed.', 409,
+      { detail: { code: 'composer_workspace_stale', message: 'The confirmed workspace changed.', details: {} } }));
+    await test.observe(snapshot(test.closed, changed));
+    expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
+    expect(apiMock.scenarioDocuments.load).toHaveBeenCalledWith(expect.objectContaining({
+      expectedWorkspaceEpoch: 'workspace.1', expectedWorkspaceRevision: 1,
+      draftId: 'draft.1', expectedDraftRevision: 1,
+      deploymentDraftId: 'deployment.1', expectedDeploymentDraftRevision: 1,
+    }), '/projects/other', true);
+    expect(test.all().some((p) => typeof p.children === 'string'
+      && p.children.includes('Scenario closed, but the replacement was refused or is unresolved.'))).toBe(true);
+    await test.observe(snapshot(test.closed, changed));
+    expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
+  },
+);
+
+it.each(['publication', 'fault'])('refuses intervening %s without loading', async (change) => {
   const test = await mount(false);
   await test.openLoad();
   await act(async () => { test.close.resolve(test.closed); });
   const next = snapshot(test.closed, test.published);
-  if (change === 'draft') next.authoringWorkspace.programDraftRevision += 1;
-  if (change === 'deployment') next.authoringWorkspace.deploymentDraftRevision += 1;
-  if (change === 'epoch') next.authoringWorkspace.workspaceEpoch = 'another';
-  if (change === 'owner') next.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
   if (change === 'publication') {
     const changed = active(true, 4);
     (next.runtime.sections.manager.payload!.active as Record<string, unknown>).publication = changed.publication;
@@ -351,7 +376,7 @@ it.each(['load', 'new'])('cancels waiting without a follow-up, then allows later
 });
 
 
-it.each(['draft', 'deployment', 'epoch', 'owner', 'publication'])('refuses popup acknowledgement after %s changes before Close', async (change) => {
+it.each(['draft', 'deployment', 'epoch', 'publication'])('refuses popup acknowledgement after %s changes before Close', async (change) => {
   const test = await mount(false);
   await test.click(test.find((p) => p['aria-label'] === 'Load Scenario'));
   await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
@@ -361,13 +386,31 @@ it.each(['draft', 'deployment', 'epoch', 'owner', 'publication'])('refuses popup
   if (change === 'draft') next.authoringWorkspace.programDraftRevision += 1;
   if (change === 'deployment') next.authoringWorkspace.deploymentDraftRevision += 1;
   if (change === 'epoch') next.authoringWorkspace.workspaceEpoch = 'another';
-  if (change === 'owner') next.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
   if (change === 'publication') (next.runtime.sections.manager.payload!.active as Record<string, unknown>).publication = active(false, 4).publication;
   await test.observe(next);
   await test.click(test.find((p) => p.children === 'Close and continue'));
   expect(test.closeScenario).not.toHaveBeenCalled();
   expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
   expect(test.all().some((p) => typeof p.children === 'string' && p.children.includes('No replacement was requested'))).toBe(true);
+});
+
+it('continues the confirmed Load through a Manager and receiver rejoin', async () => {
+  const test = await mount(false);
+  await test.click(test.find((p) => p['aria-label'] === 'Load Scenario'));
+  await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
+  await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Load Scenario'));
+  const rejoined = snapshot(test.predecessor, test.published);
+  rejoined.receiverEpoch = 'receiver.2';
+  rejoined.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
+  await test.observe(rejoined);
+  await test.click(test.find((p) => p.children === 'Close and continue'));
+  expect(test.closeScenario).toHaveBeenCalledTimes(1);
+  await act(async () => { test.close.resolve(test.closed); });
+  const closed = snapshot(test.closed, test.published);
+  closed.receiverEpoch = 'receiver.2';
+  closed.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
+  await test.observe(closed);
+  expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
 });
 
 it('blocks cancellation while the one replacement mutation is submitting', async () => {
@@ -453,7 +496,8 @@ it.each(['reset', 'detach'])('unmounting only the initiating header during %s ab
   expect(callerSignal.aborted).toBe(true);
   await act(async () => {
     if (phase === 'reset') resetReceipt.resolve({ status: 'sent', reset: { requestId: 'reset.1',
-      correlationId: reset.mock.calls[0][0].correlationId, ...reset.mock.calls[0][0].expected } });
+      correlationId: reset.mock.calls[0][0].correlationId, programRunnerOwnerEpoch: initial.programCycle.programRunnerOwnerEpoch,
+      ...reset.mock.calls[0][0].expected } });
     else {
       const transaction = apiMock.scene.commit.mock.calls[0][0] as SceneTransactionRequest;
       detachReceipt.resolve({ request_id: transaction.request_context.request_id,
@@ -506,7 +550,8 @@ async function terminalReplacement() {
     programCycle: { ...test.current.programCycle, state: 'idle_after_reset' as const, programRunId: null,
       cycleGeneration: 8, cycleClaimGeneration: null, causalCorrelationId: reset.mock.calls[0][0].correlationId } });
   const sent = (): ProgramResetOutcome => ({ status: 'sent', reset: { requestId: 'reset.1',
-    correlationId: reset.mock.calls[0][0].correlationId, ...reset.mock.calls[0][0].expected } });
+    correlationId: reset.mock.calls[0][0].correlationId, programRunnerOwnerEpoch: initial.programCycle.programRunnerOwnerEpoch,
+    ...reset.mock.calls[0][0].expected } });
   return { test, open, reset, receipt, observation, lifecycleClose, idle, sent };
 }
 

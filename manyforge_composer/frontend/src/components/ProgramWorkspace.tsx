@@ -13,6 +13,7 @@ import type {
   SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
+import { resolvedTargetRoles } from '../utils/targetRoleResolution';
 import { globalRuleIds, interruptConditionKeyUses, type TargetStopChain } from '../utils/interruptAuthoring';
 import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import {
@@ -35,6 +36,10 @@ import {
   ProgramPropertyEditor,
 } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
+import {
+  createdReferenceValue,
+  type ProgramReferenceSource,
+} from './property/ProgramSchemaValueEditor';
 import { ProgramSettingsEditor } from './ProgramSettingsEditor';
 import { TreeEditorPreferences } from './TreeEditorPreferences';
 import { onOpenSettingsRequest } from '../state/settingsNavigation';
@@ -163,10 +168,7 @@ export function ProgramWorkspace({
     expectedType: string | null;
     expectedAccess: 'read' | 'write' | 'read_write' | null;
   } | null>(null);
-  const [pendingReference, setPendingReference] = useState<{
-    nodeId: string;
-    parameterId: string;
-    semanticType: string;
+  const [pendingReference, setPendingReference] = useState<ProgramReferenceSource & {
     target: 'blackboard_key' | 'program_parameter' | 'program_requirements';
     createdId: string | null;
     applying: boolean;
@@ -372,7 +374,11 @@ export function ProgramWorkspace({
     if (!node || !declarationExists) return;
     const request = buildProgramParameterMutation(node, pendingReference.parameterId, {
       kind: 'literal',
-      value: pendingReference.createdId,
+      value: createdReferenceValue(
+        pendingReference,
+        node.parameters[pendingReference.parameterId],
+        pendingReference.createdId,
+      ),
     });
     setPendingReference((current) => current === null ? null : { ...current, applying: true });
     void mutate(request.mutation, request.args).then((response) => {
@@ -536,6 +542,10 @@ export function ProgramWorkspace({
           <ProgramNodePalette
             roots={authoring.forest}
             program={authoring}
+            boundTargets={programRoleAssignment == null
+              ? deploymentWorkspace?.binding?.target_role_bindings ?? []
+              : resolvedTargetRoles(authoring, programRoleAssignment)}
+            motionDescriptors={motionDescriptors}
             catalogEntries={catalogEntries}
             catalogIdentity={catalogIdentity}
             environment={nodeEnvironment}

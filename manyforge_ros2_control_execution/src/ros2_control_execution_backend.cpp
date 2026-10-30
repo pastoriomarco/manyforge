@@ -109,6 +109,12 @@ bool make_goal(const TrajectoryDTO &trajectory,
     goal.trajectory.points.push_back(std::move(point));
     previous = time;
   }
+  // Stock JTC 6.10 (`tolerances.hpp` resolve_tolerance_source, control_msgs
+  // JointTolerance.msg): -1 erases a tolerance (0 would keep the configured
+  // default), and an erased goal tolerance is never checked. A `kKept` lane
+  // sends no override and no goal time, so every goal (motion, and a Stop
+  // ramp, spring-back or brake alike; maintainer M6) gets the lane's arrival
+  // tolerance and `goal_time`.
   if (lane.goal_tolerance_policy == ExecutionGoalTolerancePolicy::kErased) {
     for (const auto &name : lane.joint_names) {
       control_msgs::msg::JointTolerance tolerance;
@@ -529,7 +535,7 @@ Ros2ControlExecutionBackend::Replace(const ExecutionGoalKey &active_key,
   }
   // Core owns the approved ManyMove-shaped past samples and all correction.
   // Preserve supplied time/PVA exactly; no clamp, synthetic pin or rescaling.
-  return SendGoal(next_key, trajectory, active_key, garbage);
+  return SendGoal(next_key, trajectory, active_key, garbage, std::nullopt);
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::ReplaceScheduled(
     const ExecutionGoalKey &active_key, const ExecutionGoalKey &next_key,

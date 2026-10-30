@@ -159,6 +159,11 @@ void mix_resolved_binding(IntentIdentityBuilder& identity,
   }
   mix_resolved_frame(identity, binding.base_frame);
   mix_resolved_frame(identity, binding.tcp_frame);
+  // A trajectory retimed for one speed-check set is not reused for another.
+  if (!binding.speed_check_frames.empty()) {
+    identity.mix(static_cast<std::uint64_t>(binding.speed_check_frames.size()));
+    for (const auto& frame : binding.speed_check_frames) mix_resolved_frame(identity, frame);
+  }
   identity.mix(static_cast<std::uint64_t>(binding.component_attachment_revisions.size()));
   for (const auto& revision : binding.component_attachment_revisions) {
     identity.mix(revision.value());

@@ -444,6 +444,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                     "code": error.code,
                     "details": error.details,
                     "message": str(error),
+                    "producer": error.producer,
                 }
             },
         )

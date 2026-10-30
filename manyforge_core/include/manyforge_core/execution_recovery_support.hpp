@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <deque>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/types/recovery.hpp>
 #include <manyforge_core/types/stop_certificate.hpp>
@@ -21,21 +20,17 @@ void apply_observed_state_to_stop_certificate(const ObservedRobotStatePublicatio
                                               double at_rest_velocity_threshold_rad_s,
                                               KernelStopCertificateDTO& certificate);
 
-/// Bounded, deterministic store of definitive stop certificates
+/// Deterministic store of definitive stop certificates
 /// (spec/230 §3.7.1). NOT thread-safe: the owner guards it with a leaf
 /// mutex. Semantics:
-///  - every published certificate is retained in a bounded FIFO evidence
-///    ring (oldest evicted first, deterministically);
 ///  - per stop-owner kind, the AUTHORITATIVE certificate is selected by
 ///    strictly monotonic (stop_owner_generation, certificate_revision):
-///    a late completion from an older generation is retained as evidence
-///    but can never displace or become authoritative for a newer one;
+///    a late completion from an older generation can never displace or
+///    become authoritative for a newer one;
 ///  - admission lookups are by exact (owner kind, execution, latch,
 ///    generation) match against the authoritative selection only.
 class RecoveryCertificateStore {
  public:
-  static constexpr std::size_t kEvidenceRingCapacity = 16;
-
   /// Returns the assigned strictly increasing certificate revision.
   std::uint64_t publish(KernelStopCertificateDTO certificate);
 
@@ -54,10 +49,6 @@ class RecoveryCertificateStore {
       StopOwnerKind kind, std::uint64_t execution_id, const std::string& latch_id,
       std::uint64_t stop_owner_generation) const;
 
-  [[nodiscard]] const std::deque<KernelStopCertificateDTO>& evidence_ring() const {
-    return evidence_ring_;
-  }
-
   [[nodiscard]] std::uint64_t last_revision() const { return next_revision_; }
 
  private:
@@ -66,7 +57,6 @@ class RecoveryCertificateStore {
 
   std::uint64_t next_revision_ = 0;
   std::optional<KernelStopCertificateDTO> authoritative_[kOwnerKindCount];
-  std::deque<KernelStopCertificateDTO> evidence_ring_;
 };
 
 /// Coherent execution-to-generation binding for one stop-owner kind. NOT
@@ -188,6 +178,12 @@ MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapt
 KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
                                                       const RecoveryReadinessPolicy& policy,
                                                       std::uint64_t previous_revision);
+
+/// A certified ordinary Stop whose execute worker's terminal cleanup is still
+/// pending: settled under its certificate, but neither retry nor close is
+/// decided yet (status waiting, `terminal_cleanup_pending`).
+[[nodiscard]] bool stopped_awaiting_terminal_cleanup(
+    const KernelRecoveryAssessmentDTO& assessment) noexcept;
 
 /// True when two assessments differ in identity, authority, actionability,
 /// status, allowed actions, or reason — i.e. when publication must advance

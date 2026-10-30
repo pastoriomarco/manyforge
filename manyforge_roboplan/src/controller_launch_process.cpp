@@ -44,6 +44,7 @@ constexpr std::string_view kBringupPackage = "manyforge_ros_bringup";
 constexpr std::string_view kMockLaunchFile = "mock_control.launch.py";
 constexpr std::string_view kIsaacLaunchFile =
     "isaac_topic_based_control.launch.py";
+constexpr std::string_view kIsaacGripperLaunchFile = "isaac_gripper.launch.py";
 constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
 constexpr std::string_view kPoseSourceLaunchFile = "pose_source.launch.py";
 constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
@@ -57,7 +58,7 @@ constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
       ((command.lane == ControllerLaunchLane::kMock &&
         argv[3] == kMockLaunchFile) ||
        (command.lane == ControllerLaunchLane::kIsaac &&
-        argv[3] == kIsaacLaunchFile) ||
+        (argv[3] == kIsaacLaunchFile || argv[3] == kIsaacGripperLaunchFile)) ||
        (command.lane == ControllerLaunchLane::kSimulatedPlc &&
         argv[3] == kSimulatedPlcLaunchFile) ||
        (command.lane == ControllerLaunchLane::kPoseSource &&
@@ -466,8 +467,7 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
 
 ControllerLaunchCommand
 isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
-                                const IsaacControllerLane &lane,
-                                const std::optional<double> gripper_state_freshness_timeout_s) {
+                                const IsaacControllerLane &lane) {
   require_artifacts(artifacts, ControllerLaunchLane::kIsaac);
   if (lane.joint_commands_topic.empty() || lane.joint_states_topic.empty()) {
     fail("Isaac lane facts have no joint topics");
@@ -487,15 +487,6 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
   if (!artifacts.frame_prefix.empty()) {
     host_owned.push_back("frame_prefix:=" + artifacts.frame_prefix);
   }
-  std::vector<std::string> further;
-  if (gripper_state_freshness_timeout_s.has_value()) {
-    std::array<char, 64> text{};
-    const auto written = std::to_chars(text.data(), text.data() + text.size(),
-                                       *gripper_state_freshness_timeout_s);
-    further.push_back("gripper_state_freshness_timeout_s:=" +
-                      std::string(text.data(), written.ptr));
-    host_owned.push_back(further.back());
-  }
   ControllerLaunchCommand command;
   command.controllable_component_id = artifacts.controllable_component_id;
   command.lane = ControllerLaunchLane::kIsaac;
@@ -508,7 +499,7 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
     }
     command.argv.push_back(argument);
   }
-  command.identity = identity_of(artifacts, further);
+  command.identity = identity_of(artifacts, {});
   command.robot_description_sha256 = artifacts.robot_description_sha256;
   command.controllers_sha256 = artifacts.controllers_sha256;
   command.controller_profile = artifacts.controller_profile;
@@ -519,6 +510,61 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
   command.controllers_yaml = artifacts.controllers_yaml;
   // The inactive controller infrastructure stays attached across Apply when
   // its exact generated configuration is unchanged.
+  command.keep_across_apply = true;
+  return command;
+}
+
+ControllerLaunchCommand
+isaac_gripper_launch_command(const ControllerLaunchArtifacts &artifacts,
+                             const std::optional<IsaacGripperBridgeLane> &bridge,
+                             const std::optional<double> gripper_state_freshness_timeout_s) {
+  if (artifacts.lane != ControllerLaunchLane::kIsaac ||
+      artifacts.robot_description_file.empty() ||
+      artifacts.robot_description_sha256.empty() ||
+      bridge.has_value() != gripper_state_freshness_timeout_s.has_value()) {
+    fail("Isaac tool '" + artifacts.controllable_component_id +
+         "' has no complete description or bridge feedback budget");
+  }
+  std::vector<std::string> arguments{
+      "robot_description_file:=" + artifacts.robot_description_file.string(),
+      "runtime_namespace:=" + artifacts.runtime_namespace,
+  };
+  if (!artifacts.frame_prefix.empty()) {
+    arguments.push_back("frame_prefix:=" + artifacts.frame_prefix);
+  }
+  // The identity: everything but the per-activation description path.
+  std::vector<std::string> further{artifacts.runtime_namespace,
+                                   artifacts.frame_prefix};
+  if (bridge.has_value()) {
+    std::array<char, 64> text{};
+    const auto written = std::to_chars(text.data(), text.data() + text.size(),
+                                       *gripper_state_freshness_timeout_s);
+    for (auto argument :
+         {"gripper_bridge_parameters:=" + bridge->parameters_file,
+          "gripper_action_name:=" + bridge->action_name,
+          "gripper_command_topic:=" + bridge->command_topic,
+          "gripper_state_topic:=" + bridge->state_topic,
+          "gripper_state_freshness_timeout_s:=" +
+              std::string(text.data(), written.ptr)}) {
+      further.push_back(argument);
+      arguments.push_back(std::move(argument));
+    }
+  }
+  ControllerLaunchCommand command;
+  command.controllable_component_id = artifacts.controllable_component_id;
+  command.lane = ControllerLaunchLane::kIsaac;
+  command.argv = {std::string(kRos2), "launch", std::string(kBringupPackage),
+                  std::string(kIsaacGripperLaunchFile)};
+  command.argv.insert(command.argv.end(), arguments.begin(), arguments.end());
+  command.identity = "isaac_gripper\n" + artifacts.controllable_component_id +
+                     "\n" + artifacts.controller_profile + "\n" +
+                     artifacts.robot_description_sha256 + "\n";
+  for (const auto &value : further) command.identity += value + "\n";
+  command.robot_description_sha256 = artifacts.robot_description_sha256;
+  command.controller_profile = artifacts.controller_profile;
+  command.runtime_namespace = artifacts.runtime_namespace;
+  command.frame_prefix = artifacts.frame_prefix;
+  // As the arm's Isaac launch: an unchanged tool keeps its process across Apply.
   command.keep_across_apply = true;
   return command;
 }

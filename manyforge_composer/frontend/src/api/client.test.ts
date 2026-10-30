@@ -7,6 +7,7 @@ import {
   HISTORIAN_PAGE_LIMIT,
   api,
   historianListPath,
+  preparationCauseCode,
   resolveStructuralAssetUrl,
 } from './client';
 
@@ -47,6 +48,24 @@ it('classifies a refusal only by the backend before-effect marker', () => {
     expect(refusedBeforeEffect(error)).toBe(false);
     expect(authoringRefusalMessage(error)).toBeNull();
   }
+});
+
+it('reads the typed cause of a refused preparation, never its text', () => {
+  const refused = (code: string, details: Record<string, unknown>) => new ApiError(
+    'refused', 409, { detail: { code, message: 'refused', effect: 'none', details } },
+  );
+  expect(preparationCauseCode(refused('activation_preparation_failed', {
+    preparer_detail: 'manyforge_prepare_activation: pneumatic_io_presets_coincident: robot',
+    cause_code: 'pneumatic_io_presets_coincident',
+  }))).toBe('pneumatic_io_presets_coincident');
+  // The reason only in the text is not a cause.
+  expect(preparationCauseCode(refused('activation_preparation_failed', {
+    preparer_detail: 'manyforge_prepare_activation: pneumatic_io_unsupported_on_isaac: Isaac',
+  }))).toBeNull();
+  expect(preparationCauseCode(refused('stale_generation', {
+    cause_code: 'pneumatic_io_presets_coincident',
+  }))).toBeNull();
+  expect(preparationCauseCode(new Error('pneumatic_io_presets_coincident'))).toBeNull();
 });
 
 it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
@@ -117,6 +136,23 @@ import type { RuntimeScaleControlSelector } from '../types/robotControl';
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it('reports a body read cut by the caller abort as that abort, not invalid JSON', async () => {
+  const controller = new AbortController();
+  const reason = new Error('Activation sequence cancelled; accepted work remains observable.');
+  const cut = { ok: true, status: 200, statusText: 'OK', json: vi.fn().mockImplementation(async () => {
+    controller.abort(reason);
+    throw new Error('The operation was aborted.');
+  }) } as unknown as Response;
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(cut));
+  await expect(api.cclc.component('lite6_robot', controller.signal)).rejects.toBe(reason);
+  // A success reply whose body really is not JSON is still reported as such.
+  const malformed = { ok: true, status: 200, statusText: 'OK',
+    json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token <')) } as unknown as Response;
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(malformed));
+  await expect(api.cclc.component('lite6_robot', new AbortController().signal))
+    .rejects.toThrow('Invalid JSON response from /api/cclc/components/lite6_robot');
 });
 
 it('reads the shared authoring workspace through its single endpoint', async () => {
@@ -363,6 +399,43 @@ it('sends Recover cell as one request carrying only its request identity', async
     },
   });
   await expect(api.execution.cellRecover('request.other')).rejects.toThrow();
+});
+
+it('sends the shown incident IDs with Recover cell when given (M6 item 36)', async () => {
+  const fetchMock = vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.cell_recover_result.v1',
+    request_id: 'request.recover.2',
+    outcome: 'not_recovered',
+    acknowledged_incidents: [],
+    latch_cleared: false,
+    recovered_components: [],
+    reason: {
+      code: 'cclc_incident_changed', message: 'changed',
+      details: { controllable_component_id: 'arm', incident_id: 'incident.b' },
+    },
+  }));
+  vi.stubGlobal('fetch', fetchMock);
+
+  const result = await api.execution.cellRecover('request.recover.2', ['incident.a']);
+  expect(result.reason?.code).toBe('cclc_incident_changed');
+  const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(JSON.parse(String(options.body))).toEqual({
+    request_context: {
+      request_id: 'request.recover.2',
+      source_label: 'composer_ui',
+      correlation_id: null,
+    },
+    expected_incident_ids: ['incident.a'],
+  });
+
+  // RECTIME: an automatic resend is replay-only.
+  await api.execution.cellRecover('request.recover.2', ['incident.a'], undefined, true);
+  const [, resend] = fetchMock.mock.calls[1] as [string, RequestInit];
+  expect(JSON.parse(String(resend.body))).toMatchObject({
+    request_context: { request_id: 'request.recover.2' },
+    expected_incident_ids: ['incident.a'],
+    replay_only: true,
+  });
 });
 
 it('reads global-rule recovery offers and clears one with its exact selector (SX-2206)', async () => {
@@ -1143,6 +1216,7 @@ describe('headless intent client', () => {
       apply_generation: 3,
       apply_id: 'apply-3',
       candidate_projection_revision: null,
+      failure_acknowledgement: 'unavailable',
       error: null,
       failure: null,
       last_progress: {
@@ -1163,7 +1237,24 @@ describe('headless intent client', () => {
       request_owner_epoch: 'owner-3',
       state: 'pending',
     };
-    const fetchMock = vi.fn().mockResolvedValue(response(payload));
+    const acknowledgedPayload = {
+      ...payload,
+      failure_acknowledgement: 'acknowledged',
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'apply_admission_failed',
+        effect_boundary: 'before_effect',
+        effect_disposition: 'known',
+        message: 'Apply was refused before effects began.',
+        phase: 'fence_accepted',
+        producer: 'kernel',
+      },
+      state: 'failed',
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(payload))
+      .mockResolvedValueOnce(response(acknowledgedPayload));
     vi.stubGlobal('fetch', fetchMock);
 
     const observed = await api.manager.applyStatus('apply-3', 3);
@@ -1173,6 +1264,21 @@ describe('headless intent client', () => {
       '/api/manager/apply/status?apply_id=apply-3&apply_generation=3',
     );
     expect(observed.phase).toBe('fence_accepted');
+
+    const requestContext = {
+      request_id: 'composer-manager-apply-ack.request-1',
+      source_label: 'manyforge_composer',
+    };
+    const acknowledged = await api.manager.acknowledgeApply('apply-3', 3, requestContext);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      '/api/manager/apply/acknowledge?apply_id=apply-3&apply_generation=3',
+    );
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: 'POST' });
+    expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({
+      request_context: requestContext,
+    }));
+    expect(acknowledged.failureAcknowledgement).toBe('acknowledged');
   });
 
   it('rejects an Apply status for a different durable identity', async () => {
@@ -1181,6 +1287,7 @@ describe('headless intent client', () => {
       apply_generation: 4,
       apply_id: 'different-apply',
       candidate_projection_revision: null,
+      failure_acknowledgement: 'unavailable',
       error: null,
       failure: null,
       last_progress: {

@@ -196,9 +196,11 @@ struct ParticipantStopStageHelper::Run {
   const PreparedStopStageCommandDTO& command;
   std::stop_token cancellation;
   TimePoint started{};
-  /// This robot's own Stop-time bound (Q51, never extended): its controlled
-  /// deadline for a controlled stage, its lane's stop-completion timeout for a
-  /// hard stage (Q57).
+  /// This robot's own Stop-time bound (Q51): its controlled deadline for a
+  /// controlled stage, its lane's stop-completion timeout for a hard stage
+  /// (Q57). Once a Stop trajectory (controlled, or the hard stage's brake) is
+  /// sent, a normal motion's no-report bound for it (maintainer M6,
+  /// `FinishReplacement`, SX-609 `TryControlledHardStop`).
   TimePoint terminal_deadline{};
   /// The Stop request (t0), recovered from the Kernel's elapsed time.
   TimePoint stop_requested_at{};
@@ -1054,6 +1056,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
       SoftOnPathPlannerConfig planner;
       planner.stop_traj_delta_s = config_.stop_traj_delta_s;
       planner.sample_period_s = config_.sample_period_s;
+      planner.lead_in_anchor = config_.lead_in_anchor;
       planner.allow_model_velocity_fallback = !measured_velocity;
       planner.max_initial_path_deviation_rad = config_.max_initial_path_deviation_rad;
       planner.max_initial_velocity_deviation_rad_s = config_.max_initial_velocity_deviation_rad_s;
@@ -1254,7 +1257,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   }
   return FinishReplacement(run, sent, next, std::move(joined.value()), std::move(cursor_map),
                            baseline, dispatched_at, trip, mode, plan.path_deviation_max_rad,
-                           stop_deadline, start.value().controller_offset_s);
+                           stop_deadline, start.value().controller_offset_s, frozen_factor);
 }
 
 // Q130 (maintainer): ManyMove's controlled stop for searches and probes stopped
@@ -1386,7 +1389,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
                               : port_.Replace(run.goal.key, next, stop);
   return FinishReplacement(run, sent, next, std::move(stop), std::nullopt, baseline,
                            dispatched_at, trip, "spring_back_fast", 0.0, stop_deadline,
-                           scheduled_start.controller_offset_s);
+                           scheduled_start.controller_offset_s, frozen_factor);
 }
 
 // EXPERIMENTAL release timer: hold before the send through the stage's own
@@ -1429,7 +1432,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
     const std::optional<ExecutionControllerSampleDTO>& baseline, const TimePoint dispatched_at,
     const ExecutionControllerSampleDTO& trip, const std::string& mode,
-    const double initial_path_deviation_rad, const TimePoint stop_deadline, double controller_offset_s) {
+    const double initial_path_deviation_rad, const TimePoint stop_deadline, double controller_offset_s,
+    const double frozen_factor) {
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     const auto original = port_.ReadGoal(run.goal.key);
     if (original.has_value() && original->result == ExecutionGoalResult::kSucceeded &&
@@ -1448,6 +1452,19 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   }
   run.dispatched = true;
   run.finish_goal = next;
+  // Maintainer M6: once sent, the Stop trajectory finishes like a normal
+  // motion, on the controller's report (success, or its goal-tolerance
+  // verdict after `goal_time`). Its no-report bound is a normal motion's for
+  // the trajectory as the controller runs it (path time at the frozen
+  // factor), never past the Kernel's watchdog of this stage.
+  const double wall_duration_s =
+      sent_trajectory.waypoints.empty()
+          ? 0.0
+          : std::max(0.0, sent_trajectory.waypoints.back().time_from_start_s) / frozen_factor;
+  const auto no_report_deadline =
+      std::min(dispatched_at + stop_trajectory_no_report_ns(wall_duration_s),
+               run.stop_requested_at +
+                   controlled_stage_watchdog_ns(stop_deadline - run.stop_requested_at));
   const auto association = std::make_shared<ExecutionSampleAssociation>(
       port_.ReadReadiness().binding_epoch, baseline, dispatched_at);
   Record(SentGoal{next, std::move(sent_trajectory), std::move(cursor_map), association,
@@ -1501,14 +1518,16 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     static_cast<void>(run.spring_observer->SpringReturnPointReady(*run.spring_return_point));
   }
 
-  // Finish: the replacement's result; the path deviation is measured from the
-  // controller samples meanwhile (Q22 diagnostic).
+  // Finish: the replacement's result, like a normal motion's; the path
+  // deviation is measured from the controller samples meanwhile (Q22
+  // diagnostic). The post-finish observation shares the same bound.
+  run.terminal_deadline = no_report_deadline;
   double deviation = initial_path_deviation_rad;
   std::size_t deviation_samples = 0U;
   std::optional<ErrorDTO> deviation_error;
   TimePoint last_receipt = trip.local_receipt_stamp_ns;
   std::optional<ExecutionGoalObservationDTO> finished;
-  const bool done = Await(run, stop_deadline, [&] {
+  const bool done = Await(run, no_report_deadline, [&] {
     const auto sample = port_.ReadSample();
     if (sample.has_value() && sample->local_receipt_stamp_ns > last_receipt &&
         finite_vector(sample->measured_positions_rad, run.lane.joint_names.size())) {
@@ -1550,8 +1569,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   }
   if (!done) {
     return Fail(run, stage_error("backend_stop_not_confirmed",
-                                 "The controller did not finish the Stop replacement within the "
-                                 "Stop deadline",
+                                 "The controller did not report the Stop replacement's result "
+                                 "within a normal motion's bound",
                                  {{"mode", mode}}));
   }
   if (finished->result == ExecutionGoalResult::kSucceeded) {
@@ -1661,7 +1680,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunHardStage(
     Run& run, const bool controlled_hard_stop_allowed) {
   // Q28/Q57 (as `main`): the hard stop is bounded by the lane's stop
   // completion timeout from the stage start; the Kernel arms no watchdog of
-  // its own for it.
+  // its own for it. A brake that is sent finishes like a normal motion
+  // instead (SX-609, `TryControlledHardStop`).
   run.terminal_deadline =
       std::min(run.terminal_deadline, run.started + config_.hard_stop_completion_timeout_ns);
   // Q35: on any hard-stop trigger the speed ramp stops.
@@ -1789,7 +1809,8 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     fallback_reason = "controlled_hard_stop_join_failed";
     return std::nullopt;
   }
-  const auto sent = start ? port_.ReplaceScheduled(live.key, next, joined.value(), *start->scheduled)
+  const auto sent = start ? port_.ReplaceScheduled(live.key, next, joined.value(),
+                                                   *start->scheduled)
                           : port_.Replace(live.key, next, joined.value());
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     fallback_reason = "controlled_hard_stop_refused";
@@ -1843,6 +1864,17 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   }
   run.hard_stop_level = "controlled_hard_stop";
   run.recognition_delay_ns = association->recognition_delay_ns();
+  // SX-609 (maintainer M6): the installed brake is a trajectory with the
+  // arrival check, so it finishes like a normal motion: on the controller's
+  // report, with a normal motion's no-report bound for the brake in wall time
+  // at the frozen factor (its path time / factor), not the lane's hard-stop
+  // timeout. That timeout bounds only the cancel/hold floor below.
+  run.terminal_deadline =
+      dispatched_at +
+      stop_trajectory_no_report_ns(
+          joined.value().waypoints.empty()
+              ? 0.0
+              : std::max(0.0, joined.value().waypoints.back().time_from_start_s) / factor);
   // Q50 level-3 finish, as JTC realizes it (Track 2 SX-162/164): this brake's
   // own kSucceeded plus a sample newer (controller source stamp) than the
   // newest evidence associated with the brake (or, with none, than the newest
@@ -1888,12 +1920,14 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   }
   if (ended_unsuccessfully.has_value()) {
     fallback_reason = std::string("controlled_hard_stop_ended_") + to_string(*ended_unsuccessfully);
+    // The floor (cancel or hold) keeps the lane's hard-stop timeout, from now.
+    run.terminal_deadline = clock_.now() + config_.hard_stop_completion_timeout_ns;
     return std::nullopt;
   }
   if (!finished) {
     return Fail(run, stage_error("stop_evidence_phase_expired",
-                                 "The controlled hard stop did not finish braking in the Stop "
-                                 "budget"));
+                                 "The controlled hard stop got no finishing report within a "
+                                 "normal motion's bound"));
   }
   return Succeed(run, finish_receipt, "controlled_hard_stop_succeeded_then_hold");
 }

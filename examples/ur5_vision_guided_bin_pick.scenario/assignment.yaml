@@ -6,7 +6,7 @@
     },
     {
       "component_role_id": "tool",
-      "controllable_component_id": "ur5_robot"
+      "controllable_component_id": "robotiq_2f_85"
     }
   ],
   "target_roles": [

@@ -16,6 +16,8 @@ import {
   type PoseSourceComponent,
 } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
+import { LifecycleBudgetField } from './LifecycleBudgetField';
+import type { FocusedEditorScope } from './DeploymentFocusedEditor';
 import { pneumaticGripperDrafts } from '../utils/pneumaticGripperAuthoring';
 
 const text = (value: JsonValue | undefined) => (typeof value === 'string' ? value : '');
@@ -151,13 +153,12 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
   const configuration = component.runtimeConfiguration;
   const prefix = component.componentId;
   const gripperComponentIds = [...new Set(gripperTargets.map((target) => target.componentId))];
-  const [error, setError] = useState<string | null>(null);
   const nextRelativeReferenceKey = useRef(0);
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const write = async (next: JsonObject) => {
-    const result = await controller.mutate(
+    // A refusal shows once, in the yellow Deployment notice row.
+    await controller.mutate(
       ['components', component.index, 'configuration', 'runtime_configuration'], 'set', next);
-    setError(result === null ? 'The Deployment owner rejected this pose-source change.' : null);
   };
   const block = (name: string) => (value: JsonObject | null) => {
     const next = { ...configuration };
@@ -209,6 +210,8 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
   return (
     <section className="deployment-pose-source" aria-label={`${prefix} pose source`}>
       <header><strong>{prefix}</strong></header>
+      <LifecycleBudgetField controller={controller} componentIndex={component.index}
+        componentId={component.componentId} disabled={disabled} />
       <Field label="Stream budget (s)" prefix={prefix} type="number" disabled={disabled}
         value={budgetNs === null ? '' : budgetNs / 1e9} validate={range(1e-9, 60)}
         onCommit={(value) => { void write({ ...configuration, stream_budget_ns: Math.round(Number(value) * 1e9) }); }} />
@@ -490,7 +493,6 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
           ))}
         </ul>
       )}
-      {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
     </section>
   );
 }
@@ -499,18 +501,20 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
  * The Deployment's pose-source components: their own fields, the objects
  * linked to each (links are edited on the Object panel), and links whose
  * object is not in the current Program scene (orphans), which can be removed.
+ * One component's page shows only its form; the cell settings only the orphans.
  */
-export function PoseSourceComponentSection({ controller, programSceneIds }: {
+export function PoseSourceComponentSection({ controller, programSceneIds, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
   /** The Program Draft's scene object ids; null without a Program (no orphan list). */
   programSceneIds: readonly string[] | null;
+  scope?: FocusedEditorScope;
 }) {
   const document = controller.workspace?.draft.document ?? null;
-  const components = poseSourceComponents(document);
+  const components = scope === 'cell' ? [] : poseSourceComponents(document).filter((component) => (
+    typeof scope !== 'object' || component.componentId === scope.componentId));
   const links = poseLinks(document);
-  const orphans = programSceneIds === null
+  const orphans = programSceneIds === null || typeof scope === 'object'
     ? [] : links.filter((link) => !programSceneIds.includes(link.scene_resource_id));
-  const [error, setError] = useState<string | null>(null);
   if (components.length === 0 && orphans.length === 0) return null;
   const robotIds = (Array.isArray(document?.components) ? document.components : []).flatMap((value) => {
     const item = jsonObject(value);
@@ -525,8 +529,8 @@ export function PoseSourceComponentSection({ controller, programSceneIds }: {
   })).values()];
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const remove = async (sceneResourceId: string) => {
-    const result = await savePoseLink(controller, sceneResourceId, null);
-    setError(result === null ? 'The Deployment owner rejected removing this link.' : null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    await savePoseLink(controller, sceneResourceId, null);
   };
   return (
     <details className="dcard">
@@ -552,7 +556,6 @@ export function PoseSourceComponentSection({ controller, programSceneIds }: {
             </ul>
           </section>
         )}
-        {error && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
         <p className="field-help">A pose source is a model-free component that publishes object poses from the simulator or 3D detections, and optionally the measured robot joint state and TCP for the viewer. Objects are linked to it on their Object panel.</p>
       </div>
     </details>

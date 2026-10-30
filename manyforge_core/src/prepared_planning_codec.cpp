@@ -591,6 +591,20 @@ ResolvedFrameDTO get_frame(const CanonicalValue& v) {
   }
   fail("frame_tag_invalid");
 }
+// Speed-check frame sets are emitted only when non-empty, so requests that
+// check the TCP alone keep their previous encoding.
+CanonicalValue frames_value(const std::vector<ResolvedFrameDTO>& frames) {
+  CanonicalValue::Array result;
+  result.reserve(frames.size());
+  for (const auto& frame : frames) result.push_back(frame_value(frame));
+  return CanonicalValue(std::move(result));
+}
+std::vector<ResolvedFrameDTO> get_frames(const CanonicalValue& v) {
+  std::vector<ResolvedFrameDTO> result;
+  for (const auto& frame : v.as_array()) result.push_back(get_frame(frame));
+  if (result.empty()) fail("speed_check_frames_invalid");
+  return result;
+}
 CanonicalValue coordinate_position(const CoordinatePositionDTO& v) {
   return std::visit(
       [](const auto& x) {
@@ -921,6 +935,8 @@ CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
   if (m.remaining_planning_budget_s)
     fields.emplace_back("remaining_planning_budget_s",
                         CanonicalValue(*m.remaining_planning_budget_s));
+  if (!m.source_speed_check_frames.empty())
+    fields.emplace_back("source_speed_check_frames", frames_value(m.source_speed_check_frames));
   return CanonicalValue(std::move(fields));
 }
 MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
@@ -929,7 +945,7 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
          "divergence_cursor_s", "suffix_start_state", "source_base_frame", "source_tcp_frame",
          "source_speed_profile", "source_per_resource_dynamics_limits",
          "remaining_preparation_budget_s"},
-        {"remaining_planning_budget_s"});
+        {"remaining_planning_budget_s", "source_speed_check_frames"});
   const auto& goal = member(v, "source_goal");
   exact(goal, {"controller_goal_id", "controller_goal_generation"});
   MovingReplacementInputDTO result{
@@ -947,13 +963,15 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
       number(member(v, "remaining_preparation_budget_s"))};
   if (const auto* budget = v.find_object_member("remaining_planning_budget_s"))
     result.remaining_planning_budget_s = number(*budget);
+  if (const auto* frames = v.find_object_member("source_speed_check_frames"))
+    result.source_speed_check_frames = get_frames(*frames);
   validate_replacement_input(result);
   return result;
 }
 
 CanonicalValue plan_request_value(const PlanRequestDTO& r) {
   validate_replacement_request(r);
-  if (r.retained_collision_world || r.retained_collision_policy)
+  if (r.retained_collision_world || r.retained_collision_policy || r.retained_clearance_margins)
     fail("private_collision_handles_must_be_null");
   if (!r.active_control_configuration_generation.nonzero() ||
       static_cast<double>(r.active_control_configuration_generation.value()) >
@@ -1049,13 +1067,17 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
     f.emplace_back("contact_policy_id", CanonicalValue(*r.contact_policy_id));
   if (r.moving_replacement)
     f.emplace_back("moving_replacement", replacement_value(*r.moving_replacement));
+  if (!r.speed_check_frames.empty())
+    f.emplace_back("speed_check_frames", frames_value(r.speed_check_frames));
   return CanonicalValue(std::move(f));
 }
 PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   const bool ha = v.find_object_member("action_span") != nullptr;
   const bool hc = v.find_object_member("contact_policy_id") != nullptr;
   const bool hm = v.find_object_member("moving_replacement") != nullptr;
-  if (object(v).size() != 47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U))
+  const bool hs = v.find_object_member("speed_check_frames") != nullptr;
+  if (object(v).size() !=
+      47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U) + (hs ? 1U : 0U))
     fail("plan_request_member_count_invalid");
   PlanRequestDTO r{
       OperationId(text(member(v, "operation_id"))),
@@ -1210,6 +1232,7 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
                                   text(member(a, "parent_node_attempt_id"))};
   }
   if (hm) r.moving_replacement = get_replacement(member(v, "moving_replacement"));
+  if (hs) r.speed_check_frames = get_frames(member(v, "speed_check_frames"));
   validate_replacement_request(r);
   return r;
 }

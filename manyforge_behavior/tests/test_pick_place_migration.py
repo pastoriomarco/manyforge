@@ -118,7 +118,7 @@ def test_pick_place_template_preserves_one_qualified_tcp_and_separate_carrier() 
     parameters = {
         'target_role': 'arm', 'tool_target_role': 'gripper',
         'base_frame_role': 'base',
-        'tcp_endpoint': {'target_role': 'gripper', 'frame_role': 'tcp'},
+        'tcp_endpoint': {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'},
         'carrier_frame_role': 'carrier', 'selected_object_id': 'part',
         'tool_position': {'kind': 'named_preset', 'name': 'closed'},
         'contact_policy_id': 'pick.contact',

@@ -298,6 +298,7 @@ def headless_client() -> (
                         dispositions[row].adapter_build_qualified
                         and dispositions[row].owner_port_name is None
                     ),
+                    "reasons": [],
                     "reason_codes": sorted(
                         {
                             "program_binding_unselected",
@@ -345,12 +346,13 @@ def headless_client() -> (
         },
     }
     source_model = {
-        "schema_version": "manyforge.source_model_projection.v2",
+        "schema_version": "manyforge.source_model_projection.v3",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
         "model_map_contract": None,
         "model_map_product_id": None,
+        "components": [],
         "occurrences": [],
         "targets": [],
         "source": {
@@ -377,7 +379,7 @@ def headless_client() -> (
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v2",
+                b"manyforge.source_model_projection.v3",
                 canonical_json_bytes(
                     {
                         key: value
@@ -591,6 +593,15 @@ def headless_client() -> (
                 },
                 request=request,
             )
+        elif path == "/api/manager/apply/acknowledge":
+            payload = {
+                "api_version": "manyforge.manager_command_response.v1",
+                "apply_generation": int(request.url.params["apply_generation"]),
+                "apply_id": request.url.params["apply_id"],
+                "failure_acknowledgement": "acknowledged",
+                "ok": True,
+                "state": "failed",
+            }
         elif path in {
             "/api/execution/stops",
             "/api/execution/full-stop",
@@ -724,6 +735,14 @@ def headless_client() -> (
             }
         elif path == "/api/program/runs/program-run.7/node-correction-previews":
             payload = {"forwarded": path}
+        elif path == "/api/execution/force-close":
+            if body["step"] == "stop":
+                return httpx.Response(409, json={"ok": False, "error": {
+                    "code": "scenario_force_close_stop_unconfirmed", "message": "unconfirmed",
+                    "details": {"reason": "stop_not_contained"}}}, request=request)
+            payload = {"ok": True, "command": "force_close", "result": {
+                "step": body["step"], "stop_generation": 5, "operations": [],
+                "released_orphan_resources": []}}
         else:
             return httpx.Response(404, json={"detail": "unknown"}, request=request)
         return httpx.Response(200, json=payload, request=request)
@@ -1019,7 +1038,7 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
             {"mode": "composer-assistant"}
         ]
         assert composer.get("/api/source-model").json()["schema_version"] == (
-            "manyforge.source_model_projection.v2"
+            "manyforge.source_model_projection.v3"
         )
         catalog = composer.get("/api/catalog").json()
         assert catalog["environmentDigest"] == node_environment["environment_digest"]
@@ -1063,7 +1082,7 @@ def test_composer_source_model_uses_one_coherent_context_request(
         response = composer.get("/api/source-model")
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == ("manyforge.source_model_projection.v2")
+    assert response.json()["schema_version"] == ("manyforge.source_model_projection.v3")
     assert [
         item["path"]
         for item in requests
@@ -1074,6 +1093,38 @@ def test_composer_source_model_uses_one_coherent_context_request(
             "/api/source-model-context",
         }
     ] == ["/api/source-model-context"]
+
+
+def test_composer_proxies_apply_acknowledgement_as_post_with_query_identity(
+    headless_client,
+) -> None:
+    client, requests, _node_environment = headless_client
+
+    with _composer(client) as composer:
+        response = composer.post(
+            "/api/manager/apply/acknowledge",
+            params={"apply_id": "apply-7", "apply_generation": 7},
+            json={"request_context": {
+                "request_id": "composer-ack.request.7",
+                "source_label": "manyforge_composer",
+            }},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["failure_acknowledgement"] == "acknowledged"
+    # Composer startup recovers its authoring owner; isolate the forwarding
+    # assertion while still checking for any other non-startup request.
+    assert _without_authoring_owner_calls(requests) == [{
+        "method": "POST",
+        "path": "/api/manager/apply/acknowledge",
+        "query": "apply_id=apply-7&apply_generation=7",
+        "body": {
+            "request_context": {
+                "request_id": "composer-ack.request.7",
+                "source_label": "manyforge_composer",
+            }
+        },
+    }]
 
 
 def test_composer_program_routes_forward_when_draft_matches_applied(
@@ -2215,7 +2266,7 @@ def test_composer_does_not_serve_removed_runtime_override_routes(headless_client
 
 
 @pytest.mark.parametrize("result", [None, {"replay_status": "replayed_exact", "acceptance": None, "status": None}])
-def test_lifecycle_request_result_proxy_preserves_exact_request_without_submit(result) -> None:
+def test_lifecycle_request_result_proxy_forwards_normalized_request_without_submit(result) -> None:
     body = {
         "request_context": _caller(), "controllable_component_id": "component.arm",
         "intent": "prepare", "expected_graph_revision": "graph.1",
@@ -2250,7 +2301,13 @@ def test_lifecycle_request_result_proxy_preserves_exact_request_without_submit(r
         response = composer.post("/api/cclc/lifecycle/requests/result", json=body)
     assert response.status_code == 200
     assert response.json() == {"result": result}
-    assert calls == [body]
+    # The validated route serializes the newer optional incident fields as
+    # null. Headless drops null fields before asking CCLC for the result.
+    assert calls == [{
+        **body,
+        "acknowledge_incident": None,
+        "expected_incident_id": None,
+    }]
 
 
 def _close_detach_body():
@@ -2455,7 +2512,7 @@ def test_global_io_rule_recovery_variant_is_proxied_unchanged(headless_client) -
     assert [item["body"] for item in forwarded] == [recovery]
 
 
-def test_cell_recover_forwards_only_the_caller_identity(headless_client) -> None:
+def test_cell_recover_forwards_caller_identity_with_schema_defaults(headless_client) -> None:
     client, requests, _node_environment = headless_client
     body = {
         "request_context": {
@@ -2480,4 +2537,33 @@ def test_cell_recover_forwards_only_the_caller_identity(headless_client) -> None
     assert accepted.json()["outcome"] == "done"
     assert echoed.status_code == 422
     forwarded = [item for item in requests if item["path"] == "/api/execution/cell-recover"]
-    assert [item["body"] for item in forwarded] == [body]
+    assert forwarded == [{
+        "method": "POST",
+        "path": "/api/execution/cell-recover",
+        "query": "",
+        "body": {
+            **body,
+            "expected_incident_ids": None,
+            "replay_only": False,
+        },
+    }]
+
+
+def test_force_close_steps_forward_unchanged_with_their_typed_refusal(headless_client) -> None:
+    # Item 37: Force close runs in Headless; Composer forwards each step.
+    client, requests, _node_environment = headless_client
+    context = {"request_id": "force-close.1", "request_owner_epoch": "kernel.epoch.1",
+               "source_label": "composer_ui", "correlation_id": None}
+    stop = {"request_context": context, "step": "stop", "expected_stop_generation": 4}
+    operations = {"request_context": context, "step": "close_operations", "expected_stop_generation": None}
+    with _composer(client) as composer:
+        refused = composer.post("/api/execution/force-close", json=stop)
+        closed = composer.post("/api/execution/force-close", json=operations)
+        malformed = composer.post("/api/execution/force-close", json={"request_context": context, "step": "stop"})
+    assert refused.status_code == 409, refused.text
+    assert "scenario_force_close_stop_unconfirmed" in refused.text
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["result"]["step"] == "close_operations"
+    assert malformed.status_code == 422
+    forwarded = [item["body"] for item in requests if item["path"] == "/api/execution/force-close"]
+    assert forwarded == [stop, operations]

@@ -2,11 +2,11 @@
 # Replace __arm_controller__/__joint__ with the retained binding names/joints
 # and null with each joint's retained max_deceleration_on_cancel. No fallback.
 # Rename the controller_manager key to the retained manager name when different.
-# Copy each model's vendor joint constraints exactly before adding cancel bounds;
-# xArm7 has no joint7 trajectory/goal block. Do not extrapolate another joint's.
-# Common values come from xarm_ros2 c3172e57's five vendor controller YAMLs:
-# xarm5, xarm6, xarm7, lite6, uf850. Real goal tolerances remain unchanged;
-# the simulation execution port erases goal tolerances on each goal.
+# Copy each model's vendor trajectory constraint exactly before adding cancel
+# bounds; xArm7 has no joint7 trajectory block. Do not extrapolate another
+# joint's. Common values come from xarm_ros2 c3172e57's five vendor controller
+# YAMLs: xarm5, xarm6, xarm7, lite6, uf850. Each joint's `goal` is the profile
+# row's arrival tolerance; every lane keeps goal tolerances on each goal.
 # Q64 overrides only the offline action monitor rate to 20 Hz; real vendor
 # controller files retain their 10 Hz value.
 /**/controller_manager:

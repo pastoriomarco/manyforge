@@ -200,7 +200,7 @@ Products(std::string planning_id = "planning",
       core::RuntimeProfileId(std::string(native_execution_runtime_contract::kRuntimeProfileId));
   runtime.runtime_profile_revision =
       core::RuntimeProfileRevision(
-          "sha256:434fb70e6b70d8fd04bbefeb103b2832dd9b69708d621b0eff78c1db62b17120");
+          "sha256:b4d1e602c5d312a4248be8d9d6a5f8e27b36d3545fa12507d0c5c28336c9ec15");
   auto positions = core::JsonValueDTO::Array{core::JsonValueDTO{0.1},
                                              core::JsonValueDTO{0.2}};
   auto limits =
@@ -772,6 +772,21 @@ TEST(ApplyAffectedScope, CrossCellValuesRejectBeforeScopeProduction) {
       static_cast<void>(derive_apply_configuration_fence_scope_verified_values(
           predecessor, candidate)),
       ApplyAffectedScopeError);
+}
+
+TEST(ApplyAffectedScope, UnknownInstalledStateKeepsItsTypedCodeAndInvalidArgumentBase) {
+  const auto bundle = Bundle(Graph({}, {}, {}, {}), Products());
+  const std::vector<const core::RetainedBundleDTO *> foreign_sources{nullptr};
+  try {
+    static_cast<void>(derive_apply_configuration_fence_scope_verified_values(
+        bundle, bundle, {}, foreign_sources));
+    FAIL() << "unknown terminal product was accepted";
+  } catch (const ApplyAffectedScopeError &error) {
+    EXPECT_EQ(error.code(), "actual_installed_state_unknown");
+    EXPECT_NE(std::string(error.what()).find("actual_installed_state_unknown:"), std::string::npos);
+    const std::exception &base = error;
+    EXPECT_NE(dynamic_cast<const std::invalid_argument *>(&base), nullptr);
+  }
 }
 
 TEST(ApplyAffectedScope, MovingTakeoverBudgetChangeFencesEveryCellResource) {

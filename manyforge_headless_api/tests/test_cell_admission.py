@@ -336,3 +336,37 @@ def test_publication_deadline_bounds_the_whole_exchange_not_each_step(
         for connection in accepted:
             connection.close()
         listener.close()
+
+
+@pytest.mark.parametrize(
+    ("producer", "expected_producer"),
+    [("component_manager", "component_manager"), (None, "kernel")],
+)
+def test_cell_admission_error_retains_optional_producer(
+    tmp_path, monkeypatch, producer, expected_producer
+) -> None:
+    client = CellAdmissionClient(tmp_path)
+    error = {
+        "code": "stale_generation",
+        "details": {"reason": "expected_generation_stale"},
+        "message": "stale admission generation",
+    }
+    if producer is not None:
+        error["producer"] = producer
+    monkeypatch.setattr(
+        client,
+        "_exchange",
+        lambda _packet, **_kwargs: {
+            "api_version": cell_admission.EXECUTION_RESPONSE_VERSION,
+            "command": "cell_admission_get",
+            "error": error,
+            "ok": False,
+        },
+    )
+
+    with pytest.raises(CellAdmissionError) as refused:
+        client.get()
+
+    assert refused.value.code == "stale_generation"
+    assert refused.value.details == {"reason": "expected_generation_stale"}
+    assert refused.value.producer == expected_producer

@@ -24,7 +24,9 @@ from manyforge_behavior.program import (
     NODE_OUTCOME_NONE,
     Program,
     ProgramValidationError,
+    active_tcp_key,
     interrupt_state_key,
+    is_active_tcp_key,
     is_interrupt_state_key,
     is_node_outcome_key,
     node_outcome_key,
@@ -322,7 +324,7 @@ def _validate_fields(
 # Types a Program can author (defaults, `initial:`); their values are checked
 # by the Program's own declared-type validator, pose frames included.
 _AUTHORED_VALUE_TYPES = frozenset(
-    {"bool", "float64", "int64", "scene_resource", "stored_pose", "string", "string_list"}
+    {"bool", "float64", "int64", "scene_resource", "stored_pose", "string", "string_list", "tcp_entry"}
 )
 
 
@@ -420,6 +422,7 @@ class ProgramValueStore:
         # Mirror writes per interrupt_state key, unchanged values included:
         # each is one reading of the Kernel rule state (Rule 2 gate wait).
         self._interrupt_state_readings: dict[str, int] = {}
+        self._interrupt_notify_rule_reader: Callable[[], tuple[str, ...] | None] | None = None
         self._lock = RLock()
         self._published: frozenset[str] | None = None
         self._on_published: Callable[[PublishedKeyChange], None] | None = None
@@ -741,8 +744,8 @@ class ProgramValueStore:
             for key in sorted(self._values):
                 if self._declarations[key].persistence == "persistent":
                     continue
-                if is_interrupt_state_key(key):
-                    # System-owned and always current (contract 64).
+                if is_interrupt_state_key(key) or is_active_tcp_key(key):
+                    # System-owned and always current across a Run reset.
                     continue
                 if is_node_outcome_key(key):
                     # System start value `none` (contract 105).
@@ -877,11 +880,61 @@ class ProgramValueStore:
             self._publish_locked(key, current)
         return True
 
+    def write_active_tcp(self, target_role: str, entry: Mapping[str, Any] | None) -> bool:
+        """Mirror the robot's confirmed TCP into its read-only role key.
+
+        ``None`` makes the value unavailable. A role not declared in this
+        Program is ignored, as with the interrupt-state mirror.
+        """
+
+        key = active_tcp_key(target_role)
+        declaration = self._declarations.get(key)
+        if declaration is None:
+            return False
+        if entry is not None:
+            entry = _copy_runtime_value(entry)
+            validate_blackboard_value(
+                self._program, declaration, entry, label=f"blackboard key {key!r}"
+            )
+        with self._lock:
+            current = self._values.get(key)
+            if entry is None:
+                if current is None:
+                    return True
+                self._values.pop(key)
+            elif current is not None and current.value == entry:
+                return True
+            else:
+                self._values[key] = ProgramValueRecord(
+                    status="succeeded", value=entry, metadata={"writer": "active_tcp_mirror"}
+                )
+            self._publish_locked(key, current)
+        return True
+
+    def set_interrupt_notify_rule_reader(
+        self, reader: Callable[[], tuple[str, ...] | None] | None
+    ) -> None:
+        """Install the Run's context-qualified catalog view for gate retries."""
+
+        with self._lock:
+            self._interrupt_notify_rule_reader = reader
+
+    def interrupt_rule_is_notify(self, rule_id: str) -> bool:
+        """Whether the current catalog proves this rule uses notify mode."""
+
+        with self._lock:
+            reader = self._interrupt_notify_rule_reader
+        if reader is None:
+            return False
+        notify_rule_ids = reader()
+        return notify_rule_ids is not None and rule_id in notify_rule_ids
+
     def interrupt_state_reading(self, rule_id: str) -> tuple[int, str | None]:
         """(readings, state) of one global rule: how many mirror readings this
         store received for it, and the current state (None: unavailable or
         not declared). A motion node gated by the rule re-evaluates its
-        admission only on a newer reading that is ``clear``."""
+        admission only on a newer clear reading, or a newer tripped reading
+        when the context-qualified catalog marks the rule notify."""
 
         key = interrupt_state_key(rule_id)
         with self._lock:
@@ -1128,6 +1181,7 @@ class NodeAttemptInputResolver:
         parameters: Mapping[str, Any],
         value_sources: Mapping[str, Mapping[str, Any]],
         blackboard_read_parameters: tuple[str, ...] = (),
+        derived_active_tcp_key: str | None = None,
     ) -> NodeAttemptInputSnapshot:
         """Resolve one attempt's inputs, before the node's own work starts.
 
@@ -1237,6 +1291,18 @@ class NodeAttemptInputResolver:
                 )
             blackboard_keys.add(key)
             key_readers.setdefault(key, []).append((parameter_id, "blackboard_key", key))
+
+        # Current's key is fixed from the bound target role by the node
+        # binder, not selected by an authored blackboard-key parameter.
+        if derived_active_tcp_key is not None:
+            if not isinstance(derived_active_tcp_key, str) or not is_active_tcp_key(
+                derived_active_tcp_key
+            ):
+                raise failure(
+                    "derived Active TCP key is invalid", INPUT_INVALID, None,
+                    "blackboard_key", derived_active_tcp_key,
+                )
+            blackboard_keys.add(derived_active_tcp_key)
 
         def key_reader(key: str) -> tuple[str | None, str, str | None]:
             readers = key_readers.get(key)
@@ -1395,6 +1461,23 @@ class NodeAttemptInputResolver:
             )
         prefix = f"node[{node_id}].parameters."
         for parameter_id, value in resolved.items():
+            source = value_sources.get(parameter_id)
+            if (
+                node_id == "motion.set_tcp"
+                and parameter_id == "tcp"
+                and isinstance(source, Mapping)
+                and source.get("kind") == "blackboard_key"
+                and self.key_type(source.get("reference")) == "tcp_entry"
+            ):
+                try:
+                    self._program.validate_key_value(
+                        source["reference"], value, path=f"{prefix}{parameter_id}"
+                    )
+                except ValueError as exc:
+                    raise failure(
+                        str(exc), INPUT_INVALID, parameter_id, *origin(parameter_id)
+                    ) from exc
+                continue
             issues = validate_value(
                 by_id[parameter_id].schema,
                 value,
@@ -1430,6 +1513,10 @@ class NodeAttemptInputResolver:
             parameter_id: _copy_runtime_value(blackboard_snapshot[resolved[parameter_id]])
             for parameter_id in blackboard_read_parameters
         }
+        if derived_active_tcp_key is not None:
+            declared_blackboard["active_tcp"] = _copy_runtime_value(
+                blackboard_snapshot[derived_active_tcp_key]
+            )
         return NodeAttemptInputSnapshot(
             parameters=MappingProxyType(_copy_runtime_value(resolved)),
             blackboard=MappingProxyType(declared_blackboard),

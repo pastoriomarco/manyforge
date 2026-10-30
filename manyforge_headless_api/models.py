@@ -283,6 +283,44 @@ class CallerAttributionRequest(StrictRequest):
         )
 
 
+class ManagerApplyAcknowledgementContext(StrictRequest):
+    """Bounded audit context for one operator acknowledgement attempt.
+
+    The Apply identity is carried separately in the URL/private command. This
+    request context records the acknowledging client; it is not authority or a
+    replay key, and callers that have no operator-command epoch omit it.
+    """
+
+    request_id: str
+    source_label: str
+    request_owner_epoch: str | None = None
+    correlation_id: str | None = None
+
+    @field_validator("request_id", "source_label")
+    @classmethod
+    def validate_required_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @field_validator("request_owner_epoch", "correlation_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
+class ManagerApplyAcknowledgementRequest(StrictRequest):
+    request_context: ManagerApplyAcknowledgementContext
+
+
 class ExecutionControlAttributionRequest(CallerAttributionRequest):
     """Optional causal identity of one persistent execution-control session."""
 
@@ -1284,6 +1322,10 @@ class ManagerApplyProgress(StrictRequest):
 
 MAX_APPLY_FAILURE_CODE_BYTES = 128
 MAX_APPLY_FAILURE_MESSAGE_BYTES = 1024
+MAX_APPLY_FAILURE_PRODUCER_BYTES = 64
+MAX_APPLY_FAILURE_CAUSE_DETAILS = 16
+MAX_APPLY_FAILURE_CAUSE_DETAIL_KEY_BYTES = 64
+MAX_APPLY_FAILURE_CAUSE_DETAIL_VALUE_BYTES = 256
 
 ManagerApplyTerminalState = Literal[
     "pending",
@@ -1306,8 +1348,18 @@ class ManagerApplyFailure(StrictRequest):
     message: str
     phase: ManagerApplyPhase
     effect_disposition: Literal["known", "unknown"]
+    # The typed inner cause: its own code (the phase code when the cause had
+    # none), its bounded details and the owner that produced it.
+    cause_code: str
+    cause_details: dict[str, str]
+    producer: str
+    # Stated by the failure's source, never inferred from the code.
+    # "before_effect": the Apply made no configuration, runtime, component or
+    # Scene change. An admission claim, a Kernel fence and fail-closed
+    # readiness may still exist; whoever releases them checks those directly.
+    effect_boundary: Literal["before_effect", "unknown"]
 
-    @field_validator("code")
+    @field_validator("code", "cause_code")
     @classmethod
     def validate_code(cls, value: str) -> str:
         return _bounded_nfc(
@@ -1315,6 +1367,33 @@ class ManagerApplyFailure(StrictRequest):
             label="code",
             maximum_bytes=MAX_APPLY_FAILURE_CODE_BYTES,
         )
+
+    @field_validator("producer")
+    @classmethod
+    def validate_producer(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="producer",
+            maximum_bytes=MAX_APPLY_FAILURE_PRODUCER_BYTES,
+        )
+
+    @field_validator("cause_details")
+    @classmethod
+    def validate_cause_details(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > MAX_APPLY_FAILURE_CAUSE_DETAILS or any(
+            not key
+            or len(key.encode("utf-8")) > MAX_APPLY_FAILURE_CAUSE_DETAIL_KEY_BYTES
+            or len(item.encode("utf-8")) > MAX_APPLY_FAILURE_CAUSE_DETAIL_VALUE_BYTES
+            for key, item in value.items()
+        ):
+            raise ValueError("cause_details must be a bounded string map")
+        return value
+
+    @model_validator(mode="after")
+    def require_known_effects_before_effect(self) -> "ManagerApplyFailure":
+        if self.effect_boundary == "before_effect" and self.effect_disposition != "known":
+            raise ValueError("a failure before any effect has known effects")
+        return self
 
     @field_validator("message")
     @classmethod
@@ -1366,6 +1445,7 @@ class ManagerApplyStatus(StrictRequest):
     phase: ManagerApplyPhase
     last_progress: ManagerApplyProgress
     state: ManagerApplyTerminalState
+    failure_acknowledgement: Literal["available", "acknowledged", "unavailable"]
     candidate_projection_revision: ProjectionRevisionRequest | None = None
     failure: ManagerApplyFailure | None = None
 
@@ -1417,6 +1497,15 @@ class ManagerApplyStatus(StrictRequest):
                     "the retained failure disposition must match the terminal "
                     "state"
                 )
+        if self.failure_acknowledgement != "unavailable" and (
+            self.state != "failed"
+            or self.failure is None
+            or self.failure.effect_boundary != "before_effect"
+        ):
+            raise ValueError(
+                "failure acknowledgement is available or acknowledged only "
+                "for a failed operation with a retained before-effect failure"
+            )
         return self
 
 
@@ -1810,6 +1899,8 @@ class AddSceneObjectRequest(StrictRequest):
     support_contacts: Annotated[
         list[SceneSupportContactRequest], Field(max_length=4096)
     ] = Field(default_factory=list)
+    # Object mass (kg); absent means 0, so a present mass is positive.
+    mass_kg: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
 
     @field_validator("scene_resource_id")
     @classmethod
@@ -2734,13 +2825,14 @@ class RuntimeObjectReferenceBindingRequest(StrictRequest):
         )
 
 
-class MotionEndpointReferenceRequest(StrictRequest):
-    """One portable TCP selection; the native owner verifies its sealed binding."""
+class TcpEntryRequest(StrictRequest):
+    """One owner-qualified TCP in the retained Deployment."""
 
-    target_role_id: str
+    component_id: str
+    target_id: str
     frame_role_id: str
 
-    @field_validator("target_role_id", "frame_role_id")
+    @field_validator("component_id", "target_id", "frame_role_id")
     @classmethod
     def validate_endpoint_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -2750,11 +2842,41 @@ class MotionEndpointReferenceRequest(StrictRequest):
         )
 
 
+class CurrentTcpSelectorRequest(StrictRequest):
+    kind: Literal["current"]
+
+
+class DefaultTcpOfRoleSelectorRequest(StrictRequest):
+    kind: Literal["default_of_role"]
+    role: str
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        return _bounded_nfc(value, label="role", maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class TcpEntrySelectorRequest(StrictRequest):
+    kind: Literal["entry"]
+    entry: TcpEntryRequest
+
+
+TcpSelectorRequest = Annotated[
+    CurrentTcpSelectorRequest | DefaultTcpOfRoleSelectorRequest | TcpEntrySelectorRequest,
+    Field(discriminator="kind"),
+]
+
+
+class SetTcpParticipantRequest(StrictRequest):
+    kind: Literal["set_tcp"]
+    tcp: TcpSelectorRequest
+
+
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
     base_frame_role_id: str
-    tcp_endpoint: MotionEndpointReferenceRequest
+    tcp_endpoint: TcpSelectorRequest
     tolerances: MotionTolerancesRequest
     speed_profile: MotionSpeedProfileRequest
     timeouts: MotionTimeoutsRequest
@@ -2772,12 +2894,19 @@ class MotionParticipantRequest(StrictRequest):
     )
     # Frame of an absolute pose/Cartesian goal; absent means the base frame.
     goal_frame_reference: FrameReferenceRequest | None = None
+    # Collision clearance for this move (m); absent means the Deployment's
+    # collision_clearance_m, 0 turns it off for this move.
+    clearance_m: Annotated[
+        float | None, Field(ge=0, le=0.05, allow_inf_nan=False)
+    ] = None
 
     @model_serializer(mode="wrap")
     def serialize_motion(self, handler) -> dict[str, Any]:
         result = handler(self)
         if self.goal_frame_reference is None:
             result.pop("goal_frame_reference", None)
+        if self.clearance_m is None:
+            result.pop("clearance_m", None)
         return result
 
     @field_validator(
@@ -2859,7 +2988,7 @@ class OperationParticipantRequest(StrictRequest):
     required_capability_id: str
     action_span: ActionSpanRequest | None
     payload: Annotated[
-        MotionParticipantRequest | CapabilityCommandParticipantRequest,
+        MotionParticipantRequest | CapabilityCommandParticipantRequest | SetTcpParticipantRequest,
         Field(discriminator="kind"),
     ]
 
@@ -3192,8 +3321,7 @@ def _validate_pick_place_operations(
             participant.target_role_id,
             participant.required_capability_id,
             participant.payload.base_frame_role_id,
-            participant.payload.tcp_endpoint.target_role_id,
-            participant.payload.tcp_endpoint.frame_role_id,
+            participant.payload.tcp_endpoint.model_dump_json(),
         )
         for participant in motion_participants
         if isinstance(participant.payload, MotionParticipantRequest)
@@ -3726,6 +3854,23 @@ class CellRecoverRequest(StrictRequest):
     """One operator Recover cell: incidents, then the current Stop-fault latch."""
 
     request_context: CellRecoverRequestContext
+    # M6 (item 36): the open incident IDs the operator was shown. An open
+    # incident not listed refuses the press `cclc_incident_changed` before any
+    # step; absent: today's press (every open incident is acknowledged).
+    expected_incident_ids: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=128)]],
+        Field(max_length=256),
+    ] | None = None
+    # M6 (RECTIME): an automatic resend after an HTTP timeout. It only reads
+    # the replay ledger and never starts a press: an unknown request ID (a
+    # Headless restart or an evicted result) is answered, not run.
+    replay_only: bool = False
+
+
+class CellRecoverAbortRequest(StrictRequest):
+    """SX-679: the operator's abort of the running Recover cell press."""
+
+    request_context: CellRecoverRequestContext
 
 
 class GlobalIoRuleRecoveryContext(StrictRequest):
@@ -4169,6 +4314,13 @@ class ComponentLifecycleRequest(StrictRequest):
     ]
     reason: str | None = None
     close_incident_recovery: CloseIncidentRecoveryRequest | None = None
+    # M6: false never acknowledges an open incident or stream latch; CCLC
+    # refuses `cclc_incident_open` instead. Absent: today's operator Recover.
+    acknowledge_incident: bool | None = None
+    # M6 (item 36): the operator's Recover acknowledges only this open
+    # incident; another one is refused `cclc_incident_changed` (409, no
+    # effect). None open (item 26): an ordinary Recover. Absent: today's Recover.
+    expected_incident_id: str | None = None
     confirmed: bool
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     program_node_evidence: ProgramNodeAdmissionEvidenceRequest | None = None
@@ -4189,11 +4341,25 @@ class ComponentLifecycleRequest(StrictRequest):
             return None
         return _bounded_nfc(value, label="reason", maximum_bytes=1_024)
 
+    @field_validator("expected_incident_id")
+    @classmethod
+    def validate_expected_incident(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label="expected_incident_id", maximum_bytes=128)
+
     @model_validator(mode="after")
     def validate_domain_order(self) -> "ComponentLifecycleRequest":
         if self.close_incident_recovery is not None and (
                 self.intent != "recover" or self.reason != "cell closed by operator"):
             raise ValueError("Close incident recovery requires explicit Recover and its exact reason")
+        if self.expected_incident_id is not None and (
+                self.intent != "recover"
+                or self.acknowledge_incident is False
+                or self.close_incident_recovery is not None):
+            raise ValueError(
+                "expected_incident_id belongs to an ordinary Recover that acknowledges an incident"
+            )
         if self.program_node_evidence is not None:
             raise ValueError(
                 "component lifecycle mutations are unsupported as Program nodes; "

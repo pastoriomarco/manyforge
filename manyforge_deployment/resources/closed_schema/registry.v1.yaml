@@ -23,7 +23,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: component_type
     schema_id: manyforge.component_type.v1
-    schema_revision: sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4
+    schema_revision: sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde
     relative_path: catalog/manyforge.component_type.v1.yaml
     qualification: qualified
   - record_kind: contact_policy
@@ -43,7 +43,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: model_asset
     schema_id: manyforge.model_asset.v1
-    schema_revision: sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c
+    schema_revision: sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6
     relative_path: catalog/manyforge.model_asset.v1.yaml
     qualification: qualified
   - record_kind: provider_manifest
@@ -75,12 +75,12 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.io_provider_execution.v1
-    schema_revision: sha256:6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4
+    schema_revision: sha256:253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7
     relative_path: value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
     qualification: qualified
   # DX-753: retain archival native schema for shared Draft/import validation.
   - schema_id: manyforge.value_schema.runtime.native_execution.v1
-    schema_revision: sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48
+    schema_revision: sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190
     relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.pose_source.v2
@@ -88,6 +88,6 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.pose_source.v2.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274
+    schema_revision: sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

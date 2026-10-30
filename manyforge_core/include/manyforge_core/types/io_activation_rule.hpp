@@ -59,9 +59,11 @@ struct IoActivationRulePolicyBindingDTO final {
   /// condition or fabricated key types/values. Canonical literal user keys.
   std::vector<std::string> waiting_for_program_keys{};
   /// Authored `on_trip: full_stop`: a trip with motion in scope is a cell
-  /// Full Stop (as scope `everything`). `gate` (false) keeps the scoped Stop.
+  /// Full Stop (as scope `everything`). `gate` keeps the scoped Stop.
   /// The release (post_latch_disposition) and idle latch are compiled with it.
   bool full_stop_on_trip{false};
+  /// Notify publishes condition state without a motion effect or latch.
+  bool notify_on_trip{false};
   friend bool operator==(const IoActivationRulePolicyBindingDTO&,
                          const IoActivationRulePolicyBindingDTO&) = default;
 };

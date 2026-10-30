@@ -245,7 +245,7 @@
     },
     {
       "frame_role_id": "flange",
-      "source_link_name": "flange"
+      "source_link_name": "tool0"
     },
     {
       "frame_role_id": "gripper_tcp",
@@ -276,7 +276,7 @@
       "source_group_name": "robotiq_2f_85_gripper"
     }
   ],
-  "model_revision": "sha256:b11ecd5791ba69d8855b7e7df482059af9e2e00bf440a9063d0ea62cdd14ba1a",
+  "model_revision": "sha256:199f08b6b1260910c29fec123182172423d687814f94df7dfeb54629c7b236e5",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

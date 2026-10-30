@@ -117,27 +117,44 @@ collision_failure_details(const roboplan::Scene &scene,
   }
   const auto distance_count =
       std::min(model.collisionPairs.size(), data.distanceResults.size());
-  for (std::size_t index = 0U; index < distance_count; ++index) {
-    const auto distance = data.distanceResults[index].min_distance;
-    if (!std::isfinite(distance) || distance > 0.0) {
-      continue;
+  // A real contact first; otherwise a pair closer than its collision
+  // clearance (the scene's per-pair security margin), reported as
+  // `classification: clearance`.
+  for (const bool clearance : {false, true}) {
+    for (std::size_t index = 0U; index < distance_count; ++index) {
+      const auto distance = data.distanceResults[index].min_distance;
+      const double margin = index < data.collisionRequests.size()
+                                ? data.collisionRequests[index].security_margin
+                                : 0.0;
+      if (!std::isfinite(distance) ||
+          (clearance ? !(distance > 0.0 && distance < margin) : distance > 0.0)) {
+        continue;
+      }
+      const auto &pair = model.collisionPairs[index];
+      if (pair.first < model.geometryObjects.size() &&
+          pair.second < model.geometryObjects.size()) {
+        details.emplace("collision_body_a",
+                        model.geometryObjects[pair.first].name);
+        details.emplace("collision_body_b",
+                        model.geometryObjects[pair.second].name);
+        details.emplace("collision_signed_distance_m", std::to_string(distance));
+      }
+      if (clearance) {
+        details.emplace("classification", "clearance");
+        details.emplace("collision_clearance_m", std::to_string(margin));
+      }
+      return details;
     }
-    const auto &pair = model.collisionPairs[index];
-    if (pair.first < model.geometryObjects.size() &&
-        pair.second < model.geometryObjects.size()) {
-      details.emplace("collision_body_a",
-                      model.geometryObjects[pair.first].name);
-      details.emplace("collision_body_b",
-                      model.geometryObjects[pair.second].name);
-      details.emplace("collision_signed_distance_m", std::to_string(distance));
-    }
-    break;
   }
   return details;
 }
 
 [[nodiscard]] std::string collision_failure_message(
     std::string message, const std::map<std::string, std::string> &details) {
+  if (const auto classification = details.find("classification");
+      classification != details.end() && classification->second == "clearance") {
+    message += " (closer than the collision clearance)";
+  }
   const auto body_a = details.find("collision_body_a");
   const auto body_b = details.find("collision_body_b");
   if (body_a != details.end() && body_b != details.end()) {
@@ -425,7 +442,8 @@ validate_binding(const roboplan::Scene &scene,
           [&](const auto &frame) { return frame_exists(scene, frame); }) ||
       config.maximum_trajectory_samples < 2U ||
       config.maximum_trajectory_samples > 1'000'000U ||
-      !finite_positive(config.trajectory_sample_period_s)) {
+      !finite_positive(config.trajectory_sample_period_s) ||
+      !finite_positive(config.collision_check_step_rad)) {
     return core::Result<void>::Err(
         make_error(ErrorCode::kInvalidRequest,
                    "RoboPlan candidate binding is incomplete or inconsistent",
@@ -463,7 +481,11 @@ validate_request_binding(const RoboPlanCandidateBindingDTO &binding,
       request.model_revision != binding.model_revision ||
       request.resources != binding.resources ||
       !contains_frame(binding.permitted_frames, request.base_frame) ||
-      !contains_frame(binding.permitted_frames, request.tcp_frame)) {
+      !contains_frame(binding.permitted_frames, request.tcp_frame) ||
+      !std::all_of(request.speed_check_frames.begin(),
+                   request.speed_check_frames.end(), [&](const auto &frame) {
+                     return contains_frame(binding.permitted_frames, frame);
+                   })) {
     return core::Result<void>::Err(
         make_error(ErrorCode::kInvalidRequest,
                    "RoboPlan request does not match the exact retained "
@@ -724,6 +746,15 @@ void scale_trajectory_time(roboplan::JointTrajectory &trajectory,
   }
 }
 
+[[nodiscard]] std::vector<std::string>
+compiled_speed_frames(const std::vector<core::ResolvedFrameDTO> &frames) {
+  std::vector<std::string> result;
+  result.reserve(frames.size());
+  for (const auto &frame : frames)
+    result.push_back(core::compiled_frame_name(frame));
+  return result;
+}
+
 [[nodiscard]] detail::CartesianTrajectoryContractInput
 cartesian_contract_input(const RoboPlanCandidateBindingDTO &binding,
                          const RoboPlanCandidateRequestDTO &request,
@@ -732,7 +763,8 @@ cartesian_contract_input(const RoboPlanCandidateBindingDTO &binding,
       binding.compiled_group_name,
       core::compiled_frame_name(request.base_frame),
       core::compiled_frame_name(request.tcp_frame), request.speed_profile,
-      caps.portable_by_joint};
+      caps.portable_by_joint,
+      compiled_speed_frames(request.speed_check_frames)};
 }
 
 [[nodiscard]] CartesianPlanningControl
@@ -1634,7 +1666,12 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       !prefix.cartesian_waypoint_times_s.empty() ||
       prefix.cartesian_fidelity_metrics ||
       !contains_frame(binding.permitted_frames, moving.source_base_frame) ||
-      !contains_frame(binding.permitted_frames, moving.source_tcp_frame))
+      !contains_frame(binding.permitted_frames, moving.source_tcp_frame) ||
+      !std::all_of(moving.source_speed_check_frames.begin(),
+                   moving.source_speed_check_frames.end(),
+                   [&](const auto &frame) {
+                     return contains_frame(binding.permitted_frames, frame);
+                   }))
     return invalid();
   if (const auto error = detail::validate_cartesian_trajectory_output(
           native_trajectory(prefix), binding.compiled_joint_names, control))
@@ -1747,7 +1784,8 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       binding.compiled_group_name,
       core::compiled_frame_name(moving.source_base_frame),
       core::compiled_frame_name(moving.source_tcp_frame),
-      moving.source_speed_profile, source_caps.value().portable_by_joint};
+      moving.source_speed_profile, source_caps.value().portable_by_joint,
+      compiled_speed_frames(moving.source_speed_check_frames)};
   const auto future_contract =
       cartesian_contract_input(binding, input, future_caps);
   const auto contract_control = cartesian_control(control);
@@ -2291,7 +2329,8 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
                                        "planning_timeout");
     auto rrt_options = planning_profile_rrt_options(
         production_rrt_options(binding_.compiled_group_name, rrt_timeout,
-                               request.planning_attempt_index),
+                               request.planning_attempt_index,
+                               config_.collision_check_step_rad),
         request.planning_profile);
     roboplan::RRT planner(planning_scene, rrt_options);
     if (request_seed.has_value()) {
@@ -2312,7 +2351,7 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
     if (shortcut_candidate_for_attempt(request.planning_attempt_index)) {
       const auto shortcut_options = production_shortcutting_options(
           binding_.compiled_group_name, request_seed,
-          request.planning_attempt_index);
+          request.planning_attempt_index, config_.collision_check_step_rad);
       roboplan::PathShortcutter shortcutter(planning_scene, shortcut_options);
       candidate_path = shortcutter.shortcut(candidate_path);
       if (auto error = control_error(control, "shortcut"); error.has_value()) {

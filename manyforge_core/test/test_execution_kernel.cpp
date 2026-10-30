@@ -2098,6 +2098,55 @@ CollisionResult make_authoritative_collision_result() {
   return result;
 }
 
+// M6 clearance fixtures: one robot link plus scene obstacles, and a mock
+// engine answer for one pair at a signed distance that honours the query's
+// clearance margin like ManyForgeCollisionEngine.
+const CollisionBodyId kClearanceTestLink = "component/arm/model/arm_model/body/link1/collision/0";
+
+CollisionWorldSnapshot make_clearance_test_world(CollisionWorldSnapshot world,
+                                                 const std::vector<std::string>& obstacles) {
+  world.bodies.push_back(make_test_robot_link_body("link1"));
+  for (const auto& obstacle : obstacles) {
+    world.bodies.push_back(make_observed_box_body(obstacle, make_test_pose(), obstacle + "-hash"));
+  }
+  std::sort(world.bodies.begin(), world.bodies.end(),
+            [](const auto& left, const auto& right) { return left.body_id < right.body_id; });
+  world.body_count = static_cast<std::int64_t>(world.bodies.size());
+  world.geometry_count = world.body_count;
+  world.component_model_body_count = 1;
+  world.scene_resource_count = world.body_count - 1;
+  return world;
+}
+
+CollisionPairId clearance_test_pair(const std::string& obstacle) {
+  return CollisionPairId{kClearanceTestLink, "scene/" + obstacle + "/shape/0"};
+}
+
+std::optional<CollisionResult> clearance_test_result(const CollisionQuery& query,
+                                                     const CollisionPairId& pair,
+                                                     double signed_distance_m) {
+  const double margin =
+      query.clearance_margins ? query.clearance_margins->margin_for(pair) : 0.0;
+  if (signed_distance_m > 0.0 && signed_distance_m >= margin) {
+    return std::nullopt;
+  }
+  auto result = make_authoritative_collision_result();
+  result.normalized_pairs = {pair};
+  if (signed_distance_m > 0.0) {
+    result.clearance_violations = {CollisionPairClearance{pair, signed_distance_m}};
+  }
+  return result;
+}
+
+double clearance_test_joint(const CollisionQuery& query, const std::string& joint) {
+  const auto& names = query.robot_state.joint_names;
+  const auto found = std::find(names.begin(), names.end(), joint);
+  return found == names.end()
+             ? 0.0
+             : query.robot_state.positions_rad.at(
+                   static_cast<std::size_t>(std::distance(names.begin(), found)));
+}
+
 CollisionResult make_support_contact_collision_result(const CollisionPairId& pair,
                                                       double signed_clearance_m) {
   CollisionResult result;
@@ -2362,7 +2411,9 @@ class ExecutionKernelTest : public ::testing::Test {
   }
 
   /// Helper: prepare, dispatch and wait for async completion.
-  Result<uint64_t> execute_sync(const ExecuteRequestDTO& req) {
+  Result<uint64_t> execute_sync(const ExecuteRequestDTO& req) { return execute_sync(kernel, req); }
+
+  Result<uint64_t> execute_sync(ExecutionKernel& target, const ExecuteRequestDTO& req) {
     auto prepared = prepared_motion_request(req);
     if (req.target_mode == MotionTargetModeDTO::kRelative || req.goal_frame_reference.has_value()) {
       auto controlled = testing::make_test_controlled_state(
@@ -2373,10 +2424,10 @@ class ExecutionKernelTest : public ::testing::Test {
       context.addressed_publication_value = testing::make_test_observed_state_publication(
           prepared.execution_request.binding, controlled, clock.now());
     }
-    auto result = prepare_and_dispatch(kernel, std::move(prepared));
+    auto result = prepare_and_dispatch(target, std::move(prepared));
     if (result.ok()) {
-      const bool completed = kernel.wait_for_completion(2'000'000'000);
-      const bool already_terminal = kernel.get_status().fact.has_value();
+      const bool completed = target.wait_for_completion(2'000'000'000);
+      const bool already_terminal = target.get_status().fact.has_value();
       EXPECT_TRUE(completed || already_terminal)
           << "execute_sync timed out waiting for " << req.move_id;
     }
@@ -2387,10 +2438,11 @@ class ExecutionKernelTest : public ::testing::Test {
     store_cache(make_test_request(move_id), std::move(trajectory));
   }
 
-  void store_cache(const ExecuteRequestDTO& request, TrajectoryDTO trajectory) {
+  void store_cache(const ExecuteRequestDTO& request, TrajectoryDTO trajectory,
+                   std::uint32_t planning_attempt_index = 0U) {
     const auto resolved_request = prepared_motion_request(request).execution_request;
     cache.store(trajectory_cache_key(resolved_request), std::move(trajectory),
-                trajectory_cache_intent_identity(resolved_request));
+                trajectory_cache_intent_identity(resolved_request), planning_attempt_index);
   }
 
   TrajectoryCacheKey cache_key(const std::string& move_id) const {
@@ -3217,8 +3269,8 @@ TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureRetryDeadlineFollowsMe
   // Retry readiness of a no-effect failure keeps the same observation
   // freshness rule as the Stop-backed retry classes: newer measured samples
   // extend the published validity deadline without churning the revision,
-  // and a stale source lets the deadline elapse (the Program offer then
-  // disables Retry as recovery_owner_observation_expired).
+  // and a stale source lets the deadline elapse (a press then refuses at
+  // recovery admission; the Program offer itself carries no expiry).
   PlanResultDTO plan_err;
   plan_err.error = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
                             "RoboPlan could not resolve the pose goal",
@@ -3729,10 +3781,11 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
-  // One validation pass over the two stored waypoints (0 -> 1 rad) and the
-  // interpolants that keep every step within kValidationMaxJointStepRad.
+  // One validation pass over the two stored waypoints (both joints 0 -> 1
+  // rad: sqrt(2) rad apart) and the interpolants at the planner's default
+  // collision-check step.
   EXPECT_EQ(collision_engine->check_count.load(),
-            static_cast<int>(std::ceil(1.0 / kValidationMaxJointStepRad)) + 1);
+            static_cast<int>(std::ceil(std::sqrt(2.0) / kDefaultCollisionCheckStepRad)) + 1);
   std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const KernelEvent& e) {
     return e.type == KernelEventType::kErrorRaised;
@@ -4751,7 +4804,8 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
 TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionStrictlyBetweenWaypoints) {
   // M55 F-1: the only colliding configuration lies strictly between the two
   // stored waypoints (0 and 1 rad). Checking the stored waypoints alone
-  // accepted it; the runtime lookahead then stopped the motion.
+  // accepted it; the runtime lookahead then stopped the motion. The band is
+  // two planner steps wide, so a sample at the planner step lands in it.
   collision_engine->result_for_query =
       [](const CollisionQuery& query) -> std::optional<CollisionResult> {
     const auto& names = query.robot_state.joint_names;
@@ -4759,7 +4813,7 @@ TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionStrictlyBetweenWay
     if (j1 == names.end()) return std::nullopt;
     const double position = query.robot_state.positions_rad.at(
         static_cast<std::size_t>(std::distance(names.begin(), j1)));
-    if (position > 0.5 && position < 0.5 + 2.0 * kValidationMaxJointStepRad) {
+    if (position > 0.5 && position < 0.5 + 2.0 * kDefaultCollisionCheckStepRad) {
       return make_authoritative_collision_result();
     }
     return std::nullopt;
@@ -4778,9 +4832,333 @@ TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionStrictlyBetweenWay
   EXPECT_LT(failing_j1, 1.0);
 }
 
+// --- M6 collision clearance (security margin)
+
+TEST_F(ExecutionKernelTest, Config_CollisionClearanceAndCheckStepRejectOutOfRange) {
+  for (const double bad : {-0.001, 0.0501}) {
+    ExecutionKernelConfig config;
+    config.collision_clearance_m = bad;
+    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+                 std::invalid_argument);
+  }
+  for (const double bad : {0.0, -0.01, 0.2001}) {
+    ExecutionKernelConfig config;
+    config.collision_check_step_rad = bad;
+    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
+                 std::invalid_argument);
+  }
+  // 0 turns the clearance off; no lower floor otherwise.
+  for (const double admitted : {0.0, 0.0002, 0.05}) {
+    ExecutionKernelConfig config;
+    config.collision_clearance_m = admitted;
+    EXPECT_NO_THROW(
+        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
+  }
+  for (const double admitted : {0.001, 0.2}) {
+    ExecutionKernelConfig config;
+    config.collision_check_step_rad = admitted;
+    EXPECT_NO_THROW(
+        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
+  }
+}
+
+TEST_F(ExecutionKernelTest, Execute_ValidationChecksTheCurveAtTheConfiguredPlannerStep) {
+  // M6 decision 18: validation samples the executed curve at the planner's
+  // collision-check step, settable (Deployment collision_check_step_rad),
+  // measured like RoboPlan's configuration distance. Both joints 0 -> 1 rad
+  // (sqrt(2) rad) at 0.01: 142 steps, 143 checked states; not the default
+  // step's 30 and not the former fixed 0.0005 rad joint step's 2001.
+  ExecutionKernelConfig config;
+  config.collision_check_step_rad = 0.01;
+  ExecutionKernel stepped_kernel{planner, context, execution, clock, scheduler, cache, config};
+  configure_authoritative_collision_validation(stepped_kernel, collision_world_publisher,
+                                               collision_engine);
+  std::mutex positions_mutex;
+  std::map<std::int64_t, std::pair<double, double>> checked;
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index) {
+      std::lock_guard lock(positions_mutex);
+      checked[*query.waypoint_index] = {clearance_test_joint(query, "j1"),
+                                        clearance_test_joint(query, "j2")};
+    }
+    return std::nullopt;
+  };
+
+  auto result = prepare_and_dispatch(stepped_kernel, make_test_request("planner_step"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  stepped_kernel.wait_for_completion();
+  EXPECT_EQ(ended_as(stepped_kernel), "completed");
+  EXPECT_EQ(collision_engine->check_count.load(),
+            static_cast<int>(std::ceil(std::sqrt(2.0) / 0.01)) + 1);
+  std::lock_guard lock(positions_mutex);
+  ASSERT_EQ(checked.size(), 143U);
+  for (auto it = std::next(checked.begin()); it != checked.end(); ++it) {
+    const auto& [j1, j2] = it->second;
+    const auto& [p1, p2] = std::prev(it)->second;
+    EXPECT_LE(std::hypot(j1 - p1, j2 - p2), 0.01 + 1e-12);
+  }
+}
+
+TEST_F(ExecutionKernelTest, Execute_ValidationOfARetryUsesTheRetryPlannerStep) {
+  // SX-608: validation uses the step the trajectory was planned with. Both
+  // joints 0 -> 1 rad (sqrt(2) rad). The first attempt (0.05: 29 steps) has
+  // a sample at j1 = 15/29 = 0.51724 inside a thin band and is refused; the
+  // retry is planned at min(0.05, 0.01) and validated at 0.01 (142 steps,
+  // samples at 73/142 = 0.51408 and 74/142 = 0.52113, both outside the
+  // band), so it is accepted and dispatched.
+  std::mutex indexes_mutex;
+  std::int64_t max_index = -1;
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index) {
+      std::lock_guard lock(indexes_mutex);
+      max_index = std::max(max_index, *query.waypoint_index);
+    }
+    const double j1 = clearance_test_joint(query, "j1");
+    if (j1 > 0.5170 && j1 < 0.5175) return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+
+  const auto result = execute_sync(make_test_request("retry_step"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(planner.last_request.planning_attempt_index, 1U);
+  EXPECT_DOUBLE_EQ(collision_check_step_for_attempt(kDefaultCollisionCheckStepRad, 1U), 0.01);
+  std::lock_guard lock(indexes_mutex);
+  EXPECT_EQ(max_index, static_cast<std::int64_t>(std::ceil(std::sqrt(2.0) / 0.01)));
+}
+
+TEST_F(ExecutionKernelTest, Execute_CachedRetryTrajectoryIsRevalidatedAtTheRetryStep) {
+  // SX-617: a trajectory planned on a retry (attempt 1, 0.01) is stored with
+  // its attempt; a later cache hit is revalidated at 0.01 (143 states), not
+  // at the first attempt's 0.05 (30 states), and the planner is not called.
+  store_cache(make_test_request("cached_retry"), make_test_trajectory(), 1U);
+  std::mutex indexes_mutex;
+  std::int64_t max_index = -1;
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index) {
+      std::lock_guard lock(indexes_mutex);
+      max_index = std::max(max_index, *query.waypoint_index);
+    }
+    return std::nullopt;
+  };
+  const int plans_before = planner.plan_count;
+
+  const auto result = execute_sync(make_test_request("cached_retry"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, plans_before);
+  EXPECT_EQ(kernel.get_metrics().cache_hits, 1U);
+  std::lock_guard lock(indexes_mutex);
+  EXPECT_EQ(max_index, static_cast<std::int64_t>(std::ceil(std::sqrt(2.0) / 0.01)));
+}
+
+TEST_F(ExecutionKernelTest, Execute_RetryTrajectoryIsCachedWithItsAttempt) {
+  // The retry of Execute_ValidationOfARetryUsesTheRetryPlannerStep is stored
+  // with attempt 1, so its reuse keeps the 0.01 step.
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    const double j1 = clearance_test_joint(query, "j1");
+    if (j1 > 0.5170 && j1 < 0.5175) return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  const auto request = make_test_request("retry_cached");
+  ASSERT_TRUE(execute_sync(request).ok());
+  ASSERT_EQ(ended_as(kernel), "completed");
+  const auto resolved = prepared_motion_request(request).execution_request;
+  const auto stored =
+      cache.lookup(trajectory_cache_key(resolved), trajectory_cache_intent_identity(resolved));
+  ASSERT_EQ(stored.disposition, TrajectoryCacheLookupDisposition::kFound);
+  EXPECT_EQ(stored.planning_attempt_index, 1U);
+}
+
+TEST_F(ExecutionKernelTest, Execute_DefaultClearanceIsOffAsInMerge55) {
+  // M6 final decision: the default clearance is 0. With no Deployment or
+  // move clearance, a pick whose fingers come within 1 mm of the part is
+  // accepted, no margins reach the planner or validation, and no start
+  // clearance query runs (merge 5.5 behaviour).
+  ExecuteRequestDTO req = make_relative_object_request("clearance_default", "graspable");
+  Pose3DTO reference;
+  reference.position_m = {0.3, -0.2, 0.15};
+  reference.orientation = {0.0, 0.0, 0.0, 1.0};
+  context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
+  install_mock_retained_object(collision_world_publisher, "graspable");
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(*collision_world_publisher.current_snapshot, {"table"}));
+  const auto target = clearance_test_pair("graspable");
+  std::atomic<int> queries_with_margins{0};
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.clearance_margins) ++queries_with_margins;
+    return clearance_test_result(query, target,
+                                 0.004 - 0.003 * clearance_test_joint(query, "j1"));
+  };
+
+  EXPECT_DOUBLE_EQ(kDefaultCollisionClearanceM, 0.0);
+  const auto result = execute_sync(req);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(planner.last_request.retained_clearance_margins);
+  EXPECT_EQ(queries_with_margins.load(), 0);
+}
+
+TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAContactPolicy) {
+  // M6 decision 17: the move's target object is not exempt by itself. With a
+  // 3 mm clearance, a pick approach whose fingers come within 1 mm of it,
+  // with no contact-grasp policy, is refused as a clearance violation; the
+  // table keeps the clearance as well.
+  ExecuteRequestDTO req = make_relative_object_request("clearance_pick", "graspable");
+  req.clearance_m = 0.003;
+  Pose3DTO reference;
+  reference.position_m = {0.3, -0.2, 0.15};
+  reference.orientation = {0.0, 0.0, 0.0, 1.0};
+  context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
+  install_mock_retained_object(collision_world_publisher, "graspable");
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(*collision_world_publisher.current_snapshot, {"table"}));
+  const auto target = clearance_test_pair("graspable");
+  const auto table = clearance_test_pair("table");
+  // 4 mm at the start (outside the clearance), 1 mm at the end.
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (auto near_target = clearance_test_result(
+            query, target, 0.004 - 0.003 * clearance_test_joint(query, "j1"))) {
+      return near_target;
+    }
+    return clearance_test_result(query, table, 0.05);
+  };
+
+  execute_sync(req);
+  EXPECT_EQ(ended_as(kernel), "failed");
+  EXPECT_EQ(execution.execute_count, 0);
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
+  EXPECT_EQ(snapshot.error->details.at("classification"), "clearance");
+  EXPECT_DOUBLE_EQ(std::stod(snapshot.error->details.at("collision_clearance_m")), 0.003);
+  const auto& margins = planner.last_request.retained_clearance_margins;
+  ASSERT_TRUE(margins);
+  EXPECT_DOUBLE_EQ(margins->margin_for(target), 0.003);
+  EXPECT_DOUBLE_EQ(margins->margin_for(table), 0.003);
+}
+
+TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearance) {
+  // M6 decision 16: with a 3 mm Deployment clearance, the same pick with the
+  // move's own clearance_m of 0.5 mm is accepted, and the planner and
+  // validation both carry 0.5 mm; 0 turns the clearance off for the move.
+  ExecutionKernelConfig config;
+  config.collision_clearance_m = 0.003;
+  ExecutionKernel cell_kernel{planner, context, execution, clock, scheduler, cache, config};
+  configure_authoritative_collision_validation(cell_kernel, collision_world_publisher,
+                                               collision_engine);
+  Pose3DTO reference;
+  reference.position_m = {0.3, -0.2, 0.15};
+  reference.orientation = {0.0, 0.0, 0.0, 1.0};
+  install_mock_retained_object(collision_world_publisher, "graspable");
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(*collision_world_publisher.current_snapshot, {"table"}));
+  const auto target = clearance_test_pair("graspable");
+  const auto table = clearance_test_pair("table");
+  std::mutex margins_mutex;
+  std::set<double> validation_margins;
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (query.waypoint_index && *query.waypoint_index > 0) {
+      std::lock_guard lock(margins_mutex);
+      validation_margins.insert(query.clearance_margins
+                                    ? query.clearance_margins->margin_for(target)
+                                    : 0.0);
+    }
+    if (auto near_target = clearance_test_result(
+            query, target, 0.004 - 0.003 * clearance_test_joint(query, "j1"))) {
+      return near_target;
+    }
+    return clearance_test_result(query, table, 0.05);
+  };
+
+  ExecuteRequestDTO req = make_relative_object_request("clearance_pick_close", "graspable");
+  req.clearance_m = 0.0005;
+  context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
+  const auto result = execute_sync(cell_kernel, req);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(cell_kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  const auto& margins = planner.last_request.retained_clearance_margins;
+  ASSERT_TRUE(margins);
+  EXPECT_DOUBLE_EQ(margins->margin_m, 0.0005);
+  EXPECT_DOUBLE_EQ(margins->margin_for(target), 0.0005);
+  EXPECT_DOUBLE_EQ(margins->margin_for(table), 0.0005);
+  {
+    std::lock_guard lock(margins_mutex);
+    EXPECT_EQ(validation_margins, (std::set<double>{0.0005}));
+  }
+
+  // A computed completion waits for its acknowledgement before the next move.
+  ASSERT_TRUE(cell_kernel.acknowledge_completed(result.value()).accepted);
+  ExecuteRequestDTO off = make_relative_object_request("clearance_pick_off", "graspable");
+  off.clearance_m = 0.0;
+  context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
+  const auto off_result = execute_sync(cell_kernel, off);
+  ASSERT_TRUE(off_result.ok()) << off_result.error().message;
+  EXPECT_EQ(ended_as(cell_kernel), "completed");
+  EXPECT_FALSE(planner.last_request.retained_clearance_margins);
+}
+
+TEST_F(ExecutionKernelTest, Execute_ClearanceReleasesAMoveThatStartsInsideIt) {
+  // With a 3 mm clearance, after a Stop 2 mm from the wall, the +Z jog away (clearance grows with
+  // j1) is accepted: the wall pair keeps a margin just below its start
+  // clearance, for the planner and for validation.
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(make_test_collision_world_snapshot(), {"wall"}));
+  const auto wall = clearance_test_pair("wall");
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    return clearance_test_result(query, wall, 0.002 + 0.01 * clearance_test_joint(query, "j1"));
+  };
+
+  auto request = make_test_request("clearance_jog_away");
+  request.clearance_m = 0.003;
+  const auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  ASSERT_TRUE(planner.last_request.retained_clearance_margins);
+  EXPECT_NEAR(planner.last_request.retained_clearance_margins->margin_for(wall),
+              0.002 - kClearanceStartReleaseToleranceM, 1e-12);
+}
+
+TEST_F(ExecutionKernelTest, Execute_ClearanceRefusesAMoveCloserToWhatItStartsNear) {
+  // The same start, but the move approaches the wall: refused once it comes
+  // closer than the released margin, as a clearance violation.
+  collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
+      make_clearance_test_world(make_test_collision_world_snapshot(), {"wall"}));
+  const auto wall = clearance_test_pair("wall");
+  collision_engine->result_for_query =
+      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    return clearance_test_result(query, wall, 0.002 - 0.01 * clearance_test_joint(query, "j1"));
+  };
+
+  auto request = make_test_request("clearance_jog_toward");
+  request.clearance_m = 0.003;
+  execute_sync(request);
+  EXPECT_EQ(ended_as(kernel), "failed");
+  EXPECT_EQ(execution.execute_count, 0);
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
+  EXPECT_EQ(snapshot.error->details.at("classification"), "clearance");
+}
+
 // --- Collision validation samples the executed curve (M55 F-1 / FIX2)
 
 namespace {
+// A fine step, so the curve tests see many inserted samples.
+constexpr double kTestStepRad = 0.0005;
+
 TrajectoryWaypointDTO waypoint(double time_s, std::vector<double> positions,
                                std::vector<double> velocities = {},
                                std::vector<double> accelerations = {}) {
@@ -4829,13 +5207,13 @@ std::optional<double> joint_position(const CollisionQuery& query, const std::str
 
 TEST(CollisionValidationSamplingTest, SamplesTheExecutedSplineNotTheChord) {
   const auto sampled = sample_for_collision_validation(
-      curved_cubic_trajectory(), kValidationMaxJointStepRad, kValidationMaxCheckedStates, {});
+      curved_cubic_trajectory(), kTestStepRad, kValidationMaxCheckedStates, {});
   ASSERT_TRUE(sampled.ok()) << sampled.error().message;
   const auto& samples = sampled.value().trajectory;
   double peak = 0.0;
   for (const auto& point : samples.waypoints) peak = std::max(peak, point.positions_rad[0]);
   EXPECT_NEAR(peak, 0.25, 1e-6);
-  EXPECT_LE(max_consecutive_step(samples), kValidationMaxJointStepRad + 1e-12);
+  EXPECT_LE(max_consecutive_step(samples), kTestStepRad + 1e-12);
   EXPECT_GT(sampled.value().inserted, 0U);
 }
 
@@ -4846,10 +5224,10 @@ TEST(CollisionValidationSamplingTest, QuinticOvershootStaysWithinTheStep) {
       {waypoint(0.0, {0.3, -0.2}, {2.0, -1.0}, {-5.0, 4.0}),
        waypoint(0.5, {0.3, -0.2}, {-1.5, 0.5}, {3.0, -2.0})});
   const auto sampled = sample_for_collision_validation(
-      trajectory, kValidationMaxJointStepRad, kValidationMaxCheckedStates, {});
+      trajectory, kTestStepRad, kValidationMaxCheckedStates, {});
   ASSERT_TRUE(sampled.ok()) << sampled.error().message;
   EXPECT_GT(sampled.value().inserted, 0U);
-  EXPECT_LE(max_consecutive_step(sampled.value().trajectory), kValidationMaxJointStepRad + 1e-12);
+  EXPECT_LE(max_consecutive_step(sampled.value().trajectory), kTestStepRad + 1e-12);
   // The samples lie on the shared sampler's curve.
   TrajectorySampleResult reference;
   for (const auto& point : sampled.value().trajectory.waypoints) {
@@ -4865,7 +5243,7 @@ TEST(CollisionValidationSamplingTest, FractionsReferToTheStoredTrajectory) {
   const auto trajectory = two_joint_trajectory(
       {waypoint(0.0, {0.0, 0.0}), waypoint(1.0, {1.0, 0.0}), waypoint(2.0, {1.001, 0.0})});
   const auto sampled = sample_for_collision_validation(
-      trajectory, kValidationMaxJointStepRad, kValidationMaxCheckedStates, {});
+      trajectory, kTestStepRad, kValidationMaxCheckedStates, {});
   ASSERT_TRUE(sampled.ok()) << sampled.error().message;
   const auto& points = sampled.value().trajectory.waypoints;
   const auto& fractions = sampled.value().original_fractions;
@@ -4886,20 +5264,21 @@ TEST(CollisionValidationSamplingTest, FractionsReferToTheStoredTrajectory) {
 }
 
 TEST(CollisionValidationSamplingTest, RefusesAboveTheSampleBudgetAndOnCancellation) {
-  const auto trajectory = make_test_trajectory();  // 0 -> 1 rad: 2001 samples
-  const auto over = sample_for_collision_validation(trajectory, kValidationMaxJointStepRad, 2000, {});
+  // Both joints 0 -> 1 rad: sqrt(2) / 0.0005 -> 2829 steps, 2830 samples.
+  const auto trajectory = make_test_trajectory();
+  const auto over = sample_for_collision_validation(trajectory, kTestStepRad, 2829, {});
   ASSERT_FALSE(over.ok());
   EXPECT_EQ(over.error().code, kErrorValidationCollision);
   EXPECT_EQ(over.error().details.at("reason"), "collision_validation_sample_budget_exceeded");
-  EXPECT_TRUE(sample_for_collision_validation(trajectory, kValidationMaxJointStepRad, 2001, {}).ok());
+  EXPECT_TRUE(sample_for_collision_validation(trajectory, kTestStepRad, 2830, {}).ok());
   const auto huge = sample_for_collision_validation(
-      make_test_trajectory_from({0.0, 0.0}, {1.0e300, 0.0}), kValidationMaxJointStepRad,
+      make_test_trajectory_from({0.0, 0.0}, {1.0e300, 0.0}), kTestStepRad,
       kValidationMaxCheckedStates, {});
   ASSERT_FALSE(huge.ok());
   EXPECT_EQ(huge.error().details.at("reason"), "collision_validation_sample_budget_exceeded");
   int polls = 0;
   const auto cancelled = sample_for_collision_validation(
-      trajectory, kValidationMaxJointStepRad, kValidationMaxCheckedStates,
+      trajectory, kTestStepRad, kValidationMaxCheckedStates,
       [&polls]() -> const char* {
         ++polls;
         return "collision_validation_cancelled";
@@ -4916,7 +5295,7 @@ TEST(CollisionValidationSamplingTest, StopInsideOneLongSegmentIsHonouredWithinTh
   const auto trajectory = make_test_trajectory_from({0.0, 0.0}, {90.0, 0.0});
   int polls = 0;
   const auto stopped = sample_for_collision_validation(
-      trajectory, kValidationMaxJointStepRad, kValidationMaxCheckedStates,
+      trajectory, kTestStepRad, kValidationMaxCheckedStates,
       [&polls]() -> const char* {
         return ++polls >= 3 ? "collision_validation_wall_timeout" : nullptr;
       });
@@ -4926,6 +5305,24 @@ TEST(CollisionValidationSamplingTest, StopInsideOneLongSegmentIsHonouredWithinTh
   EXPECT_EQ(polls, 3);
   EXPECT_LE(std::stoul(stopped.error().details.at("inserted_samples")),
             2 * kValidationSamplingPollInterval);
+}
+
+TEST(CollisionValidationSamplingTest, StepIsTheJointSpaceDistanceLikeThePlanner) {
+  // Both joints move 1 rad: the configuration distance is sqrt(2) rad, so
+  // the default planner step (0.05) gives ceil(sqrt(2) / 0.05) = 29 steps,
+  // and no two consecutive samples are farther apart than the step.
+  const auto trajectory = two_joint_trajectory(
+      {waypoint(0.0, {0.0, 0.0}), waypoint(1.0, {1.0, 1.0})});
+  const auto sampled = sample_for_collision_validation(
+      trajectory, kDefaultCollisionCheckStepRad, kValidationMaxCheckedStates, {});
+  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
+  const auto& points = sampled.value().trajectory.waypoints;
+  ASSERT_EQ(points.size(), 30U);
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    EXPECT_LE(std::hypot(points[i].positions_rad[0] - points[i - 1].positions_rad[0],
+                         points[i].positions_rad[1] - points[i - 1].positions_rad[1]),
+              kDefaultCollisionCheckStepRad + 1e-12);
+  }
 }
 
 TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionOnTheSplineNotTheChord) {
@@ -9097,7 +9494,6 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
   ASSERT_TRUE(status.fact->error.has_value());
   EXPECT_EQ(status.fact->error->code, kErrorPlanningTimeout);
   EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_TRUE(timeout_kernel.stop_certificate_evidence().empty());
   EXPECT_EQ(timeout_kernel.get_metrics().plans_failed, 1U);
   ts_scheduler.advance_to(ts_clock.now());
   const auto assessment = timeout_kernel.get_recovery_assessment();
@@ -9121,7 +9517,6 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_BackendReportedMatchesKernelDeadline
   ASSERT_TRUE(status.fact->error.has_value());
   EXPECT_EQ(status.fact->error->code, kErrorPlanningTimeout);
   EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_TRUE(kernel.stop_certificate_evidence().empty());
 }
 
 TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcrossRuns) {
@@ -9477,7 +9872,12 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
           }
           std::this_thread::sleep_for(std::chrono::microseconds(50));
         },
-        ExecutionPortParticipantStateAuthority{&publication, [] { return Result<void>::Ok(); }},
+        ExecutionPortParticipantStateAuthority{&publication,
+                                               [this] {
+                                                 ++syncs;
+                                                 return sync_hook ? sync_hook()
+                                                                  : Result<void>::Ok();
+                                               }},
         std::move(config));
     pkernel = std::make_unique<ExecutionKernel>(planner, context, *participant, pclock, pscheduler,
                                                 pcache);
@@ -9754,6 +10154,9 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   std::function<void()> tick;
   std::atomic<int> ticks{0};
   std::atomic<std::uint64_t> receipts{0U};
+  // M6 ADAPTERM: the lane's pre-planning sync (its re-engage), when set.
+  std::function<Result<void>()> sync_hook;
+  std::atomic<int> syncs{0};
   std::unique_ptr<ExecutionPortParticipant> participant;
   std::unique_ptr<ExecutionKernel> pkernel;
 };
@@ -9851,7 +10254,126 @@ TEST_F(PortParticipantKernelTest, MeasuredDispatchChecksTheStartStateBeforeTheGo
       EXPECT_EQ(error->code, "start_state_mismatch");
       EXPECT_EQ(error->details.at("start_tolerance_rad"), "0.010000");
       EXPECT_EQ(error->details.at("max_joint_error_rad"), "0.050000");
+      // M6 ADAPTERM: e.g. a jog or Move-to target computed before a manual
+      // move; the typed refusal tells the operator what to do.
+      EXPECT_NE(error->message.find("preview again"), std::string::npos) << error->message;
     }
+  }
+}
+
+// M6 ADAPTERM: an admitted motion after an idle move from the robot's own
+// interface. The participant's pre-planning sync (the lane's re-engage) runs
+// before planning; the robot then reports its current pose and the goal is
+// sent from it.
+TEST_F(PortParticipantKernelTest, AnIdleMoveIsReengagedBeforePlanningAndTheGoalStartsThere) {
+  Build(Config(StateAuthorityClass::kMeasured));
+  int plans_at_sync = -1;
+  sync_hook = [&] {
+    plans_at_sync = planner.plan_count;
+    // The controllers are back: a fresh sample at the current pose.
+    Sample(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    return Result<void>::Ok();
+  };
+  std::atomic<int> step{0};
+  tick = [&] {
+    pclock.advance(100'000'000);
+    const auto key = SubmittedKey();
+    if (!key) return;
+    ++step;
+    if (step == 1) Executing(*key);
+    if (step < 3) {
+      Sample(0.2 * step, 0.1 * step, 0.5);
+    } else if (step == 3) {
+      port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    } else {
+      Sample(4.0, 2.0, 0.0);
+    }
+  };
+  ASSERT_TRUE(prepare_and_dispatch(*pkernel, PortRequest("port_reengaged")).ok());
+  ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << ended_as(*pkernel) << " " << Reason();
+  EXPECT_EQ(syncs.load(), 1);
+  EXPECT_EQ(plans_at_sync, 0);
+  const auto submits = Calls<testing::FakeExecutionPort::SubmitCall>();
+  ASSERT_EQ(submits.size(), 1U);
+  EXPECT_EQ(submits.front().trajectory.waypoints.front().positions_rad,
+            (std::vector<double>{0.0, 0.0}));
+}
+
+// M6 ADAPTERM: a re-engage that fails refuses the admitted motion typed,
+// before planning; no goal is sent, the robot does not move.
+TEST_F(PortParticipantKernelTest, AReengageFailureRefusesTheMotionBeforeAnyGoal) {
+  Build(Config(StateAuthorityClass::kMeasured));
+  sync_hook = [] {
+    return Result<void>::Err(ErrorDTO{
+        kErrorExecutionRejected,
+        "The robot moved from its own interface was not re-engaged; the motion did not start",
+        {{"reason", "motion_reengage_failed"}, {"cause", "xarm_reengage_not_confirmed"}}});
+  };
+  const auto refused = prepare_and_dispatch(*pkernel, PortRequest("port_not_reengaged"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, kErrorExecutionRejected);
+  EXPECT_EQ(refused.error().details.at("reason"), "motion_reengage_failed");
+  EXPECT_EQ(refused.error().details.at("cause"), "xarm_reengage_not_confirmed");
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+}
+
+// M6 (approval list 2, item 34): a jog/Move-to preview made while the arm
+// counted as moved planned from the vendor pose. Execute keeps the existing
+// flow: the pre-planning sync re-arms (ADAPTERM), then the participant checks
+// the trajectory's start against the first fresh measured sample after the
+// rebind. The fixture planner's trajectory starts at 0 rad, the pose it was
+// planned from. Unchanged: the goal is sent from there. The fresh measured
+// pose differs from that start: refused "preview again", no goal is sent.
+TEST_F(PortParticipantKernelTest, AfterTheRearmTheGoalIsSentOnlyFromTheFreshMeasuredPose) {
+  for (const double rearmed_at : {0.005, 0.05}) {
+    const bool unchanged = rearmed_at < 0.01;
+    SCOPED_TRACE(unchanged ? "unchanged" : "moved");
+    Reset();
+    syncs = 0;
+    planner.plan_count = 0;  // Reset() keeps the planner's count across passes.
+    Build(Config(StateAuthorityClass::kMeasured));
+    int plans_at_sync = -1;
+    sync_hook = [&] {
+      plans_at_sync = planner.plan_count;
+      // The re-arm: the controllers are back, the first fresh sample.
+      Sample(0.0, 0.0, 0.0, 1.0, 0.0, rearmed_at);
+      return Result<void>::Ok();
+    };
+    std::atomic<int> step{0};
+    tick = [&] {
+      pclock.advance(100'000'000);
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      if (step == 1) Executing(*key);
+      if (step < 3) {
+        Sample(0.2 * step, 0.1 * step, 0.5);
+      } else if (step == 3) {
+        port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      } else {
+        Sample(4.0, 2.0, 0.0);
+      }
+    };
+    ASSERT_TRUE(prepare_and_dispatch(*pkernel, PortRequest("port_live_preview")).ok());
+    ASSERT_TRUE(wait_for_ended(*pkernel, unchanged ? "completed" : "failed"))
+        << ended_as(*pkernel) << " " << Reason();
+    EXPECT_EQ(syncs.load(), 1);
+    EXPECT_EQ(plans_at_sync, 0);
+    const auto submits = Calls<testing::FakeExecutionPort::SubmitCall>();
+    if (unchanged) {
+      ASSERT_EQ(submits.size(), 1U);
+      EXPECT_EQ(submits.front().trajectory.waypoints.front().positions_rad,
+                (std::vector<double>{0.0, 0.0}));
+    } else {
+      EXPECT_TRUE(submits.empty());
+      EXPECT_EQ(Reason(), "start_state_mismatch");
+      const auto error = pkernel->get_execution_snapshot().error;
+      ASSERT_TRUE(error.has_value());
+      EXPECT_EQ(error->code, "start_state_mismatch");
+      EXPECT_NE(error->message.find("preview again"), std::string::npos) << error->message;
+    }
+    sync_hook = nullptr;
   }
 }
 
@@ -9885,6 +10407,351 @@ TEST_F(PortParticipantKernelTest, DiagnosticContextCallbackPrecedesSendAndCannot
   ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
   EXPECT_EQ(observations.load(), 1);
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+}
+
+// M6 ADAPTERM TOOLCTX (live 2026-10-28): a TCP offset send leaves the
+// controller's ready state; the lane re-arms the robot and binds the
+// reactivated controller on a new port (a new epoch). The dispatch decision
+// then runs again on that port: a fresh sample at the start pose sends the
+// goal there; a robot that is no longer at the start refuses typed.
+TEST_F(PortParticipantKernelTest, AToolContextRearmRevalidatesTheDispatchOnTheReboundPort) {
+  for (const bool moved : {false, true}) {
+    SCOPED_TRACE(moved ? "moved" : "at the start");
+    Reset();
+    auto config = Config(StateAuthorityClass::kMeasured);
+    std::shared_ptr<testing::FakeExecutionPort> old_port;
+    config.apply_tool_context = [&](const PreparedOperationParticipantDTO&) {
+      old_port = port;
+      auto next = std::make_shared<testing::FakeExecutionPort>();
+      next->SetLaneFacts(port->ReadLaneFacts());
+      auto readiness = port->ReadReadiness();
+      readiness.binding_epoch = ExecutionBindingEpoch(readiness.binding_epoch.value() + 1U);
+      next->SetReadiness(readiness);
+      const auto rebound = participant->RebindPort(next);
+      EXPECT_TRUE(rebound.ok());
+      port = next;
+      Sample(0.0, 0.0, 0.0, 1.0, 0.0, moved ? 0.05 : 0.0);
+      return Result<void>::Ok();
+    };
+    Build(std::move(config));
+    std::atomic<int> step{0};
+    tick = [&] {
+      pclock.advance(100'000'000);
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      if (step == 1) Executing(*key);
+      if (step < 3) {
+        Sample(0.2 * step, 0.1 * step, 0.5);
+      } else if (step == 3) {
+        port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      } else {
+        Sample(4.0, 2.0, 0.0);
+      }
+    };
+    Sample(0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    ASSERT_TRUE(prepare_and_dispatch(*pkernel, PortRequest(moved ? "rearm_moved" : "rearm_ok")).ok());
+    // The worker applies the tool context after the dispatch returns: wait for the end.
+    ASSERT_TRUE(wait_for_ended(*pkernel, moved ? "failed" : "completed"))
+        << ended_as(*pkernel) << " " << Reason();
+    ASSERT_TRUE(old_port);
+    // Never a goal on the retired port.
+    for (const auto& command : old_port->commands())
+      EXPECT_FALSE(std::holds_alternative<testing::FakeExecutionPort::SubmitCall>(command));
+    if (!moved) {
+      EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+      continue;
+    }
+    EXPECT_EQ(Reason(), "start_state_mismatch");
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+  }
+}
+
+TEST_F(PortParticipantKernelTest, ToolContextIsAppliedAtRestBeforeTheSendAndAFailureRefusesTheMotion) {
+  // TOOLCTX: the lane applies the robot's tool context once per new goal,
+  // before Submit (nothing in flight), with the motion's own TCP. A context
+  // the robot did not confirm sends no goal: the motion fails typed.
+  for (const bool fails : {false, true}) {
+    SCOPED_TRACE(fails ? "fails" : "applies");
+    Reset();
+    auto config = Config(StateAuthorityClass::kCommanded);
+    std::atomic<int> applications{0};
+    config.apply_tool_context = [&](const PreparedOperationParticipantDTO& prepared) {
+      ++applications;
+      EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+      EXPECT_FALSE(compiled_frame_name(
+                       std::get<PreparedMotionExecutionDTO>(prepared.payload).plan_request.tcp_frame)
+                       .empty());
+      if (!fails) return Result<void>::Ok();
+      return Result<void>::Err(ErrorDTO{
+          "execution_rejected", "the robot did not confirm its TCP offset",
+          {{"reason", "xarm_service_timeout"}, {"tool_context_field", "tcp_offset"}}});
+    };
+    Build(std::move(config));
+    std::atomic<int> step{0};
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      pclock.advance(250'000'000);
+      if (step == 1) Executing(*key);
+      if (step < 17) Sample(0.25 * step, 0.125 * step, 0.5);
+      if (step == 17) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    };
+    ASSERT_TRUE(Start(PortRequest(fails ? "tool_context_fails" : "tool_context_applies")).ok());
+    if (!fails) {
+      ASSERT_TRUE(wait_for_ended(*pkernel, "completed")) << Reason();
+      EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+      EXPECT_EQ(applications.load(), 1);
+      continue;
+    }
+    ASSERT_TRUE(wait_for_ended(*pkernel, "failed")) << ended_as(*pkernel);
+    EXPECT_EQ(Reason(), "tool_context_not_applied");
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+    EXPECT_EQ(applications.load(), 1);
+    auto error = pkernel->get_execution_snapshot().error;
+    if (!error.has_value() && pkernel->get_status().fact.has_value())
+      error = pkernel->get_status().fact->error;
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->details.at("cause"), "xarm_service_timeout");
+    EXPECT_EQ(error->details.at("tool_context_field"), "tcp_offset");
+  }
+}
+
+TEST_F(PortParticipantKernelTest, StopDuringASlowToolContextApplyWinsAndNoGoalIsSent) {
+  // S1: the tool-context send runs without the participant lock. A Stop
+  // pressed during a slow send enters at once (it does not wait behind the
+  // send), and the goal is then refused with the Stop-wins outcome: no
+  // Submit, before or after the Stop.
+  const auto product = DirectBackendProduct();
+  pkernel.reset();
+  participant.reset();
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::atomic<int> applications{0};
+  auto config = Config(StateAuthorityClass::kCommanded);
+  config.apply_tool_context = [&, released](const PreparedOperationParticipantDTO&) {
+    if (++applications == 1) entered.set_value();
+    released.wait();  // a slow vendor send (e.g. set_tcp_offset)
+    return Result<void>::Ok();
+  };
+  Build(std::move(config));
+  ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
+  const ExecutionGoalKey key{ControllerGoalId("slow_apply.goal"), ControllerGoalGeneration(1U)};
+  ExecutionHandle handle;
+  Result<void> applied = Result<void>::Ok();
+  std::thread dispatcher([&] {
+    // M6b: the tool-context action, then the dispatch (as the Kernel runs them).
+    applied = participant->ApplyToolContext(product);
+    handle = participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+  });
+  entered.get_future().wait();
+  // The Stop (cancelled right after its entry so this test ends) runs while
+  // the send is still blocked.
+  std::atomic<bool> stop_returned{false};
+  std::thread stopper([&] {
+    std::stop_source cancel;
+    cancel.request_stop();
+    const auto stage = StageForProduct(product, key, 0U);
+    (void)participant->TranslateStopStage(stage, BudgetFor(stage), cancel.get_token());
+    stop_returned = true;
+  });
+  for (int attempt = 0; attempt < 2000 && !stop_returned; ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(stop_returned.load()) << "the Stop waited behind the tool-context send";
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+  release.set_value();
+  dispatcher.join();
+  stopper.join();
+  EXPECT_EQ(applications.load(), 1);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+  ASSERT_FALSE(applied.ok());
+  EXPECT_EQ(applied.error().details.at("reason"), "execution_port_stop_in_flight");
+  EXPECT_EQ(handle.execution_generation, 0U);
+  ASSERT_TRUE(handle.get_snapshot);
+  const auto snapshot = handle.get_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kFailed);
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"), "execution_port_stop_in_flight");
+}
+
+TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesThatGoal) {
+  // M6b (maintainer rule): a Stop stage naming a goal this participant never
+  // sent, with no goal live and no other Stop running, has nothing to stop. It
+  // is contained without any controller sample or rest check (not a failed
+  // uncontained Stop), and that goal is never sent afterwards.
+  const auto product = DirectBackendProduct();
+  pkernel.reset();
+  participant.reset();
+  Build(Config(StateAuthorityClass::kCommanded));
+  ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
+  // No controller sample at all (e.g. the joint state stream is off).
+  const ExecutionGoalKey key{ControllerGoalId("unsent.goal"), ControllerGoalGeneration(1U)};
+  const auto stage = StageForProduct(product, key, 0U);
+  const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->details.at("reason") : "");
+  EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
+  EXPECT_FALSE(result.error.has_value());
+  ASSERT_EQ(result.evidence_items.size(),
+            stage.participant_stop_plan.stage_commands.at(0U).resolved_stage.evidence_requirements.size());
+  for (const auto& item : result.evidence_items) {
+    EXPECT_EQ(item.state, StopEvidenceItemStateDTO::kSatisfied);
+  }
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+  EXPECT_FALSE(participant->GoalInFlight());
+
+  const auto handle =
+      participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+  EXPECT_EQ(handle.execution_generation, 0U);
+  ASSERT_TRUE(handle.get_snapshot);
+  const auto snapshot = handle.get_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kFailed);
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"), "execution_port_stop_in_flight");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+
+  // No further checks: a sample reporting motion does not change it.
+  Sample(0.0, 0.0, 0.5);
+  const ExecutionGoalKey other{ControllerGoalId("unsent.goal.other"),
+                               ControllerGoalGeneration(2U)};
+  const auto other_stage = StageForProduct(product, other, 0U);
+  const auto contained =
+      participant->TranslateStopStage(other_stage, BudgetFor(other_stage), {});
+  EXPECT_EQ(contained.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+}
+
+TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
+  // TOOLCTX: the tool context is applied for a new goal only, never for a
+  // moving replacement (Replace, or ReplaceScheduled on a lane that supports
+  // it): the robot is moving then.
+  for (const bool scheduled : {false, true}) {
+    SCOPED_TRACE(scheduled ? "ReplaceScheduled" : "Replace");
+    Reset();
+    auto lane = port->ReadLaneFacts();
+    lane.supports_scheduled_replacement = scheduled;
+    port->SetLaneFacts(lane);
+    const auto product = DirectBackendProduct();
+    pkernel.reset();
+    participant.reset();
+    std::atomic<int> applications{0};
+    auto config = Config(StateAuthorityClass::kCommanded);
+    config.apply_tool_context = [&](const PreparedOperationParticipantDTO&) {
+      ++applications;
+      return Result<void>::Ok();
+    };
+    Build(std::move(config));
+    ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
+    Sample(0.0, 0.0, 0.0);
+    const ExecutionGoalKey old{ControllerGoalId("toolctx.old"), ControllerGoalGeneration(1U)};
+    ASSERT_TRUE(participant->ApplyToolContext(product).ok());
+    const auto handle =
+        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+    ASSERT_NE(handle.execution_generation, 0U);
+    EXPECT_EQ(applications.load(), 1);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    pclock.advance(5'000'000);
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok()) << source.error().message;
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ExecutionGoalKey next{ControllerGoalId("toolctx.next"), ControllerGoalGeneration(2U)};
+    const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
+                                                       pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::ReplaceCall>().size(), 1U);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+    EXPECT_EQ(applications.load(), 1);  // the original goal's send only
+  }
+}
+
+// M6b (maintainer 2026-10-29): the tool-context action is its own step before
+// the motion is sent, and the motion counts as running (Executing) only once
+// it was sent: during the action the execution is still Validating, nothing
+// was submitted and no execute-started event was published. A refused action
+// never reaches Executing.
+TEST_F(PortParticipantKernelTest, TheMotionCountsAsRunningOnlyAfterTheToolContextAction) {
+  for (const bool fails : {false, true}) {
+    SCOPED_TRACE(fails ? "refused" : "applied");
+    Reset();
+    std::mutex events_mutex;
+    std::vector<KernelEvent> events;
+    std::atomic<int> applications{0};
+    std::optional<ExecutionState> state_during_action;
+    bool started_during_action = true;
+    auto config = Config(StateAuthorityClass::kCommanded);
+    config.apply_tool_context = [&](const PreparedOperationParticipantDTO&) {
+      ++applications;
+      const auto state = pkernel->get_status().state;
+      {
+        std::lock_guard lock(events_mutex);
+        state_during_action = state;
+        started_during_action = std::any_of(events.begin(), events.end(), [](const auto& event) {
+          return event.type == KernelEventType::kExecuteStarted ||
+                 (event.type == KernelEventType::kStateTransition &&
+                  event.to_state == ExecutionState::kExecuting);
+        });
+      }
+      EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+      if (!fails) return Result<void>::Ok();
+      return Result<void>::Err(ErrorDTO{
+          "robot_controller_unresponsive", "the robot controller did not answer in time",
+          {{"reason", "xarm_set_tcp_offset"}, {"tool_context_field", "tcp_offset"}}});
+    };
+    Build(std::move(config));
+    const auto subscription = pkernel->subscribe_events([&](const KernelEvent& event) {
+      std::lock_guard lock(events_mutex);
+      events.push_back(event);
+    });
+    struct Unsubscribe final {
+      ExecutionKernel& kernel;
+      decltype(subscription) handle;
+      ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+    } unsubscribe{*pkernel, subscription};
+    std::atomic<int> step{0};
+    tick = [&] {
+      const auto key = SubmittedKey();
+      if (!key) return;
+      ++step;
+      pclock.advance(250'000'000);
+      if (step == 1) Executing(*key);
+      if (step < 17) Sample(0.25 * step, 0.125 * step, 0.5);
+      if (step == 17) port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+    };
+    ASSERT_TRUE(Start(PortRequest(fails ? "toolctx_action_refused" : "toolctx_action_applied")).ok());
+    ASSERT_TRUE(wait_for_ended(*pkernel, fails ? "failed" : "completed"))
+        << ended_as(*pkernel) << " " << Reason();
+    EXPECT_EQ(applications.load(), 1);
+    std::lock_guard lock(events_mutex);
+    EXPECT_EQ(state_during_action, std::optional(ExecutionState::kValidating));
+    EXPECT_FALSE(started_during_action);
+    const auto started = std::count_if(events.begin(), events.end(), [](const auto& event) {
+      return event.type == KernelEventType::kExecuteStarted;
+    });
+    if (!fails) {
+      EXPECT_EQ(started, 1);
+      EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+      continue;
+    }
+    EXPECT_EQ(started, 0);
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+    EXPECT_EQ(Reason(), "tool_context_not_applied");
+    auto error = pkernel->get_execution_snapshot().error;
+    if (!error.has_value() && pkernel->get_status().fact.has_value())
+      error = pkernel->get_status().fact->error;
+    ASSERT_TRUE(error.has_value());
+    EXPECT_EQ(error->details.at("cause"), "xarm_set_tcp_offset");
+    EXPECT_EQ(error->details.at("tool_context_field"), "tcp_offset");
+  }
 }
 
 TEST_F(PortParticipantKernelTest, CommandedDispatchHasNoMeasuredStartStateCheck) {
@@ -9983,6 +10850,65 @@ TEST_F(PortParticipantKernelTest, MeasuredCompletionChecksTheFinalToleranceAfter
     if (test.reason != "none") {
       EXPECT_EQ(pkernel->get_execution_snapshot().error->details.at("phase"),
                 "terminal_result_state_gate");
+    }
+  }
+}
+
+// Merge 6 arrival ("finished and within tolerance"): every lane keeps its
+// arrival tolerance as the JTC goal constraint, so the controller reports a
+// trajectory that finished outside it as a goal-tolerance abort and holds a
+// trajectory that has not settled. Samples at the target never complete the
+// motion before the controller reports it finished; finished within tolerance
+// (a succeeded result, plus the measured lane's own terminal sample) does.
+// The measured lane's finished-but-out-of-tolerance sample is covered by
+// MeasuredCompletionChecksTheFinalToleranceAfterTheResult.
+TEST_F(PortParticipantKernelTest, ArrivalNeedsTheFinishedResultAndTheLaneTolerance) {
+  for (const auto authority : {StateAuthorityClass::kCommanded, StateAuthorityClass::kMeasured}) {
+    for (const auto result :
+         {ExecutionGoalResult::kSucceeded, ExecutionGoalResult::kAbortedGoalTolerance}) {
+      const bool measured = authority == StateAuthorityClass::kMeasured;
+      const bool finished_within = result == ExecutionGoalResult::kSucceeded;
+      SCOPED_TRACE(std::string(measured ? "measured" : "commanded") + " " + to_string(result));
+      Reset();
+      Build(Config(authority));
+      std::atomic<int> step{0};
+      std::atomic<bool> held_until_finished{true};
+      tick = [&] {
+        const auto key = SubmittedKey();
+        if (!key) return;
+        ++step;
+        pclock.advance(100'000'000);
+        if (step == 1) Executing(*key);
+        if (step <= 6) {
+          // Path time over and every joint at the target, but the controller
+          // still runs the goal: within tolerance, not finished.
+          Sample(4.0, 2.0, 0.0);
+          if (step >= 2 &&
+              participant->get_execution_snapshot().state != ExecutionState::kExecuting) {
+            held_until_finished = false;
+          }
+        } else if (step == 7) {
+          port->FinishGoal(*key, result, std::nullopt, pclock.now());
+        } else {
+          Sample(4.0, 2.0, 0.0);  // the measured lane's post-result sample
+        }
+      };
+      if (measured) Sample(0.0, 0.0, 0.0);  // the measured start state
+      ASSERT_TRUE(Start(PortRequest("port_arrival")).ok());
+      ASSERT_TRUE(wait_for_ended(*pkernel, finished_within ? "completed" : "failed"))
+          << ended_as(*pkernel) << " " << Reason();
+      EXPECT_TRUE(held_until_finished);
+      EXPECT_GE(step.load(), 7);
+      if (finished_within) {
+        EXPECT_EQ(Reason(), "none");
+        EXPECT_EQ(participant->get_execution_snapshot().joint_positions_rad,
+                  (std::vector<double>{2.0, 2.0}));
+      } else {
+        EXPECT_EQ(Reason(), "controller_result_failed");
+        EXPECT_EQ(pkernel->get_execution_snapshot().error->details.at("goal_result"),
+                  to_string(result));
+      }
+      EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
     }
   }
 }
@@ -10677,6 +11603,9 @@ TEST_F(PortParticipantKernelTest,
                                                      pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
   ASSERT_TRUE(sent.handle);
+  // The original goal was a plain Submit; one replacement followed.
+  const auto motion_replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+  ASSERT_EQ(motion_replaces.size(), 1U);
   // A successful predecessor result does not contain a still pending newcomer.
   port->FinishGoal(old, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
   EXPECT_FALSE(handle.wait_for_completion(0));
@@ -13178,6 +14107,111 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(execution.reset_count, resets);
   EXPECT_EQ(execution.stop_count, stops);
   EXPECT_EQ(execution.retire_count, 1);
+}
+
+// F-6a (W): the real engine after a nominal addressed Stop settles a moving
+// motion (a first-stage gate or Program-requested Stop). The execute worker's
+// terminal cleanup is held after the backend ends: settlement is accepted, but
+// the assessment says waiting (terminal_cleanup_pending), not retry_ready
+// with eligible_close false, so the Runner rereads instead of retaining the
+// operation (`participant_engine_busy`). Cleanup completion republishes it.
+class HeldCleanupExecution final : public ReplacementObservationExecution {
+ public:
+  std::mutex hold_mutex;
+  std::condition_variable hold_changed;
+  bool ended{};
+  bool released{};
+
+  ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
+                           const ControllerGoalId& goal,
+                           ControllerGoalGeneration generation) override {
+    auto handle = ReplacementObservationExecution::Dispatch(product, goal, generation);
+    auto wait = std::move(handle.wait_for_completion);
+    handle.wait_for_completion = [this, wait = std::move(wait)](std::int64_t timeout) {
+      const bool done = wait(timeout);
+      if (!done) return false;
+      std::unique_lock lock(hold_mutex);
+      ended = true;
+      hold_changed.notify_all();
+      hold_changed.wait(lock, [this] { return released; });
+      return true;
+    };
+    return handle;
+  }
+  bool WaitEnded() {
+    std::unique_lock lock(hold_mutex);
+    return hold_changed.wait_for(lock, std::chrono::seconds(2), [this] { return ended; });
+  }
+  void Release() {
+    std::lock_guard lock(hold_mutex);
+    released = true;
+    hold_changed.notify_all();
+  }
+};
+
+TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsCloseEligible) {
+  HeldCleanupExecution backend;
+  backend.enable_execution_progress_publication();
+  struct ReleaseOnExit {
+    HeldCleanupExecution& backend;
+    ~ReleaseOnExit() { backend.Release(); }
+  } release_on_exit{backend};
+  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+  owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
+  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+                                {collision_engine});
+  const auto authority = kernel_spring_authority("gate.moving");
+  const auto started = prepare_and_dispatch(owner, authority);
+  ASSERT_TRUE(started.ok());
+  ASSERT_TRUE(backend.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(owner, ExecutionState::kExecuting));
+  const auto observed = owner.ObservePreparedMotion(started.value());
+  ASSERT_TRUE(observed.ok());
+  ASSERT_TRUE(observed.value().last_dispatched_participant);
+  const auto& binding = authority.execution_request.binding;
+  const auto stage = kernel_spring_stage(
+      *observed.value().last_dispatched_participant,
+      {binding.controller_goal_id, binding.controller_goal_generation}, authority,
+      StopId("gate.moving.stop"), StopGeneration(1U));
+  EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto containment = kernel_spring_result(stage);
+  const auto certificate = kernel_spring_certificate(containment);
+  ASSERT_EQ(certificate.result, StopCertificateResultDTO::kSucceededNominal);
+  backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
+  ASSERT_TRUE(
+      backend.execute_controlled_stop(*authority.ordinary_stop_plan->participant_stop_profile)
+          .backend_stop_confirmed);
+  ASSERT_TRUE(backend.WaitEnded());  // The backend ended; worker cleanup is held.
+  const StopCertificateRefDTO reference{certificate.stop_certificate_id,
+                                        certificate.stop_certificate_revision, certificate.stop_id,
+                                        certificate.stop_generation};
+  const auto settled = owner.settle_addressed_participant_stop(
+      {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
+  // Settlement accepts the certified Stop while cleanup is pending.
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  const auto& held = settled.value().recovery_assessment;
+  EXPECT_EQ(held.execution_state, ExecutionState::kStopped);
+  EXPECT_EQ(held.status, RecoveryAssessmentStatus::kWaiting);
+  EXPECT_EQ(held.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
+  EXPECT_TRUE(stopped_awaiting_terminal_cleanup(held));
+  EXPECT_TRUE(held.backend_stop_confirmed);
+  EXPECT_EQ(held.stop_certificate_id, reference.stop_certificate_id.value());
+  EXPECT_FALSE(held.eligible_close);
+  EXPECT_FALSE(held.retry_admissible);
+  backend.Release();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto current = owner.get_recovery_assessment();
+  // The worker's terminal cleanup schedules the cached assessment's refresh.
+  while (!current.eligible_close && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    scheduler.advance_to(clock.now());
+    current = owner.get_recovery_assessment();
+  }
+  EXPECT_TRUE(current.eligible_close);
+  EXPECT_EQ(current.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_EQ(current.execution_state, ExecutionState::kStopped);
+  EXPECT_EQ(current.stop_certificate_id, reference.stop_certificate_id.value());
 }
 
 TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithoutReplanning) {

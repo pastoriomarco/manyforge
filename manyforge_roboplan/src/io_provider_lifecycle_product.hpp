@@ -60,7 +60,8 @@ public:
          core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
          core::ProviderManifestDTO manifest,
          std::shared_ptr<core::IClock> clock,
-         core::Duration observation_freshness_ns);
+         core::Duration observation_freshness_ns,
+         core::Duration poll_period_ns);
 
   ~IoProviderDriverRecord();
   IoProviderDriverRecord(const IoProviderDriverRecord &) = delete;

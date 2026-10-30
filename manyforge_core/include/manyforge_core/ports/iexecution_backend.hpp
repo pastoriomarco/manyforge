@@ -110,6 +110,15 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return Result<void>::Err(ErrorCode::kUnsupportedCapability);
   }
 
+  /// M6b: the apply-tool-context action of a new (non-replacement) goal, run
+  /// by the Kernel before the motion counts as running and before `Dispatch`:
+  /// the lane sends the robot's TCP and payload for this motion when they
+  /// differ and waits until the robot has settled. An error refuses the
+  /// motion before it is sent. Default: nothing to apply.
+  virtual Result<void> ApplyToolContext(const PreparedOperationParticipantDTO& /*participant*/) {
+    return Result<void>::Ok();
+  }
+
   /// Dispatch one already-prepared participant under the Kernel-minted goal.
   /// Exact repetition returns the same goal-bound handle and never sends a
   /// second transport command.

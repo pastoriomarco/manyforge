@@ -86,11 +86,11 @@ using namespace manyforge::core;
   return std::move(sealed.value());
 }
 
-[[nodiscard]] MotionParticipantIntentDTO motion_payload(std::string owner = "arm") {
+[[nodiscard]] MotionParticipantIntentDTO motion_payload() {
   return MotionParticipantIntentDTO{
       MoveId("move.1"),
       FrameRoleId("base"),
-      MotionEndpointReferenceDTO{TargetRoleId(std::move(owner)), FrameRoleId("tcp")},
+      CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
       TimeoutsDTO{},
@@ -150,7 +150,7 @@ TEST(RuntimeParticipantRegistryTest, RejectsTrajectoryMotionAgainstPrismaticComm
   RuntimeParticipantRegistry registry(
       {binding_for("gripper", "gripper", "planning.motion.joint_goal", CoordinateKind::kLinear)});
   const auto operation =
-      operation_for("gripper", "planning.motion.joint_goal", motion_payload("gripper"));
+      operation_for("gripper", "planning.motion.joint_goal", motion_payload());
 
   auto resolved = registry.resolve(operation, 0U);
   ASSERT_FALSE(resolved.ok());
@@ -921,22 +921,51 @@ TEST(RuntimeParticipantRegistryTest,
   auto selected = verify_runtime_participant_binding(value);
   ASSERT_TRUE(selected.ok()) << selected.error().message;
   RuntimeParticipantRegistry registry({selected.value()});
+  const TcpEntryDTO fingertip{ControllableComponentId("tool.1"), CommandTargetId("gripper"),
+                              FrameRoleId("fingertip")};
   auto motion = motion_payload();
-  motion.tcp_endpoint = MotionEndpointReferenceDTO{TargetRoleId("tool"), FrameRoleId("fingertip")};
+  motion.tcp_endpoint = fingertip;
   auto operation = operation_for("arm", "planning.motion.joint_goal", motion);
   const auto resolved = registry.resolve(operation, 0U);
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   EXPECT_EQ(resolved.value().value().command_target_id, CommandTargetId("arm"));
   EXPECT_EQ(resolved.value().value().resources, value.resources);
   auto& requested = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
-  requested.tcp_endpoint.target_role_id = TargetRoleId("other_tool");
+  // A different target or frame cannot consume this captured TCP. The owner
+  // is not in the sealed binding (B7); the Kernel checks it.
+  auto other = fingertip;
+  other.target_id = CommandTargetId("other_gripper");
+  requested.tcp_endpoint = other;
   EXPECT_FALSE(registry.resolve(operation, 0U).ok());
-  requested.tcp_endpoint.target_role_id = TargetRoleId("tool");
-  requested.tcp_endpoint.frame_role_id = FrameRoleId("other_tip");
+  other = fingertip;
+  other.frame_role_id = FrameRoleId("other_tip");
+  requested.tcp_endpoint = other;
   EXPECT_FALSE(registry.resolve(operation, 0U).ok());
-  requested = motion_payload();
-  EXPECT_FALSE(registry.resolve(operation, 0U)
-                   .ok());  // A different owner/frame cannot consume this captured TCP.
+  // Current and form 2 were resolved by the owner's resolver into this capture.
+  requested.tcp_endpoint = CurrentTcpDTO{};
+  EXPECT_TRUE(registry.resolve(operation, 0U).ok());
+  requested.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("tool")};
+  EXPECT_TRUE(registry.resolve(operation, 0U).ok());
+}
+
+TEST(RuntimeParticipantRegistryTest, SetTcpResolvesToTheRobotMotionTargetLikeAMove) {
+  RuntimeParticipantRegistry registry(
+      {binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular)});
+  const TcpEntryDTO own{ControllableComponentId("robot.1"), CommandTargetId("arm"),
+                        FrameRoleId("tcp")};
+  auto operation = operation_for("arm", "planning.motion.joint_goal", motion_payload());
+  operation.participants.front().payload = SetTcpParticipantIntentDTO{own};
+  const auto resolved = registry.resolve(operation, 0U);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_EQ(tcp_entry_of(*resolved.value().value().motion_endpoint,
+                         resolved.value().value().controllable_component_id),
+            own);
+  auto other = own;
+  other.frame_role_id = FrameRoleId("base");
+  operation.participants.front().payload = SetTcpParticipantIntentDTO{other};
+  const auto refused = registry.resolve(operation, 0U);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "runtime_motion_mapping_incomplete");
 }
 
 }  // namespace

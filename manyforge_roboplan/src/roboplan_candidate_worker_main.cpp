@@ -383,6 +383,42 @@ void add_geometry(roboplan::Scene& scene,
   return scene;
 }
 
+// Sets one plan's clearance margins on the worker scene; pairs not listed,
+// and every pair for IK, keep margin 0. Rebuilds only when they change.
+void apply_pair_margins(roboplan::Scene& scene,
+                        const std::vector<RoboPlanPairMarginDTO>& margins,
+                        std::vector<RoboPlanPairMarginDTO>& applied) {
+  if (margins == applied) {
+    return;
+  }
+  const auto& collision_model = scene.getCollisionModel();
+  std::vector<double> values(collision_model.collisionPairs.size(), 0.0);
+  for (const auto& margin : margins) {
+    const auto first = scene.getCollisionGeometryIds(margin.first);
+    const auto second = scene.getCollisionGeometryIds(margin.second);
+    if (!first.has_value() || !second.has_value()) {
+      fail("clearance margin names an absent body");
+    }
+    for (const auto first_id : first.value()) {
+      for (const auto second_id : second.value()) {
+        if (first_id == second_id) {
+          continue;
+        }
+        const auto index = collision_model.findCollisionPair(
+            pinocchio::CollisionPair(first_id, second_id));
+        if (index < values.size()) {
+          values[index] = margin.margin_m;
+        }
+      }
+    }
+  }
+  const auto result = scene.setCollisionPairMargins(values);
+  if (!result.has_value()) {
+    fail("could not apply clearance margins: " + result.error());
+  }
+  applied = margins;
+}
+
 void constrain_process(pid_t expected_parent) {
   if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
     fail("PR_SET_PDEATHSIG failed: " + std::string(std::strerror(errno)));
@@ -435,6 +471,7 @@ int run_worker(int descriptor) {
   auto scene = make_scene(input.model);
   RoboPlanCandidateComputer computer(scene, std::move(input.binding),
                                      input.candidate_config);
+  std::vector<RoboPlanPairMarginDTO> applied_margins;
   send_frame(descriptor, MessageType::kReady, {});
 
   for (;;) {
@@ -444,6 +481,7 @@ int run_worker(int descriptor) {
         std::optional<std::int64_t> planning_deadline_ns;
         auto candidate =
             worker_protocol::decode_candidate_request(request.payload, &planning_deadline_ns);
+        apply_pair_margins(*scene, candidate.collision_pair_margins, applied_margins);
         RoboPlanCandidateControl control;
         if (planning_deadline_ns) {
           const auto deadline = std::chrono::steady_clock::time_point(
@@ -503,6 +541,7 @@ int run_worker(int descriptor) {
       }
       case MessageType::kIk: {
         auto candidate = worker_protocol::decode_ik_request(request.payload);
+        apply_pair_margins(*scene, {}, applied_margins);
         auto result = computer.solve_ik(
             candidate.goal, candidate.base_frame, candidate.tcp_frame,
             candidate.seed_state, candidate.timeout_s);

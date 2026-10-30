@@ -43,6 +43,7 @@ add_library(manyforge_core
   src/component_lifecycle_plan_validity.cpp
   src/component_lifecycle_snapshot.cpp
   src/component_lifecycle_admission.cpp
+  src/component_lifecycle_admission_query.cpp
   src/component_lifecycle_coordinator.cpp
   src/cclc_open_request.cpp
   src/cclc_lifecycle_target_driver.cpp
@@ -56,6 +57,7 @@ add_library(manyforge_core
   src/component_lifecycle_journal_codec.cpp
   src/component_lifecycle_plan_catalog_codec.cpp
   src/component_lifecycle_plan_evaluator.cpp
+  src/component_lifecycle_transition_runner.cpp
   src/fixed_cclc_port_registry.cpp
   src/runtime_contract_manifest_codec.cpp
   src/controller_lifecycle.cpp
@@ -98,6 +100,7 @@ add_library(manyforge_core
   src/kinematic_state_view_provider.cpp
   src/motion_target_resolution.cpp
   src/operation_intent.cpp
+  src/tcp_selector_codec.cpp
   src/participant_stop_stage.cpp
   src/pick_place_candidate.cpp
   src/pick_place_planning_owner.cpp
@@ -115,6 +118,7 @@ add_library(manyforge_core
   src/resource_addressed_kernel_events.cpp
   src/resource_addressed_kernel_takeover.cpp
   src/resource_addressed_kernel_takeover_fallback.cpp
+  src/resource_addressed_kernel_immediate_step.cpp
   src/resource_addressed_kernel_stop.cpp
   src/resolved_stop_base_plan_codec.cpp
   src/resolved_stop_base_plan_decoder.cpp
@@ -227,35 +231,6 @@ if(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL)
     POSITION_INDEPENDENT_CODE ON)
 endif()
 
-# The resolved Stop base-plan repository is another independent optional
-# concrete adapter. Keep durable filesystem effects outside the pure Core
-# target and let each composed owner select the adapter explicitly.
-set(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT OFF)
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  set(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT ON)
-endif()
-option(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY
-       "Build the POSIX durable resolved Stop base-plan repository"
-       ${_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT})
-unset(_MANYFORGE_CORE_STOP_PLAN_REPOSITORY_DEFAULT)
-if(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
-  add_library(manyforge_core_filesystem_resolved_stop_base_plan_repository
-    src/filesystem_resolved_stop_base_plan_repository.cpp)
-  add_library(manyforge::core_filesystem_resolved_stop_base_plan_repository
-    ALIAS manyforge_core_filesystem_resolved_stop_base_plan_repository)
-  target_include_directories(
-    manyforge_core_filesystem_resolved_stop_base_plan_repository PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-  target_link_libraries(
-    manyforge_core_filesystem_resolved_stop_base_plan_repository
-    PUBLIC manyforge_core
-    PRIVATE manyforge::content_identity)
-  set_target_properties(
-    manyforge_core_filesystem_resolved_stop_base_plan_repository PROPERTIES
-    POSITION_INDEPENDENT_CODE ON)
-endif()
-
 # Testing
 option(BUILD_TESTING "Build unit tests" ON)
 if(BUILD_TESTING)
@@ -356,6 +331,20 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_component_lifecycle_plan_evaluator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_component_lifecycle_admission_query
+    test/test_component_lifecycle_admission_query.cpp)
+  target_link_libraries(test_component_lifecycle_admission_query PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle_admission_query
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_component_lifecycle_transition_runner
+    test/test_component_lifecycle_transition_runner.cpp)
+  target_link_libraries(test_component_lifecycle_transition_runner PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_lifecycle_transition_runner
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_controller_lifecycle_evaluator
     test/test_controller_lifecycle_evaluator.cpp)
   target_link_libraries(test_controller_lifecycle_evaluator PRIVATE
@@ -443,6 +432,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_operation_intent PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_operation_intent
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_tcp_selector_codec
+    test/test_tcp_selector_codec.cpp)
+  target_link_libraries(test_tcp_selector_codec PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_tcp_selector_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_resource_slot_table
@@ -618,17 +614,6 @@ if(BUILD_TESTING)
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_prepared_execution
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  if(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
-    add_executable(test_filesystem_resolved_stop_base_plan_repository
-      test/test_filesystem_resolved_stop_base_plan_repository.cpp)
-    target_link_libraries(
-      test_filesystem_resolved_stop_base_plan_repository PRIVATE
-      manyforge_core_filesystem_resolved_stop_base_plan_repository
-      GTest::gtest_main)
-    gtest_discover_tests(test_filesystem_resolved_stop_base_plan_repository
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-  endif()
 
   add_executable(test_resource_addressed_execution_kernel
     test/test_resource_addressed_execution_kernel.cpp)
@@ -857,6 +842,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_error_code_mapping
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_typed_error test/test_typed_error.cpp)
+  target_link_libraries(test_typed_error PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_typed_error
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_kernel_event_factories
     test/test_kernel_event_factories.cpp)
   target_link_libraries(test_kernel_event_factories PRIVATE
@@ -883,6 +873,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_pose_math PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_pose_math
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_tool_context
+    test/test_tool_context.cpp)
+  target_link_libraries(test_tool_context PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_tool_context
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_pick_place_candidate

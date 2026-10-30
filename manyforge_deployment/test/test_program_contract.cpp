@@ -1973,6 +1973,16 @@ TEST(ProgramContractTest, ChecksPathKeyedValueSourcesAndFieldExpressions) {
           "supplies unknown catalog parameter 'absent'");
   rejects(node("count", CanonicalValue(1.0), {{"value[01]", expression("1")}}),
           "path_index_invalid");
+  try {
+    static_cast<void>(verify(node("count", CanonicalValue(1.0),
+                                  {{"value[01]", expression("1")}})));
+    FAIL() << "malformed value path was accepted";
+  } catch (const ProgramContractError &error) {
+    EXPECT_EQ(error.code(), "path_index_invalid");
+    EXPECT_NE(std::string(error.what()).find("path_index_invalid"), std::string::npos);
+    const std::exception &base = error;
+    EXPECT_NE(dynamic_cast<const std::invalid_argument *>(&base), nullptr);
+  }
   rejects(node("place", pose,
                {{"value", CanonicalValue(CanonicalValue::Object{
                               {"kind", CanonicalValue("blackboard_key")},

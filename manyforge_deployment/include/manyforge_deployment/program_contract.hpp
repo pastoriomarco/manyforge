@@ -23,6 +23,12 @@ inline constexpr std::uint64_t kMaxDurableProgramBytes =
 class ProgramContractError final : public std::invalid_argument {
 public:
   using std::invalid_argument::invalid_argument;
+  ProgramContractError(const std::string &message, std::string code)
+      : std::invalid_argument(message), code_(std::move(code)) {}
+  [[nodiscard]] const std::string &code() const noexcept { return code_; }
+
+private:
+  std::string code_;
 };
 
 /// Pure bounded authoring normalization shared by revision tools and the

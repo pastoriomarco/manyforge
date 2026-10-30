@@ -1,8 +1,10 @@
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -19,23 +21,36 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
+/// The gripper transport of one Isaac tool: the gripper's action, the topics
+/// and joint values the simulator uses, and the bridge the tool's launch runs.
+struct IsaacGripperFacts final {
+  std::string_view transport_kind;
+  std::string_view action_name;
+  std::string_view command_topic;
+  std::string_view state_topic;
+  std::string_view completion_policy;
+  double open_position;
+  double closed_position;
+  double open_effort;
+  double close_effort;
+  bool publish_nominal_position;
+  double result_timeout_s;
+  /// The GripperCommand bridge parameters file; empty for the direct-effort
+  /// transport, which needs no bridge.
+  std::string_view bridge_parameters;
+};
+
+/// One Isaac profile row. A robot row has arm facts; a tool row (merge 6) has
+/// gripper facts only.
 struct IsaacProfileFacts final {
   std::string_view profile_id;
+  /// Empty for a tool row.
   std::string_view hardware_component_name;
   /// The lane controller YAML's per-joint `max_deceleration_on_cancel`.
   double cancel_deceleration_rad_s2;
   double stop_completion_timeout_s;
-  std::string_view gripper_transport_kind;
-  std::string_view gripper_action_name;
-  std::string_view gripper_command_topic;
-  std::string_view gripper_state_topic;
-  std::string_view gripper_completion_policy;
-  double gripper_open_position;
-  double gripper_closed_position;
-  double gripper_open_effort;
-  double gripper_close_effort;
-  bool gripper_publish_nominal_position;
-  double gripper_result_timeout_s;
+  /// Null for an arm-only robot row.
+  const IsaacGripperFacts *gripper;
 };
 
 // Lane facts common to both Isaac profiles: the controller YAML
@@ -52,11 +67,7 @@ constexpr double kStopSamplePeriodS = 0.01;
 constexpr double kTrackingErrorToleranceRad = 0.05;
 constexpr double kTrackingErrorTimeoutS = 0.0;
 
-constexpr IsaacProfileFacts kLite6Profile{
-    "lite6",
-    "IsaacLite6TopicBasedSystem",
-    8.0,
-    1.5,
+constexpr IsaacGripperFacts kLiteGripperFacts{
     "isaac_joint_state_effort",
     "lite_gripper_controller/gripper_cmd",
     "/isaac_joint_commands_gripper",
@@ -68,13 +79,10 @@ constexpr IsaacProfileFacts kLite6Profile{
     -5.0,
     true,
     5.0,
+    "",
 };
 
-constexpr IsaacProfileFacts kUr10eProfile{
-    "ur10e",
-    "IsaacUR10eTopicBasedSystem",
-    10.0,
-    0.5,
+constexpr IsaacGripperFacts kRobotiq2F140Facts{
     "ros_gripper_command",
     "robotiq_gripper_controller/gripper_cmd",
     "/isaac_gripper_state",
@@ -86,17 +94,50 @@ constexpr IsaacProfileFacts kUr10eProfile{
     40.0,
     false,
     15.0,
+    "isaac_robotiq_2f_140_gripper_bridge.yaml",
 };
+
+// Merge 6: the robots `lite6`/`ur10e` are arm-only and the tools
+// `lite_gripper`/`robotiq_2f_140` own their gripper transport; the USD stays
+// one articulation per pair.
+constexpr std::array<IsaacProfileFacts, 4U> kIsaacProfiles{{
+    {"lite6", "IsaacLite6TopicBasedSystem", 8.0, 1.5, nullptr},
+    {"lite_gripper", "", 0.0, 0.0, &kLiteGripperFacts},
+    {"ur10e", "IsaacUR10eTopicBasedSystem", 10.0, 0.5, nullptr},
+    {"robotiq_2f_140", "", 0.0, 0.0, &kRobotiq2F140Facts},
+}};
 
 [[nodiscard]] const IsaacProfileFacts &
 profile_facts(const std::string_view profile_id) {
-  if (profile_id == kLite6Profile.profile_id) {
-    return kLite6Profile;
+  const auto found =
+      std::find_if(kIsaacProfiles.begin(), kIsaacProfiles.end(),
+                   [&](const auto &row) { return row.profile_id == profile_id; });
+  if (found == kIsaacProfiles.end()) {
+    throw std::invalid_argument("unsupported retained Isaac ROS profile");
   }
-  if (profile_id == kUr10eProfile.profile_id) {
-    return kUr10eProfile;
+  return *found;
+}
+
+/// The arm facts of a robot row; a tool row has none.
+[[nodiscard]] const IsaacProfileFacts &
+arm_profile_facts(const std::string_view profile_id) {
+  const auto &profile = profile_facts(profile_id);
+  if (profile.hardware_component_name.empty()) {
+    throw std::invalid_argument("retained Isaac ROS profile '" +
+                                std::string(profile_id) + "' has no arm");
   }
-  throw std::invalid_argument("unsupported retained Isaac ROS profile");
+  return profile;
+}
+
+/// The gripper facts of a tool row; an arm-only row has none.
+[[nodiscard]] const IsaacGripperFacts &
+gripper_profile_facts(const std::string_view profile_id) {
+  const auto &profile = profile_facts(profile_id);
+  if (profile.gripper == nullptr) {
+    throw std::invalid_argument("retained Isaac ROS profile '" +
+                                std::string(profile_id) + "' has no gripper");
+  }
+  return *profile.gripper;
 }
 
 [[nodiscard]] std::vector<std::string>
@@ -229,7 +270,11 @@ make_simulation_jtc_config(const std::string &runtime_namespace,
   lane.feedback_rate_hz = rates.action_monitor_rate_hz;
   lane.state_rate_hz = rates.state_publish_rate_hz;
   lane.controller_update_rate_hz = rates.controller_update_rate_hz;
-  lane.goal_tolerance_policy = core::ExecutionGoalTolerancePolicy::kErased;
+  // Arrival (maintainer 2026-10-28): every lane keeps its controller file's
+  // per-joint `goal` constraint (the profile row's arrival tolerance), so
+  // stock JTC succeeds only when the trajectory finished with every joint
+  // within it, and otherwise aborts with a goal-tolerance result.
+  lane.goal_tolerance_policy = core::ExecutionGoalTolerancePolicy::kKept;
   config.arm.controller = RetainedRos2ControlArmController{
       scoped_name(runtime_namespace, kControllerManagerNodeName),
       std::string(arm_controller_name), std::string(hardware_component_name)};
@@ -443,6 +488,62 @@ retained_isaac_controller_lane(
                           initial_joint_positions_rad.end())};
 }
 
+std::optional<IsaacGripperBridgeLane>
+retained_isaac_gripper_bridge(const std::string_view isaac_profile) {
+  const auto &profile = gripper_profile_facts(isaac_profile);
+  if (profile.bridge_parameters.empty())
+    return std::nullopt;
+  return IsaacGripperBridgeLane{std::string(profile.action_name),
+                                std::string(profile.command_topic),
+                                std::string(profile.state_topic),
+                                std::string(profile.bridge_parameters)};
+}
+
+void configure_retained_isaac_gripper_action(
+    RetainedRos2ControlBackendConfig &config,
+    const core::RuntimeParticipantBinding &gripper,
+    const std::string_view isaac_profile,
+    const std::string_view runtime_namespace) {
+  const auto &profile = gripper_profile_facts(isaac_profile);
+  if (!gripper.value().control_path.has_value() ||
+      gripper.value().control_path->state_authority_class !=
+          core::StateAuthorityClass::kCommanded) {
+    throw std::invalid_argument(
+        "retained Isaac ROS profile requires a commanded gripper control path");
+  }
+  if (gripper.value().resources.size() != 1U ||
+      gripper.value().resources.front().compiled_resource_name.empty() ||
+      !gripper.value().resources.front().source_joint_name.has_value() ||
+      gripper.value().resources.front().source_joint_name->empty()) {
+    throw std::invalid_argument(
+        "retained Isaac ROS gripper has no exact coordinate mapping");
+  }
+  ros2_control_execution::Ros2GripperActionConfig gripper_config;
+  gripper_config.action_name =
+      scoped_name(runtime_namespace, profile.action_name);
+  gripper_config.transport_kind = profile.transport_kind;
+  gripper_config.command_topic = profile.command_topic;
+  gripper_config.state_topic = profile.state_topic;
+  gripper_config.command_joint_names = {
+      *gripper.value().resources.front().source_joint_name};
+  gripper_config.state_joint_name =
+      *gripper.value().resources.front().source_joint_name;
+  gripper_config.group_id =
+      sole_compiled_group(gripper, "retained Isaac ROS gripper binding");
+  gripper_config.joint_name =
+      gripper.value().resources.front().compiled_resource_name;
+  gripper_config.completion_policy = profile.completion_policy;
+  gripper_config.open_position = profile.open_position;
+  gripper_config.closed_position = profile.closed_position;
+  gripper_config.open_effort = profile.open_effort;
+  gripper_config.close_effort = profile.close_effort;
+  gripper_config.publish_nominal_position =
+      profile.publish_nominal_position;
+  gripper_config.wait_for_action_server_timeout_s = 2.0;
+  gripper_config.result_timeout_s = profile.result_timeout_s;
+  config.gripper = std::move(gripper_config);
+}
+
 RetainedRos2ControlBackendConfig
 make_retained_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
@@ -463,22 +564,18 @@ make_retained_isaac_ros2_control_backend_config(
         "retained ROS component selects the offline mock lane; its "
         "configuration is make_retained_mock_ros2_control_backend_config");
   }
-  const auto &profile = profile_facts(*selected->isaac_profile);
+  const auto &profile = arm_profile_facts(*selected->isaac_profile);
   const auto runtime_namespace =
       retained_isaac_ros_namespace(motion_binding);
   if (!motion_binding.value().control_path.has_value() ||
       motion_binding.value().control_path->state_authority_class !=
-          core::StateAuthorityClass::kCommanded ||
-      !gripper_binding.has_value() ||
-      !gripper_binding->value().control_path.has_value() ||
-      gripper_binding->value().control_path->state_authority_class !=
           core::StateAuthorityClass::kCommanded) {
     throw std::invalid_argument(
-        "retained Isaac ROS profile requires commanded motion and gripper "
-        "control paths");
+        "retained Isaac ROS profile requires a commanded motion control path");
   }
-  if (motion_binding.value().controllable_component_id !=
-      gripper_binding->value().controllable_component_id) {
+  if (gripper_binding.has_value() &&
+      motion_binding.value().controllable_component_id !=
+          gripper_binding->value().controllable_component_id) {
     throw std::invalid_argument(
         "retained Isaac motion and gripper bindings must address the same "
         "controllable component");
@@ -520,40 +617,13 @@ make_retained_isaac_ros2_control_backend_config(
         joint, profile.cancel_deceleration_rad_s2);
   }
 
-  const auto &gripper = *gripper_binding;
-  if (gripper.value().resources.size() != 1U ||
-      gripper.value().resources.front().compiled_resource_name.empty() ||
-      !gripper.value().resources.front().source_joint_name.has_value() ||
-      gripper.value().resources.front().source_joint_name->empty()) {
-    throw std::invalid_argument(
-        "retained Isaac ROS gripper has no exact coordinate mapping");
+  if (gripper_binding.has_value()) {
+    configure_retained_isaac_gripper_action(config, *gripper_binding,
+                                            *selected->isaac_profile,
+                                            runtime_namespace);
+    configure_retained_gripper_output_mode(config, runtime_configuration,
+                                           *gripper_binding);
   }
-  ros2_control_execution::Ros2GripperActionConfig gripper_config;
-  gripper_config.action_name =
-      scoped_name(runtime_namespace, profile.gripper_action_name);
-  gripper_config.transport_kind = profile.gripper_transport_kind;
-  gripper_config.command_topic = profile.gripper_command_topic;
-  gripper_config.state_topic = profile.gripper_state_topic;
-  gripper_config.command_joint_names = {
-      *gripper.value().resources.front().source_joint_name};
-  gripper_config.state_joint_name =
-      *gripper.value().resources.front().source_joint_name;
-  gripper_config.group_id =
-      sole_compiled_group(gripper, "retained Isaac ROS gripper binding");
-  gripper_config.joint_name =
-      gripper.value().resources.front().compiled_resource_name;
-  gripper_config.completion_policy = profile.gripper_completion_policy;
-  gripper_config.open_position = profile.gripper_open_position;
-  gripper_config.closed_position = profile.gripper_closed_position;
-  gripper_config.open_effort = profile.gripper_open_effort;
-  gripper_config.close_effort = profile.gripper_close_effort;
-  gripper_config.publish_nominal_position =
-      profile.gripper_publish_nominal_position;
-  gripper_config.wait_for_action_server_timeout_s = 2.0;
-  gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
-
-  config.gripper = std::move(gripper_config);
-  configure_retained_gripper_output_mode(config, runtime_configuration, gripper);
   return config;
 }
 
@@ -590,6 +660,11 @@ void configure_retained_gripper_output_mode(
           configuration.gripper_target_configurations.end(), matches) != 1)
     throw std::invalid_argument("retained ROS gripper requires one exact authored output row");
   config.gripper->actuation_kind = retained_ros2_control_gripper_actuation_kind(configuration, binding);
+  // Opt-in stall-window grasp evidence (position grippers only, by decode).
+  if (found->grasp_confirmation && found->grasp_confirmation->stall_window)
+    config.gripper->grasp_stall_window = ros2_control_execution::Ros2GripperActionConfig::
+        GraspStallWindow{found->grasp_confirmation->stall_window->min_position,
+                         found->grasp_confirmation->stall_window->max_position};
   // A mapped gripper's physical writes are separate admitted I/O operations.
   // Its own operation uses the existing no-output logical state semantics.
   config.gripper->output_mode = found->pneumatic_io
@@ -598,8 +673,11 @@ void configure_retained_gripper_output_mode(
   const auto *profile = deployment::ros2_control_execution_runtime_contract::
       find_controller_profile(configuration, binding.value().controllable_component_id);
   if (profile && profile->isaac_profile && found->pneumatic_io)
-    throw std::invalid_argument("pneumatic_io_unsupported_on_isaac: Isaac uses its existing gripper transport");
-  const bool streamless_real_pneumatic = profile != nullptr && profile->real_profile &&
+    throw core::TypedError("pneumatic_io_unsupported_on_isaac",
+                           "pneumatic_io_unsupported_on_isaac: Isaac uses its existing gripper transport");
+  // A lane-free pneumatic tool (D4) has no controller profile and, like a
+  // Real pneumatic gripper, no feedback stream.
+  const bool streamless_real_pneumatic = (profile == nullptr || profile->real_profile) &&
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
   if (!streamless_real_pneumatic) {
     const auto &feedback = retained_component_stream(
@@ -848,12 +926,22 @@ make_retained_real_ros2_control_backend_config(
       measured_joints_budget_ns(measured_lane,
           motion_binding.value().controllable_component_id, stream_overrides));
   config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
+  // The component's Deployment setting: the soft Stop lead-in starts at the
+  // controller's command position (absent or `commanded`) or at the measured
+  // position (`measured`).
+  config.participant.stop.lead_in_anchor =
+      selected->stop_lead_in_anchor.value_or(core::StopLeadInAnchor::kCommanded);
   // The measured authority's start and terminal state gates and its progress
   // cursor freshness, from the profile's data row.
   config.participant.progress_freshness_budget_ns =
       static_cast<core::Duration>(profile.joint_state_freshness_s * 1e9);
   config.participant.start_tolerance_rad = profile.start_tolerance_rad;
-  config.participant.final_tolerance_rad = profile.final_tolerance_rad;
+  // The terminal gate reads the row's arrival tolerance, the same value as
+  // the controllers' JTC `goal` constraint, so it re-checks what JTC's kept
+  // goal tolerance already enforces. TODO(merge 6 ARRIVE): remove after the
+  // live validation of the kept JTC goal tolerance on Real (maintainer
+  // 2026-10-28: kept until then).
+  config.participant.final_tolerance_rad = profile.arrival_tolerance_rad;
   config.participant.completion_state_timeout_ns =
       static_cast<core::Duration>(profile.completion_state_timeout_s * 1e9);
   config.observed_state_authority_profile_id =

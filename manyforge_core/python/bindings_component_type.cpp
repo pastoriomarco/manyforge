@@ -192,16 +192,18 @@ void register_component_type_bindings(py::module_& module) {
                        ModelRoleId model_role_id,
                        FrameRoleId asset_frame_role_id,
                        std::vector<CollisionBodyRoleId>
-                           contact_body_role_ids) {
+                           contact_body_role_ids,
+                       bool tcp) {
              return ComponentTypeFrameRoleDTO{
                  std::move(frame_role_id), std::move(model_role_id),
                  std::move(asset_frame_role_id),
-                 std::move(contact_body_role_ids)};
+                 std::move(contact_body_role_ids), tcp};
            }),
            py::arg("frame_role_id"), py::arg("model_role_id"),
            py::arg("asset_frame_role_id"),
            py::arg("contact_body_role_ids") =
-               std::vector<CollisionBodyRoleId>{})
+               std::vector<CollisionBodyRoleId>{},
+           py::arg("tcp") = false)
       .def_readonly("frame_role_id",
                     &ComponentTypeFrameRoleDTO::frame_role_id)
       .def_readonly("model_role_id",
@@ -210,6 +212,7 @@ void register_component_type_bindings(py::module_& module) {
                     &ComponentTypeFrameRoleDTO::asset_frame_role_id)
       .def_readonly("contact_body_role_ids",
                     &ComponentTypeFrameRoleDTO::contact_body_role_ids)
+      .def_readonly("tcp", &ComponentTypeFrameRoleDTO::tcp)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -267,18 +270,21 @@ void register_component_type_bindings(py::module_& module) {
                std::vector<ComponentTypeFrameRoleDTO> frame_roles,
                std::vector<ComponentTypeCollisionBodyRoleDTO>
                    collision_body_roles,
-               std::vector<ComponentTypeCapabilityDTO> capabilities) {
+               std::vector<ComponentTypeCapabilityDTO> capabilities,
+               std::optional<FrameRoleId> default_tcp_frame_role_id) {
              return ComponentTypeCommandTargetDTO{
                  std::move(command_target_id),
                  std::move(model_group_roles),
                  resource_roles_from_python(resource_roles),
                  std::move(frame_roles),
                  std::move(collision_body_roles),
-                 std::move(capabilities)};
+                 std::move(capabilities),
+                 std::move(default_tcp_frame_role_id)};
            }),
            py::arg("command_target_id"), py::arg("model_group_roles"),
            py::arg("resource_roles"), py::arg("frame_roles"),
-           py::arg("collision_body_roles"), py::arg("capabilities"))
+           py::arg("collision_body_roles"), py::arg("capabilities"),
+           py::arg("default_tcp_frame_role_id") = std::nullopt)
       .def_readonly("command_target_id",
                     &ComponentTypeCommandTargetDTO::command_target_id)
       .def_readonly("model_group_roles",
@@ -295,6 +301,9 @@ void register_component_type_bindings(py::module_& module) {
           &ComponentTypeCommandTargetDTO::collision_body_roles)
       .def_readonly("capabilities",
                     &ComponentTypeCommandTargetDTO::capabilities)
+      .def_readonly(
+          "default_tcp_frame_role_id",
+          &ComponentTypeCommandTargetDTO::default_tcp_frame_role_id)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

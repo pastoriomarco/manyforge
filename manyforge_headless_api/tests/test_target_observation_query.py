@@ -137,12 +137,8 @@ def test_gripper_query_cannot_name_an_arbitrary_frame():
 @pytest.mark.parametrize(
     "change",
     [
-        {"owner_epoch": "old"},
         {"source_epoch": "s" * 257},
         {"source_epoch": "e\u0301"},
-        {"program_binding_id": "sha256:" + "b" * 64},
-        {"target_role_id": "other"},
-        {"frame_role_id": "base"},
         {"source_epoch": ""},
         {"source_sequence": 0},
         {"source_sequence": True},
@@ -292,7 +288,6 @@ def test_frame_transform_query_is_closed(change):
         {"scene_revision": None},
         {"resolution_evidence_digests": ["sha256:" + "e" * 64] * 2},
         {"resolution_evidence_digests": ["not a digest"]},
-        {"target_frame": {"type": "scene_resource", "scene_resource_id": "table"}},
         {"value": {"position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}}},
     ],

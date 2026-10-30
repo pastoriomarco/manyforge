@@ -42,6 +42,28 @@ import {
 import { SourceableLeaf, SourceableValue } from './ValueSourceField';
 import { NamespaceGroupOptions, useNamespaceGroups } from '../common/NamespaceGroupOptions';
 
+/** The node parameter a reference created from a picker is written to. */
+export interface ProgramReferenceSource {
+  nodeId: string;
+  parameterId: string;
+  semanticType: string;
+  /**
+   * The whole parameter value naming the created reference, from the current
+   * one; when omitted the parameter becomes the created id itself. A picker
+   * inside an object parameter (`on_grasp_lost.set_key`) sets only its field.
+   */
+  parameterValue?: (current: JsonValue | undefined, createdId: string) => JsonValue;
+}
+
+/** The literal a created reference writes to its node parameter. */
+export function createdReferenceValue(
+  source: ProgramReferenceSource,
+  current: JsonValue | undefined,
+  createdId: string,
+): JsonValue {
+  return source.parameterValue === undefined ? createdId : source.parameterValue(current, createdId);
+}
+
 export interface ProgramSchemaValueEditorContext {
   entry: CatalogEntry;
   node: ProgramTreeNode;
@@ -60,7 +82,7 @@ export interface ProgramSchemaValueEditorContext {
     target: ProgramSemanticCreateTarget,
     expectedType: string | null,
     expectedAccess: 'read' | 'write' | 'read_write' | null,
-    source: { nodeId: string; parameterId: string; semanticType: string },
+    source: ProgramReferenceSource,
   ) => void;
 }
 

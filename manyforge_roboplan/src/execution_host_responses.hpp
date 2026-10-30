@@ -2,6 +2,8 @@
 
 #include <manyforge_core/types/io_activation_rule.hpp>
 
+#include <exception>
+
 #include "execution_host_commands.hpp"
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
@@ -14,6 +16,9 @@ namespace manyforge::roboplan_backend::host_detail {
 [[nodiscard]] CanonicalValue
 ErrorResponse(std::string code, std::string message,
               std::map<std::string, std::string> details = {});
+
+[[nodiscard]] core::ErrorDTO
+ExecutionCommandExceptionError(const std::exception &error);
 
 [[nodiscard]] CanonicalValue ExecutionOwnerNotReadyIdentityResponse(
     const core::ResourceAddressedExecutionKernel &owner,

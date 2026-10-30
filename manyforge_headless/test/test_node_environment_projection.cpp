@@ -108,6 +108,8 @@ TEST(NodeEnvironmentProjection,
       MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST);
 
   const auto available = projection.Project(admission.retained_bundle(), true);
+  ASSERT_NE(available.find_object_member("capability_offers"), nullptr);
+  EXPECT_TRUE(available.find_object_member("capability_offers")->as_array().empty());
   const auto bytes = content_identity::canonical_json(available);
   EXPECT_NE(
       bytes.find(
@@ -120,12 +122,13 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
   EXPECT_EQ(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 49U);
+  // motion.set_tcp (50 nodes); it has no healthy owner in the empty package.
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 50U);
   EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 0U);
   EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 14U);
-  EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 35U);
+  EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 36U);
   EXPECT_EQ(bytes.find("\"cclc_node_adapter_unavailable_until_i7\""),
             std::string::npos);
   EXPECT_EQ(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),

@@ -90,13 +90,13 @@ export function valueSourceMenuEntries(
       title: model.unavailable ?? (model.keyChoices.length === 0 ? 'No readable key of this type is declared.' : undefined),
       items: keyItems,
     },
-    {
-      label: 'Use parameter…',
-      disabled: unavailable,
-      title: model.unavailable ?? (model.parameterChoices.length === 0 ? 'No parameter of this type is declared.' : undefined),
-      items: choices(model.parameterChoices),
-    },
   ];
+  if (!model.keyOnly) entries.push({
+    label: 'Use parameter…',
+    disabled: unavailable,
+    title: model.unavailable ?? (model.parameterChoices.length === 0 ? 'No parameter of this type is declared.' : undefined),
+    items: choices(model.parameterChoices),
+  });
   if (model.formulaType === null) return entries;
   entries.push('separator');
   if (model.current?.kind === 'expression') {

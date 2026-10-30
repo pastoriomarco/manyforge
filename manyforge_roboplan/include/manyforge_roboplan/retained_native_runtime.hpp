@@ -29,7 +29,9 @@
 #include <mutex>
 #include <optional>
 #include <roboplan/core/scene.hpp>
+#include <set>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -101,6 +103,9 @@ struct RetainedRuntimeBackendSet final {
   core::IControlDomainExecutionPort *gripper_stop_execution_port{};
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
+  /// Active TCP (M7): the robot's Set TCP step; absent: Set TCP is refused
+  /// (`set_tcp_unavailable`).
+  std::optional<core::SetTcpStep> set_tcp{};
 };
 
 using RetainedRuntimeBackendFactory = std::function<RetainedRuntimeBackendSet(
@@ -127,6 +132,9 @@ using RetainedRobotMeasuredSourcePreparer = std::function<
 struct RetainedResolvedParticipant final {
   core::RuntimeParticipantBinding binding;
   bool intrinsic_direct_control{};
+  /// B7: the owner of the motion endpoint's frame (the index's owner of its
+  /// model); the Kernel stamps the request's TCP frame with it.
+  std::optional<core::ControllableComponentId> motion_endpoint_owner{};
 };
 
 using RetainedRuntimeParticipantResolver =
@@ -225,6 +233,22 @@ private:
   std::shared_ptr<core::IReferencePoseResolver> target_;
 };
 
+/// Existing retained model-map exposures, restricted to the exact motion
+/// component/model or the models of components mounted on it (a tool's
+/// TCPs), form the planner's frame inventory: each frame once, stamped with
+/// its owner (B7). Without a map the focused-runtime legacy inventory remains
+/// exactly the participant's frames.
+[[nodiscard]] std::vector<core::ResolvedFrameDTO>
+retained_motion_planner_frames(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map = nullptr);
+
+/// LOADFIX9: the compiled names of `retained_motion_planner_frames`, in the
+/// same order. The motion model generation computes FK for each of them.
+[[nodiscard]] std::vector<std::string> retained_motion_planner_frame_names(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map);
+
 /// Already-verified inputs to one native runtime composition.
 ///
 /// Deployment/product readers and the logical-scene owner remain outside this
@@ -232,14 +256,6 @@ private:
 /// a planner whose worker model has the same projection revision, and a
 /// reference resolver backed by the logical-scene owner. No path, model name,
 /// robot default, or group selector is accepted here.
-/// Existing retained model-map exposures, restricted to the exact motion
-/// component/model, form the planner's frame inventory. Without a map the
-/// focused-runtime legacy inventory remains exactly the participant's frames.
-[[nodiscard]] std::vector<core::ResolvedFrameDTO>
-retained_motion_planner_frames(
-    const core::RuntimeParticipantBinding &runtime,
-    const deployment::VerifiedRetainedModelMap *model_map = nullptr);
-
 struct RetainedNativeRuntimeInput final {
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
@@ -294,6 +310,9 @@ struct RetainedNativeRuntimeInput final {
       control_binding_representatives{};
   /// Sole Deployment-authored TCP-speed maximum for this exact motion target.
   std::optional<double> deployment_maximum_tcp_linear_speed_mps{};
+  /// The robot flange the maximum also holds at under the Deployment's
+  /// `tcp_speed_check: active_tcp_and_flange`; absent for `active_tcp`.
+  std::optional<core::ResolvedFrameDTO> speed_check_flange_frame{};
   /// Retained manual-motion ceilings for the exact motion binding above.
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
   /// Saved settings, resolved once against the immutable model at activation.
@@ -437,12 +456,16 @@ struct RetainedNativeRuntime final
   core::IControlDomainExecutionPort *gripper_stop_execution_port{};
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
+  /// Active TCP (M7): from the backend set; on every registration of the
+  /// motion engine (physical, representatives, aliases).
+  std::optional<core::SetTcpStep> set_tcp;
   std::optional<RetainedGripperPositionLimits> gripper_position_limits;
   /// Exact non-speed motion policy sealed against this motion target. It
   /// carries the Deployment-selected ordinary-motion jerk profile only.
   std::optional<core::RuntimeParticipantPolicySelection>
       motion_participant_policy;
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
+  std::optional<core::ResolvedFrameDTO> speed_check_flange_frame;
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;

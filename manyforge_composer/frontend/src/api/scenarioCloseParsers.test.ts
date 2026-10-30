@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { api } from './client';
-import { parseCanonicalEmptySelection, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
+import { parseCanonicalEmptySelection, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
   parseLifecycleTargetRetirementResult } from './scenarioCloseParsers';
 import type { LifecycleTargetRetirementIntent } from '../types/scenarioClose';
 
@@ -130,4 +130,25 @@ it.each(['retire', 'result', 'settlement', 'selection'])('preserves actual typed
     : surface === 'result' ? api.cclc.targetRetirementResult(intent)
     : surface === 'settlement' ? api.cclc.ownerSettlement(intent.scope) : api.manager.canonicalEmptySelection();
   await expect(operation).rejects.toMatchObject({ status, structuredError: { code, message: 'actual owner refusal' } });
+});
+
+// Item 37: a Force close reply must name its own step.
+it('parses a Force close step reply and refuses another step or shape', () => {
+  const reply = { api_version: 'manyforge.execution_command_response.v1', ok: true, command: 'force_close',
+    history: { event_id: 'event-1', recorded: true }, result: { step: 'close_operations', stop_generation: 5,
+      released_orphan_resources: [], operations: [{ operation_id: 'op.io', operation_revision: 2, state: 'failed',
+        containment_uncertain: false, targets: [{ controllable_component_id: 'io', command_target_id: 'valve', output_unknown: true }] }] } };
+  expect(parseForceCloseResult(reply, 'close_operations')).toEqual({ step: 'close_operations', stopGeneration: 5,
+    motionBlockCleared: false, operations: [{ operationId: 'op.io', operationRevision: 2, state: 'failed', containmentUncertain: false,
+      targets: [{ controllableComponentId: 'io', commandTargetId: 'valve', outputUnknown: true }] }] });
+  expect(parseForceCloseResult({ ...reply, result: { ...reply.result, motion_block_cleared: true } }, 'close_operations')
+    .motionBlockCleared).toBe(true);
+  expect(() => parseForceCloseResult(reply, 'stop')).toThrow('does not match its step');
+  // Night change 8: the server answers `stop` with the Kernel's `arm` reply.
+  const armed = { ...reply, result: { step: 'arm', stop_generation: 5, released_orphan_resources: [], operations: [] } };
+  expect(parseForceCloseResult(armed, 'stop')).toEqual({ step: 'stop', stopGeneration: 5, motionBlockCleared: false, operations: [] });
+  expect(() => parseForceCloseResult(armed, 'close_operations')).toThrow('does not match its step');
+  expect(() => parseForceCloseResult({ ...reply, ok: false }, 'close_operations')).toThrow();
+  expect(() => parseForceCloseResult({ ...reply, result: { ...reply.result, operations: [{ operation_id: 'op.io' }] } },
+    'close_operations')).toThrow('operation row is invalid');
 });

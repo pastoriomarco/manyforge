@@ -1709,10 +1709,26 @@ TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripIsGateByDefaultAndOwnsIdl
                             {"idle_behaviour", CanonicalValue("latch")}});
   EXPECT_EQ(full.find_object_member("on_trip")->as_string(), "full_stop");
   EXPECT_EQ(full.find_object_member("idle_behaviour")->as_string(), "latch");
+  const auto notify = sealed({{"on_trip", CanonicalValue("notify")}});
+  ASSERT_NE(notify.find_object_member("on_trip"), nullptr);
+  EXPECT_EQ(notify.find_object_member("on_trip")->as_string(), "notify");
+  EXPECT_EQ(notify.find_object_member("idle_behaviour"), nullptr);
+  EXPECT_EQ(notify.find_object_member("stop_entry_stage_id"), nullptr);
+  for (const auto *mode : {"gate", "full_stop"}) {
+    const auto with_entry = sealed({{"on_trip", CanonicalValue(mode)},
+                                    {"stop_entry_stage_id", CanonicalValue("stage")}});
+    ASSERT_NE(with_entry.find_object_member("stop_entry_stage_id"), nullptr);
+    EXPECT_EQ(with_entry.find_object_member("stop_entry_stage_id")->as_string(), "stage");
+  }
   for (auto invalid : std::vector<CanonicalValue::Object>{
            {{"on_trip", CanonicalValue("stop")}},
+           {{"on_trip", CanonicalValue(true)}},
+           {{"on_trip", CanonicalValue(nullptr)}},
            {{"idle_behaviour", CanonicalValue("latch")}},
            {{"on_trip", CanonicalValue("gate")}, {"idle_behaviour", CanonicalValue("ignore")}},
+           {{"on_trip", CanonicalValue("notify")}, {"idle_behaviour", CanonicalValue("latch")}},
+           {{"on_trip", CanonicalValue("notify")}, {"idle_behaviour", CanonicalValue("ignore")}},
+           {{"on_trip", CanonicalValue("notify")}, {"stop_entry_stage_id", CanonicalValue("stage")}},
            {{"latch_release", CanonicalValue("operator")}}})
     EXPECT_THROW(static_cast<void>(decode(document(std::move(invalid)))),
                  DeploymentApplicabilityCodecError);

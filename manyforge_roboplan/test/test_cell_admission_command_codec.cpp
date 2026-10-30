@@ -117,7 +117,7 @@ public:
     ++acquire_calls;
     if (acquire_calls >= 3U)
       return core::Result<core::CellAdmissionClaimDTO>::Err(
-          core::ErrorDTO{"stale_generation", "expected_generation_stale",
+          core::ErrorDTO{"stale_generation", "cell-admission request rejected",
                          {{"admission_generation", "8"}}});
     return core::Result<core::CellAdmissionClaimDTO>::Ok(
         {intent, core::CellAdmissionClaimGeneration(3U),
@@ -383,7 +383,7 @@ TEST(CellAdmissionCommandCodec,
   EXPECT_EQ(error.find_object_member("code")->as_string(),
             "stale_generation");
   EXPECT_EQ(error.find_object_member("message")->as_string(),
-            "expected_generation_stale");
+            "cell-admission request rejected");
   EXPECT_EQ(error.find_object_member("details")
                 ->find_object_member("admission_generation")
                 ->as_string(),
@@ -473,7 +473,7 @@ TEST(CellAdmissionCommandCodec, FreezesExactCommandSpecificJsonShapes) {
   EXPECT_EQ(
       ci::canonical_json(CellAdmissionResponseValue(
           "cell_admission_acquire", error)),
-      R"({"api_version":"manyforge.execution_command_response.v1","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale"},"ok":false})");
+      R"({"api_version":"manyforge.execution_command_response.v1","command":"cell_admission_acquire","error":{"code":"stale_generation","details":{"admission_generation":"9"},"message":"stale","producer":"kernel"},"ok":false})");
 
   auto payload = Envelope("cell_admission_release", Release()).as_object();
   for (auto &[key, value] : payload) {

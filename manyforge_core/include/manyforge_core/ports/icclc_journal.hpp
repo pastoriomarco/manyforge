@@ -484,22 +484,9 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
         {"apply_bring_up_journal_unavailable", "delegated generation lookup is not composed", {}});
   }
   [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
-  InspectApplyComponentBringUpRequest(const RequestOwnerEpoch&,
-      const ComponentLifecycleIntentDTO&, const ContentDigest&) {
-    return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
-        {"apply_bring_up_journal_unavailable", "delegated Apply ledger is not composed", {}});
-  }
-  [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
   ReadApplyComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&, const ContentDigest&) {
     return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
         {"apply_bring_up_journal_unavailable", "delegated Apply lookup is not composed", {}});
-  }
-  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO>
-  AcceptOrReplayApplyComponentBringUp(const RequestOwnerEpoch&,
-      const ComponentLifecycleIntentDTO&, const ComponentLifecycleAcceptedDTO&,
-      const ComponentLifecycleStatusDTO&, const ContentDigest&) {
-    return Result<CCLCLifecycleRequestResultDTO>::Err(
-        {"apply_bring_up_journal_unavailable", "delegated Apply ledger is not composed", {}});
   }
 
   [[nodiscard]] virtual Result<void> RecordSelectedCellClaimAttempt(

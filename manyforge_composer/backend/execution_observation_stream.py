@@ -283,8 +283,9 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
 class ExecutionObservationSubscription:
     wake: asyncio.Event
     payload: str | None = None
-    last_applied: tuple[str, str, int] | None = None
-    outstanding: tuple[str, str, int] | None = None
+    last_applied: tuple[str, str, int, int] | None = None
+    outstanding: tuple[str, str, int, int] | None = None
+    offered_at: float = 0.0
     credit: bool = False
     closed: bool = False
     unavailable: bool = False
@@ -311,10 +312,10 @@ def observation_cursor(
 
 
 def _is_newer(
-    candidate: tuple[str, str, int],
-    applied: tuple[str, str, int] | None,
+    candidate: tuple[str, str, int, int],
+    applied: tuple[str, str, int, int] | None,
 ) -> bool:
-    return applied is None or candidate[:2] != applied[:2] or candidate[2] > applied[2]
+    return applied is None or candidate[3] > applied[3]
 
 
 class ExecutionObservationSource:
@@ -334,9 +335,18 @@ class ExecutionObservationSource:
         self._last_payload: str | None = None
         self._last_identity: tuple[str, str, int] | None = None
         self._last_render_signature: tuple[Any, ...] | None = None
+        self._delivery_sequence = 0
+        self._outside_identity: dict[str, Any] | None = None
+        self._outside_sources: list[dict[str, Any]] = []
+        self._outside_received = 0.0
+        self._outside_worker: threading.Thread | None = None
+        self._outside_cancel: threading.Event | None = None
         self._worker: threading.Thread | None = None
         self._shutdown = False
         self._active_upstream_cancel: threading.Event | None = None
+        # At most one additional execution-owner read is pending even when an
+        # outside update consumes the browser credit first.
+        self._execution_read_pending = False
         self._demand_generation = 0
         self._retry_after_generation = -1
         self._connections = 0
@@ -377,8 +387,13 @@ class ExecutionObservationSource:
                 self._last_payload = None
                 self._last_identity = None
                 self._last_render_signature = None
+                self._execution_read_pending = False
                 if self._active_upstream_cancel is not None:
                     self._active_upstream_cancel.set()
+                if self._outside_cancel is not None:
+                    self._outside_cancel.set()
+                self._outside_identity = None
+                self._outside_sources = []
             self._demand_generation += 1
             self._condition.notify_all()
 
@@ -390,15 +405,20 @@ class ExecutionObservationSource:
             self._subscriptions.clear()
             if self._active_upstream_cancel is not None:
                 self._active_upstream_cancel.set()
+            if self._outside_cancel is not None:
+                self._outside_cancel.set()
             self._condition.notify_all()
             worker = self._worker
+            outside_worker = self._outside_worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
+        if outside_worker is not None and outside_worker is not threading.current_thread():
+            outside_worker.join(timeout=2.0)
 
     def grant_credit(
         self,
         subscription: ExecutionObservationSubscription,
-        last_applied: tuple[str, str, int] | None,
+        last_applied: tuple[str, str, int, int] | None,
     ) -> None:
         wakes: list[ExecutionObservationSubscription] = []
         with self._condition:
@@ -427,11 +447,13 @@ class ExecutionObservationSource:
             elif last_applied != subscription.last_applied:
                 raise ValueError("execution observation renewal cursor is stale")
             subscription.credit = True
+            self._execution_read_pending = True
             self._credits += 1
             self._demand_generation += 1
             if self._offer_current_locked(subscription):
                 wakes.append(subscription)
             self._ensure_worker_locked()
+            self._ensure_outside_worker_locked()
             self._condition.notify_all()
         self._wake_subscriptions(wakes)
 
@@ -449,7 +471,14 @@ class ExecutionObservationSource:
             subscription.wake.clear()
             if payload is not None:
                 self._sent += 1
-            return payload
+                frame = json.loads(payload)
+                elapsed = max(0, round((self._monotonic() - subscription.offered_at) * 1_000_000_000))
+                for row in frame["outside_pose_sources"]:
+                    row["age_at_delivery_ns"] = min(
+                        _MAXIMUM_SAFE_INTEGER, row["age_at_delivery_ns"] + elapsed
+                    )
+                return encode_execution_observation_frame(frame)
+            return None
 
     def status(self) -> dict[str, Any]:
         with self._condition:
@@ -507,11 +536,20 @@ class ExecutionObservationSource:
             or subscription.outstanding is not None
             or self._last_payload is None
             or self._last_identity is None
-            or not _is_newer(self._last_identity, subscription.last_applied)
+            or not _is_newer((*self._last_identity, self._delivery_sequence), subscription.last_applied)
         ):
             return False
-        subscription.payload = self._last_payload
-        subscription.outstanding = self._last_identity
+        frame = json.loads(self._last_payload)
+        identity = {key: frame[key] for key in ("cell_id", "retained_bundle_id", "graph_revision")}
+        elapsed = max(0, round((self._monotonic() - self._outside_received) * 1_000_000_000))
+        frame["outside_pose_sources"] = [
+            {**row, "age_at_delivery_ns": min(_MAXIMUM_SAFE_INTEGER, row["age_at_delivery_ns"] + elapsed)}
+            for row in self._outside_sources
+        ] if identity == self._outside_identity else []
+        frame["delivery_sequence"] = self._delivery_sequence
+        subscription.payload = encode_execution_observation_frame(frame)
+        subscription.offered_at = self._monotonic()
+        subscription.outstanding = (*self._last_identity, self._delivery_sequence)
         subscription.credit = False
         return True
 
@@ -572,6 +610,8 @@ class ExecutionObservationSource:
                 )
             if self._last_identity == identity:
                 self._coalesced += 1
+                if self._has_demand_locked():
+                    self._execution_read_pending = True
                 return
             payload = encode_execution_observation_frame(frame)
             if (
@@ -586,11 +626,14 @@ class ExecutionObservationSource:
                 self._last_payload = payload
                 self._coalesced += 1
                 self._last_error = None
+                if self._has_demand_locked():
+                    self._execution_read_pending = True
                 self._condition.notify_all()
                 return
             self._last_identity = identity
             self._last_render_signature = signature
             self._last_payload = payload
+            self._delivery_sequence += 1
             self._published += 1
             self._last_error = None
             for subscription in self._subscriptions:
@@ -599,13 +642,90 @@ class ExecutionObservationSource:
             self._condition.notify_all()
         self._wake_subscriptions(wakes)
 
+    def _ensure_outside_worker_locked(self) -> None:
+        if self._outside_worker is not None and self._outside_worker.is_alive():
+            return
+        cancel = threading.Event()
+        self._outside_cancel = cancel
+        self._outside_worker = threading.Thread(
+            target=self._run_outside_worker, args=(cancel,),
+            name="manyforge-viewer-pose", daemon=True,
+        )
+        self._outside_worker.start()
+
+    def _run_outside_worker(self, cancel: threading.Event) -> None:
+        try:
+            cursor: int | None = None
+            with self._client.open_viewer_pose_stream() as upstream:
+                while not cancel.is_set():
+                    response = upstream.next(cursor, cancel)
+                    received = self._monotonic()
+                    generation = response.get("generation")
+                    identity, sources = response.get("identity"), response.get("sources")
+                    if (type(generation) is not int or generation < 0
+                            or not isinstance(sources, list)
+                            or (identity is not None and not isinstance(identity, dict))
+                            or any(not isinstance(row, dict)
+                                or set(row) != {"source", "age_at_delivery_ns", "freshness_budget_ns"}
+                                or not isinstance(row["source"], dict)
+                                or any(type(row[field]) is not int or not 0 <= row[field] <= _MAXIMUM_SAFE_INTEGER
+                                       for field in ("age_at_delivery_ns", "freshness_budget_ns"))
+                                for row in sources)):
+                        raise ExecutionObservationProjectionError("invalid viewer pose projection")
+                    cursor = generation
+                    wakes: list[ExecutionObservationSubscription] = []
+                    with self._condition:
+                        if cancel.is_set() or self._outside_cancel is not cancel or not self._subscriptions:
+                            return
+                        previous = [
+                            (row["source"], row["freshness_budget_ns"])
+                            for row in self._outside_sources
+                        ]
+                        current = [
+                            (row["source"], row["freshness_budget_ns"])
+                            for row in sources
+                        ]
+                        changed = identity != self._outside_identity or current != previous
+                        self._outside_identity = identity
+                        self._outside_sources = sources
+                        self._outside_received = received
+                        if changed:
+                            self._delivery_sequence += 1
+                            for subscription in self._subscriptions:
+                                if self._offer_current_locked(subscription):
+                                    wakes.append(subscription)
+                    self._wake_subscriptions(wakes)
+        except Exception:
+            failed: list[ExecutionObservationSubscription] = []
+            with self._condition:
+                if self._outside_cancel is cancel and not cancel.is_set():
+                    self._outside_identity = None
+                    self._outside_sources = []
+                    for subscription in self._subscriptions:
+                        subscription.unavailable = True
+                        subscription.payload = None
+                        subscription.credit = False
+                        subscription.outstanding = None
+                        failed.append(subscription)
+                    if self._active_upstream_cancel is not None:
+                        self._active_upstream_cancel.set()
+            self._wake_subscriptions(failed)
+        finally:
+            with self._condition:
+                if self._outside_cancel is cancel:
+                    self._outside_cancel = None
+                self._outside_worker = None
+                if self._subscriptions and not self._shutdown and self._has_demand_locked():
+                    self._ensure_outside_worker_locked()
+
     def _run_worker(self) -> None:
         while True:
             with self._condition:
                 self._condition.wait_for(
                     lambda: self._shutdown
                     or (
-                        self._has_demand_locked()
+                        self._execution_read_pending
+                        and any(not item.closed and not item.unavailable for item in self._subscriptions)
                         and self._demand_generation > self._retry_after_generation
                     )
                 )
@@ -622,10 +742,11 @@ class ExecutionObservationSource:
                             self._condition.wait_for(
                                 lambda: self._shutdown
                                 or cancel.is_set()
-                                or self._has_demand_locked()
+                                or self._execution_read_pending
                             )
                             if self._shutdown or cancel.is_set():
                                 break
+                            self._execution_read_pending = False
                             cursor = observation_cursor(self._last_identity)
                         started = self._monotonic()
                         response = upstream.next(cursor, cancel)

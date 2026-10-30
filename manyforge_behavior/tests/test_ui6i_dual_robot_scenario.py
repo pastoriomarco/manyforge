@@ -28,13 +28,17 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         row["controllable_component_id"]: row
         for row in graph["controllable_components"]
     }
+    # Merge 6: each robot carries its own tool, mounted on its flange; a
+    # mounted tool has no cell pose of its own.
     assert {
         component: row["root_pose_in_cell"]["position_m"]
         for component, row in components.items()
+        if "root_pose_in_cell" in row
     } == {"lite6_robot": [0, 0, 0], "ur5e_robot": [0, 1, 0]}
+    assert set(components) == {"lite6_robot", "lite_gripper", "robotiq_2f_85", "ur5e_robot"}
     assert {
         row["model_asset_id"] for row in graph["model_instances"]
-    } == {"lite6_lite_gripper", "ur5e_robotiq_2f_85"}
+    } == {"lite6", "lite_gripper", "robotiq_2f_85", "ur5e"}
     assert len(graph["runtime_units"]) == 1
     runtime = graph["runtime_units"][0]
     # Q63-Q68: both robots run on the offline mock lane in one ROS runtime
@@ -42,8 +46,10 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
     assert runtime["runtime_unit_id"] == "robot_cell.ros2_control_execution"
     assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
     assert runtime["configuration"]["controller_profiles"] == [
-        {"controllable_component_id": "lite6_robot", "frame_prefix": "", "mock_profile": "lite6_lite_gripper"},
-        {"controllable_component_id": "ur5e_robot", "frame_prefix": "", "mock_profile": "ur5e_robotiq_2f_85"},
+        {"controllable_component_id": "lite6_robot", "frame_prefix": "", "mock_profile": "lite6"},
+        {"controllable_component_id": "lite_gripper", "frame_prefix": "", "mock_profile": "lite_gripper"},
+        {"controllable_component_id": "robotiq_2f_85", "frame_prefix": "", "mock_profile": "robotiq_2f_85"},
+        {"controllable_component_id": "ur5e_robot", "frame_prefix": "", "mock_profile": "ur5e"},
     ]
     assert {
         row["controllable_component_id"]
@@ -53,22 +59,26 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         row["controllable_component_id"]: row
         for row in runtime["configuration"]["gripper_target_configurations"]
     }
-    assert set(grippers) == {"lite6_robot", "ur5e_robot"}
-    # CP9: each Mock robot declares its measured joints and gripper feedback.
-    assert [
+    assert set(grippers) == {"lite_gripper", "robotiq_2f_85"}
+    # CP9: each Mock robot declares its measured joints; each Mock tool its
+    # measured joints and gripper feedback.
+    assert sorted(
         (row["controllable_component_id"], row["stream_id"], row["budget_ns"],
          row["severity"], row["recovery"])
         for row in runtime["configuration"]["component_streams"]
-    ] == [
-        (component, stream, budget, "fault", "ack")
-        for component in ("lite6_robot", "ur5e_robot")
-        for stream, budget in (("gripper_feedback", 1000000000), ("measured_joints", 250000000))
+    ) == [
+        ("lite6_robot", "measured_joints", 250000000, "fault", "ack"),
+        ("lite_gripper", "gripper_feedback", 1000000000, "fault", "ack"),
+        ("lite_gripper", "measured_joints", 250000000, "fault", "ack"),
+        ("robotiq_2f_85", "gripper_feedback", 1000000000, "fault", "ack"),
+        ("robotiq_2f_85", "measured_joints", 250000000, "fault", "ack"),
+        ("ur5e_robot", "measured_joints", 250000000, "fault", "ack"),
     ]
     # Gripper model A1: the Lite6 lite gripper is pneumatic, the Robotiq
     # 2F-85 is position commanded.
     assert {
         component_id: row["actuation_kind"] for component_id, row in grippers.items()
-    } == {"lite6_robot": "pneumatic", "ur5e_robot": "position_commanded"}
+    } == {"lite_gripper": "pneumatic", "robotiq_2f_85": "position_commanded"}
     assert all(
         row["command_target_id"] == "gripper"
         and row["open_state_ref"] == "open"
@@ -188,8 +198,11 @@ def test_both_variants_are_registered_as_qualified_scenarios() -> None:
         deployment = load_strict_json_yaml(path / "deployment.yaml")
         assert deployment["api_version"] == "manyforge.deployment_intent.v2"
         assert deployment["deployment_artifact_id"] == "ur5e_lite6_wall"
+        # M6 tool split: each robot's gripper is its own mounted component.
         assert {row["component_id"] for row in deployment["components"]} == {
             "lite6_robot",
+            "lite_gripper",
+            "robotiq_2f_85",
             "ur5e_robot",
         }
         assignment = load_strict_json_yaml(path / "assignment.yaml")

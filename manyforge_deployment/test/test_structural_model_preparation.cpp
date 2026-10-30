@@ -22,7 +22,7 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kModelAssetSchemaRevision =
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
 constexpr std::string_view kIdentityPrefix =
     "manyforge.content-identity.v1";
 

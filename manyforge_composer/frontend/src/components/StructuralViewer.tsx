@@ -118,6 +118,7 @@ import { VIEWPORT_COLORS } from '../styles/tokens';
 
 interface StructuralViewerProps {
   viewerActive: boolean;
+  onViewerPoseRateChange?: (rate: number) => void;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   modelPresentation: ViewerModelPresentation;
   onRetry: () => void;
@@ -1554,14 +1555,24 @@ function MeasuredRobotStateGhost({
         return;
       }
       const group = root.current;
+      let changed = false;
       if (group !== null && group.visible !== (current !== null)) {
         group.visible = current !== null;
-        invalidate();
+        changed = true;
       }
+      // G2-b: an element with no stream, or no data yet, is not drawn.
+      const hidden = new Set(current?.hiddenLinkNames ?? []);
+      for (const [linkName, link] of linkGroups) {
+        if (link.current !== null && link.current.visible === hidden.has(linkName)) {
+          link.current.visible = !hidden.has(linkName);
+          changed = true;
+        }
+      }
+      if (changed) invalidate();
     };
     update();
     return reader.subscribeMeasuredRobotPresentation(update);
-  }, [initial, invalidate, reader]);
+  }, [initial, invalidate, linkGroups, reader]);
   // A comparison robot is one coherent retained-model pose. Hide it entirely
   // if a projection ever supplies only a subset of the model links.
   if (initial === null
@@ -3133,6 +3144,7 @@ const NO_FRAME_AXES: NonNullable<StructuralViewerProps['frameAxes']> = [];
 
 function StructuralViewerContent({
   viewerActive,
+  onViewerPoseRateChange,
   manifest,
   modelPresentation,
   onRetry,
@@ -3201,6 +3213,13 @@ function StructuralViewerContent({
     DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE,
   );
   const [rendererKind, setRendererKind] = useState<ViewerRendererKind | null>(null);
+  // Match ViewerCanvas's cached inspection and its GPU bootstrap choice.
+  const rateRendererKind = rendererKind
+    ?? (pageViewerRendererInspection()?.software ? 'software' : 'gpu');
+  const poseRateHz = composerSettings.settings.viewerGraphics[rateRendererKind].poseRateHz;
+  useEffect(() => {
+    onViewerPoseRateChange?.(poseRateHz);
+  }, [onViewerPoseRateChange, poseRateHz]);
   const {
     collisionGeometry: collisionsVisible,
     wireframeOverlays: wireframeVisible,
@@ -3421,6 +3440,13 @@ function StructuralViewerContent({
     onInspectorMinimizedChange?.(false);
   }, [onInspectorMinimizedChange, robotPanelLocked]);
   useEffect(() => onOpenSettingsRequest('viewer', openViewerSettings), [openViewerSettings]);
+  const robotControlOffered = robotControlSurface !== undefined;
+  const openRobotControl = useCallback(() => {
+    if (!robotControlOffered) return;
+    setInspectorPanel('robot');
+    onInspectorMinimizedChange?.(false);
+  }, [onInspectorMinimizedChange, robotControlOffered]);
+  useEffect(() => onOpenSettingsRequest('robot', openRobotControl), [openRobotControl]);
 
   const visualCount = manifest.status === 'ready'
     ? manifest.data.links.reduce((total, link) => total + link.visuals.length, 0)

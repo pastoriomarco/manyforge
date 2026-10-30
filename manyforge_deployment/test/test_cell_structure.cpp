@@ -7,7 +7,9 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <numbers>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/capability_definition_codec.hpp>
@@ -17,9 +19,11 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/program_binding.hpp>
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -54,9 +58,9 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
+    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
 constexpr std::string_view kModelAssetSchemaRevision =
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
 
 static_assert(!std::is_aggregate_v<CompositionQualifiedCellIr>);
 static_assert(!std::is_default_constructible_v<CompositionQualifiedCellIr>);
@@ -155,7 +159,11 @@ struct AssetSpec final {
   std::vector<std::pair<std::string, std::vector<std::string>>> bodies{
       {"arm_collision", {"base_link", "tip_link"}}};
   std::vector<SourceArtifactSpec> source_artifacts{};
+  // TCP-A: frame roles that are offset frames (`pose_in_source_link`).
+  std::map<std::string, core::PlacementPoseDTO, std::less<>> frame_offsets{};
 };
+
+[[nodiscard]] CanonicalValue pose_value(const core::PlacementPoseDTO& pose);
 
 [[nodiscard]] std::string urdf_for(std::string_view id) {
   return "<robot name=\"" + std::string(id) +
@@ -265,10 +273,15 @@ struct QualifiedSource final {
 
   CanonicalValue::Array frames;
   for (const auto& [role, source] : spec.frames) {
-    frames.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object frame{
         {"frame_role_id", CanonicalValue(role)},
         {"source_link_name", CanonicalValue(source)},
-    });
+    };
+    if (const auto offset = spec.frame_offsets.find(role);
+        offset != spec.frame_offsets.end()) {
+      frame.emplace_back("pose_in_source_link", pose_value(offset->second));
+    }
+    frames.emplace_back(std::move(frame));
   }
   CanonicalValue::Array groups;
   if (spec.with_srdf) {
@@ -503,6 +516,12 @@ struct TypeSpec final {
   std::vector<std::string> accepts_tags{"robot-tool"};
   std::uint64_t max_attachments = 1U;
   std::optional<core::ComponentTypeModelMountDTO> mount{std::nullopt};
+  // TCP-A: the target's `tcp` frame role is a TCP and its default.
+  bool tcp_target = false;
+  // The target's frame role id (its default TCP with `tcp_target`), and
+  // further untagged frame roles {role, asset frame role}.
+  std::string target_frame_role{"tcp"};
+  std::vector<std::pair<std::string, std::string>> extra_frame_roles{};
 };
 
 struct QualifiedType final {
@@ -601,7 +620,7 @@ struct QualifiedType final {
                 {"source_kind", CanonicalValue("component_local")},
             });
           }
-          targets.emplace_back(CanonicalValue::Object{
+          CanonicalValue::Object target_row{
               {"command_target_id",
                CanonicalValue(std::string(target_id))},
               {"model_group_roles",
@@ -617,14 +636,28 @@ struct QualifiedType final {
               {"resource_roles",
                CanonicalValue(std::move(target_resources))},
               {"frame_roles",
-               CanonicalValue(CanonicalValue::Array{
-                   CanonicalValue(CanonicalValue::Object{
-                       {"frame_role_id", CanonicalValue("tcp")},
+               CanonicalValue([&] {
+                 CanonicalValue::Object frame{
+                     {"frame_role_id", CanonicalValue(spec.target_frame_role)},
+                     {"model_role_id",
+                      CanonicalValue(spec.target_model_role)},
+                     {"asset_frame_role_id",
+                      CanonicalValue(std::string(frame_source))},
+                 };
+                 if (spec.tcp_target) {
+                   frame.emplace_back("tcp", CanonicalValue(true));
+                 }
+                 CanonicalValue::Array frames{CanonicalValue(std::move(frame))};
+                 for (const auto& [role, source] : spec.extra_frame_roles) {
+                   frames.emplace_back(CanonicalValue::Object{
+                       {"frame_role_id", CanonicalValue(role)},
                        {"model_role_id",
                         CanonicalValue(spec.target_model_role)},
-                       {"asset_frame_role_id",
-                        CanonicalValue(std::string(frame_source))},
-                   })})},
+                       {"asset_frame_role_id", CanonicalValue(source)},
+                   });
+                 }
+                 return frames;
+               }())},
               {"collision_body_roles",
                CanonicalValue(CanonicalValue::Array{
                    CanonicalValue(CanonicalValue::Object{
@@ -643,7 +676,12 @@ struct QualifiedType final {
                        {"capability_definition_revision",
                         CanonicalValue(revision)},
                    })})},
-          });
+          };
+          if (spec.tcp_target) {
+            target_row.emplace_back("default_tcp_frame_role_id",
+                                    CanonicalValue(spec.target_frame_role));
+          }
+          targets.emplace_back(std::move(target_row));
         };
     if (spec.with_target) {
       const auto resource_roles =
@@ -736,6 +774,8 @@ struct ModelSpec final {
   std::string instance_id;
   const QualifiedSource* source;
   bool passive = false;
+  // TCP-A: the occurrence's Deployment custom TCPs (graph rows).
+  std::vector<core::ModelCustomTcpDTO> custom_tcps{};
 };
 
 struct ComponentSpec final {
@@ -751,6 +791,8 @@ struct AttachmentSpec final {
   std::string parent_interface;
   std::string child_component;
   std::string child_interface;
+  // B5: the primary tool among several on one parent interface.
+  bool primary = false;
 };
 
 struct BindingSpec final {
@@ -838,6 +880,17 @@ struct BindingSpec final {
                            ? identity_pose()
                            : pose_value(pose->second));
     }
+    if (!model.custom_tcps.empty()) {
+      CanonicalValue::Array custom;
+      for (const auto& tcp : model.custom_tcps) {
+        custom.emplace_back(CanonicalValue::Object{
+            {"frame_role_id", CanonicalValue(tcp.frame_role_id.value())},
+            {"parent_link_name", CanonicalValue(tcp.parent_link_name)},
+            {"pose_in_parent_link", pose_value(tcp.pose_in_parent_link)},
+        });
+      }
+      row.emplace_back("custom_tcps", CanonicalValue(std::move(custom)));
+    }
     model_rows.emplace_back(std::move(row));
   }
   CanonicalValue::Array component_rows;
@@ -881,7 +934,7 @@ struct BindingSpec final {
   CanonicalValue::Array attachment_rows;
   for (const auto& attachment : attachments) {
     const auto pose = attachment_poses.find(attachment.id);
-    attachment_rows.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object attachment_row{
         {"component_attachment_id", CanonicalValue(attachment.id)},
         {"component_attachment_revision",
          CanonicalValue(std::string(kZeroDigest))},
@@ -903,7 +956,10 @@ struct BindingSpec final {
          pose == attachment_poses.end()
              ? identity_pose()
              : pose_value(pose->second)},
-    });
+    };
+    if (attachment.primary)
+      attachment_row.emplace_back("primary", CanonicalValue(true));
+    attachment_rows.emplace_back(std::move(attachment_row));
   }
   CanonicalValue::Array domain_rows;
   if (!control_bindings.empty()) {
@@ -1660,6 +1716,564 @@ TEST(CellStructure,
   EXPECT_EQ(attachment->component_attachment_id.value(), "tool_on_arm");
   EXPECT_EQ(attachment->parent_component_id.value(), "arm");
   EXPECT_EQ(attachment->child_component_id.value(), "tool");
+}
+
+// Merge 6 tool split: the rigid link groups meeting at an attachment mount
+// (the parent interface link with its fixed neighbours, the child root with
+// its fixed neighbours) get Adjacent disabled-collision pairs; moving links
+// beyond either group do not.
+TEST(CellComposition, AttachmentMountDisablesCollisionsBetweenRigidGroups) {
+  auto arm_source = qualify_source_with_documents(
+      AssetSpec{.id = "split_arm_asset",
+                .frames = {{"base", "base_link"},
+                           {"flange", "flange_link"}},
+                .groups = {},
+                .bodies = {{"arm_collision", {"base_link", "link6"}}}},
+      "<robot name=\"split_arm\"><link name=\"base_link\"/>"
+      "<link name=\"link6\"/><link name=\"flange_link\"/>"
+      "<joint name=\"joint1\" type=\"revolute\">"
+      "<parent link=\"base_link\"/><child link=\"link6\"/>"
+      "<axis xyz=\"0 0 1\"/><limit lower=\"-3\" upper=\"3\" "
+      "effort=\"1\" velocity=\"1\"/></joint>"
+      "<joint name=\"flange_fix\" type=\"fixed\">"
+      "<parent link=\"link6\"/><child link=\"flange_link\"/></joint>"
+      "</robot>");
+  auto tool_source = qualify_source_with_documents(
+      AssetSpec{.id = "split_tool_asset",
+                .frames = {{"base", "mount_link"}},
+                .groups = {},
+                .resources = {},
+                .bodies = {{"tool_collision", {"finger", "tool_base"}}}},
+      "<robot name=\"split_tool\"><link name=\"mount_link\"/>"
+      "<link name=\"tool_base\"/><link name=\"finger\"/>"
+      "<joint name=\"tool_fix\" type=\"fixed\">"
+      "<parent link=\"mount_link\"/><child link=\"tool_base\"/></joint>"
+      "<joint name=\"finger_joint\" type=\"prismatic\">"
+      "<parent link=\"tool_base\"/><child link=\"finger\"/>"
+      "<axis xyz=\"1 0 0\"/><limit lower=\"0\" upper=\"0.04\" "
+      "effort=\"1\" velocity=\"1\"/></joint></robot>");
+  auto arm_type = qualify_type(
+      TypeSpec{.id = "split_arm_type",
+               .tags = {"articulated-arm"},
+               .with_interface = true,
+               .interface_frame = "flange",
+               .accepts_tags = {"tool"}});
+  auto tool_type = qualify_type(
+      TypeSpec{.id = "split_tool_type",
+               .tags = {"gripper", "tool"},
+               .root_frame = "base",
+               .with_interface = true,
+               .interface_id = "mount",
+               .interface_frame = "base",
+               .accepts_tags = {"articulated-arm"}});
+  const auto sources = source_values({&arm_source, &tool_source});
+  const auto types = type_values({&arm_type, &tool_type});
+  const auto mounted = graph_for(
+      {{"arm_model", &arm_source, false},
+       {"tool_model", &tool_source, false}},
+      {{"arm", &arm_type, {{"body", "arm_model"}}, true},
+       {"tool", &tool_type, {{"body", "tool_model"}}, false}},
+      {{"tool_on_arm", "arm", "flange", "tool", "mount"}});
+  const auto composed = compose_cell_occurrences(mounted, sources, types);
+
+  const auto connection = std::find_if(
+      composed.fixed_connections().begin(),
+      composed.fixed_connections().end(), [](const auto& row) {
+        return std::holds_alternative<CompositionComponentAttachment>(
+            row.source);
+      });
+  ASSERT_NE(connection, composed.fixed_connections().end());
+  const auto parent_of = [&](const std::string& child) {
+    for (const auto& joint : composed.flattened_urdf().joints)
+      if (joint.child_link_name == child) return joint.parent_link_name;
+    return std::string{};
+  };
+  const auto child_of = [&](const std::string& parent) {
+    for (const auto& joint : composed.flattened_urdf().joints)
+      if (joint.parent_link_name == parent &&
+          joint.type == UrdfJointType::kFixed)
+        return joint.child_link_name;
+    return std::string{};
+  };
+  const auto& flange = connection->compiled_parent_link_name;
+  const auto& mount = connection->compiled_child_link_name;
+  const auto link6 = parent_of(flange);
+  const auto tool_base = child_of(mount);
+  ASSERT_FALSE(link6.empty());
+  ASSERT_FALSE(tool_base.empty());
+  std::set<std::pair<std::string, std::string>> expected;
+  for (const auto& parent : {flange, link6})
+    for (const auto& child : {mount, tool_base})
+      expected.emplace(std::minmax(parent, child));
+  std::set<std::pair<std::string, std::string>> actual;
+  for (const auto& pair : composed.flattened_srdf().disabled_collisions) {
+    EXPECT_EQ(pair.reason, std::optional<std::string>("Adjacent"));
+    EXPECT_LT(pair.first_link_name, pair.second_link_name);
+    actual.emplace(pair.first_link_name, pair.second_link_name);
+  }
+  // base_link (beyond joint1) and finger (beyond finger_joint) stay enabled.
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(composed.flattened_srdf().disabled_collisions.size(), 4U);
+
+  const auto again = compose_cell_occurrences(mounted, sources, types);
+  EXPECT_EQ(again.flattened_srdf().disabled_collisions,
+            composed.flattened_srdf().disabled_collisions);
+
+  const auto unmounted = graph_for(
+      {{"arm_model", &arm_source, false},
+       {"tool_model", &tool_source, false}},
+      {{"arm", &arm_type, {{"body", "arm_model"}}, true},
+       {"tool", &tool_type, {{"body", "tool_model"}}, true}});
+  EXPECT_TRUE(compose_cell_occurrences(unmounted, sources, types)
+                  .flattened_srdf()
+                  .disabled_collisions.empty());
+}
+
+// TCP-A: a descriptor offset frame and a Deployment custom TCP each compose
+// as one generated massless link on one generated fixed joint, so the TCP's
+// frame path is its parent's plus that joint (FK = parent * pose).
+TEST(CellComposition, OffsetFramesAndCustomTcpsComposeAsMasslessFixedLinks) {
+  const double half = std::sqrt(0.5);
+  const core::PlacementPoseDTO pen_pose{{0.0, 0.0, 0.12}, {0.0, 0.0, half, half}};
+  const core::PlacementPoseDTO probe_pose{{0.01, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
+  auto source = qualify_source(AssetSpec{
+      .id = "offset_asset",
+      .with_srdf = true,
+      .frames = {{"base", "base_link"}, {"pen", "tip_link"}, {"tcp", "tip_link"}},
+      .frame_offsets = {{"pen", pen_pose}}});
+  auto type = qualify_type(TypeSpec{.id = "offset_type",
+                                    .tags = {},
+                                    .with_target = true,
+                                    .tcp_target = true});
+  const auto sources = source_values({&source});
+  const auto types = type_values({&type});
+  const auto graph_with = [&](std::vector<core::ModelCustomTcpDTO> custom) {
+    return graph_for({{"model", &source, false, std::move(custom)}},
+                     {{"component", &type, {{"body", "model"}}, true}});
+  };
+  const auto composed = compose_cell_occurrences(
+      graph_with({{core::FrameRoleId("probe"), "pen", probe_pose}}), sources,
+      types);
+
+  const auto compiled = [&](const CompositionQualifiedCellIr& cell,
+                            OccurrenceSymbolKind kind, std::string_view name) {
+    return require_real_vendor_compiled_symbol(cell, "model", kind, name);
+  };
+  const auto tip = compiled(composed, OccurrenceSymbolKind::kLink, "tip_link");
+  const auto pen = compiled(composed, OccurrenceSymbolKind::kLink, "pen");
+  const auto probe = compiled(composed, OccurrenceSymbolKind::kLink, "probe");
+  const auto joint_to = [&](const std::string& child) {
+    const auto found = std::find_if(
+        composed.flattened_urdf().joints.begin(),
+        composed.flattened_urdf().joints.end(),
+        [&](const auto& joint) { return joint.child_link_name == child; });
+    if (found == composed.flattened_urdf().joints.end())
+      throw std::runtime_error("no joint to " + child);
+    return *found;
+  };
+  for (const auto& [link, parent, pose] :
+       {std::tuple{pen, tip, pen_pose}, std::tuple{probe, pen, probe_pose}}) {
+    const auto joint = joint_to(link);
+    EXPECT_EQ(joint.type, UrdfJointType::kFixed);
+    EXPECT_EQ(joint.parent_link_name, parent);
+    EXPECT_EQ(joint.origin.xyz_m, pose.position_m);
+    // No inertia, visual or collision: the generated link adds no geometry.
+    const auto row = std::find_if(
+        composed.flattened_urdf().links.begin(),
+        composed.flattened_urdf().links.end(),
+        [&](const auto& candidate) { return candidate.name == link; });
+    ASSERT_NE(row, composed.flattened_urdf().links.end());
+    EXPECT_FALSE(row->inertial.has_value());
+    EXPECT_TRUE(row->visuals.empty());
+    EXPECT_TRUE(row->collisions.empty());
+  }
+  EXPECT_NEAR(joint_to(pen).origin.rpy_rad[2], std::numbers::pi / 2.0, 1e-12);
+  EXPECT_NEAR(joint_to(pen).origin.rpy_rad[0], 0.0, 1e-12);
+  for (const auto& body : composed.targets().front().collision_bodies) {
+    EXPECT_EQ(std::count(body.compiled_link_names.begin(),
+                         body.compiled_link_names.end(), pen), 0);
+    EXPECT_EQ(std::count(body.compiled_link_names.begin(),
+                         body.compiled_link_names.end(), probe), 0);
+  }
+
+  // FK: the offset frame's path is its parent link's path plus one segment.
+  const auto path_to = [&](const std::string& compiled_frame)
+      -> const CompositionFramePath& {
+    const auto found = std::find_if(
+        composed.frame_paths().begin(), composed.frame_paths().end(),
+        [&](const auto& path) {
+          return std::visit([](const auto& frame) { return frame.compiled_frame_name; },
+                            path.terminal_frame) == compiled_frame;
+        });
+    if (found == composed.frame_paths().end())
+      throw std::runtime_error("no frame path");
+    return *found;
+  };
+  const auto& tcp_path = path_to(tip);
+  const auto& pen_path = path_to(pen);
+  const auto& probe_path = path_to(probe);
+  ASSERT_EQ(pen_path.segments.size(), tcp_path.segments.size() + 1U);
+  EXPECT_TRUE(std::equal(tcp_path.segments.begin(), tcp_path.segments.end(),
+                         pen_path.segments.begin()));
+  const auto* last = std::get_if<CompositionModelJointPathSegment>(
+      &pen_path.segments.back());
+  ASSERT_NE(last, nullptr);
+  EXPECT_EQ(last->compiled_child_link_name, pen);
+  EXPECT_EQ(last->source_joint_name, offset_frame_joint_name("pen"));
+  ASSERT_EQ(probe_path.segments.size(), pen_path.segments.size() + 1U);
+
+  // The target with a default TCP exposes the custom TCP; the type's own
+  // frames stay as they are.
+  const auto& frames = composed.targets().front().frames;
+  ASSERT_EQ(frames.size(), 2U);
+  EXPECT_EQ(frames[0].frame_role_id.value(), "probe");
+  EXPECT_EQ(frames[1].frame_role_id.value(), "tcp");
+
+  // Stable names on re-Apply; adding a custom TCP renames nothing else.
+  const auto again = compose_cell_occurrences(
+      graph_with({{core::FrameRoleId("probe"), "pen", probe_pose}}), sources,
+      types);
+  EXPECT_EQ(again.flattened_urdf(), composed.flattened_urdf());
+  EXPECT_EQ(again.frames(), composed.frames());
+  const auto plain = compose_cell_occurrences(graph_with({}), sources, types);
+  EXPECT_EQ(compiled(plain, OccurrenceSymbolKind::kJoint, "joint1"),
+            compiled(composed, OccurrenceSymbolKind::kJoint, "joint1"));
+  EXPECT_EQ(compiled(plain, OccurrenceSymbolKind::kLink, "pen"), pen);
+
+  // No chaining onto a custom TCP; no custom TCP over an existing frame.
+  EXPECT_THROW((void)compose_cell_occurrences(
+                   graph_with({{core::FrameRoleId("a"), "pen", probe_pose},
+                               {core::FrameRoleId("b"), "a", probe_pose}}),
+                   sources, types),
+               CellCompositionError);
+  EXPECT_THROW((void)compose_cell_occurrences(
+                   graph_with({{core::FrameRoleId("tip_link"), "pen", probe_pose}}),
+                   sources, types),
+               CellCompositionError);
+  EXPECT_THROW((void)compose_cell_occurrences(
+                   graph_with({{core::FrameRoleId("missing"), "nowhere", probe_pose}}),
+                   sources, types),
+               CellCompositionError);
+}
+
+// D1 (item 42): a TCP may have any name. A mounted tool whose default TCP is
+// `cup_center` on a target that is not `gripper` exposes it as `tcp` too, and
+// the robot's `tcp` (Robot Control's default) resolves to it.
+namespace any_tcp {
+
+struct Cell final {
+  QualifiedSource arm_source;
+  QualifiedSource tool_source;
+  QualifiedType arm_type;
+  QualifiedType tool_type;
+};
+
+[[nodiscard]] Cell make_cell(
+    std::string tool_default,
+    std::vector<std::pair<std::string, std::string>> tool_extra_frames = {}) {
+  return Cell{
+      qualify_source(AssetSpec{.id = "any_tcp_arm_asset",
+                               .with_srdf = true,
+                               .frames = {{"base", "base_link"},
+                                          {"flange", "tip_link"}}}),
+      qualify_source(AssetSpec{.id = "any_tcp_tool_asset",
+                               .with_srdf = true,
+                               .frames = {{"base", "base_link"},
+                                          {"cup", "tip_link"},
+                                          {"side", "base_link"}}}),
+      qualify_type(TypeSpec{.id = "any_tcp_arm_type",
+                            .tags = {"articulated-arm"},
+                            .with_target = true,
+                            .target_frame_source = "flange",
+                            .with_interface = true,
+                            .interface_frame = "flange",
+                            .accepts_tags = {"tool"},
+                            .tcp_target = true,
+                            .target_frame_role = "flange"}),
+      qualify_type(TypeSpec{.id = "any_tcp_tool_type",
+                            .tags = {"tool"},
+                            .with_target = true,
+                            .target_frame_source = "cup",
+                            .with_interface = true,
+                            .interface_id = "mount",
+                            .interface_frame = "base",
+                            .accepts_tags = {"articulated-arm"},
+                            .tcp_target = true,
+                            .target_frame_role = std::move(tool_default),
+                            .extra_frame_roles = std::move(tool_extra_frames)}),
+  };
+}
+
+[[nodiscard]] GraphRevisionVerifiedCellGraph mounted_graph(
+    const Cell& cell, std::vector<core::ModelCustomTcpDTO> tool_custom = {}) {
+  return graph_for(
+      {{"arm_model", &cell.arm_source, false},
+       {"tool_model", &cell.tool_source, false, std::move(tool_custom)}},
+      {{"arm", &cell.arm_type, {{"body", "arm_model"}}, true},
+       {"tool", &cell.tool_type, {{"body", "tool_model"}}, false}},
+      {{"tool_on_arm", "arm", "flange", "tool", "mount"}});
+}
+
+[[nodiscard]] const CompositionTargetResolution& target_of(
+    const CompositionQualifiedCellIr& composed, std::string_view component) {
+  const auto found = std::find_if(
+      composed.targets().begin(), composed.targets().end(),
+      [&](const auto& row) {
+        return row.controllable_component_id.value() == component;
+      });
+  if (found == composed.targets().end())
+    throw std::runtime_error("no target of " + std::string(component));
+  return *found;
+}
+
+[[nodiscard]] const CompositionTargetFrameResolution* frame_of(
+    const CompositionTargetResolution& target, std::string_view role) {
+  const auto found = std::find_if(
+      target.frames.begin(), target.frames.end(),
+      [&](const auto& row) { return row.frame_role_id.value() == role; });
+  return found == target.frames.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] std::string composition_error(
+    const GraphRevisionVerifiedCellGraph& graph, const Cell& cell) {
+  try {
+    (void)compose_cell_occurrences(
+        graph, source_values({&cell.arm_source, &cell.tool_source}),
+        type_values({&cell.arm_type, &cell.tool_type}));
+  } catch (const CellCompositionError& error) {
+    return error.what();
+  }
+  return {};
+}
+
+}  // namespace any_tcp
+
+// C-RQ8: every frame has one name. A tool's default TCP named otherwise
+// (`cup_center`, a tool `flange`) gets no `tcp` row, and a robot target's
+// `tcp` is its own frame only: no mounted tool's default stands in (D1 gone).
+TEST(CellComposition, EveryFrameHasOneNameAndNoTcpAlias) {
+  const auto cell = any_tcp::make_cell("cup_center");
+  const auto graph = any_tcp::mounted_graph(cell);
+  const auto composed = compose_cell_occurrences(
+      graph, source_values({&cell.arm_source, &cell.tool_source}),
+      type_values({&cell.arm_type, &cell.tool_type}));
+
+  const auto& tool = any_tcp::target_of(composed, "tool");
+  EXPECT_EQ(tool.command_target_id.value(), "command");
+  ASSERT_NE(any_tcp::frame_of(tool, "cup_center"), nullptr);
+  EXPECT_EQ(any_tcp::frame_of(tool, "tcp"), nullptr);
+  EXPECT_EQ(tool.frames.size(), 1U);
+
+  // The arm's `tcp` is not the tool's default: the arm has no `tcp` frame.
+  const auto& arm = any_tcp::target_of(composed, "arm");
+  EXPECT_EQ(find_target_frame_role(arm, core::FrameRoleId("tcp")), nullptr);
+  EXPECT_EQ(find_target_frame_role(arm, core::FrameRoleId("flange")),
+            any_tcp::frame_of(arm, "flange"));
+  EXPECT_EQ(find_target_frame_role(tool, core::FrameRoleId("cup_center")),
+            any_tcp::frame_of(tool, "cup_center"));
+
+  // A tool's default named `flange` keeps that one name too.
+  const auto flange_cell = any_tcp::make_cell("flange");
+  const auto flange_composed = compose_cell_occurrences(
+      any_tcp::mounted_graph(flange_cell),
+      source_values({&flange_cell.arm_source, &flange_cell.tool_source}),
+      type_values({&flange_cell.arm_type, &flange_cell.tool_type}));
+  const auto& flange_tool = any_tcp::target_of(flange_composed, "tool");
+  ASSERT_NE(any_tcp::frame_of(flange_tool, "flange"), nullptr);
+  EXPECT_EQ(any_tcp::frame_of(flange_tool, "tcp"), nullptr);
+}
+
+// Without a tool, a robot's `tcp` is its own `tcp` frame or nothing: a
+// default TCP named otherwise is not also `tcp`, and the flange does not
+// stand in for it.
+TEST(CellComposition, RobotTcpIsItsOwnFrameOnly) {
+  auto source = qualify_source(AssetSpec{
+      .id = "any_tcp_robot_asset",
+      .with_srdf = true,
+      .frames = {{"base", "base_link"}, {"flange", "tip_link"}, {"pen", "base_link"}}});
+  const auto resolve = [&](const std::string& default_tcp) {
+    auto type = qualify_type(TypeSpec{.id = "any_tcp_robot_" + default_tcp,
+                                      .tags = {},
+                                      .with_target = true,
+                                      .target_frame_source = default_tcp == "tcp"
+                                                                 ? "pen"
+                                                                 : default_tcp,
+                                      .tcp_target = true,
+                                      .target_frame_role = default_tcp});
+    const auto graph = graph_for({{"model", &source, false}},
+                                 {{"robot", &type, {{"body", "model"}}, true}});
+    const auto composed = compose_cell_occurrences(
+        graph, source_values({&source}), type_values({&type}));
+    const auto* frame = find_target_frame_role(composed.targets().front(),
+                                               core::FrameRoleId("tcp"));
+    if (frame == nullptr) return std::string{};
+    const auto* model = std::get_if<CompositionComponentModelFrame>(&frame->frame);
+    return model == nullptr ? std::string{} : model->frame_role_id.value();
+  };
+  // An explicit robot `tcp`.
+  EXPECT_EQ(resolve("tcp"), "pen");
+  // A default TCP named otherwise, or the flange: no `tcp`.
+  EXPECT_EQ(resolve("pen"), "");
+  EXPECT_EQ(resolve("flange"), "");
+}
+
+// Names stay unique per target: a custom TCP named like an existing frame
+// is refused. `tcp` is an ordinary name: a custom TCP or a non-default frame
+// role may use it next to a default TCP named otherwise.
+TEST(CellComposition, TcpIsAnOrdinaryNameNextToAnyDefault) {
+  const core::PlacementPoseDTO pose{{0.0, 0.0, 0.01}, {0.0, 0.0, 0.0, 1.0}};
+  const auto cell = any_tcp::make_cell("cup_center");
+  const auto message = any_tcp::composition_error(
+      any_tcp::mounted_graph(
+          cell, {{core::FrameRoleId("cup_center"), "tip_link", pose}}),
+      cell);
+  EXPECT_NE(message.find("custom_tcp_name_collision"), std::string::npos) << message;
+  for (const auto* name : {"tcp", "probe"}) {
+    const auto composed = compose_cell_occurrences(
+        any_tcp::mounted_graph(cell, {{core::FrameRoleId(name), "tip_link", pose}}),
+        source_values({&cell.arm_source, &cell.tool_source}),
+        type_values({&cell.arm_type, &cell.tool_type}));
+    EXPECT_NE(any_tcp::frame_of(any_tcp::target_of(composed, "tool"), name), nullptr)
+        << name;
+  }
+
+  // A tool frame role `tcp` that is not its default TCP is its own frame.
+  const auto named = any_tcp::make_cell("cup_center", {{"tcp", "side"}});
+  const auto composed = compose_cell_occurrences(
+      any_tcp::mounted_graph(named),
+      source_values({&named.arm_source, &named.tool_source}),
+      type_values({&named.arm_type, &named.tool_type}));
+  const auto& tool = any_tcp::target_of(composed, "tool");
+  const auto* tcp = any_tcp::frame_of(tool, "tcp");
+  const auto* cup_center = any_tcp::frame_of(tool, "cup_center");
+  ASSERT_NE(tcp, nullptr);
+  ASSERT_NE(cup_center, nullptr);
+  EXPECT_NE(tcp->frame, cup_center->frame);
+}
+
+// B5 (C-P1): two or more tools (components tagged `tool`) on one parent
+// interface need exactly one primary, on a tool (`mount_primary_tool_required`);
+// a single tool needs none, and a component without the `tool` tag (a
+// camera) sharing the interface neither needs nor counts as a primary.
+TEST(CellStructure, SeveralToolsOnOneInterfaceNeedExactlyOnePrimary) {
+  auto arm_source = qualify_source(AssetSpec{
+      .id = "primary_arm_asset", .frames = {{"base", "base_link"}, {"flange", "tip_link"}}});
+  auto tool_source = qualify_source(AssetSpec{.id = "primary_tool_asset"});
+  auto arm_type = qualify_type(TypeSpec{.id = "primary_arm_type",
+                                        .tags = {"articulated-arm"},
+                                        .with_interface = true,
+                                        .interface_frame = "flange",
+                                        .accepts_tags = {"camera", "tool"},
+                                        .max_attachments = 3U});
+  auto tool_type = qualify_type(TypeSpec{.id = "primary_tool_type",
+                                         .tags = {"tool"},
+                                         .with_interface = true,
+                                         .interface_id = "mount",
+                                         .interface_frame = "base",
+                                         .accepts_tags = {"articulated-arm"}});
+  auto camera_type = qualify_type(TypeSpec{.id = "primary_camera_type",
+                                           .tags = {"camera"},
+                                           .with_interface = true,
+                                           .interface_id = "mount",
+                                           .interface_frame = "base",
+                                           .accepts_tags = {"articulated-arm"}});
+  struct Mounts {
+    bool gripper_primary = false;
+    bool with_nozzle = false;
+    bool nozzle_primary = false;
+    bool with_camera = false;
+    bool camera_primary = false;
+  };
+  const auto compose = [&](const Mounts& mounts) {
+    std::vector<ModelSpec> models{{"arm_model", &arm_source, false},
+                                  {"gripper_model", &tool_source, false}};
+    std::vector<ComponentSpec> components{
+        {"arm", &arm_type, {{"body", "arm_model"}}, true},
+        {"gripper", &tool_type, {{"body", "gripper_model"}}, false}};
+    std::vector<AttachmentSpec> attachments{
+        {"gripper", "arm", "flange", "gripper", "mount", mounts.gripper_primary}};
+    if (mounts.with_nozzle) {
+      models.push_back({"nozzle_model", &tool_source, false});
+      components.push_back({"nozzle", &tool_type, {{"body", "nozzle_model"}}, false});
+      attachments.push_back(
+          {"nozzle", "arm", "flange", "nozzle", "mount", mounts.nozzle_primary});
+    }
+    if (mounts.with_camera) {
+      models.push_back({"camera_model", &tool_source, false});
+      components.push_back({"camera", &camera_type, {{"body", "camera_model"}}, false});
+      attachments.push_back(
+          {"camera", "arm", "flange", "camera", "mount", mounts.camera_primary});
+    }
+    // The component-type closure is exact: the camera type only when a
+    // camera component uses it.
+    try {
+      (void)compose_cell_occurrences(
+          graph_for(std::move(models), std::move(components), std::move(attachments)),
+          source_values({&arm_source, &tool_source}),
+          mounts.with_camera ? type_values({&arm_type, &tool_type, &camera_type})
+                             : type_values({&arm_type, &tool_type}));
+    } catch (const core::TypedError& error) {
+      return error.code();
+    }
+    return std::string{};
+  };
+  const auto refused = [&](const Mounts& mounts) {
+    return compose(mounts) == "mount_primary_tool_required";
+  };
+  // One tool: no primary needed, and a primary on it is accepted.
+  EXPECT_EQ(compose({}), "");
+  EXPECT_EQ(compose({.gripper_primary = true}), "");
+  // Two tools: none or both primary are refused; exactly one is accepted.
+  EXPECT_TRUE(refused({.with_nozzle = true}));
+  EXPECT_TRUE(refused({.gripper_primary = true, .with_nozzle = true, .nozzle_primary = true}));
+  EXPECT_EQ(compose({.with_nozzle = true, .nozzle_primary = true}), "");
+  EXPECT_EQ(compose({.gripper_primary = true, .with_nozzle = true}), "");
+  // One tool and a camera without the `tool` tag: no primary needed.
+  EXPECT_EQ(compose({.with_camera = true}), "");
+  // Two tools and a camera: the camera neither needs nor carries the mark.
+  EXPECT_EQ(compose({.with_nozzle = true, .nozzle_primary = true, .with_camera = true}), "");
+  EXPECT_TRUE(refused({.with_nozzle = true, .with_camera = true}));
+  EXPECT_TRUE(refused({.with_nozzle = true, .with_camera = true, .camera_primary = true}));
+  EXPECT_TRUE(refused(
+      {.with_nozzle = true, .nozzle_primary = true, .with_camera = true, .camera_primary = true}));
+}
+
+// TCP-A: an offset frame role's parent is a source link, never another
+// offset frame, and its generated link names no existing link.
+TEST(CellStructure, OffsetFrameRolesAreValidatedAgainstTheSource) {
+  const core::PlacementPoseDTO pose{{0.0, 0.0, 0.1}, {0.0, 0.0, 0.0, 1.0}};
+  EXPECT_THROW((void)qualify_source(AssetSpec{
+                   .id = "unknown_parent",
+                   .frames = {{"base", "base_link"}, {"pen", "no_link"}},
+                   .frame_offsets = {{"pen", pose}}}),
+               std::invalid_argument);
+  EXPECT_THROW((void)qualify_source(AssetSpec{
+                   .id = "chained",
+                   .frames = {{"base", "base_link"}, {"pen", "tip_link"},
+                              {"pen2", "pen"}},
+                   .frame_offsets = {{"pen", pose}, {"pen2", pose}}}),
+               std::invalid_argument);
+  EXPECT_THROW((void)qualify_source(AssetSpec{
+                   .id = "named_like_a_link",
+                   .frames = {{"base", "base_link"}, {"tip_link", "base_link"}},
+                   .frame_offsets = {{"tip_link", pose}}}),
+               std::invalid_argument);
+  EXPECT_THROW((void)qualify_source(AssetSpec{
+                   .id = "not_unit",
+                   .frames = {{"base", "base_link"}, {"pen", "tip_link"}},
+                   .frame_offsets = {{"pen", {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 2.0}}}}}),
+               std::invalid_argument);
+  const auto valid = qualify_source(AssetSpec{
+      .id = "valid_offset",
+      .frames = {{"base", "base_link"}, {"pen", "tip_link"}},
+      .frame_offsets = {{"pen", pose}}});
+  const auto& bindings = valid.value.value().frame_role_bindings;
+  const auto pen = std::find_if(bindings.begin(), bindings.end(), [](const auto& row) {
+    return row.frame_role_id.value() == "pen";
+  });
+  ASSERT_NE(pen, bindings.end());
+  EXPECT_EQ(pen->pose_in_source_link, std::optional<core::PlacementPoseDTO>(pose));
+  EXPECT_EQ(core::frame_role_link_name(*pen), "pen");
 }
 
 TEST(CellStructure, RequiresExactModelAndComponentTypeDependencyClosures) {

@@ -206,6 +206,15 @@ enum class CommandKind {
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
+  kForceClose,
+  /// Active TCP (M7): every robot's Active TCP (the Runner's baseline).
+  kReadActiveTcp,
+  kResolveAttachActiveTcp,
+  /// A read queued behind earlier enqueued submissions on this host.
+  kReadActiveTcpOrdered,
+  /// Active TCP (M7, T-MQ3, T-MQ9): reset every robot to its End-effector
+  /// TCP (Program Reset with reload, `simulation.reset`, world reload).
+  kResetActiveTcp,
 };
 
 enum class CommandLane {
@@ -217,7 +226,7 @@ enum class CommandLane {
 /// Commands whose addressed-Kernel entry takes its submission ordering. A
 /// motion-preview session (and pick/place planning built on one) retains that
 /// ordering for its whole planning transaction, so these commands run on the
-/// submission-ordered lane, FIFO in accept order, and never occupy the
+/// submission-ordered lane, FIFO in host enqueue order, and never occupy the
 /// ordinary lane that serves Stop status, Reset, events, cell admission and
 /// operator-alarm attention.
 /// Shared closed row decoder, also used after normalizing actual sealed
@@ -312,6 +321,8 @@ struct Command final {
 
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
+  std::optional<core::ProgramBindingId> attach_binding_id;
+  std::optional<core::TargetRoleId> attach_holder_role;
   std::optional<MockIoInputSetRequest> mock_io_input_set{};
   std::optional<CarriedObjectLostSetRequest> carried_object_lost_set{};
   std::optional<core::ProgramNodeMockSimulationRequestDTO> mock_node_simulation{};
@@ -358,6 +369,8 @@ struct Command final {
   bool observation_cursor_supplied{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
+  /// Item 37 Force close: `arm` (with `stop_generation`) or `close_operations`.
+  std::optional<std::string> force_close_step{};
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes);

@@ -402,6 +402,45 @@ TEST(Ros2GripperCommandBackendTest,
 }
 
 TEST(Ros2GripperCommandBackendTest,
+     StallWindowGraspEvidenceIsOptInAndFollowsTheCompletedPosition) {
+  const auto complete = [](std::optional<Ros2GripperActionConfig::GraspStallWindow> window,
+                           double target) {
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    sink->set_joint_position("gripper", "finger_joint", 0.7);
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto resources = test_transport_resources(sink, clock, "arm");
+    Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+    TestTransportLifetime lifetime(*resources, backend);
+    auto config = isaac_gripper_config("/manyforge_stall_window_" + unique_suffix());
+    config.grasp_stall_window = window;
+    backend.configure_gripper_action("tool", config);
+    const auto command = backend.command_gripper(make_gripper_request(
+        target, 0.0, 0.0, "isaac_joint_state_effort", "dwell_elapsed"));
+    EXPECT_TRUE(command.accepted) << (command.error ? command.error->message : "");
+    scheduler.advance_to(clock.now());
+    EXPECT_TRUE(resources->projection_worker().drain_for(1s));
+    auto status = backend.get_gripper_status("tool");
+    EXPECT_EQ(status.state, core::GripperCommandState::kCompleted);
+    if (status.grasp_evidence) {
+      EXPECT_EQ(status.grasp_evidence->observation.command_id, command.command_id);
+      EXPECT_EQ(status.grasp_evidence->source_kind,
+                core::GraspConfirmationSourceKind::kForceCurrent);
+    }
+    return status.grasp_evidence;
+  };
+  // Default: no window, no grasp evidence (the unchanged status).
+  EXPECT_FALSE(complete(std::nullopt, 0.0).has_value());
+  const Ros2GripperActionConfig::GraspStallWindow window{0.0, 0.05};
+  const auto inside = complete(window, 0.0);
+  ASSERT_TRUE(inside.has_value());
+  EXPECT_TRUE(inside->observation.confirmed);
+  const auto outside = complete(window, 0.7);
+  ASSERT_TRUE(outside.has_value());
+  EXPECT_FALSE(outside->observation.confirmed);
+}
+
+TEST(Ros2GripperCommandBackendTest,
      StaleGripperGraspLossCannotFailReplacementGeneration) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
   sink->set_joint_position("gripper", "finger_joint", 0.7);

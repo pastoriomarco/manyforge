@@ -36,18 +36,20 @@ import {
   motionGateAuditText,
   motionGateWaitNodes,
   motionGateWaitText,
+  recoveryClassLabel,
   resetKeptMessage,
+  selectManualRecoveryTarget,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
+import { formatStructuredError } from '../state/structuredError';
 import { api } from '../api/client';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v4',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v5',
     offerId: `sha256:${'e'.repeat(64)}`,
     offerRevision: 1,
     generatedAtNs: 1,
-    validUntilNs: null,
     kernelAssessmentRevision: 1,
     controlCommandEpoch: 1,
     operationId: 'operation.1',
@@ -144,11 +146,16 @@ function robotController(): RobotControlController {
     runtimeScaleDraft: 1,
     runtimeScalePending: false,
     stopFaultRecoveryPending: false,
+    stopFaultRecoveryInProgress: false,
+    stopFaultRecoveryAbortPending: false,
+    cellRecoverBlockedReason: null,
+    setCellRecoverBlockedReason: vi.fn(),
     stopFaultRecoveryError: null,
     componentIncidents: [],
     componentIncidentsUnavailableReason: null,
     resume: vi.fn(),
     recoverStopFault: vi.fn(),
+    abortRecoverStopFault: vi.fn(),
     setRuntimeScale: vi.fn(),
     commitRuntimeScale: vi.fn(),
   } as unknown as RobotControlController;
@@ -299,6 +306,7 @@ function controller(
       selectionPending: [],
       controlPending: null,
       error: null,
+      errorRefusal: null,
     },
     cycleState,
     cycleFailure: null,
@@ -709,6 +717,33 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('<small> · Origin: node &#x27;wait&#x27;</small>');
   });
 
+  it('shows a Close without grasp evidence as a failure naming its node', () => {
+    const failed = controller('failed', 'terminal_awaiting_reset');
+    const reason: StructuredError = {
+      code: 'grasp_not_confirmed',
+      message: 'Close completed without grasp evidence from the workpiece_grasped input.',
+      details: null,
+      origin: { kind: 'program_node', nodeInstanceId: 'close', ownerApi: null },
+    };
+    failed.state.run!.reason = reason;
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={failed} />,
+    );
+    // The title is the code's display text (the error catalog's, once merged).
+    expect(markup).toContain(
+      `<div class="program-feedback error-state" role="status"><span><strong>${formatStructuredError(reason).title}</strong>`,
+    );
+    expect(markup).toContain(': Close completed without grasp evidence from the workpiece_grasped input.');
+    expect(markup).toContain('<small> · Origin: node &#x27;close&#x27;</small>');
+
+    // Any other failed run keeps its plain presentation.
+    const other: StructuredError = { ...reason, code: 'io_wait_timeout' };
+    failed.state.run!.reason = other;
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={failed} />)).toContain(
+      `<div class="program-feedback" role="status"><span>${formatStructuredError(other).title}: `,
+    );
+  });
+
   it('shows a retained failed run that carries no details or origin', () => {
     const failed = controller('failed', 'terminal_awaiting_reset');
     failed.state.run!.reason = {
@@ -952,6 +987,37 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={mixed} robot={robotController()} />,
     );
     expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+  });
+
+  it('shows a disabled Stopping until the operator Stop hold is recorded, then Resume', () => {
+    // F-6a W: the engine still finishes its Stop cleanup, so the Runner has
+    // not recorded the hold yet and projects the settling reason. Resume is
+    // never offered enabled here only for the Runner to refuse it.
+    const settling = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    const group = controls.executionSelections.groups[0];
+    group.resumeAllowed = false;
+    group.startAllowed = false;
+    group.resumeUnavailableReason = 'selected_motion_stop_settling';
+    group.startUnavailableReason = 'selected_motion_stop_settling';
+    settling.state.controls = controls;
+    const render = (program: ProgramRuntimeController) => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(render(settling)).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="all is stopping: Resume is available once its Stop has settled."[^>]*>Stopping…<\/button>/,
+    );
+    // Even a stale enabled flag never enables it while the reason says settling.
+    group.resumeAllowed = true;
+    expect(render(settling)).toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*>Stopping…<\/button>/);
+
+    // The hold is recorded: the same group offers Resume.
+    const held = controller('intervention_required');
+    const recorded = ordinaryMotionStopControls();
+    recorded.recoveryOffer = null;
+    held.state.controls = recorded;
+    expect(render(held)).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
   });
 
   it('offers Resume and Reset, but not another Stop, after ordinary Motion Stop', () => {
@@ -1434,6 +1500,32 @@ describe('Program runtime projection', () => {
     }
   });
 
+  it('opens manual recovery of a mounted tool on the tool itself, in gripper mode', () => {
+    // Merge 6: a split tool owns only its gripper target; recovery selects the
+    // tool, never the robot it is mounted on in Joint mode.
+    const robot = Object.assign(robotController(), {
+      motionTargets: [{ controllableComponentId: 'lite6_robot', commandTargetId: 'arm' }],
+      gripperTargets: [{ controllableComponentId: 'lite_gripper', commandTargetId: 'gripper' }],
+      selectRobot: vi.fn(), selectTool: vi.fn(), selectMode: vi.fn(),
+    }) as unknown as RobotControlController;
+    const operation = (target: string, command: string) => ({
+      programRunId: 'manual-run', operationId: `faulted-${command}`, operationRevision: 1,
+      resident: true, state: 'intervention_required' as const, progress: 0.5,
+      terminalError: 'Execution timeout exceeded', activeStopId: null, activeStopGeneration: null,
+      controllableComponentId: target, commandTargetId: command,
+    });
+    selectManualRecoveryTarget(robot, operation('lite_gripper', 'gripper'));
+    expect(robot.selectRobot).toHaveBeenCalledWith('lite_gripper', '');
+    expect(robot.selectTool).toHaveBeenCalledWith('gripper');
+    expect(robot.selectMode).toHaveBeenCalledWith('gripper');
+    // A robot's own motion operation still opens on its motion target.
+    vi.mocked(robot.selectRobot).mockClear();
+    vi.mocked(robot.selectMode).mockClear();
+    selectManualRecoveryTarget(robot, operation('lite6_robot', 'arm'));
+    expect(robot.selectRobot).toHaveBeenCalledWith('lite6_robot', 'arm');
+    expect(robot.selectMode).toHaveBeenCalledWith('joint');
+  });
+
   it('shows post-Reset waiting in the existing notice stack and preserves fault priority', () => {
     const program = controller('succeeded', 'idle_after_reset');
     program.commandAllowed = vi.fn(() => false);
@@ -1576,10 +1668,124 @@ describe('Program runtime projection', () => {
       onReviewProgramRecovery: vi.fn(),
     });
     expect(cell.message).toContain(
-      'Incident on component.arm: Robot moved from its own interface · cause: robot moved '
+      'component.arm: Robot moved from its own interface · cause: robot moved '
       + 'or changed mode from its own interface · vendor codes: state=5, mode=2.',
     );
     expect(cell.actions?.[0]).toMatchObject({ label: 'Recover cell', disabled: false });
+  });
+
+  it('makes each open incident one red item with its cause and Recover cell (ERRUI)', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    robot.state.status.cellStopAction.fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
+      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
+      observedTriggers: ['physical_rest_unproven' as const],
+      reasonCode: 'external_control', certificate: null,
+    };
+    robot.componentIncidents = [{
+      controllableComponentId: 'lite6_robot',
+      incident: {
+        incidentId: 'incident.1', causeClass: 'external_control', vendorCodes: [],
+        detectedAtNs: 1_000, acknowledged: false,
+        summary: 'Component lite6_robot was changed from the robot\'s own interface without a ManyForge request',
+      },
+    }];
+    const [cell] = deriveTransportGuidance({
+      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
+      motionActive: false, onReviewProgramRecovery: vi.fn(),
+      onReset: { run: vi.fn(), disabled: false },
+    });
+    expect(cell).toMatchObject({
+      id: 'recovery.cell', severity: 'error', title: 'Open incident on lite6_robot',
+      alarmDefinitionIds: ['manyforge.motion.stop_fault'],
+      alarmSubjects: [{ definitionId: 'manyforge.runtime.component_lifecycle_fault', subjectId: 'lite6_robot' }],
+    });
+    expect(cell.message).toContain('lite6_robot: Component lite6_robot was changed from the robot');
+    expect(cell.message).toContain('Press Recover cell: it acknowledges the incident and recovers the cell.');
+    expect(cell.message).toContain('This clears the cause of the alarms shown here');
+    // No Program cycle is active: Recover cell is the only action.
+    expect(cell.actions?.map((action) => action.label)).toEqual(['Recover cell']);
+    cell.actions?.[0].run();
+    expect(robot.recoverStopFault).toHaveBeenCalledTimes(1);
+
+    // RECTIME: a press that outlived one HTTP call reads "in progress".
+    robot.stopFaultRecoveryPending = true;
+    robot.stopFaultRecoveryInProgress = true;
+    const [waiting] = deriveTransportGuidance({
+      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
+      motionActive: false, onReviewProgramRecovery: vi.fn(),
+      onReset: { run: vi.fn(), disabled: false },
+    });
+    expect(waiting.actions?.map((action) => [action.label, action.disabled])).toEqual([
+      ['Recovering… (in progress)', true],
+    ]);
+  });
+
+  it('SX-679: offers Abort while Recover cell runs, and Recover cell waits while Close runs', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    robot.state.status.cellStopAction.fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
+      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
+      observedTriggers: ['physical_rest_unproven' as const],
+      reasonCode: 'external_control', certificate: null,
+    };
+    const derive = () => deriveTransportGuidance({
+      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
+      motionActive: false, onReviewProgramRecovery: vi.fn(),
+    });
+    // Scenario Close runs: Recover cell is disabled, with the reason.
+    robot.cellRecoverBlockedReason = 'Scenario Close is in progress; Recover cell waits until it ends.';
+    const blocked = derive().find((notice) => notice.id === 'recovery.cell');
+    expect(blocked?.actions?.[0]).toMatchObject({
+      id: 'recover-cell', disabled: true, title: robot.cellRecoverBlockedReason,
+    });
+    expect(derive().some((notice) => notice.id === 'recovery.cell.running')).toBe(false);
+
+    // A press runs: Abort is offered and calls the controller.
+    robot.cellRecoverBlockedReason = null;
+    robot.stopFaultRecoveryPending = true;
+    const running = derive().find((notice) => notice.id === 'recovery.cell.running');
+    expect(running?.actions?.map((action) => [action.label, action.disabled])).toEqual([
+      ['Abort Recover cell', false],
+    ]);
+    running?.actions?.[0].run();
+    expect(robot.abortRecoverStopFault).toHaveBeenCalledTimes(1);
+    robot.stopFaultRecoveryAbortPending = true;
+    expect(derive().find((notice) => notice.id === 'recovery.cell.running')?.actions?.[0])
+      .toMatchObject({ label: 'Aborting…', disabled: true });
+  });
+
+  it('puts Reset before Recover cell while a Program cycle is active (ERRUI)', () => {
+    const robot = robotController();
+    robot.state.status = statusFixture();
+    robot.currentStatus = robot.state.status;
+    robot.state.status.cellStopAction.fault = {
+      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
+      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
+      observedTriggers: ['physical_rest_unproven' as const],
+      reasonCode: 'external_control', certificate: null,
+    };
+    robot.componentIncidents = [{
+      controllableComponentId: 'lite6_robot',
+      incident: {
+        incidentId: 'incident.1', causeClass: 'external_control', vendorCodes: [],
+        detectedAtNs: 1_000, acknowledged: false, summary: 'Robot moved from its own interface',
+      },
+    }];
+    const reset = vi.fn();
+    const [cell] = deriveTransportGuidance({
+      enabled: true, program: controller('running', 'running'), robot, motionActive: false,
+      onReviewProgramRecovery: vi.fn(), onReset: { run: reset, disabled: false },
+    });
+    expect(cell.message).toContain('A Program run is still active: Reset the Program first, then Recover cell.');
+    expect(cell.actions?.map((action) => action.id)).toEqual(['reset', 'recover-cell']);
+    cell.actions?.[0].run();
+    expect(reset).toHaveBeenCalledTimes(1);
+    expect(robot.recoverStopFault).not.toHaveBeenCalled();
   });
 
   it('classifies live-view observation by what the operator can rely on', () => {
@@ -1762,7 +1968,7 @@ it('shows a failed accepted start and native comparison facts while Reset remain
  * last mounted control whose props match; `mounted` says whether one was
  * mounted; `unmount` restores the globals.
  */
-async function mountTransport(program: ProgramRuntimeController) {
+async function mountTransport(program: ProgramRuntimeController, robot = robotController()) {
   const created: Record<string, unknown>[] = [];
   const document: Record<string, unknown> = {
     nodeType: 9, activeElement: null, defaultView: {},
@@ -1799,14 +2005,22 @@ async function mountTransport(program: ProgramRuntimeController) {
   const { act } = await import('react');
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(node('div') as unknown as Element);
-  await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robotController()} />); });
+  await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} />); });
   return {
+    rerender: async () => { await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} />); }); },
     press: async (match: (props: Props) => boolean) => {
       const found = created.map(propsOf).filter((candidate): candidate is Props => (
         candidate !== undefined && match(candidate)
       )).at(-1);
       if (found === undefined) throw new Error('Mounted control not found');
       await act(() => { found.onClick!(); });
+    },
+    change: async (match: (props: Props) => boolean, event: unknown) => {
+      const found = created.map(propsOf).filter((candidate): candidate is Props => (
+        candidate !== undefined && match(candidate)
+      )).at(-1);
+      if (found === undefined) throw new Error('Mounted control not found');
+      await act(() => { (found.onChange as (value: unknown) => void)(event); });
     },
     /** Whether a control whose props match was ever mounted. */
     mounted: (match: (props: Props) => boolean) => created.map(propsOf).some((candidate) => (
@@ -1818,6 +2032,63 @@ async function mountTransport(program: ProgramRuntimeController) {
     },
   };
 }
+
+describe('Reset confirmation and persistent keys', () => {
+  it('mentions and lists persistent keys only when the Program has them and Reload is checked', async () => {
+    for (const persistence of ['run', 'persistent'] as const) {
+      const program = controller('intervention_required');
+      program.state.controls = ordinaryMotionStopControls();
+      program.state.applied!.program.blackboard = {
+        namespaces: [],
+        keys: [{ key: 'layer', type: 'int64', access: 'read_write', persistence, initial: 0 }],
+      };
+      vi.mocked(program.persistentValues.read).mockReturnValue(new Promise<never>(() => undefined));
+      const open = await mountTransport(program);
+      try {
+        await open.press((props) => props.children === 'Reset'
+          && String(props.className).startsWith('transport-reset'));
+        expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+        const note = (props: Record<string, unknown>) => props.className === 'transport-reset-option-note'
+          && JSON.stringify(props.children ?? null).includes('Persistent keys return');
+        expect(open.mounted(note)).toBe(persistence === 'persistent');
+        // The stored-value list is read only once Reload initial scene is checked.
+        expect(program.persistentValues.read).not.toHaveBeenCalled();
+        await open.change((props) => props.name === 'reloadInitialScene',
+          { target: { checked: true } });
+        expect(vi.mocked(program.persistentValues.read).mock.calls.length > 0).toBe(persistence === 'persistent');
+      } finally {
+        await open.unmount();
+      }
+    }
+  });
+
+  it('disables Reload initial scene, with the reason, while no applied Program is available', async () => {
+    for (const applied of [true, false]) {
+      const program = controller('succeeded', 'idle_after_reset');
+      if (!applied) program.state.applied = null;
+      const open = await mountTransport(program);
+      try {
+        await open.press((props) => props.children === 'Reset'
+          && String(props.className).startsWith('transport-reset'));
+        expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+        const reload = (props: Record<string, unknown>) => props.name === 'reloadInitialScene';
+        expect(open.mounted((props) => reload(props) && props.disabled === !applied)).toBe(true);
+        expect(open.mounted((props) => reload(props) && props.checked === false)).toBe(true);
+        const reason = 'No applied Program is available, so there is no initial scene to reload. Load a Scenario first.';
+        expect(open.mounted((props) => props.className === 'toggle-control' && props.title === reason))
+          .toBe(!applied);
+        // The dialog sends what it shows (`resetSelectionApplied`): without an
+        // applied Program, Reload stays unselected even if a change slips through.
+        if (!applied) {
+          await open.change(reload, { target: { checked: true } });
+          expect(open.mounted((props) => reload(props) && props.checked === true)).toBe(false);
+        }
+      } finally {
+        await open.unmount();
+      }
+    }
+  });
+});
 
 describe('Per-hold Retry and Continue', () => {
   /** Two failure holds, left and right, each owning its own group; middle is owned by none. */
@@ -1990,6 +2261,41 @@ describe('Per-hold Retry and Continue', () => {
       await transport.press((props) => props.className === 'danger-button' && props.children === 'Continue');
       expect(program.applyRecoveryAction).toHaveBeenCalledTimes(3);
       expect(program.applyRecoveryAction).toHaveBeenLastCalledWith(right.offer, 'continue_with_failure');
+    } finally {
+      await transport.unmount();
+    }
+  });
+
+  it('offers an unconfirmed Stop hold its Continue as Acknowledge, confirmed first (item 11)', async () => {
+    const program = twoHolds();
+    const [left, right] = program.state.controls!.recoveryHolds;
+    for (const offer of [program.state.controls!.recoveryOffer!, left.offer]) {
+      offer.reason = {
+        ...offer.reason,
+        code: 'program_stop_settlement_unconfirmed',
+        message: 'Stop not confirmed: acknowledge to continue',
+      };
+    }
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Stop not confirmed: acknowledge to continue"[^>]*aria-label="Acknowledge left: Stop not confirmed for held node left.move"[^>]*>Acknowledge<\/button>/,
+    );
+    // Any other hold keeps its ordinary Continue.
+    expect(markup).toContain('aria-label="Continue right: fail held node right.move"');
+
+    const transport = await mountTransport(program);
+    try {
+      await transport.press((props) => props['aria-label']
+        === 'Acknowledge left: Stop not confirmed for held node left.move');
+      expect(transport.mounted((props) => props.id === 'program-continue-confirmation-title'
+        && props.children === 'Stop not confirmed: acknowledge to continue')).toBe(true);
+      expect(program.applyRecoveryAction).not.toHaveBeenCalled();
+      await transport.press((props) => props.className === 'danger-button' && props.children === 'Acknowledge');
+      // The existing Continue action, for this hold's own offer.
+      expect(program.applyRecoveryAction).toHaveBeenCalledExactlyOnceWith(left.offer, 'continue_with_failure');
+      expect(program.applyRecoveryAction).not.toHaveBeenCalledWith(right.offer, expect.anything());
     } finally {
       await transport.unmount();
     }
@@ -2174,7 +2480,11 @@ describe('Execute activation live presentation', () => {
     const program = controller();
     const arm = activationComponent('lite6_robot');
     const plc = activationComponent('plc_io');
-    program.activationOffer = { identity: 'captured.confirmation', components: [arm, plc] };
+    program.activationOffer = {
+      identity: 'captured.confirmation',
+      activationOrder: { retainedBundleId: 'bundle', graphRevision: 'graph', componentIds: ['lite6_robot', 'plc_io'] },
+      components: [arm, plc],
+    };
     program.activationPending = true;
     program.activationComponentHealth = {
       lite6_robot: { snapshot: { ...arm, lifecycleState: 'active', lifecycleGeneration: 3 }, error: null },
@@ -2220,4 +2530,448 @@ describe('Execute activation live presentation', () => {
         : 'Current component health has not been read.');
     },
   );
+});
+
+describe('Recovery class label', () => {
+  const offer = (recoveryClass: string, code: string, reason: string | null = null) => ({
+    recoveryClass,
+    reason: {
+      code,
+      message: 'stopped',
+      details: reason === null ? null : { reason },
+      origin: null,
+    },
+  });
+
+  it('names a lost-feedback runtime-monitor Stop by its reason, not as a collision', () => {
+    // Live incident 2026-10-29: the class stays runtime_collision; only the label differs.
+    expect(recoveryClassLabel(offer('runtime_collision', 'runtime_monitor_observation_lost')))
+      .toBe('Robot position feedback lost');
+    expect(recoveryClassLabel(
+      offer('runtime_collision', 'operation_failed', 'runtime_monitor_observation_lost'),
+    )).toBe('Robot position feedback lost');
+  });
+
+  it('keeps the class label for an actual collision and other classes', () => {
+    expect(recoveryClassLabel(offer('runtime_collision', 'execution_aborted', 'runtime_collision_fault')))
+      .toBe('Runtime collision');
+    expect(recoveryClassLabel(offer('node_failure_pause', 'runtime_monitor_observation_lost')))
+      .toBe('Node failure pause');
+  });
+});
+
+
+describe('Active TCP Resume confirmation', () => {
+  function setup() {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.runRevision = program.state.run!.runRevision;
+    const group = controls.executionSelections.groups[0];
+    group.state = 'running';
+    group.heldNodeCount = 0;
+    group.ordinaryHeldNodeCount = 0;
+    program.state.controls = controls;
+    const binding = program.state.applied!.programBinding;
+    binding.target_role_bindings.push({
+      target_role_id: 'arm', component_role_id: 'robot', controllable_component_id: 'robot-a',
+      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
+    });
+    const robot = robotController();
+    const status = robot.currentStatus!;
+    robot.tcpResumeConnectionLost = false; robot.tcpResumeFresh = true; robot.tcpResumeStatus = status;
+    robot.tcpResumeCycle = { run: program.state.run, runtimeControls: controls } as unknown as
+      NonNullable<RobotControlController['tcpResumeCycle']>;
+    status.graphRevision = program.state.run!.capture.graphRevision;
+    status.retainedBundleId = program.state.run!.capture.retainedBundleId;
+    return { program, robot, group, status };
+  }
+
+  it('offers Cancel and Resume after a held robot TCP changes', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      const motion = status.directControlTargets[0];
+      motion.activeTcp = { ...motion.activeTcp!, entry: {
+        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+      }, display: 'robot-a.flange', sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      await transport.press((p) => p.children === 'Cancel');
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('updates the dialog when a displayed TCP changes and another robot changes', async () => {
+    const { program, robot, group, status } = setup();
+    const second = structuredClone(status.directControlTargets[0]);
+    second.controllableComponentId = 'robot-b';
+    second.activeTcp!.entry!.componentId = 'robot-b';
+    second.activeTcp!.display = 'robot-b.tcp';
+    status.directControlTargets.push(second);
+    program.state.applied!.programBinding.target_role_bindings.push({
+      target_role_id: 'arm-b', component_role_id: 'robot-b', controllable_component_id: 'robot-b',
+      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
+    });
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      const first = status.directControlTargets[0];
+      first.activeTcp = { ...first.activeTcp!, entry: null, display: null, sequence: 1 };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      first.activeTcp = { ...first.activeTcp!, entry: {
+        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+      }, display: 'robot-a.flange', sequence: 2 };
+      second.activeTcp = { ...second.activeTcp!, entry: null, display: null, sequence: 1 };
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => Array.isArray(p.children)
+        && p.children.every((child) => typeof child === 'string')
+        && JSON.stringify(p.children) === JSON.stringify([
+        'robot-a', ': Active TCP is now ', 'robot-a.flange', ' (was ', 'robot-a.tcp', ').',
+      ]))).toBe(true);
+      expect(transport.mounted((p) => Array.isArray(p.children)
+        && p.children.every((child) => typeof child === 'string')
+        && JSON.stringify(p.children) === JSON.stringify([
+        'robot-b', ': Active TCP is now ', 'No TCP', ' (was ', 'robot-b.tcp', ').',
+      ]))).toBe(true);
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('updates a multi-robot dialog when one current value becomes unavailable', async () => {
+    const { program, robot, group, status } = setup();
+    const second = structuredClone(status.directControlTargets[0]);
+    second.controllableComponentId = 'robot-b';
+    second.activeTcp!.entry!.componentId = 'robot-b';
+    second.activeTcp!.display = 'robot-b.tcp';
+    status.directControlTargets.push(second);
+    program.state.applied!.programBinding.target_role_bindings.push({
+      target_role_id: 'arm-b', component_role_id: 'robot-b', controllable_component_id: 'robot-b',
+      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
+    });
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      const first = status.directControlTargets[0];
+      first.activeTcp = { ...first.activeTcp!, entry: null, display: null, sequence: 1 };
+      second.activeTcp = { ...second.activeTcp!, entry: null, display: null, sequence: 1 };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      second.activeTcp = null;
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => Array.isArray(p.children)
+        && p.children.every((child) => typeof child === 'string')
+        && JSON.stringify(p.children) === JSON.stringify([
+        'robot-a', ': Active TCP is now ', 'No TCP', ' (was ', 'robot-a.tcp', ').',
+      ]))).toBe(true);
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('keeps the dialog and explains when Resume is no longer available', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 1,
+      };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      group.resumeAllowed = false;
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => p.children === 'Resume is no longer available.')).toBe(true);
+      group.resumeAllowed = true;
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeMotion).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('does not mistake mixed Ready and running work for an ordinary hold', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'mixed'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 0;
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('does not infer a current hold from retained controls when the current cycle is unavailable', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      robot.tcpResumeCycle = null;
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('does not reuse a hold baseline after the connection is lost', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      robot.tcpResumeConnectionLost = true; robot.tcpResumeFresh = false;
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      robot.tcpResumeConnectionLost = false; robot.tcpResumeFresh = true;
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('discards the baseline if loss and reconnection occur between renders', async () => {
+    const { program, robot, group, status } = setup();
+    let transportStatus = 'connected';
+    let onShellChange = () => {};
+    robot.controlSource = {
+      getShellSnapshot: () => ({ transportStatus }),
+      subscribeShell: (listener: () => void) => { onShellChange = listener; return () => {}; },
+    } as unknown as RobotControlController['controlSource'];
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      const { act } = await import('react');
+      await act(() => {
+        transportStatus = 'disconnected'; onShellChange();
+        transportStatus = 'connected'; onShellChange();
+      });
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+
+  it('does not prompt when the page first observes an already-held run', async () => {
+    const { program, robot, group, status } = setup();
+    group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+    const transport = await mountTransport(program, robot);
+    try {
+      const motion = status.directControlTargets[0];
+      motion.activeTcp = { ...motion.activeTcp!, entry: {
+        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+      }, display: 'robot-a.flange', sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
+});
+
+describe('Active TCP confirmation for halted Program and ready group', () => {
+  function markHalted(program: ProgramRuntimeController) {
+    program.state.run!.state = 'full_stopped';
+    for (const group of program.state.controls!.executionSelections.groups) {
+      group.state = 'unavailable';
+      group.ordinaryHeldNodeCount = null;
+    }
+  }
+
+  function setup() {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.runRevision = program.state.run!.runRevision;
+    controls.executionSelections.groups[0].state = 'running';
+    controls.executionSelections.groups[0].heldNodeCount = 0;
+    controls.executionSelections.groups[0].ordinaryHeldNodeCount = 0;
+    program.state.controls = controls;
+    program.state.applied!.programBinding.target_role_bindings.push({
+      target_role_id: 'arm', component_role_id: 'robot', controllable_component_id: 'robot-a',
+      command_target_id: 'arm', frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [], robot_tcps: [],
+    });
+    const robot = robotController();
+    const status = robot.currentStatus!;
+    robot.tcpResumeConnectionLost = false; robot.tcpResumeFresh = true; robot.tcpResumeStatus = status;
+    robot.tcpResumeCycle = { run: program.state.run, runtimeControls: controls } as unknown as
+      NonNullable<RobotControlController['tcpResumeCycle']>;
+    status.graphRevision = program.state.run!.capture.graphRevision;
+    status.retainedBundleId = program.state.run!.capture.retainedBundleId;
+    return { program, robot, group: controls.executionSelections.groups[0], status };
+  }
+
+  it('confirms before resuming a halted Program', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      const motion = status.directControlTargets[0];
+      motion.activeTcp = { ...motion.activeTcp!, entry: null, display: null, sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('refreshes changed Full Stop TCP values before resuming', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      const motion = status.directControlTargets[0];
+      motion.activeTcp = { ...motion.activeTcp!, entry: null, display: null, sequence: 1 };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      motion.activeTcp = { ...motion.activeTcp!, entry: {
+        componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
+      }, display: 'robot-a.flange', sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      expect(transport.mounted((p) => Array.isArray(p.children)
+        && p.children.every((child) => typeof child === 'string')
+        && JSON.stringify(p.children) === JSON.stringify([
+        'robot-a', ': Active TCP is now ', 'robot-a.flange', ' (was ', 'robot-a.tcp', ').',
+      ]))).toBe(true);
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('resumes normally if the TCP returns to its hold baseline while the dialog is open', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      const motion = status.directControlTargets[0];
+      const initial = structuredClone(motion.activeTcp!);
+      motion.activeTcp = { ...initial, entry: null, display: null, sequence: 1 };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      motion.activeTcp = { ...initial, sequence: 2 };
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('skips the Full Stop dialog when the current TCP becomes unavailable', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      robot.tcpResumeStatus = null;
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('skips the Full Stop dialog after an execution owner replacement', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      status.ownerEpoch = 'new-owner';
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null,
+        ownerEpoch: 'new-owner', sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('skips the Full Stop dialog when the page first observes an already halted run', async () => {
+    const { program, robot, status } = setup();
+    markHalted(program);
+    const transport = await mountTransport(program, robot);
+    try {
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('resumes normally if the TCP becomes unavailable after the dialog opens', async () => {
+    const { program, robot, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      markHalted(program);
+      await transport.rerender();
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
+      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      robot.tcpResumeStatus = null;
+      await transport.rerender();
+      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+    } finally { await transport.unmount(); }
+  });
+
+  it('does not prompt when Run releases an unheld ready group', async () => {
+    const { program, robot, group, status } = setup();
+    const transport = await mountTransport(program, robot);
+    try {
+      group.state = 'held'; group.heldNodeCount = 1; group.ordinaryHeldNodeCount = 1;
+      await transport.rerender();
+      group.state = 'ready'; group.heldNodeCount = 0; group.ordinaryHeldNodeCount = 0;
+      status.directControlTargets[0].activeTcp = {
+        ...status.directControlTargets[0].activeTcp!, entry: null, display: null, sequence: 2,
+      };
+      await transport.rerender();
+      await transport.press((p) => p.className === 'transport-group-resume');
+      expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
+    } finally { await transport.unmount(); }
+  });
 });

@@ -32,6 +32,7 @@ from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
     merge_param_patch,
+    motion_tcp_selection,
     parse_execution_groups,
 )
 from manyforge_behavior.pick_place_templates import (
@@ -170,6 +171,41 @@ def _is_portable_id(value: Any) -> bool:
         and _PORTABLE_ID_PATTERN.fullmatch(value) is not None
         and len(value.encode("utf-8")) <= _PORTABLE_ID_MAX_BYTES
     )
+
+
+def _prefill_motion_endpoint(
+    document: dict[str, Any], node: dict[str, Any], parameter_ids: set[str]
+) -> None:
+    """New motion and planning selectors start at the robot's Current TCP."""
+    parameters = node.setdefault("parameters", {})
+    if (
+        "tcp_endpoint" in parameter_ids
+        and "tcp_endpoint" not in parameters
+        and "tcp_endpoint" not in node.get("value_sources", {})
+    ):
+        parameters["tcp_endpoint"] = {"kind": "current"}
+
+
+def _declare_motion_endpoint(
+    document: dict[str, Any], parameters: dict[str, Any]
+) -> None:
+    """Declare the frame of an explicit entry on its portable target role."""
+    for parameter_id in ("tcp_endpoint", "tcp"):
+        endpoint = parameters.get(parameter_id)
+        if (
+            not isinstance(endpoint, dict)
+            or set(endpoint) != {"kind", "target_role", "frame_role"}
+            or endpoint.get("kind") != "entry"
+            or not _is_portable_id(endpoint.get("target_role"))
+        ):
+            continue
+        target = document.get("target_roles", {}).get(endpoint["target_role"])
+        frame_role = endpoint["frame_role"]
+        if not isinstance(target, dict) or not _is_portable_id(frame_role):
+            continue
+        frames = list(target.get("required_frame_roles", []))
+        if frame_role not in frames:
+            target["required_frame_roles"] = sorted([*frames, frame_role])
 
 
 _RECOVERY_POLICY_FIELDS = frozenset({"allow_intervention", "max_retries"})
@@ -2097,6 +2133,7 @@ class ComposerDraftSession:
             "tool_max_effort",
             "tool_command_duration_s",
             "tool_completion_timeout_s",
+            "tcp_endpoint",
         }
         macro_id = arguments.get("macro_id")
         if macro_id == "pick_subtree":
@@ -2111,7 +2148,7 @@ class ComposerDraftSession:
                 f"unknown authoring macro: {macro_id}",
                 status_code=404,
             )
-        required = common | specific | {"tcp_endpoint"}
+        required = common | specific
         if (
             set(arguments) - required - optional
             or not required <= set(arguments)
@@ -2148,34 +2185,33 @@ class ComposerDraftSession:
                 "draft_arguments_invalid",
                 "touch_body_roles must be a non-empty canonical ID array",
             )
-        endpoint = arguments["tcp_endpoint"]
-        if (
-            not isinstance(endpoint, dict)
-            or set(endpoint) != {"target_role", "frame_role"}
-            or any(
-                not _is_portable_id(endpoint.get(field))
-                for field in ("target_role", "frame_role")
-            )
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "authoring tcp_endpoint must name one portable target role and frame role",
-            )
-        endpoint_target = document.get("target_roles", {}).get(endpoint["target_role"])
-        if not isinstance(endpoint_target, dict):
-            _error(
-                "draft_target_role_not_found",
-                f"{operation} authoring endpoint target role {endpoint['target_role']!r} "
-                "is not declared",
-                status_code=404,
-            )
-        endpoint_frames = endpoint_target.get("required_frame_roles", [])
-        if endpoint["frame_role"] not in endpoint_frames:
-            _error(
-                "draft_arguments_invalid",
-                f"{operation} authoring endpoint target role {endpoint['target_role']!r} "
-                f"does not declare frame role {endpoint['frame_role']!r}",
-            )
+        try:
+            endpoint = motion_tcp_selection(arguments)["tcp_endpoint"]
+        except ProgramValidationError as exc:
+            _error("draft_arguments_invalid", str(exc))
+        role = (
+            endpoint.get("role")
+            if endpoint["kind"] == "default_of_role"
+            else endpoint.get("target_role")
+        )
+        if role is not None:
+            endpoint_target = document.get("target_roles", {}).get(role)
+            if not isinstance(endpoint_target, dict):
+                _error(
+                    "draft_target_role_not_found",
+                    f"{operation} authoring TCP target role {role!r} is not declared",
+                    status_code=404,
+                )
+            if (
+                endpoint["kind"] == "entry"
+                and endpoint["frame_role"]
+                not in endpoint_target.get("required_frame_roles", [])
+            ):
+                _error(
+                    "draft_arguments_invalid",
+                    f"{operation} authoring TCP target role {role!r} "
+                    f"does not declare frame role {endpoint['frame_role']!r}",
+                )
         scene_ids = {row.get("scene_resource_id") for row in self._scene(document)}
         if arguments["scene_resource_id"] not in scene_ids:
             _error(
@@ -3157,6 +3193,10 @@ class ComposerDraftSession:
                     "reference": motion_bindings[field],
                 }
             node["value_sources"] = sources
+        _prefill_motion_endpoint(
+            document, node, {parameter.id for parameter in entry.parameters}
+        )
+        _declare_motion_endpoint(document, node.get("parameters", {}))
         if _tree_ref(tree, node["instance_id"]) is not None:
             _error(
                 "draft_node_exists",
@@ -3237,6 +3277,7 @@ class ComposerDraftSession:
                     scene=self._scene(document),
                 )
         node["parameters"] = parameters
+        _declare_motion_endpoint(document, parameters)
         if value_sources:
             # Object member order carries no meaning; the Program keeps paths sorted.
             node["value_sources"] = dict(sorted(value_sources.items()))

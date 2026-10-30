@@ -84,13 +84,18 @@ confirmed command, so ManyForge records `stop_not_settled_measured_velocity` and
 holds `INTERVENTION_REQUIRED` for operator/robot-safety recovery.
 
 Stop-fault recovery is revision-fenced against the exact owner-issued
-`StopFaultRecoveryOfferDTO`. Fresh settlement, configuration, external
-reconciliation, reset, and orphan facts are evaluated privately by the Kernel.
-The cleared latch and resulting `StopStatusDTO` are persisted before admission
-can reopen. Recovery never resumes work and alarm acknowledgement never clears
-the latch. Reset is a separate asynchronous operation control; it joins an
-addressed containment certificate when needed and uses only the no-Stop local
-retirement seam afterward.
+`StopFaultRecoveryOfferDTO`. A no-active-goal fact covering every captured
+resource, with the Kernel reporting none reserved, dispatched or stopping,
+satisfies the stopped check without measured-rest, post-terminal surveillance
+or trigger rest/reconciliation checks. It does not waive the other Kernel gates:
+durable Stop acceptance and terminal records, reconciled configuration and
+Reset state, and no blocking Stop certificates, uncertain operations or orphan
+resources. The cleared latch and resulting `StopStatusDTO` are persisted before
+admission can reopen.
+Recovery never resumes work and alarm acknowledgement never clears the latch.
+Reset is a separate asynchronous operation control; it joins an addressed
+containment certificate when needed and uses only the no-Stop local retirement
+seam afterward.
 
 ## 2.1 Lane Matrix
 
@@ -117,9 +122,10 @@ Shared constants are in
   `soft_on_path`; it is false and forbidden as an authored field for other
   modes. The short-path case still remains under the immutable outer Stop
   deadline and terminal-evidence requirement.
-- The profile has no `max_stop_time_s`. The verified base plan owns one outer
-  deadline and fixed phase allocation; Stop acceptance publishes only the
-  shortened remaining budget and never extends it.
+- `max_stop_time_s`, when present, is the per-profile upper bound for that
+  robot's controlled Stop measured from the Stop request. When absent, the
+  deadline is the profile's deceleration time (or its default) plus
+  `complete_move_on_signal_timeout` (500 ms).
 - `per_joint_max_deceleration` and optional
   `per_joint_settle_velocity_threshold` are typed source-joint maps. Prepare
   resolves them to exact resource kinds and rejects incomplete, unknown,
@@ -287,12 +293,22 @@ For `soft_on_path`:
 1. Capture a fresh observed state before preemption.
 1. Recover the active accepted trajectory and trajectory time.
 1. Choose measured or model-derived seam velocity according to lane config.
+   The seam (lead-in start) is the active command cursor at the frozen factor
+   for model-derived state, and for measured state when the lead-in anchor is
+   `kCommanded` (the default; a Real component's Deployment
+   `stop_lead_in_anchor`, carried in its controller profile row). With
+   `kMeasured` a measured state keeps the measured projection and its projected
+   path rate. The measured state always remains the path and velocity drift
+   guard.
 1. Call `plan_soft_on_path_stop(...)`.
 1. Publish unit runtime scale when JTC speed scaling is enabled, so the stop is
    executed as authored.
 1. Dispatch the replacement trajectory with
    `send_fjt_replacement_trajectory(...)`.
-1. Wait for the managed FJT result within the effective stop deadline.
+1. Wait for the managed FJT result like a normal motion's: success, or the
+   controller's goal-tolerance result after its `goal_time`, bounded by a normal
+   motion's no-report budget for the Stop trajectory (at least 10 s). The
+   effective stop deadline bounds everything up to the dispatch.
 1. Wait, bounded by the same stop budget, for measured velocity to settle when
    the backend exposes velocity feedback. Normal controller-feedback lag is not
    classified as failure from a single instantaneous sample.

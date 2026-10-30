@@ -67,7 +67,7 @@ from manyforge_behavior.orchestration_ports import (
 )
 from manyforge_behavior.orchestration_values import NodeAttemptInputResolver
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
-from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS, MOTION_NODE_IDS
+from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS, MOTION_NODE_IDS, active_tcp_key
 from manyforge_behavior.program_clock import ProgramClock
 
 class ExecutableNodeResolverError(ValueError):
@@ -290,6 +290,24 @@ def _required_port(
     return port
 
 
+def _derived_active_tcp_key(node_id: str, parameters: Mapping[str, Any]) -> str | None:
+    """The fixed Current selector's role-scoped input, bound with the node."""
+    if node_id == "motion.set_tcp":
+        selector = parameters.get("tcp")
+    elif node_id in MOTION_NODE_IDS or node_id in INTERRUPT_MOTION_NODE_IDS or node_id in {
+        "planning.plan_pick_sequence", "planning.plan_place_sequence",
+    }:
+        selector = parameters.get("tcp_endpoint", {"kind": "current"})
+    else:
+        return None
+    if not isinstance(selector, Mapping) or selector.get("kind") != "current":
+        return None
+    role = parameters.get("target_role")
+    if not isinstance(role, str) or not role:
+        raise ValueError("Current TCP requires a bound target role")
+    return active_tcp_key(role)
+
+
 def _owner_task_builder(
     node_id: str,
     port_name: str,
@@ -338,6 +356,7 @@ def _owner_task_builder(
             intervention_port=context.ports.program_interventions,
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
+            derived_active_tcp_key=_derived_active_tcp_key(node_id, context.parameters),
             require_initial_running=require_initial_running,
             operator_stop_state=context.operator_stop_state,
             cancellable=cancellable,

@@ -33,6 +33,10 @@ collision, a new contact, or the object going back into its support still
 fails validation. The modes and fields are described in
 [Support contacts](#support-contacts) below.
 
+An object row may also set `metadata.mass_kg` (kg, 0 to 1000). The mass is
+added to the robot's controller payload while the object is attached; it is 0
+when absent.
+
 ## Who decides collisions
 
 `manyforge_collision` is the collision authority. Pre-dispatch trajectory

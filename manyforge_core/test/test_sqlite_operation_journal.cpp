@@ -1201,7 +1201,7 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
   MotionParticipantIntentDTO motion{
       MoveId("move.framed"),
       FrameRoleId("base"),
-      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
       TimeoutsDTO{},
@@ -2672,7 +2672,7 @@ TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreImmutableAcrossOwnerR
   intent.participants.front().payload = MotionParticipantIntentDTO{
       MoveId("move"),
       FrameRoleId("base"),
-      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      CurrentTcpDTO{},
       TolerancesDTO{},
       SpeedProfileDTO{},
       TimeoutsDTO{},
@@ -2967,6 +2967,69 @@ TEST(SqliteOperationJournalTest, InterruptRuleStateUsesExistingOrderedOperationa
   ASSERT_EQ(replay.value().events.size(), 1U);
   EXPECT_EQ(replay.value().events.front().sequence, last_sequence);
   EXPECT_EQ(replay.value().next_after_sequence, last_sequence);
+}
+
+// Active TCP (M7, design 4, A2a-2): one confirmed change is an operational
+// `active_tcp_changed` row (the Runner's mirror and History read it) with
+// robot, previous and new entry (null: none), source, offset sent,
+// registration generation and sequence; an invalid change consumes no
+// sequence.
+TEST(SqliteOperationJournalTest, ActiveTcpChangeIsAnOperationalRow) {
+  ScopedTemporaryDirectory directory;
+  const RequestOwnerEpoch owner("active_tcp.owner");
+  SqliteOperationJournal journal(directory.path() / "active-tcp.sqlite3", CellId("cell.test"), 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+  const TcpEntryDTO tool{ControllableComponentId("gripper"), CommandTargetId("gripper"),
+                         FrameRoleId("tcp")};
+  ActiveTcpChangeDTO change{ControllableComponentId("robot"), std::nullopt, tool,
+                            ActiveTcpChangeSource::kRobotControl, true, 2U, 3U, 7};
+  const auto recorded = journal.RecordActiveTcpChanged(owner, change);
+  ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+  change.registration_generation = 0U;
+  EXPECT_FALSE(journal.RecordActiveTcpChanged(owner, change).ok());
+  const auto events = journal.ReadOperationalEvents(owner, 0U);
+  ASSERT_TRUE(events.ok());
+  ASSERT_EQ(events.value().events.size(), 1U);
+  const auto& event = events.value().events.front();
+  EXPECT_EQ(event.sequence, recorded.value());
+  EXPECT_EQ(event.record_kind, "active_tcp_changed");
+  EXPECT_FALSE(event.operation_id);
+  EXPECT_FALSE(event.request_id);
+  EXPECT_FALSE(event.effect_pending);
+  EXPECT_EQ(event.occurred_at_ns, 7);
+  const auto payload = manyforge::content_identity::parse_canonical_json(event.payload_json);
+  EXPECT_EQ(payload.find_object_member("api_version")->as_string(),
+            "manyforge.active_tcp_change.v1");
+  EXPECT_EQ(payload.find_object_member("component_id")->as_string(), "robot");
+  EXPECT_TRUE(payload.find_object_member("previous")->is_null());
+  EXPECT_EQ(payload.find_object_member("entry")->find_object_member("component_id")->as_string(),
+            "gripper");
+  EXPECT_EQ(payload.find_object_member("source")->as_string(), "robot_control");
+  EXPECT_TRUE(payload.find_object_member("offset_sent")->as_bool());
+  EXPECT_EQ(payload.find_object_member("owner_epoch")->as_string(), "active_tcp.owner");
+  EXPECT_EQ(payload.find_object_member("registration_generation")->as_number(), 2.0);
+  EXPECT_EQ(payload.find_object_member("sequence")->as_number(), 3.0);
+}
+
+TEST(SqliteOperationJournalTest, NotifyUnknownRetainsTypedUnavailableReason) {
+  ScopedTemporaryDirectory directory;
+  SqliteOperationJournal journal(directory.path() / "notify.sqlite3", CellId("cell.test"), 8U);
+  const RequestOwnerEpoch owner("global.owner");
+  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {}).ok());
+  auto change = GlobalRuleChange(owner, IoGlobalRuleState::kUnknown);
+  change.rule.unavailable_reason = ErrorDTO{"io_watch_bound_exceeded", "watch unavailable", {{"limit", "4"}}};
+  ASSERT_TRUE(journal.RecordInterruptRuleStateChanged(change).ok());
+  const auto events = journal.ReadOperationalEvents(owner, 0U);
+  ASSERT_TRUE(events.ok());
+  ASSERT_EQ(events.value().events.size(), 1U);
+  const auto payload = manyforge::content_identity::parse_canonical_json(events.value().events[0].payload_json);
+  EXPECT_EQ(payload.find_object_member("state")->as_string(), "unknown");
+  EXPECT_TRUE(payload.find_object_member("triggering_acquisition")->is_null());
+  const auto &reason = *payload.find_object_member("unavailable_reason");
+  EXPECT_EQ(reason.find_object_member("code")->as_string(), "io_watch_bound_exceeded");
+  EXPECT_EQ(reason.find_object_member("details")->find_object_member("limit")->as_string(), "4");
+  change.rule.unavailable_reason.reset();
+  EXPECT_FALSE(journal.RecordInterruptRuleStateChanged(change).ok());
 }
 
 TEST(SqliteOperationJournalTest, InterruptRuleStateRefusesInvalidEvidenceWithoutConsumingSequence) {
@@ -3992,7 +4055,7 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
     MotionParticipantIntentDTO motion{
         MoveId("move.endpoint"),
         FrameRoleId("base"),
-        MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+        CurrentTcpDTO{},
         TolerancesDTO{0.01, 0.001, 0.01},
         SpeedProfileDTO{},
         TimeoutsDTO{},
@@ -4006,8 +4069,9 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
         {},
         {}};
     if (selected) {
-      motion.tcp_endpoint = MotionEndpointReferenceDTO{
-          TargetRoleId("tool"), FrameRoleId(selected == 1 ? "left_tip" : "right_tip")};
+      motion.tcp_endpoint = TcpEntryDTO{ControllableComponentId("lite_gripper"),
+                                        CommandTargetId("gripper"),
+                                        FrameRoleId(selected == 1 ? "left_tip" : "right_tip")};
     }
     intent.participants.front().payload = motion;
     const auto state = OperationState("operation.endpoint-" + std::to_string(selected),
@@ -4019,14 +4083,15 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
   ASSERT_TRUE(events.ok()) << events.error().message;
   ASSERT_EQ(events.value().events.size(), 3U);
   const auto& own = events.value().events[0].payload_json;
-  EXPECT_NE(own.find("\"tcp_endpoint\":{\"frame_role_id\":\"tcp\",\"target_role_id\":\"arm\"}"),
-            std::string::npos);
+  EXPECT_NE(own.find("\"tcp_endpoint\":{\"kind\":\"current\"}"), std::string::npos);
   EXPECT_EQ(own.find("tcp_frame_role_id"), std::string::npos);
   for (std::size_t index = 1; index < 3; ++index) {
     const auto& bytes = events.value().events[index].payload_json;
-    const std::string expected = std::string("\"tcp_endpoint\":{\"frame_role_id\":\"") +
-                                 (index == 1 ? "left_tip" : "right_tip") +
-                                 "\",\"target_role_id\":\"tool\"}";
+    const std::string expected =
+        std::string("\"tcp_endpoint\":{\"entry\":{\"component_id\":\"lite_gripper\","
+                    "\"frame_role_id\":\"") +
+        (index == 1 ? "left_tip" : "right_tip") +
+        "\",\"target_id\":\"gripper\"},\"kind\":\"entry\"}";
     EXPECT_NE(bytes.find(expected), std::string::npos);
     EXPECT_EQ(bytes.find("tcp_frame_role_id"), std::string::npos);
   }
@@ -4896,6 +4961,222 @@ TEST(SqliteOperationJournalTest, CorruptTerminalRowDigestFailsLeanStopRecovery) 
       replacement.BeginOwnerEpoch(RequestOwnerEpoch("execution-host.epoch.lean-digest.2"), 20, 8U, {});
   ASSERT_FALSE(recovered.ok());
   EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
+}
+
+// Item 25: Force close journals each operation it moves into history as one
+// ordinary state record: InterventionRequired, marked
+// `cell_force_closed_by_operator`. The owner then closes cleanly and a restart
+// finds the operation settled in history with no orphan resource. Without
+// that record (before item 25) the clean close is refused and the restart
+// turns the operation into an orphan.
+TEST(SqliteOperationJournalTest, ForceClosedOperationIsSettledHistoryAfterRestart) {
+  for (const bool journaled : {true, false}) {
+    SCOPED_TRACE(journaled);
+    ScopedTemporaryDirectory directory;
+    const auto database = directory.path() / "journal.sqlite3";
+    const CellId cell("cell.test");
+    const RequestOwnerEpoch epoch("owner.force-close");
+    const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+    {
+      SqliteOperationJournal journal(database, cell);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 16U, resources).ok());
+      auto state = OperationState("operation.force-closed", OperationStateKind::kExecuting, 1);
+      const auto command = CommandIntent("request.force-closed", epoch.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+      if (journaled) {
+        // What the Kernel step writes: the participant keeps its last state.
+        state.state = OperationStateKind::kInterventionRequired;
+        state.participants.front().terminal_error =
+            ErrorDTO{"cell_force_closed_by_operator",
+                     "Force close moved this operation into history; its effect is unknown", {}};
+        state.updated_at_ns = 2;
+        ASSERT_TRUE(journal
+                        .RecordOperationState(epoch, state, nullptr,
+                                              "cell_force_closed_by_operator")
+                        .ok());
+        const auto closed = journal.CloseOwnerEpoch(epoch, 3);
+        EXPECT_TRUE(closed.ok()) << closed.error().code;
+      } else {
+        const auto blocked = journal.CloseOwnerEpoch(epoch, 3);
+        ASSERT_FALSE(blocked.ok());
+        EXPECT_EQ(blocked.error().code, "operation_journal_owner_close_blocked");
+      }
+    }
+    SqliteOperationJournal replacement(database, cell);
+    const auto recovered =
+        replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.after-restart"), 4, 16U, resources);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    const auto& history = recovered.value().historical_operations.front();
+    EXPECT_EQ(history.operation_id, OperationId("operation.force-closed"));
+    EXPECT_EQ(history.state, OperationStateKind::kInterventionRequired);
+    ASSERT_TRUE(history.participants.front().terminal_error.has_value());
+    if (journaled) {
+      EXPECT_FALSE(recovered.value().replaced_unclosed_owner_epoch.has_value());
+      EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+      EXPECT_EQ(history.participants.front().terminal_error->code, "cell_force_closed_by_operator");
+      // A further restart keeps it settled: nothing waits for a second Force close.
+      EXPECT_TRUE(replacement.CloseOwnerEpoch(RequestOwnerEpoch("owner.after-restart"), 5).ok());
+    } else {
+      EXPECT_EQ(recovered.value().unreconciled_resources, resources);
+      EXPECT_EQ(history.participants.front().terminal_error->code, "execution_host_replaced");
+    }
+  }
+}
+
+// Item 25: why Force close records InterventionRequired, not Interrupted. An
+// Interrupted snapshot is terminal for replay but still refuses the clean owner
+// close, so the next start would fence the whole resource inventory.
+TEST(SqliteOperationJournalTest, InterruptedSnapshotStillRefusesTheCleanOwnerClose) {
+  ScopedTemporaryDirectory directory;
+  const RequestOwnerEpoch epoch("owner.interrupted");
+  SqliteOperationJournal journal(directory.path() / "journal.sqlite3", CellId("cell.test"));
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 16U, {ResourceId("robot.gripper")}).ok());
+  auto state = OperationState("operation.interrupted", OperationStateKind::kExecuting, 1);
+  const auto command = CommandIntent("request.interrupted", epoch.value());
+  ASSERT_TRUE(
+      journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+  state.state = OperationStateKind::kInterrupted;
+  state.updated_at_ns = 2;
+  ASSERT_TRUE(journal.RecordOperationState(epoch, state, nullptr, "test_interrupted").ok());
+  const auto blocked = journal.CloseOwnerEpoch(epoch, 3);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().code, "operation_journal_owner_close_blocked");
+}
+
+// Force close orphan release: an operation an earlier restart left orphaned
+// is written again as the same settled state, marked force-closed, with a
+// newer capture order. Its disposition is current again, so the owner closes
+// cleanly and the next start fences none of its resources. Without that
+// record every start fences them again.
+TEST(SqliteOperationJournalTest, ForceClosedOrphanIsSettledHistoryAfterTheNextRestart) {
+  for (const bool journaled : {true, false}) {
+    SCOPED_TRACE(journaled);
+    ScopedTemporaryDirectory directory;
+    const auto database = directory.path() / "journal.sqlite3";
+    const CellId cell("cell.test");
+    const std::vector<ResourceId> resources{ResourceId("robot.gripper")};
+    {
+      // The first owner never closes: its operation is left resident.
+      const RequestOwnerEpoch first("owner.crashed");
+      SqliteOperationJournal journal(database, cell);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(first, 1, 16U, resources).ok());
+      auto state = OperationState("operation.orphan", OperationStateKind::kExecuting, 1);
+      const auto command = CommandIntent("request.orphan", first.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(first, command, Acceptance(command, state), state).ok());
+    }
+    const RequestOwnerEpoch second("owner.force-close");
+    {
+      SqliteOperationJournal journal(database, cell);
+      const auto recovered = journal.BeginOwnerEpoch(second, 2, 16U, resources);
+      ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+      EXPECT_EQ(recovered.value().unreconciled_resources, resources);
+      ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+      if (journaled) {
+        // What the Kernel step writes for an orphan on a freed slot.
+        auto state = recovered.value().historical_operations.front();
+        ASSERT_EQ(state.participants.front().terminal_error->code, "execution_host_replaced");
+        state.participants.front().terminal_error->details["force_closed"] =
+            "cell_force_closed_by_operator";
+        state.updated_at_ns = 3;
+        if (state.journal_capture_order != 0U) ++state.journal_capture_order;
+        ASSERT_TRUE(journal
+                        .RecordOperationState(second, state, nullptr,
+                                              "cell_force_closed_by_operator")
+                        .ok());
+        const auto closed = journal.CloseOwnerEpoch(second, 4);
+        EXPECT_TRUE(closed.ok()) << closed.error().code;
+      } else {
+        const auto blocked = journal.CloseOwnerEpoch(second, 4);
+        ASSERT_FALSE(blocked.ok());
+        EXPECT_EQ(blocked.error().code, "operation_journal_owner_close_blocked");
+      }
+    }
+    SqliteOperationJournal replacement(database, cell);
+    const auto recovered =
+        replacement.BeginOwnerEpoch(RequestOwnerEpoch("owner.after-restart"), 5, 16U, resources);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().historical_operations.size(), 1U);
+    const auto& history = recovered.value().historical_operations.front();
+    EXPECT_EQ(history.state, OperationStateKind::kInterventionRequired);
+    if (journaled) {
+      EXPECT_FALSE(recovered.value().replaced_unclosed_owner_epoch.has_value());
+      EXPECT_TRUE(recovered.value().unreconciled_resources.empty());
+      EXPECT_TRUE(history.participants.front().terminal_error->details.contains("force_closed"));
+      EXPECT_TRUE(replacement.CloseOwnerEpoch(RequestOwnerEpoch("owner.after-restart"), 6).ok());
+    } else {
+      EXPECT_EQ(recovered.value().unreconciled_resources, resources);
+    }
+  }
+}
+
+// M6b: a surveillance checkpoint stays pending while newer samples arrive
+// during its durable write, so the next checkpoint repeats its generation with
+// a newer surveillance generation. A clear on current rest records the
+// current (newer, not yet durable) surveillance and the in-memory persistence
+// degradation; recovery still reads the latest durable checkpoint.
+TEST(SqliteOperationJournalTest, RepeatedCheckpointGenerationAndCurrentRestClearAreDurable) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.m6b-current-rest");
+  const ResourceId resource("robot.gripper");
+  const std::vector<ResourceId> inventory{resource};
+  std::optional<StopPostTerminalSurveillanceDTO> durable;
+  std::optional<LeanStopClear> clear;
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+    const auto accepted =
+        RecordFullStopAcceptance(journal, epoch, "request.m6b", "stop.m6b", 10);
+    auto terminal = MonitoringTerminalProjection(accepted, resource);
+    const auto recorded = journal.RecordStopTerminal(epoch, terminal.stop_status,
+                                                     terminal.certificate, terminal.fault_latch);
+    ASSERT_EQ(recorded.state, StopForensicProjectionStateDTO::kRecorded)
+        << (recorded.error.has_value() ? recorded.error->message : std::string{});
+    terminal = RecordedTerminal(terminal);
+    const auto checkpoint = [&](const std::uint64_t surveillance_generation) {
+      auto value = MonitoringCheckpoint(terminal, *terminal.fault_latch, resource, 1U, 2U);
+      value.owner_epoch = epoch;
+      value.surveillance_generation = surveillance_generation;
+      return value;
+    };
+    for (const std::uint64_t generation : {1U, 3U}) {
+      const auto projected = journal.RecordStopSurveillanceCheckpoint(
+          epoch, checkpoint(generation), *terminal.fault_latch,
+          static_cast<std::int64_t>(100U + generation));
+      ASSERT_EQ(projected.state, StopForensicProjectionStateDTO::kRecorded)
+          << (projected.error.has_value() ? projected.error->message : std::string{});
+    }
+    // A regressing surveillance generation is still refused.
+    EXPECT_EQ(journal.RecordStopSurveillanceCheckpoint(epoch, checkpoint(2U),
+                                                       *terminal.fault_latch, 110)
+                  .state,
+              StopForensicProjectionStateDTO::kFailed);
+    durable = checkpoint(3U);
+    durable->checkpoint_projection = StopDurableProjectionStatusDTO{
+        StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+
+    clear = ClearAfterCheckpoint(terminal, checkpoint(5U), epoch, "request.m6b.clear");
+    clear->cleared_latch.persistence_degraded = true;
+    clear->result.latch = clear->cleared_latch;
+    clear->resulting_status.fault_latch = clear->cleared_latch;
+    const auto cleared = journal.RecordStopFaultCleared(
+        epoch, clear->intent, clear->result, clear->cleared_latch, clear->resulting_status);
+    ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+    journal.Close();
+  }
+
+  SqliteOperationJournal replacement(database, cell_id, 8U);
+  const auto recovered = replacement.BeginOwnerEpoch(
+      RequestOwnerEpoch("execution-host.epoch.m6b-current-rest.2"), 200, 8U, inventory);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
+  const auto& stop = recovered.value().recovered_stops.front();
+  EXPECT_EQ(stop.fault_latch, clear->cleared_latch);
+  EXPECT_EQ(stop.surveillance, durable);
 }
 
 }  // namespace

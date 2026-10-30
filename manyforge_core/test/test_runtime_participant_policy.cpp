@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <manyforge_core/runtime_participant_policy.hpp>
+#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <optional>
 #include <string>
 
@@ -104,6 +105,49 @@ TEST(RuntimeParticipantPolicy, DeploymentMaximumCapsOperationRequest) {
   }
   EXPECT_FALSE(apply_deployment_motion_speed_limit(0.0, {}).ok());
   EXPECT_FALSE(apply_deployment_motion_speed_limit(1000.1, {}).ok());
+}
+
+TEST(RuntimeParticipantPolicy, TcpSpeedCheckNamesExactlyTwoModes) {
+  EXPECT_EQ(parse_tcp_speed_check("active_tcp"), TcpSpeedCheck::kActiveTcp);
+  EXPECT_EQ(parse_tcp_speed_check("active_tcp_and_flange"),
+            TcpSpeedCheck::kActiveTcpAndFlange);
+  for (const auto invalid : {"", "flange", "Active_TCP", "active_tcp_and_tool"})
+    EXPECT_FALSE(parse_tcp_speed_check(invalid)) << invalid;
+  for (const auto mode : {TcpSpeedCheck::kActiveTcp, TcpSpeedCheck::kActiveTcpAndFlange})
+    EXPECT_EQ(parse_tcp_speed_check(to_string(mode)), mode);
+}
+
+TEST(RuntimeParticipantPolicy, SpeedCheckFramesAddTheRobotFlangeOnce) {
+  const ResolvedFrameDTO robot_tcp = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("lite6"), ModelInstanceId("lite6.model"), FrameRoleId("tcp"),
+      "mf2_link_tcp", ModelRevision("lite6.revision")};
+  const ResolvedFrameDTO flange = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("lite6"), ModelInstanceId("lite6.model"), FrameRoleId("flange"),
+      "mf2_link_eef", ModelRevision("lite6.revision")};
+  // `active_tcp`: the active TCP alone.
+  EXPECT_EQ(speed_check_frames(robot_tcp, std::nullopt), std::vector{robot_tcp});
+  // `active_tcp_and_flange`: the TCP first, then the robot flange.
+  EXPECT_EQ(speed_check_frames(robot_tcp, flange), (std::vector{robot_tcp, flange}));
+  // A TCP on a mounted tool keeps the robot's flange as the second point.
+  const ResolvedFrameDTO tool_tcp = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("vacuum_gripper"), ModelInstanceId("vacuum_gripper.model"),
+      FrameRoleId("cup_center"), "mf2_cup_center", ModelRevision("vacuum.revision")};
+  const auto mounted = speed_check_frames(tool_tcp, flange);
+  ASSERT_EQ(mounted.size(), 2U);
+  EXPECT_EQ(frame_role_id(mounted[0]), "cup_center");
+  EXPECT_EQ(std::get<ResolvedComponentModelFrameDTO>(mounted[1]).controllable_component_id,
+            ControllableComponentId("lite6"));
+  EXPECT_EQ(frame_role_id(mounted[1]), "flange");
+  // The flange itself as TCP, or UR's `tcp` and `flange` on one link: one point.
+  EXPECT_EQ(speed_check_frames(flange, flange), std::vector{flange});
+  const ResolvedFrameDTO ur_tcp = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("ur10e"), ModelInstanceId("ur10e.model"), FrameRoleId("tcp"),
+      "mf2_tool0", ModelRevision("ur10e.revision")};
+  const ResolvedFrameDTO ur_flange = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("ur10e"), ModelInstanceId("ur10e.model"), FrameRoleId("flange"),
+      "mf2_tool0", ModelRevision("ur10e.revision")};
+  EXPECT_EQ(speed_check_frames(ur_tcp, ur_flange), std::vector{ur_tcp});
+  EXPECT_EQ(frame_role_id(ResolvedCellFrameDTO{CellId("cell"), "world"}), "");
 }
 
 TEST(RuntimeParticipantPolicy, RefusesEveryMotionInterruptScope) {

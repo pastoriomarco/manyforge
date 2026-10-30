@@ -125,10 +125,11 @@ def test_supported_model_bundle_is_complete_and_digest_bound(model_id: str) -> N
 
     assert manifest["schema"] == "manyforge.retained_robot_model_manifest.v1"
     assert manifest["model_id"] == model_id
+    # The component descriptor describes the bundle; it is not model content.
     expected_files = {
         path.relative_to(model_dir).as_posix()
         for path in model_dir.rglob("*")
-        if path.is_file() and path != manifest_path
+        if path.is_file() and path != manifest_path and path.name != "component.yaml"
     }
     entries = {entry["path"]: entry for entry in manifest["files"]}
     assert set(entries) == expected_files

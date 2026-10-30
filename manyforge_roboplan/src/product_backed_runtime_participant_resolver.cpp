@@ -1,5 +1,6 @@
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "sealed_program_execution_capture.hpp"
+#include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_deployment/program_io_stop_response_validation.hpp>
 
@@ -7,9 +8,12 @@
 #include "manyforge_roboplan/retained_native_runtime.hpp"
 
 #include <algorithm>
+#include <array>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -101,10 +105,9 @@ PhysicallyContainedBy(const core::RuntimeParticipantBinding &physical,
                   }) &&
          IsSubset(available.frame_bindings, value.frame_bindings,
                   [](const auto &left, const auto &right) {
-                    return left.model_instance_id == right.model_instance_id &&
-                           left.model_revision == right.model_revision &&
-                           left.compiled_frame_name ==
-                               right.compiled_frame_name;
+                    // The role keeps rows exact where two roles share one
+                    // frame (a UR5's `flange` and `tcp`).
+                    return core::same_program_frame(left, right);
                   }) &&
          IsSubset(available.resources, value.resources,
                   [](const auto &left, const auto &right) {
@@ -706,6 +709,41 @@ ProductBackedRuntimeParticipantResolver::BindCollisionBodyAliases(
       std::move(binding), collision_body_aliases_);
 }
 
+std::set<core::ControllableComponentId>
+ProductBackedRuntimeParticipantResolver::SelfAndMounted(
+    const core::ControllableComponentId &robot) const {
+  return retained_model_map_.kinematic_index().self_and_mounted(robot);
+}
+
+core::Result<std::vector<core::CollisionBodyId>>
+ProductBackedRuntimeParticipantResolver::ActiveTcpContactBodies(
+    const core::RuntimeParticipantBinding &robot_binding,
+    const std::optional<RobotTcp> &active) const {
+  using Reply = core::Result<std::vector<core::CollisionBodyId>>;
+  if (!active)
+    return Reply::Err({"io_source_unavailable", "Active TCP is unavailable",
+                       {{"reason", "active_tcp_unavailable"}}});
+  auto value = robot_binding.value();
+  const auto robot = value.controllable_component_id;
+  const std::array<RobotTcp, 1> rows{*active};
+  auto endpoint = ResolveRobotTcp(
+      core::TcpSelectorDTO{core::CurrentTcpDTO{}}, robot, rows, active->entry,
+      [](const core::TargetRoleId &) { return std::optional<core::TcpEntryDTO>{}; },
+      [&](const core::TcpEntryDTO &) {
+        return std::pair{value.component_role_id, value.target_role_id};
+      });
+  if (!endpoint.ok()) return Reply::Err(endpoint.error());
+  value.motion_endpoint = std::move(endpoint.value());
+  auto binding = core::verify_runtime_participant_binding(std::move(value));
+  if (!binding.ok()) return Reply::Err(binding.error());
+  auto projected = BindCollisionBodyAliases(std::move(binding.value()));
+  if (!projected.ok()) return Reply::Err(projected.error());
+  std::vector<core::CollisionBodyId> bodies;
+  for (const auto &body : projected.value().value().motion_endpoint->contact_body_bindings)
+    bodies.insert(bodies.end(), body.collision_body_ids.begin(), body.collision_body_ids.end());
+  return Reply::Ok(std::move(bodies));
+}
+
 std::shared_ptr<const deployment::ProgramBindingContract>
 ProductBackedRuntimeParticipantResolver::LoadProgram(
     const core::ProgramId &program_id,
@@ -718,6 +756,53 @@ ProductBackedRuntimeParticipantResolver::LoadProgram(
   }
   return programs_.get_verified(program_id, program_revision,
                                 *retained_bundle_);
+}
+
+core::Result<core::FrameRoleId>
+ProductBackedRuntimeParticipantResolver::ResolveAttachActiveTcp(
+    const core::ProgramBindingId &binding_id, const core::TargetRoleId &holder_role,
+    const std::function<std::optional<RobotTcp>(const core::ControllableComponentId &)> &read) const {
+  using Reply = core::Result<core::FrameRoleId>;
+  const auto binding = LoadProgramBinding(binding_id);
+  if (!binding)
+    return Reply::Err({"attach_holder_unavailable", "Applied holder binding is unavailable", {}});
+  const auto &targets = binding->value().target_role_bindings;
+  const auto holder = std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
+    return row.target_role_id == holder_role;
+  });
+  if (holder == targets.end())
+    return Reply::Err({"attach_holder_unavailable", "Applied holder role is unavailable", {}});
+  const auto &index = retained_model_map_.kinematic_index();
+  auto ancestors = index.ancestors_of(holder->controllable_component_id);
+  ancestors.insert(ancestors.begin(), holder->controllable_component_id);
+  for (const auto &robot : ancestors) {
+    const auto motion = std::find_if(physical_bindings_.begin(), physical_bindings_.end(),
+        [&](const auto &candidate) {
+          return candidate.value().controllable_component_id == robot &&
+                 candidate.value().capability_id.value() == "execution.trajectory.execute";
+        });
+    if (motion == physical_bindings_.end()) continue;
+    const auto active = read(robot);
+    if (!active)
+      return Reply::Err({"attach_active_tcp_unavailable", "The holder's robot has no Active TCP", {}});
+    if (!index.carries(robot, holder->controllable_component_id) ||
+        active->entry.component_id != holder->controllable_component_id ||
+        active->entry.target_id != holder->command_target_id)
+      return Reply::Err({"attach_active_tcp_not_holder", "Active TCP does not belong to the holder", {}});
+    const auto *target = retained_model_map_.find_target(
+        holder->controllable_component_id, holder->command_target_id);
+    if (!target || std::none_of(target->frames.begin(), target->frames.end(), [&](const auto &frame) {
+          const auto *model = std::get_if<deployment::CompositionComponentModelFrame>(&frame.frame);
+          return frame.frame_role_id == active->entry.frame_role_id && model &&
+                 model->controllable_component_id == holder->controllable_component_id &&
+                 model->model_instance_id == active->frame.model_instance_id &&
+                 model->model_revision == active->frame.model_revision &&
+                 model->compiled_frame_name == active->frame.compiled_frame_name;
+        }))
+      return Reply::Err({"attach_active_tcp_not_holder", "Active TCP frame is not a holder frame", {}});
+    return Reply::Ok(active->entry.frame_role_id);
+  }
+  return Reply::Err({"attach_active_tcp_unavailable", "The holder has no carrying robot", {}});
 }
 
 bool ProductBackedRuntimeParticipantResolver::FrameObservationCovered(
@@ -740,7 +825,7 @@ bool ProductBackedRuntimeParticipantResolver::FrameObservationCovered(
       terminal->model_revision != frame.model_revision ||
       terminal->compiled_frame_name != frame.compiled_frame_name)
     return false;
-  const auto *path = retained_model_map_.find_kinematic_frame_path(
+  const auto *path = retained_model_map_.kinematic_index().find_frame_path(
       core::ResolvedComponentModelFrameDTO{
           terminal->controllable_component_id, terminal->model_instance_id,
           terminal->frame_role_id, terminal->compiled_frame_name,
@@ -952,10 +1037,121 @@ ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
   }
 }
 
+namespace {
+
+struct HostRobotTcpOwners final {
+  std::mutex mutex;
+  HostRobotTcpReaders owners;
+};
+
+[[nodiscard]] HostRobotTcpOwners &host_robot_tcp_owners() {
+  static HostRobotTcpOwners owners;
+  return owners;
+}
+
+}  // namespace
+
+void SelectHostRobotTcps(HostRobotTcpReaders readers,
+                         const std::function<void()> &select_composition) {
+  auto &owners = host_robot_tcp_owners();
+  std::lock_guard lock(owners.mutex);
+  select_composition();
+  owners.owners.swap(readers);
+}
+
+std::optional<ActiveTcp> ReadHostRobotTcps(const core::ControllableComponentId &robot) {
+  std::function<std::optional<ActiveTcp>()> read;
+  {
+    auto &owners = host_robot_tcp_owners();
+    std::lock_guard lock(owners.mutex);
+    const auto found = owners.owners.find(robot);
+    if (found == owners.owners.end()) return std::nullopt;
+    read = found->second;
+  }
+  // The owner's own lock is taken outside the registry's.
+  return read();
+}
+
+core::Result<core::RuntimeMotionEndpointBindingDTO>
+ProductBackedRuntimeParticipantResolver::ResolveRobotTcp(
+    const core::TcpSelectorDTO &selector,
+    const core::ControllableComponentId &robot, std::span<const RobotTcp> rows,
+    const std::optional<core::TcpEntryDTO> &active,
+    const std::function<std::optional<core::TcpEntryDTO>(const core::TargetRoleId &)>
+        &default_tcp_of_role,
+    const std::function<std::pair<core::ComponentRoleId, core::TargetRoleId>(
+        const core::TcpEntryDTO &)> &role_of,
+    const bool joint_goal) const {
+  using Endpoint = core::RuntimeMotionEndpointBindingDTO;
+  // C-P2: Current with no Active TCP, or form 2 with no default TCP.
+  const auto no_tcp = [&](const std::optional<core::TargetRoleId> &role) {
+    core::ErrorDTO error{std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+                         "no end-effector TCP; choose one",
+                         {{"reason", "end_effector_tcp_unavailable"}, {"robot", robot.value()}}};
+    if (role) error.details.emplace("role", role->value());
+    return core::Result<Endpoint>::Err(std::move(error));
+  };
+  std::optional<core::TcpEntryDTO> entry;
+  if (std::holds_alternative<core::CurrentTcpDTO>(selector)) {
+    entry = active;
+    // B-run-1: a joint goal needs no TCP; with none it runs at the robot's
+    // own flange. A Cartesian goal still refuses (C-P2).
+    if (!entry && joint_goal) {
+      const auto flange = std::find_if(rows.begin(), rows.end(), [&](const RobotTcp &row) {
+        return row.entry.component_id == robot &&
+               row.entry.frame_role_id == core::FrameRoleId("flange");
+      });
+      if (flange != rows.end()) entry = flange->entry;
+    }
+    if (!entry) return no_tcp(std::nullopt);
+  } else if (const auto *form2 = std::get_if<core::DefaultTcpOfRoleDTO>(&selector)) {
+    entry = default_tcp_of_role(form2->role);
+    if (!entry) return no_tcp(form2->role);
+  } else {
+    entry = std::get<core::TcpEntryDTO>(selector);
+  }
+  // A1-1: the entry must be a TCP of a component in the robot's list.
+  const auto row = std::find_if(rows.begin(), rows.end(),
+                                [&](const RobotTcp &candidate) { return candidate.entry == *entry; });
+  if (row == rows.end())
+    return core::Result<Endpoint>::Err(core::active_tcp_unknown_error(robot, *entry));
+  // T-MQ7: its owner must be carried by the robot (the robot itself or a
+  // tool mounted on it).
+  if (!retained_model_map_.kinematic_index().carries(robot, entry->component_id))
+    return core::Result<Endpoint>::Err(core::tcp_tool_not_mounted_error(robot, *entry));
+  const auto [component_role, target_role] = role_of(*entry);
+  Endpoint endpoint{target_role, entry->target_id, row->frame, {}};
+  // T-C1: the contact bodies are the owner's, from the exact model map.
+  const auto &bodies = retained_model_map_.model_collision_bodies();
+  for (const auto &role : row->frame.contact_body_role_ids) {
+    const auto body = std::find_if(bodies.begin(), bodies.end(), [&](const auto &candidate) {
+      return candidate.owner_component_id == entry->component_id &&
+             candidate.model_instance_id == row->frame.model_instance_id &&
+             candidate.model_revision == row->frame.model_revision &&
+             candidate.collision_body_role_id == role;
+    });
+    if (body == bodies.end())
+      return Reject<Endpoint>("motion endpoint body is absent from its exact frame model",
+                              "runtime_motion_endpoint_body_unresolved",
+                              core::ErrorCode::kInvariantViolation);
+    std::vector<std::string> ids;
+    for (std::size_t index = 0; index < body->compiled_link_names.size(); ++index)
+      ids.push_back(core::make_component_collision_body_id(
+          entry->component_id, row->frame.model_instance_id, role, index));
+    endpoint.contact_body_bindings.push_back(
+        {component_role, target_role, entry->component_id, entry->target_id, std::nullopt,
+         role, row->frame.model_instance_id, row->frame.model_revision, std::move(ids)});
+  }
+  return core::Result<Endpoint>::Ok(std::move(endpoint));
+}
+
 core::Result<core::RuntimeParticipantBinding>
 ProductBackedRuntimeParticipantResolver::Resolve(
     const core::OperationIntentDTO &operation,
-    const std::size_t participant_index) const {
+    const std::size_t participant_index,
+    const RobotTcpReader &supplied_robot_tcps) const {
+  const RobotTcpReader robot_tcps =
+      supplied_robot_tcps ? supplied_robot_tcps : RobotTcpReader(ReadHostRobotTcps);
   try {
     if (participant_index >= operation.participants.size() ||
         operation.expected_retained_bundle_id !=
@@ -982,53 +1178,33 @@ ProductBackedRuntimeParticipantResolver::Resolve(
       }
       if (precomposed->value().io_output_binding)
         return core::Result<core::RuntimeParticipantBinding>::Ok(*precomposed);
-      if (const auto *motion = std::get_if<core::MotionParticipantIntentDTO>(
-              &participant.payload)) {
+      const auto *motion =
+          std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
+      const auto *set_tcp =
+          std::get_if<core::SetTcpParticipantIntentDTO>(&participant.payload);
+      if (motion != nullptr || set_tcp != nullptr) {
         auto value = precomposed->value();
-        const auto &selected = motion->tcp_endpoint;
-        const auto frame =
-            std::find_if(value.frame_bindings.begin(),
-                         value.frame_bindings.end(), [&](const auto &row) {
-                           return row.frame_role_id == selected.frame_role_id;
-                         });
-        if (selected.target_role_id != value.target_role_id ||
-            frame == value.frame_bindings.end())
+        // Robot control: the robot's list and Active TCP from its runtime
+        // owner; there is no Program role, so form 2 has no default.
+        const auto state =
+            robot_tcps ? robot_tcps(value.controllable_component_id) : std::nullopt;
+        if (!state)
           return Reject<core::RuntimeParticipantBinding>(
-              "direct-control TCP endpoint differs from its exact compiled "
-              "target/frame",
+              "direct-control robot has no Active TCP owner",
               "runtime_motion_endpoint_unresolved",
               core::ErrorCode::kMissingReference);
-        core::RuntimeMotionEndpointBindingDTO endpoint{
-            value.target_role_id, value.command_target_id, *frame, {}};
-        for (const auto &role : frame->contact_body_role_ids) {
-          const auto &bodies = retained_model_map_.model_collision_bodies();
-          const auto body =
-              std::find_if(bodies.begin(), bodies.end(), [&](const auto &row) {
-                return row.owner_component_id ==
-                           value.controllable_component_id &&
-                       row.model_instance_id == frame->model_instance_id &&
-                       row.model_revision == frame->model_revision &&
-                       row.collision_body_role_id == role;
-              });
-          if (body == bodies.end())
-            return Reject<core::RuntimeParticipantBinding>(
-                "direct-control endpoint body is absent from its exact frame "
-                "model",
-                "runtime_motion_endpoint_body_unresolved",
-                core::ErrorCode::kInvariantViolation);
-          std::vector<std::string> ids;
-          for (std::size_t index = 0; index < body->compiled_link_names.size();
-               ++index)
-            ids.push_back(core::make_component_collision_body_id(
-                value.controllable_component_id, frame->model_instance_id, role,
-                index));
-          endpoint.contact_body_bindings.push_back(
-              {value.component_role_id, value.target_role_id,
-               value.controllable_component_id, value.command_target_id,
-               std::nullopt, role, frame->model_instance_id,
-               frame->model_revision, std::move(ids)});
-        }
-        value.motion_endpoint = std::move(endpoint);
+        auto endpoint = ResolveRobotTcp(
+            motion != nullptr ? motion->tcp_endpoint : set_tcp->tcp,
+            value.controllable_component_id, state->rows(),
+            state->value() ? std::optional(state->value()->entry) : std::nullopt,
+            [](const core::TargetRoleId &) { return std::optional<core::TcpEntryDTO>{}; },
+            [&](const core::TcpEntryDTO &) {
+              return std::pair{value.component_role_id, value.target_role_id};
+            },
+            motion != nullptr && std::holds_alternative<core::JointGoalDTO>(motion->motion));
+        if (!endpoint.ok())
+          return core::Result<core::RuntimeParticipantBinding>::Err(endpoint.error());
+        value.motion_endpoint = std::move(endpoint.value());
         auto captured =
             core::verify_runtime_participant_binding(std::move(value));
         if (!captured.ok())
@@ -1102,68 +1278,47 @@ ProductBackedRuntimeParticipantResolver::Resolve(
                         supporting),
                     physical),
         std::span<const deployment::RuntimeProgramTargetBinding>(supporting));
-    if (const auto *motion =
-            std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
-        motion != nullptr) {
-      const auto &selected = motion->tcp_endpoint;
+    const auto *motion =
+        std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
+    const auto *set_tcp =
+        std::get_if<core::SetTcpParticipantIntentDTO>(&participant.payload);
+    if (motion != nullptr || set_tcp != nullptr) {
       const auto &targets = binding->value().target_role_bindings;
-      const auto endpoint_target =
-          std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
-            return row.target_role_id == selected.target_role_id;
-          });
-      if (endpoint_target == targets.end() ||
-          endpoint_target->controllable_component_id !=
-              candidate_value.controllable_component_id) {
+      const auto find_role = [&](const core::TargetRoleId &role) {
+        return std::find_if(targets.begin(), targets.end(),
+                            [&](const auto &row) { return row.target_role_id == role; });
+      };
+      const auto moving = find_role(participant.target_role_id);
+      if (moving == targets.end())
         return Reject<core::RuntimeParticipantBinding>(
-            "motion endpoint is not on the exact motion component",
-            "runtime_motion_endpoint_owner_mismatch",
-            core::ErrorCode::kInvalidRequest);
-      }
-      const auto frame = std::find_if(
-          endpoint_target->frame_role_bindings.begin(),
-          endpoint_target->frame_role_bindings.end(), [&](const auto &row) {
-            return row.frame_role_id == selected.frame_role_id;
-          });
-      if (frame == endpoint_target->frame_role_bindings.end()) {
-        return Reject<core::RuntimeParticipantBinding>(
-            "motion endpoint frame is absent from its exact Program target",
-            "runtime_motion_endpoint_unresolved",
-            core::ErrorCode::kMissingReference);
-      }
-      core::RuntimeMotionEndpointBindingDTO endpoint{
-          endpoint_target->target_role_id,
-          endpoint_target->command_target_id,
-          *frame,
-          {}};
-      for (const auto &role : frame->contact_body_role_ids) {
-        const auto body =
-            std::find_if(endpoint_target->collision_body_role_bindings.begin(),
-                         endpoint_target->collision_body_role_bindings.end(),
-                         [&](const auto &row) {
-                           return row.collision_body_role_id == role;
-                         });
-        if (body == endpoint_target->collision_body_role_bindings.end() ||
-            body->model_instance_id != frame->model_instance_id ||
-            body->model_revision != frame->model_revision) {
-          return Reject<core::RuntimeParticipantBinding>(
-              "motion endpoint body is absent from its exact frame model",
-              "runtime_motion_endpoint_body_unresolved",
-              core::ErrorCode::kInvariantViolation);
-        }
-        std::vector<std::string> ids;
-        for (std::size_t index = 0;
-             index < body->compiled_collision_body_names.size(); ++index)
-          ids.push_back(core::make_component_collision_body_id(
-              candidate_value.controllable_component_id,
-              body->model_instance_id, role, index));
-        endpoint.contact_body_bindings.push_back(
-            {endpoint_target->component_role_id,
-             endpoint_target->target_role_id,
-             endpoint_target->controllable_component_id,
-             endpoint_target->command_target_id, std::nullopt, role,
-             body->model_instance_id, body->model_revision, std::move(ids)});
-      }
-      candidate_value.motion_endpoint = std::move(endpoint);
+            "moving target role is absent from its exact Program binding",
+            "runtime_motion_endpoint_unresolved", core::ErrorCode::kMissingReference);
+      const auto &robot = candidate_value.controllable_component_id;
+      const auto state = robot_tcps ? robot_tcps(robot) : std::nullopt;
+      // TCP-A1: the moving role's `robot_tcps` (absent: no list, so every
+      // entry is refused) and each role's `default_tcp` (design 1.2).
+      const auto &rows = moving->robot_tcps;
+      auto endpoint = ResolveRobotTcp(
+          motion != nullptr ? motion->tcp_endpoint : set_tcp->tcp, robot,
+          rows ? std::span<const RobotTcp>(*rows) : std::span<const RobotTcp>(),
+          state && state->value() ? std::optional(state->value()->entry) : std::nullopt,
+          [&](const core::TargetRoleId &role) {
+            const auto row = find_role(role);
+            return row == targets.end() ? std::optional<core::TcpEntryDTO>{} : row->default_tcp;
+          },
+          [&](const core::TcpEntryDTO &entry) {
+            // The owner's Program role when it has one, else the moving one.
+            const auto owner = std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
+              return row.controllable_component_id == entry.component_id &&
+                     row.command_target_id == entry.target_id;
+            });
+            const auto &row = owner == targets.end() ? *moving : *owner;
+            return std::pair{row.component_role_id, row.target_role_id};
+          },
+          motion != nullptr && std::holds_alternative<core::JointGoalDTO>(motion->motion));
+      if (!endpoint.ok())
+        return core::Result<core::RuntimeParticipantBinding>::Err(endpoint.error());
+      candidate_value.motion_endpoint = std::move(endpoint.value());
     }
     auto candidate =
         core::verify_runtime_participant_binding(std::move(candidate_value));
@@ -1223,15 +1378,24 @@ ProductBackedRuntimeParticipantResolver::ValidateExecutionOrigin(
 core::Result<RetainedResolvedParticipant>
 ProductBackedRuntimeParticipantResolver::ResolveExecutionParticipant(
     const core::OperationIntentDTO &operation,
-    const std::size_t participant_index) const {
-  auto binding = Resolve(operation, participant_index);
+    const std::size_t participant_index,
+    const RobotTcpReader &robot_tcps) const {
+  auto binding = Resolve(operation, participant_index, robot_tcps);
   if (!binding.ok())
     return core::Result<RetainedResolvedParticipant>::Err(binding.error());
+  // B7: the endpoint frame's owner (the motion component or a tool mounted on
+  // it) stamps the Kernel request's TCP frame.
+  std::optional<core::ControllableComponentId> endpoint_owner;
+  if (const auto &endpoint = binding.value().value().motion_endpoint)
+    if (const auto *owner = retained_model_map_.kinematic_index().owner_of(
+            endpoint->frame.model_instance_id))
+      endpoint_owner = *owner;
   return core::Result<RetainedResolvedParticipant>::Ok({
       std::move(binding.value()),
       std::binary_search(intrinsic_direct_bindings_.begin(),
                          intrinsic_direct_bindings_.end(),
                          operation.program_binding_id),
+      std::move(endpoint_owner),
   });
 }
 

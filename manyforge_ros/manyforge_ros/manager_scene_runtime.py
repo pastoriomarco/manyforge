@@ -382,20 +382,9 @@ class ManagerSceneRuntimeClient:
             epoch_order = _safe_integer(
                 record["source_epoch_order"], label="source_epoch_order"
             )
-            response_bindings = _pose_observer_bindings(record["bindings"])
+            _pose_observer_bindings(record["bindings"])
         except (TypeError, ValueError) as exc:
             raise _response_invalid("observer-open response is invalid") from exc
-        if (
-            record["cell_id"] != owner.cell_id
-            or response_identity != owner.runtime_identity
-            or record["source_id"] != source_id
-            or record["source_epoch"] != source_epoch
-            or response_bindings != bindings
-        ):
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_response_identity_mismatch",
-                "observer-open response crossed its requested identity",
-            )
         return PoseObserverSession(
             cell_id=owner.cell_id,
             runtime_identity=response_identity,
@@ -548,18 +537,6 @@ class ManagerSceneRuntimeClient:
             # permission to reconstruct the selected application policy here.
         except (TypeError, ValueError) as exc:
             raise _response_invalid("observation response is invalid") from exc
-        if (
-            record["object_id"] != intent.object_id
-            or record["policy_id"] != intent.policy_id
-            or record["source_id"] != session.source_id
-            or record["source_epoch"] != session.source_epoch
-            or epoch_order != session.source_epoch_order
-            or response_sequence != source_sequence
-        ):
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_response_identity_mismatch",
-                "observation response crossed its requested identity",
-            )
         return PoseObservationResult(
             disposition=disposition,
             fresh=record["fresh"],
@@ -756,9 +733,12 @@ class ManagerSceneRuntimeClient:
             {"api_version", "error", "ok"},
             label="Manager scene-runtime failure response",
         )
-        error = _exact_object(
-            failure["error"], {"code", "message"}, label="Manager owner error"
-        )
+        error = failure["error"]
+        # `{code, message}` plus the Manager's `details` and `producer`.
+        if not isinstance(error, dict) or not (
+            {"code", "message"} <= set(error) <= {"code", "details", "message", "producer"}
+        ):
+            raise _response_invalid("Manager owner error has an unknown or missing field")
         try:
             code = _bounded_text(error["code"], label="owner error code")
             message = _bounded_text(

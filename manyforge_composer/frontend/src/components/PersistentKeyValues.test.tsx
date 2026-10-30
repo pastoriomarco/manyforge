@@ -2,7 +2,11 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { PersistentKeyValues } from '../types/api';
-import { PersistentKeyValuesView } from './PersistentKeyValues';
+import {
+  PersistentKeyResetList,
+  PersistentKeyValuesView,
+  persistentKeyResetRows,
+} from './PersistentKeyValues';
 
 function values(programRunId: string | null = null): PersistentKeyValues {
   return {
@@ -140,5 +144,43 @@ describe('stored persistent values', () => {
     expect(markup).toMatch(
       /role="alert">Stored values could not follow the last committed Apply\s*\(persistent_key_storage_unavailable\); none are shown or restored until they can\. read-only file system<\/p>/,
     );
+  });
+});
+
+describe('Reset with Reload initial scene: the stored values it resets', () => {
+  it('lists each stored value with its current and new value; unstored keys are not listed', () => {
+    const current = values();
+    const rows = persistentKeyResetRows({
+      ...current,
+      keys: [
+        ...current.keys,
+        // A read key is reset too; without `initial:` it becomes empty.
+        {
+          key: 'pallets', type: 'int64', access: 'read',
+          initial: undefined, stored: true, value: 12, sequence: 5,
+        },
+      ],
+    });
+
+    expect(rows).toEqual([
+      { key: 'layer', current: '3', next: '0' },
+      { key: 'pallets', current: '12', next: 'empty' },
+    ]);
+    const markup = renderToStaticMarkup(<PersistentKeyResetList rows={rows} />);
+    expect(markup).toContain('Stored values reset to their initial values:');
+    expect(markup).toContain('<li><code>layer</code>: 3 → 0</li>');
+    expect(markup).toContain('<li><code>pallets</code>: 12 → empty</li>');
+  });
+
+  it('shows nothing when no stored value would change', () => {
+    const current = values();
+    const rows = persistentKeyResetRows({
+      ...current,
+      // Already at `initial:`, or not stored at all.
+      keys: [{ ...current.keys[0], value: 0 }, current.keys[1]],
+    });
+
+    expect(rows).toEqual([]);
+    expect(renderToStaticMarkup(<PersistentKeyResetList rows={rows} />)).toBe('');
   });
 });

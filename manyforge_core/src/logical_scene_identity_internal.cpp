@@ -552,6 +552,14 @@ CanonicalValue SceneObject(const SceneObjectSnapshotDTO& object,
        SupportDeclarations(object.support_contacts,
                            std::string(field) + ".support_contacts")},
   };
+  // Absent at zero so massless rows keep their identity bytes.
+  Require(std::isfinite(object.mass_kg) && object.mass_kg >= 0.0,
+          std::string(field) + ".mass_kg must be finite and nonnegative");
+  if (object.mass_kg > 0.0) {
+    result.emplace_back(
+        "mass_kg", Number(object.mass_kg, std::string(field) + ".mass_kg",
+                          true));
+  }
   if (object.provider_evidence.has_value()) {
     result.emplace_back(
         "provider_evidence",
@@ -836,6 +844,8 @@ ContentDigest ComputeSceneObjectCollisionIdentity(
           {0.0, 0.0, 0.0, 1.0},
       };
     }
+    // Mass is payload, not collision geometry.
+    identity_object.mass_kg = 0.0;
     return ContentDigest(manyforge::content_identity::framed_sha256(
         kSceneObjectCollisionIdentityDomain, kLogicalSceneApiVersion,
         SceneObject(identity_object, "scene_object", snapshot_cell)));

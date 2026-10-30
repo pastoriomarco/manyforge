@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!--
+  Minimal SRDF for UR10e + Robotiq 2F-140.
+
+  This is intentionally scoped to the ManyForge/RoboPlan use case:
+  - one arm planning group from base_link_inertia to tool0
+  - disabled collisions for adjacent/fixed robot links
+  - disabled collisions for the rigidly mounted Robotiq assembly
+
+  The gripper actuation group exposes the Robotiq driver joint only.
+-->
+<robot name="ur10e">
+  <group name="arm">
+    <chain base_link="base_link_inertia" tip_link="tool0"/>
+  </group>
+  <disable_collisions link1="base_link" link2="base_link_inertia" reason="Adjacent"/>
+  <disable_collisions link1="base_link_inertia" link2="shoulder_link" reason="Adjacent"/>
+  <disable_collisions link1="shoulder_link" link2="upper_arm_link" reason="Adjacent"/>
+  <disable_collisions link1="upper_arm_link" link2="forearm_link" reason="Adjacent"/>
+  <disable_collisions link1="forearm_link" link2="wrist_1_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_1_link" link2="wrist_2_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_2_link" link2="wrist_3_link" reason="Adjacent"/>
+  <disable_collisions link1="wrist_1_link" link2="wrist_3_link" reason="Never"/>
+  <disable_collisions link1="wrist_3_link" link2="flange" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="tool0" reason="Adjacent"/>
+  <disable_collisions link1="tool0" link2="wrist_1_link" reason="Never"/>
+  <disable_collisions link1="tool0" link2="wrist_2_link" reason="Never"/>
+  <disable_collisions link1="tool0" link2="wrist_3_link" reason="Adjacent"/>
+</robot>

@@ -1,3 +1,5 @@
+import type { SceneRuntimePoseSource } from './api';
+
 export interface ExecutionObservationTarget {
   controllableComponentId: string;
   commandTargetId: string;
@@ -20,6 +22,14 @@ export interface ExecutionObservationFrame {
   sourceSequence: number;
   receivedAtMonotonicUs: number;
   targets: ExecutionObservationTarget[];
+  /** Viewer delivery cursor and current outside observations. */
+  deliverySequence?: number;
+  outsideReceivedAtMonotonicMs?: number;
+  outsidePoseSources?: Array<{
+    source: SceneRuntimePoseSource;
+    ageAtDeliveryNs: number;
+    freshnessBudgetNs: number;
+  }>;
   /**
    * Render-only measured coordinates beside commanded targets (for example a
    * simulator's own joint states). Never the solid robot's pose source.

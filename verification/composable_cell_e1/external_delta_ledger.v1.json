@@ -123,7 +123,7 @@
       "identity": {
         "commit": "099dfa5ccd80b191eb3d6da9f4795f808a63913f",
         "source_content_sha256": "d117c17658a0765f66c39187739e7af4b6533dac68a8aeb5f7dabc3b8fc67bef",
-        "build_content_sha256": "3795ce3459edea67cf83140c2bff2689681e5d39e7b63280730fd41d66929513",
+        "build_content_sha256": "c63dcf4a4e1d4a33285b7493c08438a8d30e621fb88ab70a27223096d0c19ef8",
         "git_archive_sha256": "189ba1dccb9d30c0dd2cc7fbfcc4de0d710060cf56c36dd1a2144a904cf27345",
         "tree": "3ce46cce8b51b21a0eb7b803858cb0750524e5be",
         "version": "0.7.0"
@@ -998,7 +998,7 @@
       "acceptance_evidence": [
         "UI6-I-UA1 0.7 source inspection: upstream roboplan_core still default-constructs and then assigns model-bound Pinocchio scratch",
         "UI6-I-UA1 focused container qualification: exact patched upstream core Scene 26/26 and ManyForge Scene generation 7/7",
-        "third_party/roboplan/patches.sha256 lists this patch in the five-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
         "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md retains the clean 0.6 UBSan reproduction"
       ],
       "rollback_source": "Exact raw RoboPlan 0.7.0 roboplan_core Scene constructor; the frozen 0.6 restoration closure carries roboplan_patch_0005_scene_scratch_construction.",
@@ -1044,7 +1044,7 @@
       "owner_gate": "UI6-I-UA1 dependency-internal correctness decision; UA7 selected-closure qualification",
       "acceptance_evidence": [
         "UI6-I-UA1 focused container qualification: exact patched upstream TOPPRA 17/17 including the patch's own regression cases",
-        "third_party/roboplan/patches.sha256 lists this patch in the five-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
         "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md retains the clean 0.6 reproduction"
       ],
       "rollback_source": "Exact raw RoboPlan 0.7.0 roboplan_toppra; the frozen 0.6 restoration closure carries roboplan_patch_0006_cartesian_duration_arithmetic.",
@@ -1091,7 +1091,7 @@
       "acceptance_evidence": [
         "UI6-I-UA1 0.7 source inspection: the upstream RRT state-space fix does not initialize these lower, upper, and weight members",
         "UI6-I-UA1 focused container qualification: exact patched upstream RRT 16/16 including the warning-as-error construction check, and independent DynoTree initialization 2/2",
-        "third_party/roboplan/patches.sha256 lists this patch in the five-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
         "third_party/roboplan/upstream/roboplan-060-dynotree-variant-initialization.md retains the clean 0.6 reproduction"
       ],
       "rollback_source": "Exact raw RoboPlan 0.7.0 embedded DynoTree header; the frozen 0.6 restoration closure carries roboplan_patch_0008_dynotree_variant_initialization.",
@@ -1138,7 +1138,7 @@
       "acceptance_evidence": [
         "UI6-I-UA1 0.7 source inspection: SimpleIK now uses its own per-solve SceneContext, so the 0.6 SimpleIK half is deliberately not ported",
         "UI6-I-UA1 focused container qualification: exact patched upstream RRT 16/16",
-        "third_party/roboplan/patches.sha256 lists this patch in the five-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation",
         "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md retains the clean 0.6 reproduction"
       ],
       "rollback_source": "Exact raw RoboPlan 0.7.0 PoseConstraint constructor; the frozen 0.6 restoration closure carries roboplan_patch_0009_pinocchio_scratch_direct_initialization.",
@@ -1197,7 +1197,7 @@
         "both production Dockerfiles install every RoboPlan 0.7 distribution once from the patched source and then run pip check",
         "scripts/ci/check-roboplan-dependency-stack.py requires libtoppra and libproxsuite to resolve from the exact source-built closure rather than a competing wheel generation",
         "tests/test_roboplan_dependency_stack.py",
-        "third_party/roboplan/patches.sha256 lists this patch in the five-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation"
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation"
       ],
       "rollback_source": "Exact raw RoboPlan 0.7.0 roboplan_core and roboplan_toppra pyproject.toml dependency lists.",
       "removal_condition": "Delete when the image's native dependency supply matches RoboPlan's declared wheel requirements, or upstream offers an image-supplied native dependency mode, and pip check plus the dependency-stack linkage verifier pass without it.",
@@ -1205,6 +1205,51 @@
         "state": "frozen",
         "selection": "move_to_manyforge_boundary",
         "rationale": "Native Eigen, yaml-cpp, and exact TOPPRA 0.6.10 supply is owned by ManyForge's verified image closure. The metadata-only patch makes RoboPlan's runtime wheel requirements describe that boundary instead of installing competing cmeel generations. It corrects no upstream defect: ordinary wheel consumers still need those requirements, so it is not submitted upstream."
+      }
+    },
+    {
+      "id": "roboplan_patch_0015_scene_collision_pair_margins",
+      "dependency": "RoboPlan",
+      "source_identity_refs": [
+        "roboplan_0_7_0_ua1_foundation"
+      ],
+      "local_sources": [
+        {
+          "kind": "repository_path",
+          "path": "third_party/roboplan/patches/0015-roboplan-070-scene-collision-pair-margins.patch",
+          "sha256": "fdcb0fb10d84f2df9f3f33bb7c37c8c9a5e4ddd9cd9767595894e06a63f93fb1"
+        }
+      ],
+      "guarantee": "RoboPlan 0.7 Scene accepts one finite, non-negative coal security margin per collision pair, rebuilds its broadphase so AABB inflation includes the margins, and SceneContext copies the margins, so RRT and path checks treat bodies closer than their pair margin as colliding.",
+      "consuming_surfaces": [
+        "RoboPlan 0.7 Scene and SceneContext collision checks",
+        "RoboPlan 0.7 RRT and path collision checks in the ManyForge candidate worker"
+      ],
+      "owner_gate": "M6 collision clearance; UA7 selected-closure qualification",
+      "acceptance_evidence": [
+        "RoboPlanSceneTest.TestCollisionPairMargins carried in the patch",
+        "ManyForge worker-protocol, candidate-client, and kernel clearance tests",
+        "third_party/roboplan/patches.sha256 lists this patch in the six-patch 0.7 series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_7_0_ua1_foundation"
+      ],
+      "rollback_source": "Exact raw RoboPlan 0.7.0 Scene and SceneContext; without the patch every pair keeps coal's default margin of zero.",
+      "removal_condition": "Delete after an upstream release provides an equivalent per-pair collision margin that reaches SceneContext-based planners, and the focused Scene, RRT, worker-protocol, and kernel clearance rows pass without it.",
+      "disposition": {
+        "state": "frozen",
+        "selection": "submit_upstream_and_carry_until_released",
+        "rationale": "RoboPlan 0.7 exposes no mutable path to coal's per-pair security margin, and its SceneContext rebuilds collision requests with margin zero. Writing the requests and rebuilding the broadphase is the smallest additive API; ManyForge keeps clearance policy and validation authority.",
+        "upstream_dossier": "third_party/roboplan/upstream/roboplan-070-scene-collision-pair-margins.md",
+        "dossier_fields": [
+          "exact_upstream_source",
+          "dependency_closure",
+          "minimal_reproduction",
+          "impact",
+          "smallest_patch",
+          "focused_regression",
+          "sanitizer_evidence",
+          "compatibility_risk",
+          "intended_upstream_contract",
+          "removal_predicate"
+        ]
       }
     },
     {

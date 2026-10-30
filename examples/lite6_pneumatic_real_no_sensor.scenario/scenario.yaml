@@ -7,35 +7,19 @@
   },
   "description": "Real Lite6 pneumatic example without a grasp sensor: a valve-only gripper on site address lite6_main, illustrative controller GPIO pin 0 and output polarity. Close completes after its dwell; there is no grasp sensor and no workpiece-loss rule. Configure the actual cell wiring and polarity before use; this example is not a hardware qualification.",
   "members": {
-    "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
-    "deployment.yaml": "sha256:bd109afa1342d3eaae0c4b3a2dd0ca72f142828f8f8e885e6a73bc7ecb1fbd68",
-    "program.yaml": "sha256:df8aa3607860e10b5b3ff7431439e5b09f84b0998f64c158f7cdfcb19c3be764"
+    "assignment.yaml": "sha256:93bdcf8158dba12c73f5703fd35335a0aaf83a240e71a6296aa87e7431659d17",
+    "deployment.yaml": "sha256:6f3c96ae66f29de788a51e732886ba7971a1df5165826841850602cc22f63b77",
+    "program.yaml": "sha256:a6941570acfb46a0cb9dacd18244f3d4bc8d27c488508e754180444094fabebb"
   },
   "name": "lite6_pneumatic_real_no_sensor",
   "saved_status": {
-    "checked_content_digest": "sha256:72a92fa29c7988c266146d225a9f5e786f5fdbf63196bb7d0e821129ebfc2890",
+    "checked_content_digest": "sha256:e165310b444efe62c81951829f43ad3fe4d75e17355b4904a306d1cc42f8822f",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
   "scenario_id": "lite6_pneumatic_real_no_sensor",
   "source_snapshot": {
     "entries": [
-      {
-        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
-      },
-      {
-        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
-      },
-      {
-        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
-      },
-      {
-        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
-      },
       {
         "content_digest": "sha256:ac91231b9338ecc99dc4f318854f3288d427dbf7d36d5f1a916b7cdb00e0ee8b",
         "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl"
@@ -93,12 +77,36 @@
         "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
       },
       {
-        "content_digest": "sha256:c205bbe075021433ac03ead6e322d8567b65c8fc98d61a057faffec76b51c787",
+        "content_digest": "sha256:a4be77f1dc363ff0dfd0102f7921a81e09c838ca2d0e2581a829e081ee2f4f9e",
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
+        "content_digest": "sha256:71ab0f5c34f27aebd8dd84ef7da1fb80e6bd250bff0926d801d1dc5578b91349",
         "source_id": "component:lite6_robot:urdf"
+      },
+      {
+        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8f8b5daf8860c6a63f6806bab50772f914ba3503c322ffc96a8af303da41ab90",
+        "source_id": "component:lite_gripper:srdf"
+      },
+      {
+        "content_digest": "sha256:7b1d335778d48bf01e24c96a6ef1281f24f4efd105eb27b49bb9c29e6a3e573b",
+        "source_id": "component:lite_gripper:urdf"
       }
     ],
     "schema_version": "manyforge.scenario.source_snapshot.v1"

@@ -3,10 +3,45 @@
 #include <gtest/gtest.h>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <utility>
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
+TEST(TypedErrorResponseTest, ProducerIsOnTopLevelRpcErrorOnly) {
+  const core::ErrorDTO error{"stale_generation", "stale",
+                             {{"reason", "expected_generation_stale"}}};
+  const auto nested = ErrorValue(error);
+  EXPECT_EQ(nested.find_object_member("producer"), nullptr);
+
+  const auto response = ErrorResponse(error.code, error.message, error.details);
+  const auto *wire_error = response.find_object_member("error");
+  ASSERT_NE(wire_error, nullptr);
+  const auto *producer = wire_error->find_object_member("producer");
+  ASSERT_NE(producer, nullptr);
+  EXPECT_EQ(producer->as_string(), "kernel");
+  EXPECT_EQ(wire_error->find_object_member("code")->as_string(), error.code);
+  EXPECT_EQ(wire_error->find_object_member("details")->as_object().size(), 1U);
+
+  const core::TypedError typed("stale_generation", "stale",
+                               {{"reason", "expected_generation_stale"}},
+                               "component_manager");
+  const auto refused = ExecutionCommandExceptionError(typed);
+  EXPECT_EQ(refused.code, "execution_command_invalid");
+  EXPECT_EQ(refused.message, "stale");
+  EXPECT_EQ(refused.details.at("cause_code"), "stale_generation");
+  EXPECT_EQ(refused.details.at("cause_producer"), "component_manager");
+  const auto typed_response = ErrorResponse(
+      refused.code, refused.message, refused.details);
+  const auto *typed_error = typed_response.find_object_member("error");
+  ASSERT_NE(typed_error, nullptr);
+  const auto *typed_producer = typed_error->find_object_member("producer");
+  ASSERT_NE(typed_producer, nullptr);
+  EXPECT_EQ(typed_producer->as_string(), "kernel");
+  EXPECT_EQ(typed_error->find_object_member("code")->as_string(),
+            "execution_command_invalid");
+}
+
 TEST(IoRuleResultResponseTest,
      PublicProjectionUsesSameClosedEvidenceAsDurableCodec) {
   const auto state = core::rule_codec_test::State();

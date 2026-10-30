@@ -80,7 +80,9 @@
       "collision_body_role_bindings",
       "capability_bindings",
       "signal_role_bindings",
-      "pneumatic_io"
+      "pneumatic_io",
+      "robot_tcps",
+      "default_tcp"
     ],
     "frame": [
       "frame_role_id",
@@ -88,6 +90,17 @@
       "model_revision",
       "compiled_frame_name",
       "contact_body_role_ids"
+    ],
+    "tcp_entry": [
+      "component_id",
+      "target_id",
+      "frame_role_id"
+    ],
+    "robot_tcp": [
+      "entry",
+      "frame",
+      "end_effector",
+      "component_default"
     ],
     "resource": [
       "resource_role_id",
@@ -194,7 +207,9 @@
     ],
     "target": [
       "signal_role_bindings",
-      "pneumatic_io"
+      "pneumatic_io",
+      "robot_tcps",
+      "default_tcp"
     ],
     "frame": [
       "contact_body_role_ids"
@@ -233,6 +248,8 @@
     "collision_name_uniqueness",
     "capability_has_resolution",
     "target_component_correspondence",
+    "robot_tcp_entry_frame_correspondence",
+    "robot_tcp_sorted_unique",
     "finite_contact_ranges",
     "contact_target_collision_model_correspondence",
     "generated_collision_body_ids",

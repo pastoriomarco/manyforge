@@ -597,7 +597,6 @@ core::Result<void> ValidateProgramResetSettlementReadOnly(
     const core::CellAdmissionClaimReleaseDTO& release) {
   if (!ExactReleaseIdentity(claim, release) ||
       claim.intent.claim_kind != core::CellAdmissionClaimKindDTO::kProgramReset ||
-      claim.acquired_admission_generation != claim.intent.expected_admission_generation ||
       release.settlement.settlement_kind != core::CellAdmissionSettlementKindDTO::kExplicitReset)
     return Rejected("Program Reset", "program_reset_release_identity_mismatch");
   try {

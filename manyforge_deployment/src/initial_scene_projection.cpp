@@ -235,6 +235,21 @@ SupportContacts(const CanonicalValue &row) {
   return result;
 }
 
+double MassKg(const CanonicalValue &row) {
+  const auto *metadata = row.find_object_member("metadata");
+  if (metadata == nullptr || metadata->is_null())
+    return 0.0;
+  if (!metadata->is_object())
+    Fail("metadata");
+  const auto *mass = metadata->find_object_member("mass_kg");
+  if (mass == nullptr)
+    return 0.0;
+  const auto value = Number(*mass, "metadata.mass_kg");
+  if (value < 0.0 || value > 1000.0)
+    Fail("metadata.mass_kg");
+  return value;
+}
+
 } // namespace
 
 namespace detail {
@@ -264,7 +279,7 @@ project_initial_scene_roles_value(
         core::Pose3DTO{Vector(Member(pose, "position_m"), "pose.position_m"),
                        Orientation(Member(pose, "orientation"))},
         Frame(Member(pose, "frame_ref"), components, targets, cell_id),
-        SupportContacts(row)});
+        SupportContacts(row), MassKg(row)});
   }
   return result;
 }

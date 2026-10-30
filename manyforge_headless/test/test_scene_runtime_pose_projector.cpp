@@ -107,22 +107,6 @@ public:
   Commit(const core::SceneTransactionRequestDTO &request) override {
     ++commit_count;
     last_request = request;
-    if (compaction_refusals > 0U) {
-      --compaction_refusals;
-      const auto previous = owner_epoch;
-      owner_epoch += ".next";
-      std::map<std::string, std::string> details{
-          {"expected_request_owner_epoch", owner_epoch}};
-      if (compaction_proof) {
-        details.emplace("reason", "scene_history_compaction_no_effect");
-        details.emplace("previous_request_owner_epoch", previous);
-      }
-      return {request.request_context.request_id,
-              core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch, false,
-              core::ErrorDTO{"stale_request_owner_epoch", "epoch rotated", details},
-              std::nullopt, std::nullopt,
-              core::SceneProjectionCommitStatusDTO::kNotAttempted, std::nullopt};
-    }
     if (failure.has_value()) {
       return {
           request.request_context.request_id,
@@ -218,8 +202,6 @@ public:
   std::optional<core::Pose3DTO> detached_at;
   std::size_t commit_count{};
   std::string owner_epoch{"scene-owner.1"};
-  std::size_t compaction_refusals{};
-  bool compaction_proof{true};
   std::size_t detach_refusals{};
 };
 
@@ -240,35 +222,6 @@ ApplyTo(SceneRuntimePoseProjector &projector, const FakeSceneAuthority &scene,
             std::nullopt) {
   return projector.Apply(providers, scene.projection.retained_bundle_id,
                          scene.projection.graph_revision, observation, prior);
-}
-
-TEST(SceneRuntimePoseProjector,
-     RetriesOnlyOneProvenCompactionWithANewRequestIdentity) {
-  for (const auto refusals : {1U, 2U}) {
-    FakeSceneAuthority scene;
-    scene.compaction_refusals = refusals;
-    const core::CellId cell_id("cell.1");
-    SceneRuntimePoseProjector projector(scene, cell_id);
-    const auto result = ApplyTo(projector, scene, {Provider(cell_id)}, Observation());
-    EXPECT_EQ(result.ok(), refusals == 1U);
-    EXPECT_EQ(scene.commit_count, 2U);
-    ASSERT_TRUE(scene.last_request.has_value());
-    EXPECT_TRUE(scene.last_request->request_context.request_id.value().ends_with(
-        ".after-compaction"));
-    EXPECT_EQ(scene.last_request->request_context.request_owner_epoch.value(),
-              "scene-owner.1.next");
-  }
-}
-
-TEST(SceneRuntimePoseProjector, DoesNotRetryUnprovenOldEpochRefusal) {
-  FakeSceneAuthority scene;
-  scene.compaction_refusals = 1U;
-  scene.compaction_proof = false;
-  const core::CellId cell_id("cell.1");
-  SceneRuntimePoseProjector projector(scene, cell_id);
-  const auto result = ApplyTo(projector, scene, {Provider(cell_id)}, Observation());
-  EXPECT_FALSE(result.ok());
-  EXPECT_EQ(scene.commit_count, 1U);
 }
 
 TEST(SceneRuntimePoseProjector,
@@ -872,6 +825,58 @@ deployment::UrdfDocumentIr GripperModel() {
   joint("finger", deployment::UrdfJointType::kRevolute, "gripper_base",
         "finger", {0.0, 0.03, 0.05}, {0.0, 0.0, 0.0});
   return urdf;
+}
+
+// C-P4 (G1): a grasp-lost Stop names the holder and every component it is
+// mounted on, in the Stop selector's id order. On lite6 + lite_gripper a loss
+// at the gripper also stops the arm (before: the gripper alone, so an arm
+// move was not stopped: kAlreadyTerminalNoEffect).
+TEST(SceneRuntimePoseProjector, CarrierStopScopesTheHolderAndEverythingItIsMountedOn) {
+  // The graph DTOs hold strong ids without default constructors.
+  const auto component = [](const char *id) {
+    return core::ControllableComponentDTO{core::ControllableComponentId(id),
+                                          core::ComponentTypeId("type"),
+                                          core::ComponentTypeRevision("1"),
+                                          {},
+                                          {},
+                                          std::nullopt,
+                                          std::nullopt};
+  };
+  const auto mount = [](const char *id, const char *parent, const char *child) {
+    return core::ComponentAttachmentEdgeDTO{
+        core::ComponentAttachmentId(id),
+        core::ComponentAttachmentRevision("1"),
+        {core::ControllableComponentId(parent), core::AttachmentInterfaceId("flange")},
+        {core::ControllableComponentId(child), core::AttachmentInterfaceId("mount")},
+        {},
+        false};
+  };
+  core::CellGraphDTO graph{"manyforge.cell_graph.v1",
+                           core::GraphRevision("graph-1"),
+                           core::CellId("cell"),
+                           {},
+                           {},
+                           {component("lite6_robot"), component("lite_gripper"),
+                            component("ur5_robot")},
+                           {},
+                           {},
+                           {mount("lite6_flange", "lite6_robot", "lite_gripper")}};
+  using Ids = std::vector<core::ControllableComponentId>;
+  EXPECT_EQ(SceneRuntimeCarrierStopComponents(graph, core::ControllableComponentId("lite_gripper")),
+            (Ids{core::ControllableComponentId("lite6_robot"),
+                 core::ControllableComponentId("lite_gripper")}));
+  // A holder mounted on nothing (a fixed gripper, or the arm itself) stops alone.
+  EXPECT_EQ(SceneRuntimeCarrierStopComponents(graph, core::ControllableComponentId("ur5_robot")),
+            (Ids{core::ControllableComponentId("ur5_robot")}));
+  EXPECT_EQ(SceneRuntimeCarrierStopComponents(graph, core::ControllableComponentId("lite6_robot")),
+            (Ids{core::ControllableComponentId("lite6_robot")}));
+  // A chained mount stops the whole chain.
+  graph.controllable_components.push_back(component("a_nozzle"));
+  graph.component_attachments.push_back(mount("gripper_tip", "lite_gripper", "a_nozzle"));
+  EXPECT_EQ(SceneRuntimeCarrierStopComponents(graph, core::ControllableComponentId("a_nozzle")),
+            (Ids{core::ControllableComponentId("a_nozzle"),
+                 core::ControllableComponentId("lite6_robot"),
+                 core::ControllableComponentId("lite_gripper")}));
 }
 
 TEST(SceneRuntimePoseProjector, FixedLinkTransformFollowsOnlyFixedJoints) {

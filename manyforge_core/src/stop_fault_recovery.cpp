@@ -223,16 +223,32 @@ template <typename T>
 
 [[nodiscard]] StopFaultRecoveryStatusDTO derive_status(
     const StopFaultLatchDTO& latch, const StopFaultRecoveryFactsDTO& facts) noexcept {
+  // The Stop's own acceptance and terminal records are always required: the
+  // durable clear joins them.
   if (facts.acceptance_projection.state != StopDurableProjectionStateDTO::kRecorded ||
-      facts.terminal_projection.state != StopDurableProjectionStateDTO::kRecorded ||
-      (facts.surveillance.has_value() &&
-       facts.surveillance_projection.state != StopDurableProjectionStateDTO::kRecorded)) {
+      facts.terminal_projection.state != StopDurableProjectionStateDTO::kRecorded) {
+    return StopFaultRecoveryStatusDTO::kWaitingForDurableRecord;
+  }
+  // M6b (maintainer rule): a robot with no active move and no Stop being
+  // executed is stopped; no further checks. When a no-active-goal fact covers
+  // every captured resource (and the Kernel reports none of them reserved,
+  // dispatched or stopping, below), that replaces the measured-rest
+  // settlement, the post-terminal surveillance (its state and its
+  // checkpoint's durability) and every trigger's rest/reconciliation
+  // obligation. The latch keeps its triggers and persistence_degraded as
+  // history.
+  const bool current_rest =
+      !latch.captured_resources.empty() &&
+      resource_ids(facts.external_reconciliation_facts) == latch.captured_resources;
+  if (!current_rest && facts.surveillance.has_value() &&
+      facts.surveillance_projection.state != StopDurableProjectionStateDTO::kRecorded) {
     return StopFaultRecoveryStatusDTO::kWaitingForDurableRecord;
   }
   // Q32: the component-incident containment is released when its Stop
   // finished as the controller/backend reported (its succeeded certificate),
   // not on an observed measured rest: no settlement or quiescence gate.
-  const bool rest_gated = latch.trigger != StopFaultTriggerDTO::kPhysicalRestUnproven;
+  const bool rest_gated =
+      !current_rest && latch.trigger != StopFaultTriggerDTO::kPhysicalRestUnproven;
   if (rest_gated && any_resource_unavailable(facts)) {
     return StopFaultRecoveryStatusDTO::kWaitingForObservation;
   }
@@ -254,8 +270,10 @@ template <typename T>
   }
   // Every observed trigger's obligation applies: a higher-priority primary
   // (post_reserve_fence_failed) never waives failed_uncontained's external
-  // reconciliation. The rest gate above stays keyed on the primary.
-  if (stop_fault_trigger_observed(latch, StopFaultTriggerDTO::kFailedUncontained) &&
+  // reconciliation. The rest gate above stays keyed on the primary. Current
+  // rest already is that reconciliation for every captured resource.
+  if (!current_rest &&
+      stop_fault_trigger_observed(latch, StopFaultTriggerDTO::kFailedUncontained) &&
       resource_ids(facts.external_reconciliation_facts) != latch.captured_resources) {
     return StopFaultRecoveryStatusDTO::kWaitingForExternalReconciliation;
   }

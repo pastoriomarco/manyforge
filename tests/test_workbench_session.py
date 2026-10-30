@@ -397,8 +397,10 @@ def test_classifier_observes_actual_program_journal_without_instantiating_old_ow
     assert {p.name: (p.read_bytes(), p.stat().st_ino) for p in tmp_path.iterdir() if p.is_file()} == original
 
 
-@pytest.mark.parametrize("schema,expected", [(7, "unresolved"), (9, "unknown")])
-def test_classifier_accepts_old_program_journal_but_not_unknown_future_schema(tmp_path, schema, expected):
+# The schema version is read from the journal's own metadata row, not pinned:
+# any formatted version is classified by its rows; an unformatted row is unknown.
+@pytest.mark.parametrize("schema,expected", [(7, "unresolved"), (9, "unresolved"), (0, "unknown")])
+def test_classifier_reads_program_journal_schema_from_its_metadata_row(tmp_path, schema, expected):
     path = tmp_path / "program-cycle.sqlite3"
     # These are the schema-7 owner columns and two request tables read by the
     # cold-session classifier (85893f0c^). Schema 8 only added the Reset claim.
@@ -426,7 +428,9 @@ def test_classifier_accepts_old_program_journal_but_not_unknown_future_schema(tm
              acquisition_pending_json,execution_control_revision)
             VALUES(1,1,'starting','fixture.old','run.1',0,'{}',1)""")
     original = path.read_bytes()
-    assert sessions.classify_effects(tmp_path) == expected
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert ("program_cycle" in unresolved and "program_cycle" not in unknown) is (expected == "unresolved")
+    assert ("program_cycle" in unknown) is (expected == "unknown")
     assert path.read_bytes() == original
 
 
@@ -529,17 +533,18 @@ def test_classifier_reads_v16_and_v17_kernel_stop_records_alike(tmp_path, versio
     assert path.read_bytes() == original
 
 
-@pytest.mark.parametrize("version", [15, 18])
-def test_classifier_keeps_other_kernel_journal_versions_unknown(tmp_path, version):
+@pytest.mark.parametrize("version,known", [(15, True), (18, True), (0, False)])
+def test_classifier_reads_kernel_journal_version_from_its_metadata(tmp_path, version, known):
     path = kernel_archive(tmp_path, 17, "terminal")
     with closing(sqlite3.connect(path)) as database:
         database.execute(f"PRAGMA user_version={version}")
-    _, unknown, _ = sessions._effect_observations(tmp_path)
-    assert "kernel_operation" in unknown
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert ("kernel_operation" not in unknown) is known
+    assert "kernel_operation" not in unresolved
 
 
-@pytest.mark.parametrize("version,known", [(21, True), (19, False)])
-def test_classifier_accepts_current_cclc_journal(tmp_path, version, known):
+@pytest.mark.parametrize("version,known", [(21, True), (19, True), (22, True), (0, False)])
+def test_classifier_reads_cclc_journal_version_from_its_metadata(tmp_path, version, known):
     path = tmp_path / "execution-state/cclc-journal.sqlite3"
     path.parent.mkdir(parents=True)
     # Columns read by the cclc predicates; all exist in the v21 owner DDL.
@@ -560,8 +565,8 @@ def test_classifier_accepts_current_cclc_journal(tmp_path, version, known):
     assert "cclc" not in unresolved
 
 
-@pytest.mark.parametrize("version,known", [(19, True), (17, False)])
-def test_classifier_accepts_current_manager_apply_journal(tmp_path, version, known):
+@pytest.mark.parametrize("version,known", [(19, True), (20, True), (0, False)])
+def test_classifier_reads_manager_apply_journal_version_from_its_metadata(tmp_path, version, known):
     # The Manager owners' own resource DDL, including their SQLite identity.
     resources = Path(__file__).resolve().parents[1] / "manyforge_component_manager/resources"
     (tmp_path / "manager").mkdir()
@@ -575,3 +580,30 @@ def test_classifier_accepts_current_manager_apply_journal(tmp_path, version, kno
     _, unknown, unresolved = sessions._effect_observations(tmp_path)
     assert ("manager" not in unknown) is known
     assert "manager" not in unresolved
+
+
+def test_classifier_never_reports_a_family_unknown_for_a_newer_schema_version(tmp_path):
+    # Tiny archive with the cclc metadata of a schema version the classifier
+    # has never seen: the version comes from the journal itself, so a clean
+    # journal of that family is classified by its rows, not marked unknown.
+    path = tmp_path / "execution-state/cclc-journal.sqlite3"
+    path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(path)) as database, database:
+        database.executescript("""
+            CREATE TABLE lifecycle_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
+            CREATE TABLE route_selection_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
+            CREATE TABLE cclc_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
+            CREATE TABLE cclc_route_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
+            CREATE TABLE cclc_lifecycle_cell_claims(claim_sequence INTEGER PRIMARY KEY, release_receipt_recorded INTEGER NOT NULL);
+            CREATE TABLE cclc_native_apply_reservations(reservation_id TEXT PRIMARY KEY);
+            CREATE TABLE cclc_component_incidents(incident_id TEXT PRIMARY KEY, acknowledged INTEGER);
+            INSERT INTO cclc_component_incidents VALUES('incident.1', 1);
+        """)
+        database.execute(f"PRAGMA application_id={0x4D464C4A}")
+        database.execute("PRAGMA user_version=99")
+    kernel_archive(tmp_path, 17, "cleared")
+    with closing(sqlite3.connect(tmp_path / "execution-state/operation-journal.sqlite3")) as database:
+        database.execute("PRAGMA user_version=99")
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert "cclc" not in unknown and "kernel_operation" not in unknown
+    assert "cclc" not in unresolved and "kernel_operation" not in unresolved

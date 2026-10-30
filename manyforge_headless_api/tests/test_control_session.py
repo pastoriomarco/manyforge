@@ -1574,6 +1574,7 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     [
         ({"state": "running"}, "critical"),
         ({**_cycle(), "node_status_revision": 0}, "critical"),
+        ({**_cycle(), "state": "secret-frame-value"}, "critical"),
         (
             {
                 key: value
@@ -1609,7 +1610,7 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     ],
 )
 def test_program_source_recovers_same_current_cycle_after_malformed_identity(
-    monkeypatch, malformed, event_class
+    monkeypatch, caplog, malformed, event_class
 ) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
@@ -1673,6 +1674,8 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
             # without dropping either browser or poisoning the cached cycle.
             requests.put_nowait((malformed, event_class))
             assert await asyncio.wait_for(attempts.get(), 1) == 2
+            assert "Program control source failure: type=" in caplog.text
+            assert "secret-frame-value" not in caplog.text
             assert source.semantic_context().status == "unavailable"
             assert source._cycle == _cycle()  # noqa: SLF001
             assert source.take(first) is None and source.take(second) is None
@@ -1688,6 +1691,89 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
             await source.unsubscribe(first)
             await source.unsubscribe(second)
             assert source._runner_task is None  # noqa: SLF001
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_program_source_logs_typed_owner_error(monkeypatch, caplog) -> None:
+    async def exercise() -> None:
+        attempts: asyncio.Queue[int] = asyncio.Queue()
+        count = 0
+
+        class Upstream:
+            async def __aenter__(self):
+                nonlocal count
+                count += 1
+                attempts.put_nowait(count)
+                raise HeadlessApiError(
+                    "program_cycle_reset_phase_invalid", "secret-message", details={"secret": "secret-detail"},
+                    producer="program_runner",
+                )
+
+            async def __aexit__(self, *_args):
+                return None
+
+        monkeypatch.setattr(
+            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
+        )
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle), ingress,
+            program_runner_websocket_url="ws://runner.test/state",
+        )
+        subscription = await source.subscribe()
+        try:
+            assert await asyncio.wait_for(attempts.get(), 1) == 1
+            assert await asyncio.wait_for(attempts.get(), 1) == 2
+            assert "type=HeadlessApiError code=program_cycle_reset_phase_invalid" in caplog.text
+            assert "secret-message" not in caplog.text
+            assert "secret-detail" not in caplog.text
+            assert caplog.text.count("Program control source failure:") == 1
+            assert source.semantic_context().status == "unavailable"
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_program_source_logs_clean_peer_close(monkeypatch, caplog) -> None:
+    async def exercise() -> None:
+        attempts: asyncio.Queue[None] = asyncio.Queue()
+
+        class Upstream:
+            async def __aenter__(self):
+                attempts.put_nowait(None)
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+        monkeypatch.setattr(
+            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
+        )
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle), ingress,
+            program_runner_websocket_url="ws://runner.test/state",
+        )
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(attempts.get(), 1)
+            await asyncio.wait_for(attempts.get(), 1)
+            await asyncio.wait_for(attempts.get(), 1)
+            assert "Program control source failure: type=peer_closed" in caplog.text
+            assert caplog.text.count("Program control source failure:") == 1
+            assert source.semantic_context().status == "unavailable"
+        finally:
+            await source.unsubscribe(subscription)
             ingress.close()
 
     asyncio.run(exercise())
@@ -2370,6 +2456,10 @@ def test_group_stop_and_resume_are_critical_without_a_cycle_revision_change() ->
         _program_event_class(cycle("held"), cycle("held", held_node_count=2))
         == "node_progress"
     )
+    assert _program_event_class(
+        cycle("mixed", ordinary_held_node_count=0),
+        cycle("mixed", ordinary_held_node_count=1),
+    ) == "critical"
     assert (
         _program_event_class(cycle("held"), cycle("held", resume_allowed=False))
         == "critical"
@@ -2553,6 +2643,19 @@ def _control_with_pose(positions: list[float]) -> tuple[dict[str, Any], dict[str
         {"ok": True, "identity": identity, "targets": []},
         {"ok": True, "identity": identity, "control_state": {"observed_targets": [row]}},
     )
+
+
+def test_active_tcp_is_a_meaningful_control_change_but_joint_samples_are_not() -> None:
+    _targets, before = _control_with_pose([0.0])
+    _targets, after = _control_with_pose([0.4])
+    first = {"entry": None, "display": None, "owner_epoch": "execution.1",
+             "registration_generation": 1, "sequence": 0}
+    before["control_state"]["observed_targets"][0]["active_tcp"] = first
+    after["control_state"]["observed_targets"][0]["active_tcp"] = dict(first)
+    key = control_state_module._meaningful_execution_control_key  # noqa: SLF001
+    assert key(before) == key(after)
+    after["control_state"]["observed_targets"][0]["active_tcp"]["sequence"] = 1
+    assert key(before) != key(after)
 
 
 def test_settled_motion_publishes_rest_pose_that_samples_alone_do_not() -> None:

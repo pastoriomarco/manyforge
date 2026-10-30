@@ -1,9 +1,10 @@
 /**
  * Opens a surface's own settings without sharing their state: each surface
  * listens for its own name and opens its panel. "program" is the Program
- * settings, which include how the tree editor draws the Program.
+ * settings, which include how the tree editor draws the Program; "robot" is
+ * the viewer's Robot Control panel (a Components page links to it).
  */
-export type SettingsSurface = 'viewer' | 'program';
+export type SettingsSurface = 'viewer' | 'program' | 'robot';
 
 const OPEN_SETTINGS_EVENT = 'manyforge:open-settings';
 

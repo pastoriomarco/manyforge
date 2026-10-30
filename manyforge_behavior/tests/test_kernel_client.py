@@ -22,14 +22,12 @@ from manyforge_behavior.kernel_client import (
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("request_id", "another.request"),
-        ("action", "reset_cycle"),
         ("accepted", 1),
         ("accepted", "true"),
         ("resulting_assessment", None),
     ],
 )
-def test_recovery_result_must_match_the_exact_request(field, value) -> None:
+def test_recovery_result_must_have_its_shape(field, value) -> None:
     request = {"request_id": "recovery.1", "action": "acknowledge_and_continue"}
     result = {**request, "accepted": True, "resulting_assessment": {}, field: value}
 
@@ -40,6 +38,19 @@ def test_recovery_result_must_match_the_exact_request(field, value) -> None:
 
     with pytest.raises(KernelClientResponseError, match="exact owner result"):
         KernelClient(Transport()).recover("operation.1", 3, request)
+
+
+def test_recovery_result_echo_is_not_compared() -> None:
+    # Each exchange is its own connection: the echoed identity is not compared.
+    request = {"request_id": "recovery.1", "action": "acknowledge_and_continue"}
+    result = {"request_id": "another.request", "action": "reset_cycle",
+              "accepted": True, "resulting_assessment": {}}
+
+    class Transport(FakeTransport):
+        def apply_operation_recovery(self, operation_id, revision, body):
+            return {"ok": True, "result": result}
+
+    assert KernelClient(Transport()).recover("operation.1", 3, request) == result
 
 
 class FakeTransport:

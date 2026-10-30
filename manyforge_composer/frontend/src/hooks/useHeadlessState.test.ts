@@ -802,6 +802,8 @@ function wireObservation(sequence: number): Record<string, unknown> {
     graph_revision: 'graph-1',
     source_epoch: 'joint-source.1',
     source_sequence: sequence,
+    delivery_sequence: sequence,
+    outside_pose_sources: [],
     received_at_monotonic_us: 10_000 + sequence,
     targets: [{
       controllable_component_id: 'robot-1', command_target_id: 'arm',
@@ -865,7 +867,7 @@ describe('zero-physical-component viewer demand', () => {
     return shell;
   }
 
-  function setup(demand = true) {
+  function setup(demand = true, initialRate: number | null = 30) {
     vi.useFakeTimers();
     Socket.instances = [];
     vi.stubGlobal('window', {
@@ -874,6 +876,7 @@ describe('zero-physical-component viewer demand', () => {
     });
     vi.stubGlobal('WebSocket', Socket);
     const source = new HeadlessStateSource();
+    if (initialRate !== null) source.setViewerPoseRateHz(initialRate);
     if (demand) source.setViewerDemand(true);
     source.setEnabled(true);
     const control = Socket.instances.find((socket) => new URL(socket.url).pathname === '/ws/control')!;
@@ -931,6 +934,105 @@ describe('zero-physical-component viewer demand', () => {
     expect(viewer.sent).toHaveLength(creditCount);
     expect(source.getLatestExecutionObservation()).toBeNull();
     expect(source.getExecutionObservationTransportStatus().phase).toBe('no_robot_loaded');
+    source.dispose();
+  });
+
+  it('credits the configured pose rate on initial, applied, renewal, and live changes', () => {
+    const { source, control, viewers, advanceConnected } = setup(false, null);
+    receiveControlSnapshot(control, publication(1, false));
+    source.setViewerDemand(true);
+    const viewer = viewers()[0]!;
+    viewer.onopen?.();
+    expect(viewer.sent).toEqual([]); // wait for the active graphics profile
+    for (const rate of [0, 4, 61, 5.5, NaN, Infinity]) {
+      expect(() => source.setViewerPoseRateHz(rate)).toThrow();
+    }
+    expect(viewer.sent).toEqual([]);
+    source.setViewerPoseRateHz(20);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: null, pose_rate_hz: 20 });
+    source.setViewerPoseRateHz(25);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: null, pose_rate_hz: 25 });
+    const creditCount = viewer.sent.length;
+    source.setViewerPoseRateHz(25);
+    expect(viewer.sent).toHaveLength(creditCount);
+    viewer.receive(wireObservation(1));
+    source.markExecutionObservationApplied(source.getLatestExecutionObservation()!);
+    const applied = {
+      owner_epoch: 'execution-owner.1', source_epoch: 'joint-source.1',
+      source_sequence: 1, delivery_sequence: 1,
+    };
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 25 });
+    source.setViewerPoseRateHz(5);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 5 });
+    source.setViewerPoseRateHz(60);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 60 });
+    const beforeRenewal = viewer.sent.length;
+    advanceConnected(15_000);
+    expect(viewer.sent.length).toBeGreaterThan(beforeRenewal);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 60 });
+    // A rate update while frame 2 is unapplied must credit frame 1, not frame 2.
+    viewer.receive(wireObservation(2));
+    source.setViewerPoseRateHz(30);
+    expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 30 });
+    viewer.onerror?.(); viewer.onclose?.();
+    advanceConnected(1_000);
+    const replacement = viewers().at(-1)!;
+    expect(replacement).not.toBe(viewer);
+    replacement.onopen?.();
+    expect(JSON.parse(replacement.sent[0]!)).toMatchObject({ last_applied: null, pose_rate_hz: 30 });
+    source.setViewerPoseRateHz(20);
+    expect(JSON.parse(replacement.sent.at(-1)!)).toMatchObject({ last_applied: null, pose_rate_hz: 20 });
+    replacement.receive(wireObservation(3));
+    source.markExecutionObservationApplied(source.getLatestExecutionObservation()!);
+    expect(JSON.parse(replacement.sent.at(-1)!)).toMatchObject({
+      last_applied: { ...applied, source_sequence: 3, delivery_sequence: 3 }, pose_rate_hz: 20,
+    });
+    source.dispose();
+  });
+
+  it('uses a profile initialized before the viewer opens', () => {
+    const { source, control, viewers } = setup(false, 12);
+    receiveControlSnapshot(control, publication(1, false));
+    source.setViewerDemand(true);
+    const viewer = viewers()[0]!;
+    viewer.onopen?.();
+    expect(JSON.parse(viewer.sent[0]!)).toMatchObject({ last_applied: null, pose_rate_hz: 12 });
+    source.dispose();
+  });
+
+  it('expires outside samples without another frame and removes them on disconnect', () => {
+    const { source, control, viewers } = setup(false);
+    receiveControlSnapshot(control, publication(1, false));
+    source.setViewerDemand(true);
+    const viewer = viewers()[0]!;
+    viewer.onopen?.();
+    const frame = wireObservation(1);
+    frame.outside_pose_sources = [{
+      source: {
+        buffered: false, eligible: false, expires_at_ns: 2_000_000_000,
+        fresh: true, object_id: 'robot-1', observed_at_ns: 1_000_000_000,
+        payload: { api_version: 'manyforge.ros_pose_observation.v2', kind: 'joint_state',
+          joint_names: ['joint1'], positions: [0.5], source_stamp_ns: null, topic: '/joints' },
+        payload_quality: 'good', policy_id: 'viewer.measured_robot', source_epoch: 'epoch-1',
+        source_epoch_order: 1, source_id: 'observer-1', source_sequence: 1,
+      },
+      age_at_delivery_ns: 250_000_000, freshness_budget_ns: 1_000_000_000,
+    }];
+    const listener = vi.fn();
+    source.subscribeExecutionObservation(listener);
+    viewer.receive(frame);
+    expect(source.getLatestExecutionObservation()?.outsidePoseSources).toHaveLength(1);
+    vi.advanceTimersByTime(751);
+    expect(source.getLatestExecutionObservation()?.outsidePoseSources).toEqual([]);
+    expect(listener).toHaveBeenCalled();
+
+    const next = { ...frame, delivery_sequence: 2 };
+    viewer.receive(next);
+    expect(source.getLatestExecutionObservation()?.outsidePoseSources).toHaveLength(1);
+    viewer.onerror?.();
+    expect(source.getLatestExecutionObservation()?.outsidePoseSources).toEqual([]);
+    viewer.onclose?.();
+    expect(source.getLatestExecutionObservation()?.outsidePoseSources ?? []).toEqual([]);
     source.dispose();
   });
 
@@ -1055,6 +1157,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     vi.stubGlobal('fetch', fetch);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -1127,6 +1230,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('fetch', sent);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -1177,18 +1281,19 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     try {
-      // The captured Trial-E Execute refusal (HTTP 409 from Kernel admission).
+      // A Kernel admission Reject refusal (HTTP 409).
       vi.stubGlobal('fetch', vi.fn(async () => ({
         ok: false,
         status: 409,
         json: async () => ({
           detail: {
-            code: 'stale_generation',
-            details: { reason: 'expected_generation_stale' },
+            code: 'request_ledger_full',
+            details: { reason: 'claim_capacity_exhausted' },
             message: 'cell-admission request rejected',
           },
         }),
@@ -1196,7 +1301,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       await expect(source.sendExecutionCommand(
         'program_run', { scenario_id: 'lite6' }, 'run.http.refused',
       )).rejects.toThrow(
-        /^cell-admission request rejected \(Reason: expected_generation_stale\)$/,
+        /^Too many retained requests: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
       );
 
       vi.stubGlobal('fetch', vi.fn(async () => ({
@@ -1226,10 +1331,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
           },
         }),
       })));
-      await expect(source.sendExecutionCommand(
+      const rejection = await source.sendExecutionCommand(
         'program_run', { scenario_id: 'lite6' }, 'run.http.rejected',
-      )).rejects.toThrow(
-        /^invalid_request: cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
+      ).catch((error: unknown) => error);
+      expect(rejection).toMatchObject({ executionResult: { ok: false, error: {
+        code: 'invalid_request', details: { reason: 'claim_capacity_exhausted' },
+      } } });
+      expect((rejection as Error).message).toMatch(
+        /^invalid_request: Request is invalid: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
       );
 
       const pending = source.sendExecutionCommand('program_reset', {}, 'reset.ws.rejected');
@@ -1250,21 +1359,92 @@ describe('HeadlessStateSource delivery scheduling', () => {
           received_server_sequence: '12',
           received_monotonic_ns: '102',
           disposition: 'rejected',
-          code: 'stale_generation',
+          code: 'request_ledger_full',
           semantic_owner_epoch: 'runner.epoch.1',
           execution_control_revision: 1,
           current_identity: null,
         },
         result: {
-          code: 'stale_generation',
+          code: 'request_ledger_full',
           correlation_id: 'reset.ws.rejected',
           message: 'cell-admission request rejected',
-          details: { reason: 'expected_generation_stale' },
+          details: { reason: 'claim_capacity_exhausted' },
         },
       });
       await expect(pending).rejects.toThrow(
-        /^stale_generation: cell-admission request rejected \(Reason: expected_generation_stale\)$/,
+        /^request_ledger_full: Too many retained requests: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
       );
+    } finally {
+      source.dispose();
+    }
+  });
+
+  it('sends a refused motion command once: no re-arm loop, no Recover', async () => {
+    // M6 ADAPTERM: the robot's own adapter re-engages it inside the admitted
+    // motion; Composer neither re-arms nor re-sends a refused command.
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    try {
+      const fetch = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          receipt: {
+            schema_version: 'manyforge.execution_command_receipt.v1',
+            correlation_id: 'run.refused.once',
+            control_session_id: null,
+            client_sequence: null,
+            receiver_incarnation: 'headless.receiver.1',
+            received_server_sequence: '21',
+            received_monotonic_ns: '121',
+            disposition: 'rejected',
+            code: 'component_rearm_required',
+            semantic_owner_epoch: 'runner.epoch.1',
+            execution_control_revision: 1,
+          },
+          result: {
+            ok: false,
+            error: {
+              code: 'component_rearm_required',
+              message: 'the robot was moved from its own interface',
+              details: { reason: 'moved_externally', controllable_component_id: 'arm' },
+            },
+          },
+        }),
+      }));
+      vi.stubGlobal('fetch', fetch);
+      await expect(source.sendExecutionCommand(
+        'program_run', { scenario_id: 'lite6' }, 'run.refused.once',
+      )).rejects.toThrow(/^component_rearm_required: Robot was moved outside ManyForge/);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String((fetch.mock.calls[0] as unknown[])[0])).not.toContain('/cclc/');
     } finally {
       source.dispose();
     }
@@ -1335,6 +1515,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     let shellNotifications = 0;
     let viewerNotifications = 0;
     let observationNotifications = 0;
@@ -1389,6 +1570,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setViewerDemand(true);
     source.setEnabled(true);
     const firstSocket = FakeWebSocket.instances.find(
@@ -1438,6 +1620,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setViewerDemand(true);
     source.setEnabled(true);
     source.reconnect();
@@ -1475,6 +1658,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const first = wireState(1);
@@ -1554,6 +1738,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const runtimeAt = (sample: number, scene = logicalScenePayload(sample)) => {
@@ -1643,6 +1828,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const initial = wireState(1);
@@ -1694,6 +1880,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('window', { location: { href: 'http://composer.test/' } });
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const initial = wireState(1);
@@ -1823,6 +2010,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const first = wireState(1);
@@ -1928,6 +2116,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     let viewerNotifications = 0;
     let shellNotifications = 0;
     source.subscribeViewer(() => { viewerNotifications += 1; });
@@ -2021,6 +2210,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     const initialCreations = getHeadlessStateQualificationSnapshot().socketCreations;
     source.setViewerDemand(true);
     source.setEnabled(true);
@@ -2121,6 +2311,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     const applied: number[] = [];
     source.subscribeExecutionObservation(() => {
       const frame = source.getLatestExecutionObservation();
@@ -2251,6 +2442,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     let observationNotifications = 0;
     source.subscribeExecutionObservation(() => { observationNotifications += 1; });
     source.setViewerDemand(true);
@@ -2319,6 +2511,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(7));
@@ -2375,6 +2568,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -2448,6 +2642,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     const rulesChanged = vi.fn();
     source.subscribeGlobalRules(rulesChanged);
     source.setEnabled(true);
@@ -2535,6 +2730,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     const rulesChanged = vi.fn();
     source.subscribeGlobalRules(rulesChanged);
     source.setEnabled(true);
@@ -2621,6 +2817,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -2692,6 +2889,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       shell: { complete: false, runtime },
     });
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -2760,6 +2958,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -2823,6 +3022,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     receiveControl(FakeWebSocket.shell, {
       schema_version: 'manyforge.execution_control.v2',
@@ -2879,6 +3079,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     const first = FakeWebSocket.instances[0]!;
     synchronizeControl(first);
@@ -2933,6 +3134,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -2976,6 +3178,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
@@ -3086,6 +3289,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     const first = FakeWebSocket.instances[0]!;
     synchronizeControl(first);
@@ -3162,6 +3366,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     const socket = FakeWebSocket.shell;
     synchronizeControl(socket);
@@ -3251,6 +3456,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));

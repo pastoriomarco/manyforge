@@ -2,7 +2,7 @@
   "api_version": "manyforge.program.v2",
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.8.0"
+    "content_version": "2.9.0"
   },
   "compatibility": {
     "assistant": "optional",
@@ -102,6 +102,7 @@
           "instance_id": "move_to_pick_approach",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": {
@@ -130,8 +131,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -146,6 +146,7 @@
           "instance_id": "move_to_pick",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30,
             "goal": {
@@ -174,8 +175,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -235,6 +235,7 @@
           "instance_id": "pick_retreat",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": {
@@ -255,12 +256,12 @@
             "target_mode": "relative",
             "target_reference": {
               "frame_role_id": "tcp",
+              "target_role": "gripper",
               "type": "frame_role"
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -275,6 +276,7 @@
           "instance_id": "move_to_drop_approach",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": {
@@ -303,8 +305,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -319,6 +320,7 @@
           "instance_id": "move_to_drop",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": {
@@ -348,8 +350,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -405,6 +406,7 @@
           "instance_id": "drop_retreat",
           "node_id": "motion.move_to_pose",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": {
@@ -433,8 +435,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -449,6 +450,7 @@
           "instance_id": "return_rest",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
+            "acceleration_scale": 0.8,
             "base_frame_role": "base",
             "execution_timeout_s": 30.0,
             "goal": [
@@ -480,8 +482,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -751,8 +752,7 @@
         "arm_collision"
       ],
       "required_frame_roles": [
-        "base",
-        "tcp"
+        "base"
       ],
       "required_model_roles": [
         "arm_model"

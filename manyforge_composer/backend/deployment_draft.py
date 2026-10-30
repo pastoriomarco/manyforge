@@ -777,10 +777,13 @@ def _edit_motion_target_limit(
     controllable_component_id: str,
     command_target_id: str,
     maximum_tcp_linear_speed_mps: float,
+    tcp_speed_check: str | None = None,
 ) -> dict[str, Any]:
     """Edit one exact Deployment-owned target ceiling.
 
     This authored ceiling is the target's sole configured TCP-speed maximum.
+    `tcp_speed_check` (None keeps the stored value) chooses the points where
+    that ceiling is held: the active TCP, or the active TCP and the flange.
     """
 
     if (
@@ -825,6 +828,8 @@ def _edit_motion_target_limit(
         matches[0]["maximum_tcp_linear_speed_mps"] = float(
             maximum_tcp_linear_speed_mps
         )
+        if tcp_speed_check is not None:
+            matches[0]["tcp_speed_check"] = tcp_speed_check
         try:
             return validate_deployment_intent(
                 candidate, source="<Deployment Draft mutation>"
@@ -867,6 +872,8 @@ def _edit_motion_target_limit(
             status_code=409,
         )
     matches[0]["maximum_tcp_linear_speed_mps"] = float(maximum_tcp_linear_speed_mps)
+    if tcp_speed_check is not None:
+        matches[0]["tcp_speed_check"] = tcp_speed_check
     return candidate
 
 
@@ -963,6 +970,34 @@ class DeploymentDraftSession:
             candidate = _edit_at_path(self._compiled.document, path, value, operation)
         return self._compiler(_source(candidate))
 
+    def preview_component_addition(
+        self,
+        components: Sequence[Any],
+        attachments: Sequence[Any],
+        *,
+        draft_id: str,
+        expected_revision: int,
+    ) -> CompiledDeploymentDocument:
+        """Append component rows and their attachment rows (Add component)."""
+
+        with self._lock:
+            self._require_current(draft_id, expected_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before editing",
+                    status_code=404,
+                )
+            if self._compiled.document.get("api_version") != DEPLOYMENT_INTENT_API_VERSION:
+                _fail(
+                    "deployment_component_addition_unavailable",
+                    "Add component needs a source-referenced Deployment intent",
+                )
+            candidate = deepcopy(self._compiled.document)
+            candidate["components"] = [*candidate["components"], *deepcopy(list(components))]
+            candidate["attachments"] = [*candidate["attachments"], *deepcopy(list(attachments))]
+        return self._compiler(_source(candidate))
+
     def preview_controlled_stop_update(
         self,
         profile: dict[str, Any] | None,
@@ -996,6 +1031,7 @@ class DeploymentDraftSession:
         maximum_tcp_linear_speed_mps: float,
         draft_id: str,
         expected_revision: int,
+        tcp_speed_check: str | None = None,
     ) -> CompiledDeploymentDocument:
         with self._lock:
             self._require_current(draft_id, expected_revision)
@@ -1010,6 +1046,7 @@ class DeploymentDraftSession:
                 controllable_component_id=controllable_component_id,
                 command_target_id=command_target_id,
                 maximum_tcp_linear_speed_mps=maximum_tcp_linear_speed_mps,
+                tcp_speed_check=tcp_speed_check,
             )
         return self._compiler(_source(candidate))
 

@@ -21,6 +21,8 @@ EXPECTED_BRANCH = "lyrical-no-gazebo"
 EXPECTED_COMMIT = "ef7351f90e451a37ef73de69c643b7e85040401a"
 MANIFEST_NAME = "STATIC_MANIFEST.json"
 IGNORED_DIRS = {"manymove_runtime_capture"}
+# The component descriptor describes the bundle; it is not model content.
+DESCRIPTOR_NAME = "component.yaml"
 
 
 class ValidationError(RuntimeError):
@@ -80,7 +82,7 @@ def relative_static_files(model_dir: Path) -> set[str]:
             continue
         relative = path.relative_to(model_dir)
         parts = relative.parts
-        if parts[0] == MANIFEST_NAME or parts[0] in IGNORED_DIRS:
+        if parts[0] in (MANIFEST_NAME, DESCRIPTOR_NAME) or parts[0] in IGNORED_DIRS:
             continue
         result.add(relative.as_posix())
     return result

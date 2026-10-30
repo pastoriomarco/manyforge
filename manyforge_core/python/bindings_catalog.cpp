@@ -145,12 +145,16 @@ void register_catalog_record_bindings(py::module_& module) {
           py::is_operator());
 
   py::class_<ModelFrameRoleBindingDTO>(module, "ModelFrameRoleBindingDTO", py::is_final())
-      .def(py::init([](FrameRoleId frame_role_id, std::string source_link_name) {
-             return ModelFrameRoleBindingDTO{std::move(frame_role_id), std::move(source_link_name)};
+      .def(py::init([](FrameRoleId frame_role_id, std::string source_link_name,
+                       std::optional<PlacementPoseDTO> pose_in_source_link) {
+             return ModelFrameRoleBindingDTO{std::move(frame_role_id), std::move(source_link_name),
+                                             std::move(pose_in_source_link)};
            }),
-           py::arg("frame_role_id"), py::arg("source_link_name"))
+           py::arg("frame_role_id"), py::arg("source_link_name"),
+           py::arg("pose_in_source_link") = std::nullopt)
       .def_readonly("frame_role_id", &ModelFrameRoleBindingDTO::frame_role_id)
       .def_readonly("source_link_name", &ModelFrameRoleBindingDTO::source_link_name)
+      .def_readonly("pose_in_source_link", &ModelFrameRoleBindingDTO::pose_in_source_link)
       .def(
           "__eq__",
           [](const ModelFrameRoleBindingDTO& lhs, const ModelFrameRoleBindingDTO& rhs) {
@@ -229,6 +233,26 @@ void register_catalog_record_bindings(py::module_& module) {
              const ModelCollisionBodyRoleBindingDTO& rhs) { return lhs != rhs; },
           py::is_operator());
 
+  py::class_<ModelAssetPayloadDTO>(module, "ModelAssetPayloadDTO", py::is_final())
+      .def(py::init([](double mass_kg, std::array<double, 3> center_of_mass_m) {
+             return ModelAssetPayloadDTO{mass_kg, center_of_mass_m};
+           }),
+           py::arg("mass_kg"), py::arg("center_of_mass_m"))
+      .def_readonly("mass_kg", &ModelAssetPayloadDTO::mass_kg)
+      .def_readonly("center_of_mass_m", &ModelAssetPayloadDTO::center_of_mass_m)
+      .def(
+          "__eq__",
+          [](const ModelAssetPayloadDTO& lhs, const ModelAssetPayloadDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelAssetPayloadDTO& lhs, const ModelAssetPayloadDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
   py::class_<ModelAssetDTO>(module, "ModelAssetDTO", py::is_final())
       .def(py::init([](ModelAssetId model_asset_id, ModelRevision model_revision,
                        ModelAssetInstanceCardinality instance_cardinality,
@@ -236,7 +260,8 @@ void register_catalog_record_bindings(py::module_& module) {
                        std::vector<ModelFrameRoleBindingDTO> frame_role_bindings,
                        std::vector<ModelGroupRoleBindingDTO> model_group_role_bindings,
                        std::vector<ModelResourceRoleBindingDTO> resource_role_bindings,
-                       std::vector<ModelCollisionBodyRoleBindingDTO> collision_body_role_bindings) {
+                       std::vector<ModelCollisionBodyRoleBindingDTO> collision_body_role_bindings,
+                       std::optional<ModelAssetPayloadDTO> payload) {
              return ModelAssetDTO{std::move(model_asset_id),
                                   std::move(model_revision),
                                   instance_cardinality,
@@ -245,12 +270,14 @@ void register_catalog_record_bindings(py::module_& module) {
                                   std::move(frame_role_bindings),
                                   std::move(model_group_role_bindings),
                                   std::move(resource_role_bindings),
-                                  std::move(collision_body_role_bindings)};
+                                  std::move(collision_body_role_bindings),
+                                  std::move(payload)};
            }),
            py::arg("model_asset_id"), py::arg("model_revision"), py::arg("instance_cardinality"),
            py::arg("expanded_source"), py::arg("root_frame_role_id"),
            py::arg("frame_role_bindings"), py::arg("model_group_role_bindings"),
-           py::arg("resource_role_bindings"), py::arg("collision_body_role_bindings"))
+           py::arg("resource_role_bindings"), py::arg("collision_body_role_bindings"),
+           py::arg("payload") = std::nullopt)
       .def_readonly("model_asset_id", &ModelAssetDTO::model_asset_id)
       .def_readonly("model_revision", &ModelAssetDTO::model_revision)
       .def_readonly("instance_cardinality", &ModelAssetDTO::instance_cardinality)
@@ -260,6 +287,7 @@ void register_catalog_record_bindings(py::module_& module) {
       .def_readonly("model_group_role_bindings", &ModelAssetDTO::model_group_role_bindings)
       .def_readonly("resource_role_bindings", &ModelAssetDTO::resource_role_bindings)
       .def_readonly("collision_body_role_bindings", &ModelAssetDTO::collision_body_role_bindings)
+      .def_readonly("payload", &ModelAssetDTO::payload)
       .def(
           "__eq__", [](const ModelAssetDTO& lhs, const ModelAssetDTO& rhs) { return lhs == rhs; },
           py::is_operator())

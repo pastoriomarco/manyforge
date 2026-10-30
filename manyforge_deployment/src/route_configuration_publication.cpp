@@ -153,13 +153,12 @@ VerifiedRouteConfigurationPublicationPort::
     VerifiedRouteConfigurationPublicationPort(
         const RetainedBundle &retained_bundle,
         const IVerifiedRetainedProductArtifactSource &artifact_source,
-        core::IResolvedStopBasePlanRepository &plan_repository,
         IRouteConfigurationKernelPublicationOwner &kernel_owner,
         std::vector<core::KinematicResourceSourceProjectionDTO>
             source_projections,
         std::function<std::int64_t()> now_ns)
     : retained_bundle_(retained_bundle), artifact_source_(artifact_source),
-      plan_repository_(plan_repository), kernel_owner_(kernel_owner),
+      kernel_owner_(kernel_owner),
       source_projections_(std::move(source_projections)),
       now_ns_(std::move(now_ns)) {
   if (!verify_retained_bundle_identity(retained_bundle_) || !now_ns_) {
@@ -230,10 +229,10 @@ VerifiedRouteConfigurationPublicationPort::PublishAndReadBack(
       return core::Result<core::RouteReadinessPublicationReceiptDTO>::Err(
           current.error());
     }
-    auto resolved = resolve_store_and_verify_route_readiness_batch(
+    auto resolved = resolve_and_verify_route_readiness_batch(
         retained_bundle_, artifact_source_, expected_controller_domain,
         durable_configuration, acceptance.component_expectations,
-        current.value(), plan_repository_);
+        current.value());
     if (!resolved.ok()) {
       return core::Result<core::RouteReadinessPublicationReceiptDTO>::Err(
           resolved.error());

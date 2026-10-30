@@ -354,15 +354,6 @@ class AuthoringAdmissionCoordinator:
                 },
             )
 
-    @staticmethod
-    def _require_admission_generation(
-        admission: Mapping[str, Any], envelope: AuthoringMutationEnvelope
-    ) -> None:
-        if admission.get("admission_generation") != envelope.expected_admission_generation:
-            raise refused_before_effect(
-                409, {"code": "stale_generation", "message": "admission changed"}
-            )
-
     def _draft_edit_allowed(self) -> bool:
         """Idle, or the published held-run rule applied to the owners' facts.
 
@@ -813,7 +804,8 @@ class AuthoringAdmissionCoordinator:
             raise refused_before_effect(
                 409, {"code": "authoring_not_ready", "message": "editing requires Idle"}
             )
-        self._require_admission_generation(admission, envelope)
+        # The envelope's admission generation is claim evidence only; the
+        # Kernel admits the claim on its current facts.
         revision_before = workspace.revision
         transaction_id = owner_transaction_id(
             envelope.request_owner_epoch, envelope.request_id

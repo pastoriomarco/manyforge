@@ -2,7 +2,9 @@
 
 The launch owns no scene loading, simulation control, motion, or component
 lifecycle policy. It starts controller infrastructure inactive; the existing
-CCLC path activates it only after fresh backend readiness is observed.
+CCLC path activates it only after fresh backend readiness is observed. A
+gripper is its own tool component with its own launch
+(`isaac_gripper.launch.py`).
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ from launch.actions import (
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks
 
@@ -101,37 +102,6 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "arm_controller_name", default_value="isaac_arm_controller"
             ),
-            DeclareLaunchArgument(
-                "gripper_action_name",
-                default_value="robotiq_gripper_controller/gripper_cmd",
-            ),
-            DeclareLaunchArgument(
-                "gripper_command_topic", default_value="/isaac_gripper_state"
-            ),
-            DeclareLaunchArgument(
-                "gripper_state_topic", default_value="/isaac_joint_states"
-            ),
-            DeclareLaunchArgument(
-                "gripper_readiness_topic",
-                default_value="manyforge/isaac_gripper_bridge/ready",
-            ),
-            DeclareLaunchArgument(
-                "gripper_state_freshness_timeout_s",
-                default_value="",
-                description=(
-                    "Host-passed feedback staleness threshold [s]: the "
-                    "budget of the component's gripper_feedback stream; "
-                    "required when the gripper action adapter starts."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "start_gripper_action_bridge",
-                default_value="auto",
-                description=(
-                    "auto starts the thin UR/Robotiq action adapter; Lite6 uses "
-                    "the retained C++ direct-effort transport."
-                ),
-            ),
             DeclareLaunchArgument("base_parent_frame", default_value="universe"),
             DeclareLaunchArgument("base_child_frame", default_value="world"),
             DeclareLaunchArgument("frame_prefix", default_value=""),
@@ -144,12 +114,7 @@ def generate_launch_description() -> LaunchDescription:
 
 def _launch_setup(context, *_, **__) -> list[object]:
     keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
-    package_share = Path(
-        FindPackageShare("manyforge_ros_bringup").find("manyforge_ros_bringup")
-    )
-    profile = _profile_configuration(
-        LaunchConfiguration("isaac_profile").perform(context)
-    )
+    _profile_configuration(LaunchConfiguration("isaac_profile").perform(context))
     runtime_namespace = _instance_namespace(
         LaunchConfiguration("runtime_namespace").perform(context),
         name="runtime_namespace",
@@ -300,65 +265,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
         robot_state_publisher,
         static_base_tf,
     ]
-    start_gripper = _resolve_start_gripper_action_bridge(
-        LaunchConfiguration("start_gripper_action_bridge").perform(context),
-        isaac_profile=profile["name"],
-    )
-    if start_gripper:
-        control_actions.append(
-            Node(
-                package="manyforge_ros_bringup",
-                executable="isaac_gripper_action_bridge",
-                name="manyforge_isaac_gripper_action_bridge",
-                namespace=runtime_namespace,
-                output="screen",
-                ros_arguments=["--disable-external-lib-logs"],
-                parameters=[
-                    str(
-                        package_share
-                        / "config"
-                        / "isaac_robotiq_2f_140_gripper_bridge.yaml"
-                    ),
-                    {
-                        "action_name": _scoped_ros_name(
-                            LaunchConfiguration("gripper_action_name").perform(
-                                context
-                            ),
-                            runtime_namespace=runtime_namespace,
-                            name="gripper_action_name",
-                        ),
-                        "command_topic": _absolute_ros_name(
-                            LaunchConfiguration("gripper_command_topic").perform(
-                                context
-                            ),
-                            name="gripper_command_topic",
-                        ),
-                        "state_topic": _absolute_ros_name(
-                            LaunchConfiguration("gripper_state_topic").perform(
-                                context
-                            ),
-                            name="gripper_state_topic",
-                        ),
-                        "readiness_topic": _scoped_ros_name(
-                            LaunchConfiguration("gripper_readiness_topic").perform(
-                                context
-                            ),
-                            runtime_namespace=runtime_namespace,
-                            name="gripper_readiness_topic",
-                        ),
-                        "state_freshness_timeout_s": _bounded_float(
-                            LaunchConfiguration(
-                                "gripper_state_freshness_timeout_s"
-                            ).perform(context),
-                            name="gripper_state_freshness_timeout_s",
-                            minimum=0.01,
-                            maximum=60.0,
-                        ),
-                    },
-                ],
-                on_exit=_shutdown("Isaac gripper transport adapter exited"),
-            )
-        )
     pointcloud_topic_raw = LaunchConfiguration("pointcloud_topic").perform(
         context
     ).strip()
@@ -465,35 +371,14 @@ def _read_artifact(path: Path, *, name: str) -> str:
 def _profile_configuration(value: str) -> dict[str, str]:
     normalized = value.strip().lower()
     profiles = {
-        "ur10e": {
-            "name": "ur10e",
-            "raw_gripper_topic": "/isaac_gripper_state",
-        },
-        "lite6": {
-            "name": "lite6",
-            "raw_gripper_topic": "/isaac_joint_commands_gripper",
-        },
+        "ur10e": {"name": "ur10e"},
+        "lite6": {"name": "lite6"},
     }
     if normalized not in profiles:
         raise ValueError(
             f"unsupported isaac_profile={value!r}; expected ur10e or lite6"
         )
     return dict(profiles[normalized])
-
-
-def _resolve_start_gripper_action_bridge(value: str, *, isaac_profile: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized == "auto":
-        return isaac_profile == "ur10e"
-    requested = _parse_bool_launch_value(
-        normalized, name="start_gripper_action_bridge"
-    )
-    if requested and isaac_profile != "ur10e":
-        raise ValueError(
-            "Lite6 uses the retained C++ direct-effort gripper transport; "
-            "the UR action bridge cannot be enabled for lite6"
-        )
-    return requested
 
 
 def _absolute_ros_name(value: str, *, name: str) -> str:

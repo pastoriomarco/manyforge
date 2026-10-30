@@ -702,6 +702,32 @@ core::SceneObjectPlacementDTO DecodePlacement(const CanonicalValue &value) {
   Fail("scene placement kind is unsupported");
 }
 
+// Mass is encoded only when positive so massless rows keep their bytes; a
+// present mass must be positive.
+void AppendMass(CanonicalValue::Object &value, const double mass_kg) {
+  if (mass_kg > 0.0) {
+    value.emplace_back("mass_kg", CanonicalValue(mass_kg));
+  }
+}
+
+double DecodeMass(const CanonicalValue &value) {
+  const auto *mass = value.find_object_member("mass_kg");
+  if (mass == nullptr) {
+    return 0.0;
+  }
+  const auto result = Number(*mass, "mass_kg");
+  if (result <= 0.0) {
+    Fail("mass_kg must be positive when present");
+  }
+  return result;
+}
+
+std::size_t MassFieldCount(const CanonicalValue &value) {
+  return value.is_object() && value.find_object_member("mass_kg") != nullptr
+             ? 1U
+             : 0U;
+}
+
 CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
   CanonicalValue::Array shapes;
   shapes.reserve(object.collision_shapes.size());
@@ -718,12 +744,17 @@ CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
     value.emplace_back("provider_evidence",
                        ProviderEvidence(*object.provider_evidence));
   }
+  AppendMass(value, object.mass_kg);
   return CanonicalValue(std::move(value));
 }
 
 core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
-  if (!value.is_object() || value.as_object().size() < 4U ||
-      value.as_object().size() > 5U) {
+  if (!value.is_object() ||
+      value.as_object().size() !=
+          4U + MassFieldCount(value) +
+              (value.find_object_member("provider_evidence") != nullptr
+                   ? 1U
+                   : 0U)) {
     Fail("scene object has an unknown or missing field");
   }
   core::SceneObjectSnapshotDTO result{
@@ -733,6 +764,7 @@ core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
       DecodePlacement(Member(value, "placement")),
       std::nullopt,
       DecodeSupportDeclarations(Member(value, "support_contacts")),
+      DecodeMass(value),
   };
   for (const auto &shape :
        Array(Member(value, "collision_shapes"), "collision_shapes")) {
@@ -1003,7 +1035,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
       [](const auto &request) -> CanonicalValue {
         using T = std::decay_t<decltype(request)>;
         if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
+          CanonicalValue::Object object{
               {"frame_ref", RequestFrame(request.frame_ref)},
               {"kind", CanonicalValue("add_object")},
               {"pose", Pose(request.pose)},
@@ -1012,9 +1044,11 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"shape", Shape(request.shape)},
               {"support_contacts",
                SupportDeclarations(request.support_contacts)},
-          });
+          };
+          AppendMass(object, request.mass_kg);
+          return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<T, core::UpsertObjectRequestDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
+          CanonicalValue::Object object{
               {"frame_ref", RequestFrame(request.frame_ref)},
               {"kind", CanonicalValue("upsert_object")},
               {"pose", Pose(request.pose)},
@@ -1023,7 +1057,9 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"shape", Shape(request.shape)},
               {"support_contacts",
                SupportDeclarations(request.support_contacts)},
-          });
+          };
+          AppendMass(object, request.mass_kg);
+          return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<T, core::RemoveObjectRequestDTO>) {
           return CanonicalValue(CanonicalValue::Object{
               {"kind", CanonicalValue("remove_object")},
@@ -1130,7 +1166,7 @@ DecodeRequestOperation(const CanonicalValue &value) {
   }
   const auto kind = String(Member(value, "kind"), "operation kind");
   if (kind == "add_object") {
-    ExactObject(value, 6U, "add-object request");
+    ExactObject(value, 6U + MassFieldCount(value), "add-object request");
     return core::AddObjectRequestDTO{
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
@@ -1138,10 +1174,11 @@ DecodeRequestOperation(const CanonicalValue &value) {
         DecodePose(Member(value, "pose")),
         DecodeRequestFrame(Member(value, "frame_ref")),
         DecodeSupportDeclarations(Member(value, "support_contacts")),
+        DecodeMass(value),
     };
   }
   if (kind == "upsert_object") {
-    ExactObject(value, 6U, "upsert-object request");
+    ExactObject(value, 6U + MassFieldCount(value), "upsert-object request");
     return core::UpsertObjectRequestDTO{
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
@@ -1149,6 +1186,7 @@ DecodeRequestOperation(const CanonicalValue &value) {
         DecodePose(Member(value, "pose")),
         DecodeRequestFrame(Member(value, "frame_ref")),
         DecodeSupportDeclarations(Member(value, "support_contacts")),
+        DecodeMass(value),
     };
   }
   if (kind == "remove_object") {

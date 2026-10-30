@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <stdexcept>
 #include <string>
@@ -19,15 +20,10 @@ inline constexpr std::string_view kAssistantModeCatalogApiVersion =
 inline constexpr std::uint64_t kMaximumAssistantModeProjectionBytes = 64ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaximumAssistantModeIndexBytes = 8ULL * 1024ULL * 1024ULL;
 
-class AssistantModeProjectionError : public std::runtime_error {
+class AssistantModeProjectionError : public manyforge::core::TypedError {
  public:
   AssistantModeProjectionError(std::string code, std::string message)
-      : std::runtime_error(std::move(message)), code_(std::move(code)) {}
-
-  [[nodiscard]] const std::string& code() const noexcept { return code_; }
-
- private:
-  std::string code_;
+      : manyforge::core::TypedError(std::move(code), message) {}
 };
 
 /// Build one exact mode projection from an independently verified bundle.

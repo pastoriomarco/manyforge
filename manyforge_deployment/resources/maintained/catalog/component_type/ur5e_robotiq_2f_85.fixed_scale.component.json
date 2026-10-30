@@ -85,6 +85,7 @@
         }
       ],
       "command_target_id": "arm",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "base",
@@ -92,9 +93,16 @@
           "model_role_id": "arm_model"
         },
         {
+          "asset_frame_role_id": "flange",
+          "frame_role_id": "flange",
+          "model_role_id": "arm_model",
+          "tcp": true
+        },
+        {
           "asset_frame_role_id": "tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -140,11 +148,13 @@
         }
       ],
       "command_target_id": "gripper",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "gripper_tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -169,7 +179,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur5e_robotiq_2f_85.fixed_scale.component",
-  "component_type_revision": "sha256:dce266914adb570342ad6a7f567ebae00f09de6c64b70e180af14ec9840c8dda",
+  "component_type_revision": "sha256:2531e4132e42d69825f5baa35ba3cb6e43c727d74b0104c215ec8ea55f06d841",
   "model_mounts": [],
   "model_roles": [
     {

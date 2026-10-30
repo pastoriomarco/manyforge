@@ -4,6 +4,7 @@
 #include "content_identity_internal.hpp"
 #include <algorithm>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <map>
@@ -85,8 +86,8 @@ Array member_rows(const core::CellGraphDTO &graph,
 }
 
 /// CP9 pose sources and AI models have no device-configured lifecycle limit
-/// field.
-constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = 30'000'000'000;
+/// field: the default component lifecycle budget.
+constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = core::kDefaultLifecycleBudgetNs;
 
 struct Owner final {
   core::ProviderInstanceId instance;

@@ -99,6 +99,21 @@ describe('Recover cell result wording', () => {
       + 'Clear the cause, then press Recover cell again.');
   });
 
+  it('names an incident the press had not shown (M6 item 36): nothing acknowledged', () => {
+    expect(cellRecoverMessage(result({
+      code: 'cclc_incident_changed', message: 'm',
+      details: { controllable_component_id: 'arm', incident_id: 'incident.b', cause_class: 'collision' },
+    }, 0))).toBe('An incident on arm (collision) appeared that this press had not shown. '
+      + 'Nothing was acknowledged: review it, then press Recover cell again.');
+  });
+
+  it('says to Reset the Program first when an active cycle keeps the latch (ERRUI)', () => {
+    expect(cellRecoverMessage(result({
+      code: 'program_cycle_state_running', message: 'm', details: {},
+    }))).toBe('1 component incident(s) acknowledged. The cell latch stays while a Program run is '
+      + 'active. Reset the Program first, then press Recover cell again.');
+  });
+
   it('says what the latch still waits for', () => {
     expect(cellRecoverMessage(result({
       code: 'stop_fault_recovery_waiting_for_quiescence', message: 'm', details: {},
@@ -115,6 +130,27 @@ describe('Recover cell result wording', () => {
       recoveredComponents: ['arm'],
     })).toBe('Recover started for arm. A newer cell stop replaced the one this press saw. '
       + 'Press Recover cell again.');
+  });
+
+  it('SX-679: an aborted press lists what it did and what it did not', () => {
+    expect(cellRecoverMessage({
+      ...result({
+        code: 'cell_recover_aborted', message: 'm',
+        details: { before_step: 'reenable', reenable_steps: 'arm:recover+prepare', not_reenabled: 'arm' },
+      }),
+      latchCleared: true,
+    })).toBe('1 component incident(s) acknowledged. The cell latch was cleared. '
+      + 'Recover cell was aborted before its reenable step; no later step started. '
+      + 'Re-enable steps done: arm:recover, prepare. Not enabled again: arm. '
+      + 'Press Recover cell again to continue.');
+  });
+
+  it('SX-689: a step that failed after the abort keeps its reason and says it was aborted', () => {
+    expect(cellRecoverMessage(result({
+      code: 'stale_request_owner_epoch', message: 'stale',
+      details: { aborted: 'true', reenable_steps: 'arm:recover', not_reenabled: 'arm' },
+    }, 0))).toBe('Cell recovery was refused: stale (stale_request_owner_epoch). '
+      + 'Recover cell was aborted: no later step started.');
   });
 
   it('does not call an unknown outcome a refusal', () => {

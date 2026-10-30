@@ -224,6 +224,30 @@ describe('viewer object panel during a Program run', () => {
 describe('Scene revision changes in the authoring workspace', () => {
   const workspace = () => readFileSync(new URL('./SceneAuthoringWorkspace.tsx', import.meta.url), 'utf8');
 
+  it('keeps exact drag identity separate from tolerant measured-pose stability', () => {
+    const source = workspace();
+    const start = source.indexOf('identity: JSON.stringify([observationEpoch');
+    const end = source.indexOf(']),', start);
+    const identity = source.slice(start, end);
+    const fields = [
+      'observationEpoch',
+      'status.retainedBundleId',
+      'status.graphRevision',
+      'motion.programBindingId',
+      'base',
+      'tcp',
+    ];
+    const fieldOffsets = fields.map((field) => identity.indexOf(field));
+
+    expect(start).toBeGreaterThan(0);
+    expect(fieldOffsets.every((offset) => offset >= 0)).toBe(true);
+    expect(fieldOffsets).toEqual([...fieldOffsets].sort((left, right) => left - right));
+    expect(identity).not.toMatch(/basePose|tcpPose/);
+    expect(source).toContain('candidateDragReferenceIsStable(dragReference.current, reference)');
+    // The TCP target still uses the release-time measured base transform.
+    expect(source).toContain('pose, reference.base)');
+  });
+
   it('keys the candidate-TCP gizmo without the Scene, so pose updates never cancel a drag', () => {
     const source = workspace();
     const start = source.indexOf('candidateContextKey={JSON.stringify([');

@@ -42,7 +42,7 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
+    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
 constexpr std::string_view kControlInterfaceSchemaRevision =
     "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
 constexpr std::string_view kControllerTopologySchemaRevision =
@@ -1852,7 +1852,7 @@ struct InputOptions final {
         {"controller_topology_id",
          CanonicalValue(options.desired_selection_case == DesiredSelectionCase::kWrongTopology
                             ? "wrong_topology"
-                            : graph.control_domains.front().controller_topology_id.value())},
+                            : graph.control_domains.front().controller().controller_topology_id.value())},
         {"topology_revision",
          CanonicalValue(graph.control_domains.front().controller().topology_revision.value())},
         {"activation_set_id", CanonicalValue(options.desired_selection_case ==
@@ -4616,9 +4616,21 @@ TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfi
         for (auto &[unit_name, unit_value] : members) {
           if (unit_name != "configuration") continue;
           auto configuration = unit_value.as_object();
-          for (auto &[field, item] : configuration)
+          for (auto &[field, item] : configuration) {
             if (field == "gripper_target_configurations")
               item = CanonicalValue(CanonicalValue::Array{});
+            // M6 TOOLSPLIT: the runtime codec requires the gripper_feedback
+            // stream exactly for the authored rows; drop it with the row so
+            // the missing row reaches the applicability check.
+            if (field == "component_streams") {
+              auto streams = item.as_array();
+              std::erase_if(streams, [](const CanonicalValue &stream) {
+                const auto *id = stream.find_object_member("stream_id");
+                return id != nullptr && id->as_string() == "gripper_feedback";
+              });
+              item = CanonicalValue(std::move(streams));
+            }
+          }
           unit_value = CanonicalValue(std::move(configuration));
         }
         unit = CanonicalValue(std::move(members));

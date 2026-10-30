@@ -72,11 +72,17 @@ frame_matches_binding(const core::ResolvedFrameDTO &frame,
   }
   if (const auto *component =
           std::get_if<core::ResolvedComponentModelFrameDTO>(&frame)) {
-    return component->controllable_component_id ==
-               binding.controllable_component_id &&
-           component->model_instance_id == binding.model_instance_id &&
-           component->model_revision == binding.model_revision &&
-           !component->frame_role_id.empty();
+    // A shape check only: the owner-issued inventory
+    // (retained_motion_planner_frames) holds each frame once, owner-stamped,
+    // so a tool mounted on the motion component keeps its own component and
+    // model identity; motion-model frames keep its revision. Requests match
+    // the inventory exactly (contains_frame).
+    return !component->controllable_component_id.empty() &&
+           !component->model_instance_id.empty() &&
+           !component->model_revision.empty() &&
+           !component->frame_role_id.empty() &&
+           (component->model_instance_id != binding.model_instance_id ||
+            component->model_revision == binding.model_revision);
   }
   if (const auto *passive =
           std::get_if<core::ResolvedPassiveModelFrameDTO>(&frame)) {
@@ -390,7 +396,8 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
         RoboPlanCandidateProjectionDTO{request.projection_binding,
                                        request.retained_collision_world,
                                        request.retained_collision_policy,
-                                       request.contact_policy_id});
+                                       request.contact_policy_id,
+                                       request.retained_clearance_margins});
     if (!selected.ok()) {
       return plan_error(selected.error());
     }
@@ -412,7 +419,8 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
                                         request.planning_timeout_s,
                                         request.planning_attempt_index,
                                         request.action_span,
-                                        request.moving_replacement};
+                                        request.moving_replacement,
+                                        request.speed_check_frames};
   if (candidate.moving_replacement) {
     const auto setup_elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - setup_started)

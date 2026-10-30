@@ -124,7 +124,7 @@ def _program(
         parameters: dict[str, Any] = {
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+            "tcp_endpoint": {"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
             "goal": deepcopy(_GOAL),
             "stop_mode": "soft_on_path",
             "interrupt_condition": deepcopy(_CONDITION),

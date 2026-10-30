@@ -1098,10 +1098,15 @@ Result<ResolvedStopInitialState> resolve_stop_initial_state(
   // MUST be the command frame, not the lagging measured-position projection —
   // anchoring on the projection re-issues points the controller's command has
   // already passed. Model/command authority uses the active command cursor
-  // (trajectory_time_from_start_s, required here); the feedback lane keeps the
-  // measured projection. projection.* stays the drift/velocity guard input only.
+  // (trajectory_time_from_start_s, required here). A measured trip state uses
+  // it too when its lane's lead-in anchor is kCommanded and the cursor is
+  // known; kMeasured keeps the measured projection. projection.* stays the
+  // drift/velocity guard input only.
+  const bool command_anchor =
+      use_model_velocity || (config.lead_in_anchor == StopLeadInAnchor::kCommanded &&
+                             initial_state.trajectory_time_from_start_s.has_value());
   double seam_cursor_s = projection.time_from_start_s;
-  if (use_model_velocity) {
+  if (command_anchor) {
     if (!initial_state.trajectory_time_from_start_s.has_value()) {
       return err<ResolvedStopInitialState>(
           "missing_command_cursor",
@@ -1176,6 +1181,18 @@ Result<ResolvedStopInitialState> resolve_stop_initial_state(
          {"max_initial_velocity_deviation_rad_s",
           format_double(*config.max_initial_velocity_deviation_rad_s)},
          {"recommended_disposition", "hard_stop"}});
+  }
+  // A command-anchored lead-in on a measured trip state continues the command
+  // at its own rate, the frozen runtime factor (as model authority); the
+  // measured velocity only fed the coherence guard above.
+  if (command_anchor && !use_model_velocity) {
+    if (!std::isfinite(initial_state.runtime_velocity_scale_at_trip) ||
+        initial_state.runtime_velocity_scale_at_trip < 0.0) {
+      return err<ResolvedStopInitialState>(
+          "invalid_runtime_velocity_scale_at_trip",
+          "soft_on_path runtime_velocity_scale_at_trip must be finite and >= 0");
+    }
+    path_time_rate = std::min(1.0, initial_state.runtime_velocity_scale_at_trip);
   }
 
   return Result<ResolvedStopInitialState>::Ok(
@@ -1345,6 +1362,14 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
   // retained only as a monitor (initial path/velocity deviation, sample age, stop
   // confirmation), computed above and unaffected by this seam.
   plan.diagnostics["seam"] = interrupt_structured_string("command_frame_lead_in");
+  // The lead-in anchor actually used (StopLeadInAnchor): a measured trip state
+  // starts at its measured projection only on a kMeasured lane or without a
+  // known command cursor.
+  plan.diagnostics["lead_in_anchor"] = interrupt_structured_string(
+      !use_model_velocity && (config.lead_in_anchor == StopLeadInAnchor::kMeasured ||
+                              !initial_state.trajectory_time_from_start_s.has_value())
+          ? "measured"
+          : "commanded");
   const double lead_in_s = config.stop_traj_delta_s;
   const size_t lead_in_samples =
       std::max<size_t>(1, static_cast<size_t>(std::ceil(lead_in_s / config.sample_period_s)));

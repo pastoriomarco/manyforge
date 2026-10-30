@@ -41,7 +41,11 @@ _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class HeadlessApiError(RuntimeError):
-    """Stable failure returned by a headless owner or projection adapter."""
+    """Stable failure returned by a headless owner or projection adapter.
+
+    `producer` names the owner that produced the error (`headless_api` unless
+    it forwards another owner's refusal, for example `component_manager`).
+    """
 
     def __init__(
         self,
@@ -49,10 +53,12 @@ class HeadlessApiError(RuntimeError):
         message: str,
         *,
         details: Mapping[str, Any] | None = None,
+        producer: str = "headless_api",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.details = deepcopy(dict(details or {}))
+        self.producer = producer
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +291,8 @@ class HeadlessCorePort(Protocol):
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def record_scenario_force_close(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
 
@@ -857,6 +865,14 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("record_program_diagnostic", encoded.decode("utf-8")),
             method="record_program_diagnostic",
+        )
+
+    def record_scenario_force_close(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "record_scenario_force_close", rfc8785.dumps(dict(record)).decode("utf-8")
+            ),
+            method="record_scenario_force_close",
         )
 
     def historian_health(self) -> dict[str, Any]:

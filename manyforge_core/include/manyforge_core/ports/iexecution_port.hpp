@@ -356,8 +356,10 @@ enum class ExecutionCancelSemantics {
   kHold,
 };
 
-/// Whether the lane's controller keeps goal tolerances (Q3: real lanes keep
-/// them with `goal_time > 0`; simulation lanes erase them).
+/// Whether the lane's controller keeps goal tolerances. Every ros2_control
+/// lane (Mock, Isaac, Real) keeps them: its per-joint `goal` constraint is the
+/// lane's arrival tolerance, so a succeeded goal finished within it
+/// (`robot_at_target`). `kErased` sends -1 for every joint on each goal.
 enum class ExecutionGoalTolerancePolicy {
   kErased,
   kKept,
@@ -442,9 +444,12 @@ class IExecutionPort {
   /// points with all times shifted by the elapsed time (negative times on the
   /// wire, never clamped), followed by the Stop ramp; the adapter serializes
   /// them faithfully. `kStaleKey` when `active_key` is not the current goal.
-  virtual ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active_key,
-                                                const ExecutionGoalKey& next_key,
-                                                const TrajectoryDTO& trajectory) = 0;
+  /// Every goal, a Stop's included, gets the lane's goal check (maintainer
+  /// M6: a Stop trajectory has the same arrival tolerance and `goal_time` as a
+  /// motion). A cancel-type Stop sends no goal.
+  virtual ExecutionPortCommandResultDTO Replace(
+      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const TrajectoryDTO& trajectory) = 0;
 
   /// Same identity/prefix contract as Replace, with its time-zero anchored to
   /// the named binding's controller clock. Refusal is explicit; silently

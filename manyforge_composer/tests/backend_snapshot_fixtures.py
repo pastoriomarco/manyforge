@@ -62,7 +62,7 @@ def _test_module(relative: str, name: str) -> ModuleType:
 
 # --- Stable placeholders ---------------------------------------------------
 
-_MONOTONIC_KEYS = frozenset({"generated_at_ns", "valid_until_ns"})
+_MONOTONIC_KEYS = frozenset({"generated_at_ns"})
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 

@@ -193,7 +193,6 @@ export function useResetApply({
       correlationId: plan.correlationId,
       expected: {
         programRunId: plan.programRunId,
-        programRunnerOwnerEpoch: plan.programRunnerOwnerEpoch,
         cycleGeneration: plan.cycleGeneration,
       },
     });

@@ -1,0 +1,43 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/ur5e`.
+# The arm only: a tool mounts on `flange` as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: robot
+id: universal_robots.ur5e
+version: 1.0.0
+title: Universal Robots UR5e
+license: BSD-3-Clause
+provenance:
+  notes: README.md (cut from the combined bundle) and its licenses/
+model:
+  urdf: ur5e.urdf
+  srdf: ur5e.srdf
+  package_name: manyforge_example_models
+roles:
+  root_frame: world
+  frames:
+    base: base_link
+    flange: tool0
+  groups:
+    arm: ur_manipulator
+  joints:
+    arm_joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+  collision_bodies:
+    arm_collision: [base_link_inertia, forearm_link, shoulder_link, upper_arm_link, wrist_1_link, wrist_2_link, wrist_3_link]
+tcps:                             # without a tool; a mounted tool's default TCP wins (D1)
+  - {id: flange, frame: tool0}
+tcp_speed_check: active_tcp_and_flange
+limits:
+  max_tcp_linear_speed_mps: 1.0
+lanes:
+  mock:
+    controllers:
+      template: ur
+      hardware_component_name: MockUR5eSystem
+      arm_controller: joint_trajectory_controller
+      hard_stop_completion_timeout_s: 0.5
+      gripper_result_timeout_s: 15.0
+      arrival_tolerance_rad: 0.01
+defaults:
+  initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+  maximum_tcp_linear_speed_mps: 0.25

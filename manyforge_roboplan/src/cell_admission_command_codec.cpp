@@ -570,13 +570,14 @@ Value AdmissionValue(const core::AuthoringAdmissionDTO &v) {
        Value(static_cast<double>(v.admission_generation.value()))},
       {"authoring_allowed", Value(v.authoring_allowed)}});
 }
-Value ErrorValue(const core::ErrorDTO &v) {
+Value ErrorValue(const core::ErrorDTO &v, const std::string_view producer) {
   Value::Object details;
   for (const auto &[key, value] : v.details)
     details.emplace_back(key, Value(value));
   return Value(Value::Object{{"code", Value(v.code)},
                              {"details", Value(std::move(details))},
-                             {"message", Value(v.message)}});
+                             {"message", Value(v.message)},
+                             {"producer", Value(std::string(producer))}});
 }
 bool IsCommand(std::string_view v) {
   return v == "cell_admission_get" ||
@@ -676,13 +677,14 @@ TryDecodeCellAdmissionCommand(std::string_view bytes) {
 
 Value CellAdmissionResponseValue(
     std::string_view command,
-    const cm::KernelCellAdmissionRpcResponse &response) {
+    const cm::KernelCellAdmissionRpcResponse &response,
+    const std::string_view producer) {
   Require(IsCommand(command), "unknown cell-admission response command");
   if (const auto *error = std::get_if<core::ErrorDTO>(&response))
     return Value(Value::Object{
         {"api_version", Value(std::string(kCellAdmissionResponseApiVersion))},
         {"command", Value(std::string(command))},
-        {"error", ErrorValue(*error)},
+        {"error", ErrorValue(*error, producer)},
         {"ok", Value(false)}});
   Value::Object result{
       {"api_version", Value(std::string(kCellAdmissionResponseApiVersion))},

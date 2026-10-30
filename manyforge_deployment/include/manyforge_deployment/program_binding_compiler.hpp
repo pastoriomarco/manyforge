@@ -4,12 +4,15 @@
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/capability_definition_codec.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -30,7 +33,35 @@ inline constexpr std::string_view kDirectControlComponentRoleId =
     "controlled_component";
 inline constexpr std::string_view kDirectControlTargetRoleId = "command_target";
 inline constexpr std::string_view kDirectControlBaseFrameRoleId = "base";
-inline constexpr std::string_view kDirectControlTcpFrameRoleId = "tcp";
+/// TCP-C: the frame-only role of the tool mounted on the robot's `flange`,
+/// whose TCPs Robot Control may move the robot at.
+inline constexpr std::string_view kDirectControlToolComponentRoleId =
+    "mounted_tool";
+inline constexpr std::string_view kDirectControlToolTargetRoleId =
+    "mounted_tool_target";
+
+/// A compiled robot TCP row projected into the Robot Control descriptor.
+struct DirectControlTcp final {
+  core::ProgramRobotTcpBindingDTO binding;
+  std::string display;
+  /// Interim legacy manual-motion target role. A4 removes it after Set TCP
+  /// replaces the per-browser endpoint selector.
+  std::optional<core::TargetRoleId> target_role_id;
+  bool mounted_here{};
+  bool mounted_elsewhere{};
+};
+
+using RobotTcp = core::ProgramRobotTcpBindingDTO;
+
+/// Compile the robot's own TCPs and every tool TCP in the Deployment into
+/// exact owner-qualified rows.
+[[nodiscard]] std::vector<RobotTcp> robot_tcps(
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot,
+    const core::CommandTargetId& robot_target,
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    const ICatalogArtifactSource& catalog_artifact_store);
 
 /// Deterministic physical command-target inventory derived from one exact
 /// retained cell. Entries are build-owned direct-control Program Bindings;
@@ -136,6 +167,17 @@ compile_direct_control_io_program_binding(
     const RetainedBundle &retained_bundle,
     const VerifiedRetainedModelMap &retained_model_map,
     const ICatalogArtifactSource &catalog_artifact_store);
+
+/// TCP-C: the robot's exact Deployment TCP inventory, sorted by owner entry
+/// triple with the robot's End-effector row first when present. Equal display
+/// names or compiled frames do not merge distinct owner entries. `inventory`
+/// supplies other direct-control robots for the interim mounted-elsewhere
+/// flag; the model map must be verified for `retained_bundle`.
+[[nodiscard]] std::vector<DirectControlTcp> direct_control_motion_tcps(
+    const ProgramBinding &direct_control_binding,
+    const DirectControlProgramBindingInventory &inventory,
+    const RetainedBundle &retained_bundle,
+    const VerifiedRetainedModelMap &retained_model_map);
 
 /// Compile every complete direct-control target in deterministic retained-cell
 /// order. A target is included only when its qualified component type declares

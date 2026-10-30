@@ -355,6 +355,11 @@ export interface CCLCLifecycleRequestBody {
   reason: string;
   /** Close acknowledges exactly this open incident; ordinary Recover is unchanged. */
   close_incident_recovery?: { expected_incident_id: string } | null;
+  /** M6: false never acknowledges an incident; CCLC refuses `cclc_incident_open`. */
+  acknowledge_incident?: boolean;
+  /** M6: Recover acknowledges only this open incident; another one open is
+   * `cclc_incident_changed`, none open an ordinary Recover. */
+  expected_incident_id?: string;
   confirmed: true;
 }
 
@@ -375,6 +380,8 @@ export interface CCLCTransactionStatus {
   phase: string;
   terminalResult:
     | 'succeeded'
+    | 'failed'
+    | 'connection_lost'
     | 'failed_known_no_effect'
     | 'failed_partial_effect'
     | null;

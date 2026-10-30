@@ -23,10 +23,13 @@ namespace manyforge::roboplan_backend {
 class RetainedRoboPlanKinematicsAdapter final
     : public core::IRobotKinematics {
  public:
+  /// `mounted_frame_names` adds the owner-issued frames of tools mounted on
+  /// the motion component (retained_motion_planner_frames), as the planner.
   RetainedRoboPlanKinematicsAdapter(
       core::RuntimeParticipantBinding binding,
       std::shared_ptr<roboplan::Scene> scene,
-      std::shared_ptr<std::mutex> scene_mutex);
+      std::shared_ptr<std::mutex> scene_mutex,
+      std::vector<std::string> mounted_frame_names = {});
 
   core::Result<core::Pose3DTO> forward_kinematics(
       const core::FkRequestDTO& request) const override;
@@ -131,7 +134,8 @@ make_retained_motion_model_generation(
     const core::RuntimeParticipantBinding& motion_binding,
     std::shared_ptr<roboplan::Scene> scene,
     std::shared_ptr<std::mutex> scene_mutex,
-    std::shared_ptr<RetainedKinematicStateProjector> state_projector);
+    std::shared_ptr<RetainedKinematicStateProjector> state_projector,
+    std::vector<std::string> mounted_frame_names = {});
 
 /// Stable Kernel- and host-facing owner of the current model generation.
 /// The Kernel and direct host queries borrow this object for the runtime's

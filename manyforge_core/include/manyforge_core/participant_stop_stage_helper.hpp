@@ -74,6 +74,11 @@ struct StopStageHelperConfig final {
   /// position and velocity), kCommanded on Isaac and offline (the controller's
   /// reference, velocity from the cursor at the frozen factor).
   StateAuthorityClass trip_authority{StateAuthorityClass::kCommanded};
+  /// Where a soft Stop's lead-in starts when the trip evidence carries
+  /// measured velocity (kMeasured trip authority): the controller's command
+  /// cursor (default, every lane) or the measured position's projection. Per
+  /// robot data: the Real profile row's `stop_lead_in_anchor`.
+  StopLeadInAnchor lead_in_anchor{StopLeadInAnchor::kCommanded};
   /// Stop planner lane facts (`main`'s backend configuration).
   double stop_traj_delta_s{0.0};
   double sample_period_s{0.0};
@@ -197,7 +202,8 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
       TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
       const std::optional<ExecutionControllerSampleDTO>& baseline, TimePoint dispatched_at,
       const ExecutionControllerSampleDTO& trip, const std::string& mode,
-      double initial_path_deviation_rad, TimePoint stop_deadline, double controller_offset_s);
+      double initial_path_deviation_rad, TimePoint stop_deadline, double controller_offset_s,
+      double frozen_factor);
   [[nodiscard]] ParticipantStopStageResultDTO RunNaturalCompletion(Run& run,
                                                                    TimePoint stop_deadline,
                                                                    std::string basis);

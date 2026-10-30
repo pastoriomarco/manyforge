@@ -32,13 +32,18 @@ from .authoring_admission import (
     refused_before_effect,
     scenario_artifact_http_exception,
 )
+from .component_catalog import component_catalog
 from .deployment_artifacts import (
     load_deployment_artifact,
     normalize_deployment_save_path,
     save_deployment_artifact,
 )
 from .deployment_draft import DeploymentDraftError
-from .deployment_intent import DeploymentIntentError, rebase_deployment_intent_sources
+from .deployment_intent import (
+    DEPLOYMENT_INTENT_API_VERSION,
+    DeploymentIntentError,
+    rebase_deployment_intent_sources,
+)
 from .draft_session import DraftSessionError
 from .reset_apply_log import log_reset_apply_link
 from .routes_draft import _active_catalog
@@ -99,8 +104,9 @@ def _require_draftable_composition(
             detail={
                 "code": "deployment_activation_classification_unavailable",
                 "message": (
-                    "This Deployment shape cannot be safely classified for a "
-                    "Draft-only edit. Use an explicit Manager activation path."
+                    "This Deployment document is malformed or in the old "
+                    "compiled format, so its edit cannot be checked for "
+                    "component changes. Nothing was changed."
                 ),
                 "activationRequired": True,
                 "classificationAvailable": False,
@@ -113,13 +119,49 @@ def _require_draftable_composition(
         detail={
             "code": "deployment_activation_required",
             "message": (
-                "This Deployment edit changes live controllable composition; "
-                "a Draft-only operation cannot apply it. Use an explicit "
-                "Manager activation path."
+                "This Deployment edit removes a live component or changes "
+                "its profile, model or attachments; a Draft edit cannot make "
+                "it. Close the Scenario, edit it, then Load it again."
             ),
             "activationRequired": True,
             "changedGraphKinds": list(changed_kinds),
         },
+    )
+
+
+def _adds_components_only(
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+) -> bool:
+    """Whether a Draft edit only adds component rows (Add component).
+
+    An added component is Draft-only: Manager Applied and the running cell
+    change only through the one confirmed Deployment Apply. Every existing
+    row and attachment must stay exactly as it was. A new attachment row
+    counts as part of the addition when its child is an added component (a
+    tool mounted on a robot's flange); changing or removing an attachment
+    stays activation-only.
+    """
+
+    if (
+        not isinstance(before, dict)
+        or before.get("api_version") != DEPLOYMENT_INTENT_API_VERSION
+        or after.get("api_version") != DEPLOYMENT_INTENT_API_VERSION
+    ):
+        return False
+    old = {row["component_id"]: row for row in before["components"]}
+    new = {row["component_id"]: row for row in after["components"]}
+    if not (old.keys() < new.keys() and all(new[key] == row for key, row in old.items())):
+        return False
+    attachments = list(after["attachments"])
+    for row in before["attachments"]:
+        if row not in attachments:
+            return False
+        attachments.remove(row)
+    added = new.keys() - old.keys()
+    return all(
+        isinstance(row.get("child"), dict) and row["child"].get("component_id") in added
+        for row in attachments
     )
 
 
@@ -180,6 +222,11 @@ class UpdateDeploymentRequest(_LocalFence):
     value: Any = None
 
 
+class AddComponentsRequest(_LocalFence):
+    components: list[dict[str, Any]] = Field(min_length=1, max_length=64)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+
+
 class UpdateControlledStopRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
@@ -190,6 +237,7 @@ class UpdateMotionTargetLimitRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     maximum_tcp_linear_speed_mps: float = Field(gt=0.0, le=1000.0)
+    tcp_speed_check: Literal["active_tcp", "active_tcp_and_flange"] | None = None
 
 
 class SaveDeploymentRequest(_LocalFence):
@@ -704,6 +752,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     def read_workspace() -> dict[str, Any]:
         return _workspace(state)
 
+    @router.get("/api/deployment/component-catalog")
+    def read_component_catalog() -> dict[str, Any]:
+        """Components Add component can compose into the Deployment Draft."""
+
+        return component_catalog(state.deployment_source_project_path)
+
     @router.post("/api/deployment/open-draft")
     def open_draft(body: OpenDeploymentRequest) -> dict[str, Any]:
         try:
@@ -760,9 +814,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
             )
-            _require_draftable_composition(
-                before.get("document"), compiled.document
-            )
+            if not _adds_components_only(before.get("document"), compiled.document):
+                _require_draftable_composition(
+                    before.get("document"), compiled.document
+                )
             commit_draft_edit(
                 state,
                 body,
@@ -776,6 +831,44 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
             # The Deployment workspace carries its own Draft-matched identity;
             # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
+        except Exception as error:
+            _raise(error)
+
+    @router.post("/api/deployment/draft/components")
+    def add_components(body: AddComponentsRequest) -> dict[str, Any]:
+        """Add component: new component rows and their attachment rows in one edit."""
+
+        try:
+            before = state.deployment_draft_session.retained_state()
+            if (
+                before.get("draft_id") != body.draft_id
+                or before.get("draft_revision") != body.expected_draft_revision
+            ):
+                state.deployment_draft_session.require_current(
+                    body.draft_id, body.expected_draft_revision
+                )
+            compiled = state.deployment_draft_session.preview_component_addition(
+                body.components,
+                body.attachments,
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            if not _adds_components_only(before.get("document"), compiled.document):
+                _require_draftable_composition(
+                    before.get("document"), compiled.document
+                )
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="add_deployment_components",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
             return _workspace(state)
         except Exception as error:
             _raise(error)
@@ -819,6 +912,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     controllable_component_id=body.controllable_component_id,
                     command_target_id=body.command_target_id,
                     maximum_tcp_linear_speed_mps=(body.maximum_tcp_linear_speed_mps),
+                    tcp_speed_check=body.tcp_speed_check,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
                 )
@@ -1057,7 +1151,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
         )
         current_bundle, current_graph, _ = state._manager_current(
-            state.headless_client.manager_status()
+            state.headless_client.manager_status(), phase="deployment_revert.preview"
         )
         manager_request_id = (
             "deployment-revert-"
@@ -1213,7 +1307,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         def manager_current() -> tuple[str, str]:
             try:
                 bundle, graph, _epoch = state._manager_current(
-                    state.headless_client.manager_status()
+                    state.headless_client.manager_status(), phase="deployment_candidate.preview"
                 )
                 return bundle, graph
             except DraftSessionError as error:

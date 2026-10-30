@@ -63,6 +63,11 @@ export interface WorkbenchNotice {
    */
   alarmDefinitionIds?: readonly string[];
   /**
+   * Alarms this notice represents only for these subjects (one definition on
+   * one component), shown inside it like `alarmDefinitionIds`.
+   */
+  alarmSubjects?: readonly { definitionId: string; subjectId: string }[];
+  /**
    * The condition is the expected, related consequence of a known controlled
    * transition (the model or Scene being replaced). Only while such a
    * transition is active is an error of this kind presented as information.

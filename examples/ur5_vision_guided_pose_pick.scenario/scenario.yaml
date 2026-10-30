@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:1f1cd6333f21723ac68541b2eae77a15c0f1ba39dc456e16693a091c67a54c42",
-    "program.yaml": "sha256:e85c67a213cc8fddaec02b4edf3b16a5a01f86e6b8467b434ef30dcf6615ae9e"
+    "program.yaml": "sha256:6344b01bee620e5efcb26d84075b98f2df35b3dc440bef12fd882be96a67f0a3"
   },
   "name": "ur5_vision_guided_pose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:1a639795ab938fb5e184025b38093eb937ab2bf81306d5b6fc1864d357e58d8b",
+    "checked_content_digest": "sha256:3048c031b4893fbad671be2ccad4b3733302f2ab797b8628123437057a0a873b",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

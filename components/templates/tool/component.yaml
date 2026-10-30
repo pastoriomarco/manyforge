@@ -1,0 +1,42 @@
+# Component descriptor of one tool that mounts on a robot's `flange`.
+# Guide: docs/authoring/ADDING_A_COMPONENT.md. Replace every <TODO>, put the
+# tool's URDF and SRDF in this folder, then run
+#   scripts/manyforge component check <this folder>
+#   scripts/manyforge component register <this folder>
+# A passive tool (no fingers) keeps model, mount and tcps and deletes roles,
+# gripper and lanes.
+api_version: manyforge.component_package.v1
+kind: tool
+id: __ID__
+version: 1.0.0
+title: <TODO vendor and model>
+license: <TODO SPDX id of the model files, for example BSD-3-Clause>
+provenance:
+  source: <TODO repository the URDF and SRDF come from>
+  revision: <TODO commit or release>
+model:
+  urdf: __NAME__.urdf
+  srdf: __NAME__.srdf             # the gripper group and its open/closed states
+mount:
+  frame: <TODO>                   # the URDF root link, the one on the robot flange
+tcps:                             # the first is the default TCP; each id is its name
+  - {id: tcp, frame: <TODO>}
+roles:
+  groups: {gripper: <TODO>}       # the SRDF group of the gripper
+  joints: {fingers: [<TODO>]}     # the commanded finger joint, not a mimic follower
+  collision_bodies:
+    gripper_collision: [<TODO>]   # the tool's links
+gripper:
+  actuation: position_commanded   # or pneumatic: a valve driven by I/O components
+  states: {open: open, closed: closed}   # group_states of the gripper group
+  attach_frame: <TODO>            # the link a grasped object attaches to
+  touch_links: [<TODO>]           # links that may touch a grasped object
+  # command_duration_s: 0.8       # pneumatic only: the valve dwell in seconds
+lanes:                            # the Mock lane's simulated fingers
+  mock:
+    controllers:
+      template: ufactory          # the robot's template: ufactory or ur
+      hardware_component_name: <TODO>   # e.g. MockAcmeGripperSystem
+      gripper_controller: <TODO>        # e.g. acme_gripper_controller
+      hard_stop_completion_timeout_s: 1.5
+      gripper_result_timeout_s: 5.0

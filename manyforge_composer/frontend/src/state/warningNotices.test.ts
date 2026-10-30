@@ -49,17 +49,29 @@ describe('warnings: what blocks nothing stays until acknowledged', () => {
     expect(locallyAcknowledgedWarnings([stopped], new Set([stopped.id]), acknowledge)).toEqual([]);
   });
 
-  it('shows a refused Activation that changed nothing as an acknowledgeable warning', () => {
+  it('keeps a refused Activation that changed nothing red, with one Acknowledge (item 21)', () => {
+    const run = vi.fn();
+    const dismiss = vi.fn();
     const notice = activationFailureNotice('activation.b:1', 'apply.b', {
       state: 'failed',
+      failureAcknowledgement: 'unavailable',
       failure: {
         code: 'manager_apply_preflight_refused', message: 'Candidate preflight was refused.',
         phase: 'accepted', effectDisposition: 'known',
+        causeCode: 'typed_cause_code', causeDetails: {}, producer: 'component_manager',
+        effectBoundary: 'before_effect',
       },
-    }, null, true);
-    const [shown] = locallyAcknowledgedWarnings([notice], new Set(), vi.fn());
-    expect(shown?.severity).toBe('warning');
+    }, null, true, { busy: false, error: null, outcomeUnknown: false, run, dismiss });
+    expect(notice).not.toBeNull();
+    // A failed Apply is an error: never a warning, never locally acknowledgeable as one.
+    const [shown] = locallyAcknowledgedWarnings([notice!], new Set(), vi.fn());
+    expect(shown?.severity).toBe('error');
+    expect(shown?.acknowledgeable).toBeUndefined();
     expect(labels(shown)).toEqual(['Acknowledge']);
+    // Refused before the fence: nothing is held, so Acknowledge hides it here.
+    shown?.actions?.[0]?.run();
+    expect(dismiss).toHaveBeenCalledOnce();
+    expect(run).not.toHaveBeenCalled();
   });
 
   it('shows a viewer condition as a warning that keeps its Reload action', () => {

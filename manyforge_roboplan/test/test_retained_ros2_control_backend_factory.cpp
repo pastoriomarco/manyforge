@@ -2,6 +2,7 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
@@ -35,7 +36,7 @@ namespace {
 /// The maintained provider manifest's catalog anchor
 /// (resources/maintained/catalog/provider_manifest/manyforge.provider.ros2_control.json).
 constexpr const char *kMaintainedRos2ControlCatalogSemanticDigest =
-    "sha256:f6d46812c1a953a09c081e331c92d20473ecfc42d0ac68749e30d724c03cc3b7";
+    "sha256:54f324571f97808d6ed86de3c5d9adf88314dd602e99aab82b022c5e2f3e1ff6";
 
 class NullExecutionStateSink final : public core::IExecutionStateSink {
 public:
@@ -288,15 +289,20 @@ void add_component_streams(
             });
 }
 
+// Merge 6: an Isaac robot row (`lite6`, `ur10e`) is arm-only; a tool row
+// (`lite_gripper`, `robotiq_2f_140`) is its own component with the gripper
+// target. The fixture components all select `profile`.
 [[nodiscard]]
 deployment::ros2_control_execution_runtime_contract::Configuration
 isaac_runtime_configuration(std::string profile) {
   deployment::ros2_control_execution_runtime_contract::Configuration result;
+  const bool tool = profile == "lite_gripper" || profile == "robotiq_2f_140";
   for (const char *component : {"robot_1", "robot_a", "robot_b", "robot.1"}) {
     result.controller_profiles.push_back(
         {core::ControllableComponentId(component), profile, std::nullopt});
-    result.gripper_target_configurations.push_back(fixture_gripper_row(
-        component, profile == "lite6" ? "pneumatic" : "position_commanded"));
+    if (tool)
+      result.gripper_target_configurations.push_back(fixture_gripper_row(
+          component, profile == "lite_gripper" ? "pneumatic" : "position_commanded"));
   }
   add_component_streams(result);
   result.planner_rng_seed = 12345U;
@@ -304,6 +310,23 @@ isaac_runtime_configuration(std::string profile) {
   result.execution_tick_hz = 100U;
   result.collision_monitor_period_ms = 50.0;
   return result;
+}
+
+/// An Isaac tool's gripper, composed as the host composes a gripper-only tool
+/// owner: its row's transport in its own namespace, then its output row.
+[[nodiscard]] RetainedRos2ControlBackendConfig isaac_tool_config(
+    const deployment::ros2_control_execution_runtime_contract::Configuration &runtime,
+    const core::RuntimeParticipantBinding &tool) {
+  const auto *selected = deployment::ros2_control_execution_runtime_contract::
+      find_controller_profile(runtime, tool.value().controllable_component_id);
+  if (selected == nullptr || !selected->isaac_profile.has_value())
+    throw std::logic_error("fixture tool has no Isaac row");
+  RetainedRos2ControlBackendConfig config;
+  config.node_namespace = retained_isaac_ros_namespace(tool);
+  configure_retained_isaac_gripper_action(config, tool, *selected->isaac_profile,
+                                          config.node_namespace);
+  configure_retained_gripper_output_mode(config, runtime, tool);
+  return config;
 }
 
 [[nodiscard]] core::ProviderManifestDTO ros_lifecycle_manifest() {
@@ -345,8 +368,7 @@ isaac_runtime_configuration(std::string profile) {
 TEST(RetainedRos2ControlBackendFactoryTest,
      CommandedSimulationSelectsOneNonExpiringAddressedAuthority) {
   const auto config = make_retained_isaac_ros2_control_backend_config(
-      isaac_runtime_configuration("lite6"), commanded_binding(),
-      commanded_gripper_binding());
+      isaac_runtime_configuration("lite6"), commanded_binding(), std::nullopt);
 
   const auto state = retained_ros2_control_motion_state_config(config);
 
@@ -363,10 +385,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      RetainedIsaacProfileExpandsToExactControllerAndGripperContract) {
-  const auto runtime = isaac_runtime_configuration("lite6");
-
+  // Merge 6: the robot row's arm, and its tool row's gripper (own component).
   const auto selected = make_retained_isaac_ros2_control_backend_config(
-      runtime, commanded_binding(), commanded_gripper_binding());
+      isaac_runtime_configuration("lite6"), commanded_binding(), std::nullopt);
+  const auto tool = isaac_tool_config(isaac_runtime_configuration("lite_gripper"),
+                                      commanded_gripper_binding("robot_a"));
 
   EXPECT_EQ(selected.node_namespace, "/manyforge/robot_1");
   EXPECT_EQ(selected.executor_thread_count, 3U);
@@ -383,8 +406,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_TRUE(adapter.lane_facts.supports_scale);
   EXPECT_FALSE(adapter.lane_facts.supports_scheduled_replacement);
   EXPECT_TRUE(adapter.lane_facts.has_measured_velocity);
+  // Merge 6 arrival: the lane keeps its JTC goal tolerances on every goal.
   EXPECT_EQ(adapter.lane_facts.goal_tolerance_policy,
-            core::ExecutionGoalTolerancePolicy::kErased);
+            core::ExecutionGoalTolerancePolicy::kKept);
   EXPECT_DOUBLE_EQ(adapter.lane_facts.state_rate_hz, 100.0);
   EXPECT_DOUBLE_EQ(adapter.lane_facts.feedback_rate_hz, 20.0);
   EXPECT_DOUBLE_EQ(adapter.lane_facts.controller_update_rate_hz, 100.0);
@@ -408,46 +432,51 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_TRUE(selected.arm.measured_joint_state_lane.has_value());
   EXPECT_EQ(selected.arm.measured_joint_state_lane->absolute_topic,
             "/isaac_joint_states");
-  ASSERT_TRUE(selected.gripper.has_value());
-  EXPECT_EQ(selected.gripper->action_name,
-            "/manyforge/robot_1/lite_gripper_controller/gripper_cmd");
-  EXPECT_EQ(selected.gripper->transport_kind, "isaac_joint_state_effort");
-  EXPECT_EQ(selected.gripper->command_joint_names,
+  EXPECT_FALSE(selected.gripper.has_value());
+  ASSERT_TRUE(tool.gripper.has_value());
+  EXPECT_EQ(tool.gripper->action_name,
+            "/manyforge/robot_a/lite_gripper_controller/gripper_cmd");
+  EXPECT_EQ(tool.gripper->transport_kind, "isaac_joint_state_effort");
+  EXPECT_EQ(tool.gripper->command_joint_names,
             (std::vector<std::string>{"source_gripper_joint"}));
-  EXPECT_EQ(selected.gripper->state_joint_name, "source_gripper_joint");
-  EXPECT_EQ(selected.gripper->group_id, "gripper");
-  EXPECT_EQ(selected.gripper->joint_name, "gripper_joint");
-  EXPECT_EQ(selected.gripper->completion_policy, "output_delivery");
+  EXPECT_EQ(tool.gripper->state_joint_name, "source_gripper_joint");
+  EXPECT_EQ(tool.gripper->group_id, "gripper");
+  EXPECT_EQ(tool.gripper->joint_name, "gripper_joint");
+  EXPECT_EQ(tool.gripper->completion_policy, "output_delivery");
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      SameTypeIsaacInstancesHaveDisjointControlPlaneEndpoints) {
+  // Merge 6: two robots and their two tools, each its own component.
   const auto runtime = isaac_runtime_configuration("ur10e");
+  const auto tools = isaac_runtime_configuration("robotiq_2f_140");
 
   const auto first = make_retained_isaac_ros2_control_backend_config(
-      runtime, commanded_binding("robot_a"),
-      commanded_gripper_binding("robot_a"));
+      runtime, commanded_binding("robot_a"), std::nullopt);
   const auto second = make_retained_isaac_ros2_control_backend_config(
-      runtime, commanded_binding("robot_b"),
-      commanded_gripper_binding("robot_b"));
+      runtime, commanded_binding("robot_b"), std::nullopt);
+  const auto first_tool =
+      isaac_tool_config(tools, commanded_gripper_binding("robot_a"));
+  const auto second_tool =
+      isaac_tool_config(tools, commanded_gripper_binding("robot_b"));
 
-  ASSERT_TRUE(first.gripper.has_value());
-  ASSERT_TRUE(second.gripper.has_value());
+  ASSERT_TRUE(first_tool.gripper.has_value());
+  ASSERT_TRUE(second_tool.gripper.has_value());
   const std::vector<std::string> first_endpoints{
       first.arm.adapter.action_name, first.arm.adapter.state_topic,
       first.arm.adapter.scale_topic, first.arm.controller.controller_manager,
-      first.gripper->action_name};
+      first_tool.gripper->action_name};
   const std::vector<std::string> second_endpoints{
       second.arm.adapter.action_name, second.arm.adapter.state_topic,
       second.arm.adapter.scale_topic, second.arm.controller.controller_manager,
-      second.gripper->action_name};
+      second_tool.gripper->action_name};
   for (std::size_t index = 0; index < first_endpoints.size(); ++index) {
     EXPECT_NE(first_endpoints[index], second_endpoints[index]);
   }
   // Raw Isaac gripper transport wires are lane values, not runtime-owned
   // endpoints.
-  EXPECT_EQ(first.gripper->command_topic, second.gripper->command_topic);
-  EXPECT_EQ(first.gripper->state_topic, second.gripper->state_topic);
+  EXPECT_EQ(first_tool.gripper->command_topic, second_tool.gripper->command_topic);
+  EXPECT_EQ(first_tool.gripper->state_topic, second_tool.gripper->state_topic);
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -456,9 +485,12 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 
   EXPECT_THROW(
       static_cast<void>(make_retained_isaac_ros2_control_backend_config(
-          runtime, commanded_binding("robot.1"),
-          commanded_gripper_binding("robot.1"))),
+          runtime, commanded_binding("robot.1"), std::nullopt)),
       std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(isaac_tool_config(
+                   isaac_runtime_configuration("robotiq_2f_140"),
+                   commanded_gripper_binding("robot.1"))),
+               std::invalid_argument);
   EXPECT_THROW(
       static_cast<void>(make_retained_isaac_ros2_control_backend_config(
           runtime, commanded_binding("robot_a"),
@@ -514,8 +546,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
      FactoryIsSingleUseEvenWhenConstructionFailsClosed) {
   auto factory = make_retained_ros2_control_backend_factory(
       make_retained_isaac_ros2_control_backend_config(
-          isaac_runtime_configuration("lite6"), commanded_binding(),
-          commanded_gripper_binding()));
+          isaac_runtime_configuration("lite6"), commanded_binding(), std::nullopt));
   const auto binding = commanded_binding();
   core::FakeClock clock;
   core::ManualScheduler scheduler;
@@ -533,16 +564,15 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   // The explicit required-input guard still refuses missing timing inputs
   // before any ROS entity exists, even though Q55 supplies the lane values.
   const auto motion = commanded_binding();
-  const auto gripper = commanded_gripper_binding();
   auto config = make_retained_isaac_ros2_control_backend_config(
-      isaac_runtime_configuration("lite6"), motion, gripper);
+      isaac_runtime_configuration("lite6"), motion, std::nullopt);
   config.participant.stop.replacement_start_allowance_s.reset();
   config.participant.late_cycle_margin_s = 0.0;
   auto factory = make_retained_ros2_control_backend_factory(std::move(config));
   core::FakeClock clock;
   core::ManualScheduler scheduler;
   try {
-    static_cast<void>(factory(motion, gripper, nullptr, nullptr, clock, scheduler));
+    static_cast<void>(factory(motion, std::nullopt, nullptr, nullptr, clock, scheduler));
     FAIL() << "composition without required lane inputs must refuse";
   } catch (const std::invalid_argument &error) {
     const std::string message = error.what();
@@ -1920,12 +1950,12 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 } // namespace
 TEST(RetainedRos2ControlBackendFactoryTest,
      EachComponentUsesItsOwnControllerProfileInTheOneRosUnit) {
-  // Q68: a mixed cell (Lite 6 + UR10e) hosts both components in one ROS unit;
-  // each one selects its own controller profile.
+  // Q68: a mixed cell (Lite 6 + UR10e, each with its tool) hosts every
+  // component in one ROS unit; each one selects its own controller profile.
   deployment::ros2_control_execution_runtime_contract::Configuration runtime;
   runtime.gripper_target_configurations = {
-      fixture_gripper_row("robot_a", "pneumatic"),
-      fixture_gripper_row("robot_b", "position_commanded")};
+      fixture_gripper_row("tool_a", "pneumatic"),
+      fixture_gripper_row("tool_b", "position_commanded")};
   runtime.planner_rng_seed = 12345U;
   runtime.initial_joint_positions_rad = {0.0, 0.0};
   runtime.execution_tick_hz = 100U;
@@ -1936,29 +1966,39 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       {core::ControllableComponentId("robot_b"), std::string("ur10e"),
        std::nullopt},
       {core::ControllableComponentId("robot_c"), std::nullopt,
-       std::string("lite6_lite_gripper")}};
+       std::string("lite6_lite_gripper")},
+      {core::ControllableComponentId("tool_a"), std::string("lite_gripper"),
+       std::nullopt},
+      {core::ControllableComponentId("tool_b"), std::string("robotiq_2f_140"),
+       std::nullopt}};
   add_component_streams(runtime);
   const auto lite6 = make_retained_isaac_ros2_control_backend_config(
-      runtime, commanded_binding("robot_a"), commanded_gripper_binding("robot_a"));
+      runtime, commanded_binding("robot_a"), std::nullopt);
   const auto ur10e = make_retained_isaac_ros2_control_backend_config(
-      runtime, commanded_binding("robot_b"), commanded_gripper_binding("robot_b"));
+      runtime, commanded_binding("robot_b"), std::nullopt);
+  const auto lite_gripper =
+      isaac_tool_config(runtime, commanded_gripper_binding("tool_a"));
+  const auto robotiq = isaac_tool_config(runtime, commanded_gripper_binding("tool_b"));
   EXPECT_EQ(lite6.arm.controller.hardware_component_name, "IsaacLite6TopicBasedSystem");
   EXPECT_EQ(ur10e.arm.controller.hardware_component_name, "IsaacUR10eTopicBasedSystem");
-  EXPECT_EQ(lite6.gripper->completion_policy, "output_delivery");
-  EXPECT_EQ(ur10e.gripper->completion_policy, "position_reached");
+  EXPECT_EQ(lite_gripper.gripper->completion_policy, "output_delivery");
+  EXPECT_EQ(robotiq.gripper->completion_policy, "position_reached");
   // The feedback staleness threshold is the component's `gripper_feedback`
   // stream row, not a code default.
-  EXPECT_DOUBLE_EQ(lite6.gripper->state_freshness_timeout_s, 0.75);
-  EXPECT_DOUBLE_EQ(ur10e.gripper->state_freshness_timeout_s, 0.75);
+  EXPECT_DOUBLE_EQ(lite_gripper.gripper->state_freshness_timeout_s, 0.75);
+  EXPECT_DOUBLE_EQ(robotiq.gripper->state_freshness_timeout_s, 0.75);
+  // An arm-only robot row carries no gripper: its tool is its own component.
+  EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
+                   runtime, commanded_binding("robot_a"),
+                   commanded_gripper_binding("robot_a"))),
+               std::invalid_argument);
   // The offline mock lane is built by its own builder (phase 2b); an unknown
   // component has no profile at all.
   EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
-                   runtime, commanded_binding("robot_c"),
-                   commanded_gripper_binding("robot_c"))),
+                   runtime, commanded_binding("robot_c"), std::nullopt)),
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
-                   runtime, commanded_binding("robot_d"),
-                   commanded_gripper_binding("robot_d"))),
+                   runtime, commanded_binding("robot_d"), std::nullopt)),
                std::invalid_argument);
 }
 
@@ -2020,11 +2060,17 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       row.recovery = recovery;
     }
   };
+  // Merge 6: on Isaac the robot row is arm-only and the tool row (its own
+  // component) declares the gripper feedback.
   auto isaac_runtime = isaac_runtime_configuration("lite6");
   set_rows(isaac_runtime, 300'000'000, core::StreamSeverityDTO::kWarning,
            core::StreamRecoveryDTO::kAuto);
+  auto isaac_tool_runtime = isaac_runtime_configuration("lite_gripper");
+  set_rows(isaac_tool_runtime, 300'000'000, core::StreamSeverityDTO::kWarning,
+           core::StreamRecoveryDTO::kAuto);
   const auto isaac =
-      make_retained_isaac_ros2_control_backend_config(isaac_runtime, motion, tool);
+      make_retained_isaac_ros2_control_backend_config(isaac_runtime, motion, std::nullopt);
+  const auto isaac_tool = isaac_tool_config(isaac_tool_runtime, tool);
   ASSERT_TRUE(isaac.arm.measured_joint_state_lane);
   EXPECT_EQ(isaac.arm.measured_joint_state_lane->absolute_topic,
             "/isaac_joint_states");
@@ -2036,11 +2082,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   // One value: the in-motion Stop staleness check is the measured_joints
   // row budget.
   EXPECT_EQ(isaac.participant.stop.controller_state_max_age_ns, 300'000'000);
-  ASSERT_TRUE(isaac.gripper);
-  EXPECT_DOUBLE_EQ(isaac.gripper->state_freshness_timeout_s, 0.5);
-  EXPECT_EQ(isaac.gripper->feedback_stream_severity,
+  ASSERT_TRUE(isaac_tool.gripper);
+  EXPECT_DOUBLE_EQ(isaac_tool.gripper->state_freshness_timeout_s, 0.5);
+  EXPECT_EQ(isaac_tool.gripper->feedback_stream_severity,
             core::StreamSeverityDTO::kWarning);
-  EXPECT_EQ(isaac.gripper->feedback_stream_recovery,
+  EXPECT_EQ(isaac_tool.gripper->feedback_stream_recovery,
             core::StreamRecoveryDTO::kAuto);
   auto mock_runtime = mock_runtime_configuration("lite6_lite_gripper");
   set_rows(mock_runtime, 400'000'000, core::StreamSeverityDTO::kBlocking,
@@ -2066,21 +2112,26 @@ TEST(RetainedRos2ControlBackendFactoryTest,
               kMeasuredJointStateAuthorityId);
     EXPECT_EQ(lane->measured_source_profile_id, kMeasuredJointStateProfileId);
   }
-  // A component that does not declare a required stream is refused.
-  for (const char *stream : {"measured_joints", "gripper_feedback"}) {
+  // A component that does not declare a required stream is refused. On
+  // Isaac the robot declares `measured_joints` and its tool `gripper_feedback`.
+  for (const std::string stream : {"measured_joints", "gripper_feedback"}) {
     for (bool isaac_lane : {false, true}) {
-      auto runtime = isaac_lane ? isaac_runtime_configuration("lite6")
-                                : mock_runtime_configuration("lite6_lite_gripper");
+      auto runtime =
+          !isaac_lane ? mock_runtime_configuration("lite6_lite_gripper")
+          : stream == "measured_joints" ? isaac_runtime_configuration("lite6")
+                                        : isaac_runtime_configuration("lite_gripper");
       std::erase_if(runtime.component_streams, [&](const auto &row) {
         return row.controllable_component_id == motion.value().controllable_component_id &&
                row.stream_id == stream;
       });
       EXPECT_THROW(static_cast<void>(
-                       isaac_lane
+                       !isaac_lane
+                           ? make_retained_mock_ros2_control_backend_config(
+                                 runtime, motion, tool, kMockCancel)
+                       : stream == "measured_joints"
                            ? make_retained_isaac_ros2_control_backend_config(
-                                 runtime, motion, tool)
-                           : make_retained_mock_ros2_control_backend_config(
-                                 runtime, motion, tool, kMockCancel)),
+                                 runtime, motion, std::nullopt)
+                           : isaac_tool_config(runtime, tool)),
                    std::invalid_argument);
     }
   }
@@ -2120,7 +2171,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     const auto build = [&](const std::vector<core::StreamParameterOverrideDTO> &rows) {
       return isaac_lane
                  ? make_retained_isaac_ros2_control_backend_config(
-                       isaac_runtime, motion, tool, rows)
+                       isaac_runtime, motion, std::nullopt, rows)
                  : make_retained_mock_ros2_control_backend_config(
                        mock_runtime, motion, tool, kMockCancel, rows);
     };
@@ -2321,7 +2372,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   }
   // The same invalid experimental environment is never read by the Isaac lane.
   const auto isaac = make_retained_isaac_ros2_control_backend_config(
-      isaac_runtime_configuration("lite6"), commanded_binding(), commanded_gripper_binding());
+      isaac_runtime_configuration("lite6"), commanded_binding(), std::nullopt);
   EXPECT_DOUBLE_EQ(*isaac.participant.stop.replacement_start_allowance_s, 0.020);
   EXPECT_FALSE(isaac.arm.adapter.lane_facts.experiment.any());
 }
@@ -2347,8 +2398,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_TRUE(adapter.lane_facts.has_measured_velocity);
   EXPECT_EQ(adapter.lane_facts.cancel_semantics,
             core::ExecutionCancelSemantics::kDecelerate);
+  // Merge 6 arrival: the lane keeps its JTC goal tolerances on every goal.
   EXPECT_EQ(adapter.lane_facts.goal_tolerance_policy,
-            core::ExecutionGoalTolerancePolicy::kErased);
+            core::ExecutionGoalTolerancePolicy::kKept);
   // The UFactory template's cadence (update 150, state 25, monitor 20 Hz).
   EXPECT_DOUBLE_EQ(adapter.lane_facts.controller_update_rate_hz, 150.0);
   EXPECT_DOUBLE_EQ(adapter.lane_facts.state_rate_hz, 25.0);
@@ -2456,6 +2508,7 @@ real_runtime_configuration() {
                                 std::nullopt, std::nullopt};
   profile.real_profile = "lite6_real";
   profile.device_address_ref = "lite6_main";
+  profile.adapter_family = "xarm";
   result.controller_profiles = {profile};
   result.planner_rng_seed = 12345U;
   result.execution_tick_hz = 100U;
@@ -2483,7 +2536,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(lane.measured_source_profile_id, kMeasuredJointStateProfileId);
   EXPECT_EQ(config.participant.progress_freshness_budget_ns, 250'000'000);
   EXPECT_EQ(config.participant.start_tolerance_rad, 0.02);
-  EXPECT_EQ(config.participant.final_tolerance_rad, 0.02);
+  // The terminal gate reads the Real row's arrival tolerance, the same value
+  // as the controllers' JTC goal; the lane keeps that goal on every goal.
+  EXPECT_EQ(config.participant.final_tolerance_rad, 0.01);
+  EXPECT_EQ(config.arm.adapter.lane_facts.goal_tolerance_policy,
+            core::ExecutionGoalTolerancePolicy::kKept);
   EXPECT_EQ(config.participant.completion_state_timeout_ns, 1'000'000'000);
   EXPECT_EQ(config.arm.adapter.action_name,
             "/manyforge/robot_1/lite6_traj_controller/follow_joint_trajectory");
@@ -2499,8 +2556,8 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             mock.arm.adapter.lane_facts.controller_update_rate_hz);
   EXPECT_EQ(config.arm.adapter.lane_facts.state_rate_hz,
             mock.arm.adapter.lane_facts.state_rate_hz);
-  // D7: ManyMove's 10 Hz action monitor, not Mock's 20 Hz.
-  EXPECT_DOUBLE_EQ(config.arm.adapter.lane_facts.feedback_rate_hz, 10.0);
+  // M6b JTC20: the action monitor at 20 Hz, as Mock (maintainer).
+  EXPECT_DOUBLE_EQ(config.arm.adapter.lane_facts.feedback_rate_hz, 20.0);
   EXPECT_EQ(config.participant.stop.hard_stop_completion_timeout_ns,
             mock.participant.stop.hard_stop_completion_timeout_ns);
   EXPECT_FALSE(config.arm.adapter.lane_facts.supports_scheduled_replacement);
@@ -2514,6 +2571,21 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   // The Mock builder is unchanged: commanded authority.
   EXPECT_EQ(mock.participant.stop.trip_authority,
             core::StateAuthorityClass::kCommanded);
+  // No Deployment setting: the soft Stop lead-in starts at the command
+  // position on both lanes.
+  EXPECT_EQ(config.participant.stop.lead_in_anchor, core::StopLeadInAnchor::kCommanded);
+  EXPECT_EQ(mock.participant.stop.lead_in_anchor, core::StopLeadInAnchor::kCommanded);
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     RealComponentStopLeadInAnchorComesFromItsDeploymentSetting) {
+  for (const auto anchor : {core::StopLeadInAnchor::kCommanded, core::StopLeadInAnchor::kMeasured}) {
+    auto runtime = real_runtime_configuration();
+    runtime.controller_profiles.front().stop_lead_in_anchor = anchor;
+    const auto config = make_retained_real_ros2_control_backend_config(
+        runtime, measured_binding(), std::nullopt, kMockCancel);
+    EXPECT_EQ(config.participant.stop.lead_in_anchor, anchor);
+  }
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -2697,7 +2769,7 @@ TEST(RetainedRos2ControlBackendFactoryTest, MockProfileConfigurationFailsClosed)
   // An Isaac profile is not built by the mock builder, nor the reverse.
   EXPECT_THROW(static_cast<void>(make_retained_mock_ros2_control_backend_config(
                    isaac_runtime_configuration("lite6"), commanded_binding(),
-                   commanded_gripper_binding(), kMockCancel)),
+                   std::nullopt, kMockCancel)),
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
                    mock_runtime_configuration("lite6_lite_gripper"),
@@ -2831,13 +2903,180 @@ TEST(RetainedRos2ControlBackendFactoryTest,
                std::invalid_argument);
 }
 
+// Merge 6: a robot whose tool is its own component carries no gripper on
+// Isaac; a gripper binding on the robot row is refused.
+TEST(RetainedRos2ControlBackendFactoryTest,
+     IsaacRobotRowIsArmOnlyAndRefusesAGripper) {
+  for (const auto &[robot, hardware, deceleration] :
+       {std::tuple{"lite6", "IsaacLite6TopicBasedSystem", 8.0},
+        std::tuple{"ur10e", "IsaacUR10eTopicBasedSystem", 10.0}}) {
+    SCOPED_TRACE(robot);
+    const auto arm_only = make_retained_isaac_ros2_control_backend_config(
+        isaac_runtime_configuration(robot), commanded_binding(), std::nullopt);
+    EXPECT_FALSE(arm_only.gripper.has_value());
+    EXPECT_FALSE(arm_only.arm.gripper_controller.has_value());
+    EXPECT_EQ(arm_only.arm.controller.hardware_component_name, hardware);
+    EXPECT_EQ(arm_only.arm.adapter.action_name,
+              "/manyforge/robot_1/isaac_arm_controller/follow_joint_trajectory");
+    EXPECT_EQ(arm_only.participant.stop.max_deceleration_on_cancel_rad_s2,
+              (std::map<std::string, double>{{"joint_1", deceleration}}));
+    ASSERT_TRUE(arm_only.arm.measured_joint_state_lane.has_value());
+    EXPECT_EQ(arm_only.arm.measured_joint_state_lane->absolute_topic,
+              "/isaac_joint_states");
+    EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
+                     isaac_runtime_configuration(robot), commanded_binding(),
+                     commanded_gripper_binding())),
+                 std::invalid_argument);
+  }
+}
+
+// Merge 6 (D4): a lane-free pneumatic tool has no controller profile and no
+// streams; its I/O-mapped gripper is the no-output logical owner.
+TEST(RetainedRos2ControlBackendFactoryTest,
+     LaneFreePneumaticToolIsAStreamlessNoOutputOwner) {
+  deployment::ros2_control_execution_runtime_contract::Configuration runtime;
+  auto row = fixture_gripper_row("tool_1", "pneumatic");
+  row.pneumatic_io = deployment::ros2_control_execution_runtime_contract::
+      Configuration::PneumaticIo{
+          {{core::IoSignalId{core::ControllableComponentId("valve_io"), "valve"}, false, true}},
+          {}};
+  runtime.gripper_target_configurations.push_back(std::move(row));
+  const auto tool = commanded_gripper_binding("tool_1");
+  RetainedRos2ControlBackendConfig config;
+  config.gripper = ros2_control_execution::Ros2GripperActionConfig{};
+  configure_retained_gripper_output_mode(config, runtime, tool);
+  ASSERT_TRUE(config.gripper.has_value());
+  EXPECT_EQ(config.gripper->output_mode, core::GripperOutputMode::kNone);
+  EXPECT_EQ(config.gripper->completion_policy, "no_output");
+  EXPECT_FALSE(config.arm.gripper_controller.has_value());
+}
+
+// Merge 6: the opt-in stall window comes from the tool's own gripper row;
+// without it the backend publishes no grasp evidence (the default).
+TEST(RetainedRos2ControlBackendFactoryTest,
+     ToolGripperRowCarriesItsOptInGraspStallWindow) {
+  using Contract = deployment::ros2_control_execution_runtime_contract::Configuration;
+  auto runtime = isaac_runtime_configuration("robotiq_2f_140");
+  const auto tool = commanded_gripper_binding("robot_a");
+  const auto configured = [&] {
+    RetainedRos2ControlBackendConfig config;
+    configure_retained_isaac_gripper_action(config, tool, "robotiq_2f_140", "/manyforge/robot_a");
+    configure_retained_gripper_output_mode(config, runtime, tool);
+    return config;
+  };
+  EXPECT_FALSE(configured().gripper->grasp_stall_window.has_value());
+  for (auto &row : runtime.gripper_target_configurations) {
+    if (row.controllable_component_id == core::ControllableComponentId("robot_a"))
+      row.grasp_confirmation = Contract::GraspConfirmation{
+          true, Contract::GraspStallWindow{0.001, 0.02}};
+  }
+  const auto config = configured();
+  ASSERT_TRUE(config.gripper->grasp_stall_window.has_value());
+  EXPECT_DOUBLE_EQ(config.gripper->grasp_stall_window->min_position, 0.001);
+  EXPECT_DOUBLE_EQ(config.gripper->grasp_stall_window->max_position, 0.02);
+}
+
+// M6 (SMALL3): a pneumatic I/O mapping on an Isaac gripper is refused with its
+// catalog code; the message text is unchanged.
+TEST(RetainedRos2ControlBackendFactoryTest, IsaacPneumaticIoMappingIsRefusedTyped) {
+  using Contract = deployment::ros2_control_execution_runtime_contract::Configuration;
+  auto runtime = isaac_runtime_configuration("robotiq_2f_140");
+  const auto tool = commanded_gripper_binding("robot_a");
+  for (auto &row : runtime.gripper_target_configurations) {
+    if (row.controllable_component_id == core::ControllableComponentId("robot_a"))
+      row.pneumatic_io = Contract::PneumaticIo{
+          {{core::IoSignalId{core::ControllableComponentId("valve_io"), "valve"}, false, true}},
+          {}};
+  }
+  RetainedRos2ControlBackendConfig config;
+  configure_retained_isaac_gripper_action(config, tool, "robotiq_2f_140", "/manyforge/robot_a");
+  try {
+    configure_retained_gripper_output_mode(config, runtime, tool);
+    FAIL() << "an Isaac gripper must refuse a pneumatic I/O mapping";
+  } catch (const core::TypedError &error) {
+    EXPECT_EQ(error.code(), "pneumatic_io_unsupported_on_isaac");
+    EXPECT_STREQ(error.what(),
+                 "pneumatic_io_unsupported_on_isaac: Isaac uses its existing gripper transport");
+  }
+}
+
+// Merge 6: the Isaac tool's transport is the profile's, in the tool's own
+// namespace; only an action transport has a bridge for the tool's launch.
+TEST(RetainedRos2ControlBackendFactoryTest,
+     IsaacToolGripperActionIsTheProfileTransportInTheToolNamespace) {
+  const auto tool = commanded_gripper_binding("robot_a");
+  RetainedRos2ControlBackendConfig ur10e;
+  configure_retained_isaac_gripper_action(ur10e, tool, "robotiq_2f_140", "/manyforge/robot_a");
+  ASSERT_TRUE(ur10e.gripper.has_value());
+  EXPECT_EQ(ur10e.gripper->transport_kind, "ros_gripper_command");
+  EXPECT_EQ(ur10e.gripper->action_name,
+            "/manyforge/robot_a/robotiq_gripper_controller/gripper_cmd");
+  EXPECT_EQ(ur10e.gripper->state_topic, "/isaac_joint_states");
+  EXPECT_EQ(ur10e.gripper->command_joint_names,
+            (std::vector<std::string>{"source_gripper_joint"}));
+  EXPECT_FALSE(ur10e.arm.gripper_controller.has_value());
+  RetainedRos2ControlBackendConfig lite6;
+  configure_retained_isaac_gripper_action(lite6, tool, "lite_gripper", "/manyforge/robot_a");
+  EXPECT_EQ(lite6.gripper->transport_kind, "isaac_joint_state_effort");
+  EXPECT_EQ(lite6.gripper->command_topic, "/isaac_joint_commands_gripper");
+
+  const auto bridge = retained_isaac_gripper_bridge("robotiq_2f_140");
+  ASSERT_TRUE(bridge.has_value());
+  EXPECT_EQ(bridge->action_name, "robotiq_gripper_controller/gripper_cmd");
+  EXPECT_EQ(bridge->command_topic, "/isaac_gripper_state");
+  EXPECT_EQ(bridge->state_topic, "/isaac_joint_states");
+  EXPECT_EQ(bridge->parameters_file, "isaac_robotiq_2f_140_gripper_bridge.yaml");
+  EXPECT_FALSE(retained_isaac_gripper_bridge("lite_gripper").has_value());
+  RetainedRos2ControlBackendConfig unknown;
+  EXPECT_THROW(configure_retained_isaac_gripper_action(unknown, tool, "ur5e", "/manyforge/robot_a"),
+               std::invalid_argument);
+}
+
+// Merge 6: an Isaac tool owner binds without a controller manager; its
+// lifecycle primitives go to the gripper bridge, as for a robot that carries
+// its Isaac gripper, never to a controller switch.
+TEST(RetainedRos2ControlBackendFactoryTest,
+     IsaacToolGripperOnlyOwnerUsesTheBridgeLifecycleWithoutAControllerManager) {
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  const auto tool = commanded_gripper_binding("robot_a");
+  const auto runtime = isaac_runtime_configuration("robotiq_2f_140");
+  const auto channel = test_projected_channel(
+      tool, retained_ros2_control_gripper_state_config(tool), clock);
+  auto config = gripper_only_factory_config("robot_a");
+  config.arm.gripper_controller.reset();
+  config.gripper.reset();
+  configure_retained_isaac_gripper_action(config, tool, "robotiq_2f_140", config.node_namespace);
+  configure_retained_gripper_output_mode(config, runtime, tool);
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  const auto backend = make_retained_ros2_control_gripper_backend(
+      config, tool, channel, clock, scheduler, handle);
+  ASSERT_NE(backend, nullptr);
+  EXPECT_TRUE(handle->OwnsGripper(backend.get(), tool));
+  EXPECT_FALSE(handle->participant());
+  const auto prepared = handle->lifecycle_primitive_dispatcher()(
+      core::ControlDomainId("domain.gripper"),
+      core::LifecyclePrimitiveId("ros2_control.controller.prepare"), {}, std::nullopt, {});
+  ASSERT_TRUE(prepared.error.has_value());
+  // No action server runs in this fixture: the bridge refuses, not a switch.
+  EXPECT_EQ(prepared.error->code, "ros2_control_gripper_bridge_not_ready");
+  // A half-named controller is neither a controller manager nor a bridge.
+  auto partial = config;
+  partial.arm.gripper_controller = RetainedRos2ControlArmController{
+      config.node_namespace + "/controller_manager", "", ""};
+  EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
+                   partial, tool, channel, clock, scheduler,
+                   RetainedRos2ControlRuntimeHandle::Create())),
+               std::invalid_argument);
+}
+
 TEST(RetainedRos2ControlBackendFactoryTest,
      StrictSelectedPneumaticSourceMapsDefaultAndExplicitTimeoutAcrossProfiles) {
   for (bool isaac : {false, true}) {
     for (const std::optional<double> timeout :
          {std::optional<double>{}, std::optional<double>{0.25},
           std::optional<double>{5.0}, std::optional<double>{15.0}}) {
-      auto runtime = isaac ? isaac_runtime_configuration("lite6")
+      auto runtime = isaac ? isaac_runtime_configuration("lite_gripper")
                            : mock_runtime_configuration("lite6_lite_gripper");
       auto &selected = runtime.gripper_target_configurations.front();
       selected.delivery_result_timeout_s = timeout;
@@ -2845,8 +3084,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
       foreign.delivery_result_timeout_s = 91.0;
       runtime.gripper_target_configurations.push_back(std::move(foreign));
       const auto config =
-          isaac ? make_retained_isaac_ros2_control_backend_config(
-                      runtime, commanded_binding(), commanded_gripper_binding())
+          isaac ? isaac_tool_config(runtime, commanded_gripper_binding())
                 : make_retained_mock_ros2_control_backend_config(
                       runtime, commanded_binding(), commanded_gripper_binding(),
                       kMockCancel);
@@ -2886,15 +3124,16 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   // timeout even for the Lite 6 profile; no numeric 5-to-1 heuristic is valid.
   for (bool isaac : {false, true}) {
     for (bool lite6 : {false, true}) {
+      // Merge 6: on Isaac the tool row (its own component) owns the gripper.
       auto runtime =
-          isaac ? isaac_runtime_configuration(lite6 ? "lite6" : "ur10e")
+          isaac ? isaac_runtime_configuration(lite6 ? "lite_gripper"
+                                                   : "robotiq_2f_140")
                 : mock_runtime_configuration(lite6 ? "lite6_lite_gripper"
                                                    : "ur10e_robotiq_2f_140");
       runtime.gripper_target_configurations.front().actuation_kind =
           "position_commanded";
       const auto config =
-          isaac ? make_retained_isaac_ros2_control_backend_config(
-                      runtime, commanded_binding(), commanded_gripper_binding())
+          isaac ? isaac_tool_config(runtime, commanded_gripper_binding())
                 : make_retained_mock_ros2_control_backend_config(
                       runtime, commanded_binding(), commanded_gripper_binding(),
                       kMockCancel);

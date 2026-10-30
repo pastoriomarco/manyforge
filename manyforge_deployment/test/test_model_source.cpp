@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <numbers>
 #include <manyforge_core/types/model_asset.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
@@ -27,7 +30,7 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kModelAssetSchemaRevision =
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
 
 static_assert(!std::is_aggregate_v<SourceVerifiedModelAsset>);
 static_assert(!std::is_default_constructible_v<SourceVerifiedModelAsset>);
@@ -2311,6 +2314,44 @@ TEST(ModelSource, EnforcesOneCombinedUrdfSrdfElementBudget) {
               std::string::npos)
         << error.what();
   }
+}
+
+// S4: quaternion -> URDF rpy -> quaternion keeps the rotation, also at and
+// next to gimbal lock (|sin pitch| ~ 1), where yaw is 0 and roll carries the
+// turn: rpy [30, 90, 0] deg stays [30, 90, 0], never [90, 90, 0].
+TEST(ModelSource, UrdfOriginRpyRoundTripsAtGimbalLock) {
+  const auto quaternion = [](double r, double p, double y) {
+    const double cr = std::cos(r / 2), sr = std::sin(r / 2);
+    const double cp = std::cos(p / 2), sp = std::sin(p / 2);
+    const double cy = std::cos(y / 2), sy = std::sin(y / 2);
+    return std::array<double, 4>{sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+                                 cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy};
+  };
+  const double deg = std::numbers::pi / 180.0;
+  const std::array<std::array<double, 3>, 8> cases{{{30, 90, 0},
+                                                    {30, -90, 0},
+                                                    {10, 90, 40},
+                                                    {10, -90, 40},
+                                                    {-120, 90, 75},
+                                                    {30, 89.99999, 20},
+                                                    {30, -89.9999999, 20},
+                                                    {12, 34, -56}}};
+  for (const auto& rpy_deg : cases) {
+    SCOPED_TRACE(::testing::Message() << rpy_deg[0] << " " << rpy_deg[1] << " " << rpy_deg[2]);
+    const auto q = quaternion(rpy_deg[0] * deg, rpy_deg[1] * deg, rpy_deg[2] * deg);
+    const auto origin = urdf_origin_from_pose(core::PlacementPoseDTO{{0.1, 0.2, 0.3}, q});
+    ASSERT_TRUE(origin.authored_rpy_rad.has_value());
+    EXPECT_EQ(origin.rpy_rad, *origin.authored_rpy_rad);
+    const auto back = quaternion(origin.rpy_rad[0], origin.rpy_rad[1], origin.rpy_rad[2]);
+    // Same rotation: |q . back| = 1 (q and -q are one rotation).
+    const double dot = q[0] * back[0] + q[1] * back[1] + q[2] * back[2] + q[3] * back[3];
+    EXPECT_NEAR(std::abs(dot), 1.0, 1e-12);
+  }
+  const auto locked = urdf_origin_from_pose(
+      core::PlacementPoseDTO{{0.0, 0.0, 0.0}, quaternion(30 * deg, 90 * deg, 0.0)});
+  EXPECT_NEAR(locked.rpy_rad[0], 30 * deg, 1e-9);
+  EXPECT_NEAR(locked.rpy_rad[1], 90 * deg, 1e-12);
+  EXPECT_EQ(locked.rpy_rad[2], 0.0);
 }
 
 }  // namespace

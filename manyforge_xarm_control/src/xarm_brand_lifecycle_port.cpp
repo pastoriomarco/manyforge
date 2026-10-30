@@ -43,9 +43,10 @@ constexpr int kStopRequestedFeedbackState = 6;
 constexpr int kManualMode = 2;
 
 // An own primitive explains vendor mode/state changes for this long after it
-// returned, unless a report showed its final expected pair earlier. The same
-// window bounds the verification of an own `clean_error` (m5.5).
-constexpr std::int64_t kOwnPrimitiveSettleNs = kXArmClearVerifyNs;
+// returned, unless a report showed its final expected pair earlier; an error
+// still reported this long after an own `clean_error` is labelled
+// `xarm_error_persists_after_clear` (m5.5).
+constexpr std::int64_t kOwnPrimitiveSettleNs = 5'000'000'000LL;
 
 
 [[nodiscard]] LifecycleFactValueDTO unknown_value() {
@@ -227,10 +228,12 @@ vendor_cause(const XArmObservedState &observed, const bool armed,
   return state == kStoppedFeedbackState;
 }
 
-// The D9 device facts of one fresh report, and its vendor codes.
+// The device facts of one fresh report and its vendor codes.
 [[nodiscard]] std::vector<LifecycleFactDTO>
 fresh_facts(const XArmObservedState &observed, const int axis_mask) {
-  const bool error_present = observed.error_code != 0;
+  const int error_code = observed.error_code;
+  const int warning_code = observed.warning_code;
+  const bool error_present = error_code != 0;
   const bool motion_enabled = observed.motion_enable_mask >= 0 &&
                               (observed.motion_enable_mask & axis_mask) ==
                                   axis_mask;
@@ -247,21 +250,19 @@ fresh_facts(const XArmObservedState &observed, const int axis_mask) {
            observed.motion_enable_mask < 0 ? unknown_value()
                                            : boolean_value(motion_enabled)),
       fact(core::kDeviceWarningPresentFactId,
-           observed.warning_code < 0
-               ? unknown_value()
-               : boolean_value(observed.warning_code != 0)),
+           warning_code < 0 ? unknown_value()
+                            : boolean_value(warning_code != 0)),
   };
   if (error_present) {
     facts.push_back(fact(kVendorCodeErrorFactId,
-                         token_value("C" + std::to_string(observed.error_code))));
+                         token_value("C" + std::to_string(error_code))));
   }
-  if (power_cycle_error(observed.error_code)) {
+  if (power_cycle_error(error_code)) {
     facts.push_back(fact(kVendorCodePowerCycleFactId,
                          token_value(std::string(kPowerCycleRequiredToken))));
   }
-  if (observed.warning_code > 0) {
-    facts.push_back(
-        fact(kVendorCodeWarningFactId, integer_value(observed.warning_code)));
+  if (warning_code > 0) {
+    facts.push_back(fact(kVendorCodeWarningFactId, integer_value(warning_code)));
   }
   if (observed.mode >= 0) {
     facts.push_back(fact(kVendorCodeModeFactId, integer_value(observed.mode)));
@@ -406,6 +407,9 @@ XArmBrandLifecyclePort::Classify(const std::int64_t now_ns,
   if (!condition.empty()) {
     facts.push_back(fact(kVendorCodeConditionFactId, token_value(condition)));
   }
+  if (tracking.rearm_pending) {
+    facts.push_back(fact(core::kDeviceRearmInProgressFactId, boolean_value(true)));
+  }
   if (tracking.moved_externally) {
     facts.push_back(fact(core::kDeviceMovedExternallyFactId, boolean_value(true)));
     facts.push_back(fact(core::kDeviceInMotionFactId,
@@ -486,20 +490,125 @@ void XArmBrandLifecyclePort::ObserveHardwareActive(const bool hardware_active) {
   tracking_.armed = hardware_active;
 }
 
-XArmClearVerification
-XArmBrandLifecyclePort::VerifyOwnClear(const std::int64_t settled_at_ns) const {
+XArmMotionReengageDecision
+XArmBrandLifecyclePort::MotionReengageDecision(const std::int64_t now_ns) const {
+  const auto refuse = [](std::string reason) {
+    return XArmMotionReengageDecision{XArmMotionReengage::kRefused,
+                                      std::move(reason)};
+  };
+  bool armed = true;
+  {
+    std::lock_guard lock(mutex_);
+    if (!tracking_.moved_externally) return {};
+    armed = tracking_.armed.value_or(true);
+  }
   const auto observed = transport_->observe();
-  if (!observed.received_timestamp_ns.has_value() ||
-      *observed.received_timestamp_ns <= settled_at_ns)
-    return XArmClearVerification::kPending;
-  if (observed.error_code == 0) return XArmClearVerification::kCleared;
-  return *observed.received_timestamp_ns - settled_at_ns >= kXArmClearVerifyNs
-             ? XArmClearVerification::kPersists
-             : XArmClearVerification::kPending;
+  if (!fresh_report(observed, now_ns, config_.status_freshness_ns))
+    return refuse("xarm_status_unavailable");
+  // Never automatic after an error: an emergency stop needs Recover cell.
+  if (observed.error_code != 0) return refuse("xarm_error_present");
+  if (observed.state == kMovingFeedbackState)
+    return refuse("xarm_moved_externally_in_motion");
+  const auto axis_mask = (1 << config_.axis_count) - 1;
+  if (observed.motion_enable_mask < 0 ||
+      (observed.motion_enable_mask & axis_mask) != axis_mask)
+    return refuse("xarm_axes_not_enabled");
+  if (!armed) return refuse("xarm_not_armed");
+  return {XArmMotionReengage::kNeeded, {}};
+}
+
+bool XArmBrandLifecyclePort::ReportsServoReady(const std::int64_t now_ns,
+                                               const std::int64_t since_ns,
+                                               std::optional<std::array<double, 6>> *offset) const {
+  const auto observed = transport_->observe();
+  const auto axis_mask = (1 << config_.axis_count) - 1;
+  const bool ready = fresh_report(observed, now_ns, config_.status_freshness_ns) &&
+         *observed.received_timestamp_ns > since_ns &&
+         observed.error_code == 0 && observed.mode == kJointServoMode &&
+         observed.state == kReadyFeedbackState &&
+         observed.motion_enable_mask >= 0 &&
+         (observed.motion_enable_mask & axis_mask) == axis_mask;
+  if (ready && offset) {
+    offset->reset();
+    if (observed.tcp_offset.size() == 6U) {
+      std::array<double, 6> value{};
+      std::copy(observed.tcp_offset.begin(), observed.tcp_offset.end(), value.begin());
+      *offset = value;
+    }
+  }
+  return ready;
+}
+
+void XArmBrandLifecyclePort::BeginRearm() {
+  std::lock_guard lock(mutex_);
+  tracking_.rearm_pending = true;
+}
+
+void XArmBrandLifecyclePort::EndRearm() {
+  std::lock_guard lock(mutex_);
+  tracking_.rearm_pending = false;
+}
+
+bool XArmBrandLifecyclePort::RearmInProgress() const {
+  std::lock_guard lock(mutex_);
+  return tracking_.rearm_pending;
+}
+
+std::optional<std::array<double, 6>>
+XArmBrandLifecyclePort::ReportedTcpOffset(const std::int64_t now_ns) const {
+  const auto observed = transport_->observe();
+  if (!fresh_report(observed, now_ns, config_.status_freshness_ns) ||
+      observed.tcp_offset.size() != 6U)
+    return std::nullopt;
+  std::array<double, 6> offset{};
+  std::copy(observed.tcp_offset.begin(), observed.tcp_offset.end(), offset.begin());
+  return offset;
+}
+
+core::Result<void> XArmBrandLifecyclePort::CheckReengagedAtRest(
+    const std::int64_t now_ns,
+    const std::vector<double> &measured_positions_rad) const {
+  auto gated = CheckActivationGate(now_ns, measured_positions_rad);
+  if (!gated.ok()) return gated;
+  if (transport_->observe().state == kMovingFeedbackState)
+    return core::Result<void>::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        "the robot reports it is moving",
+        {{"reason", "xarm_in_motion"}}});
+  return core::Result<void>::Ok();
+}
+
+bool XArmBrandLifecyclePort::VendorJointSampleUsable(
+    const std::int64_t now_ns, const std::vector<double> &positions) const {
+  if (positions.empty() ||
+      std::all_of(positions.begin(), positions.end(),
+                  [](const double value) { return value == 0.0; }) ||
+      !std::all_of(positions.begin(), positions.end(),
+                   [](const double value) { return std::isfinite(value); }))
+    return false;
+  const auto observed = transport_->observe();
+  if (!fresh_report(observed, now_ns, config_.status_freshness_ns) ||
+      observed.error_code != 0)
+    return false;
+  std::lock_guard lock(mutex_);
+  // Items 23/32: also through ManyForge's own re-arm until the rebind, while
+  // the plugin has the broadcaster off (the re-engage ends the move latch
+  // before the broadcaster is back).
+  return tracking_.moved_externally || tracking_.rearm_pending;
 }
 
 int XArmBrandLifecyclePort::LatestErrorCode() const {
   return transport_->observe().error_code;
+}
+
+std::optional<std::vector<core::LifecycleFactDTO>>
+XArmBrandLifecyclePort::LatestFreshFacts(
+    const std::int64_t now_ns, const std::optional<std::int64_t> received_after_ns) const {
+  const auto observed = transport_->observe();
+  if (!fresh_report(observed, now_ns, config_.status_freshness_ns) ||
+      (received_after_ns && *observed.received_timestamp_ns <= *received_after_ns))
+    return std::nullopt;
+  return fresh_facts(observed, (1 << config_.axis_count) - 1);
 }
 
 bool XArmBrandLifecyclePort::ClearErrorPermitted() const {
@@ -552,6 +661,176 @@ core::Result<void> XArmBrandLifecyclePort::CheckActivationGate(
                         " differs from the robot's reported angle");
   }
   return core::Result<void>::Ok();
+}
+
+namespace {
+
+// M6 XADAPT: a ready wait that ended without any fresh report received
+// after it started: the robot controller did not answer (as opposed to
+// answering not ready, which keeps `xarm_reengage_not_ready`).
+void unanswered_wait(const XArmBrandLifecyclePort &port, const std::int64_t now_ns,
+                     const std::int64_t since_ns, XArmReengageResult &result) {
+  if (port.LatestFreshFacts(now_ns, since_ns)) return;
+  result.error->code = std::string(kRobotControllerUnresponsiveCode);
+  result.error->message = "the robot controller sent no status report in time";
+}
+
+} // namespace
+
+XArmReengageResult ReengageAtRest(XArmBrandLifecyclePort &port,
+                                  const XArmReengageCalls &calls,
+                                  const std::stop_token cancellation) {
+  const auto failure = [](std::string reason, std::string message,
+                          const bool effect_possible) {
+    core::ErrorDTO error{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        std::move(message),
+        {{"reason", std::move(reason)},
+         {"effect", effect_possible ? "possible" : "not_started"}}};
+    return XArmReengageResult{false, std::move(error), effect_possible};
+  };
+  const auto decision = port.MotionReengageDecision(calls.now());
+  if (decision.kind == XArmMotionReengage::kNotNeeded) return {};
+  if (decision.kind == XArmMotionReengage::kRefused)
+    return failure(decision.reason,
+                   decision.reason == "xarm_moved_externally_in_motion"
+                       ? "the robot is still moving under its own interface; "
+                         "wait until it stops"
+                       : "the robot moved from its own interface cannot be "
+                         "re-engaged now; use Recover cell",
+                   false);
+  // From the first vendor step until the handle's rebind (`EndRearm`).
+  port.BeginRearm();
+  port.BeginOwnPrimitive(XArmLifecycleCommand::kArm);
+  bool effect_possible = false;
+  // A sent call may still act after this returns (late, non-zero, timeout).
+  const auto unconfirmed = [&](const XArmReengageCallResult &call,
+                               const std::string &step) {
+    effect_possible = effect_possible || call.sent;
+    port.SettleOwnPrimitive(XArmLifecycleCommand::kArm, effect_possible,
+                            calls.now());
+    // SX-584: the re-arm fact ends with this attempt; an effect that may still
+    // come is the caller's rebind-required state, not an excuse.
+    port.EndRearm();
+    auto result = failure("xarm_reengage_not_confirmed",
+                          "the robot's " + step + " was not confirmed",
+                          effect_possible);
+    // M6 XADAPT: no answer at all is the robot controller unresponsive.
+    if (call.sent && XArmCallUnanswered(call.reason)) {
+      result.error->code = std::string(kRobotControllerUnresponsiveCode);
+      result.error->message = "the robot controller did not answer its " + step + " in time";
+    }
+    result.error->details.emplace("step", step);
+    result.error->details.emplace("vendor_reason", call.reason);
+    if (call.vendor_return)
+      result.error->details.emplace("vendor_return",
+                                    std::to_string(*call.vendor_return));
+    return result;
+  };
+  const auto mode = calls.set_mode(kJointServoMode);
+  if (!mode.confirmed) return unconfirmed(mode, "set_mode");
+  effect_possible = true;
+  const auto state = calls.set_state(0);
+  if (!state.confirmed) return unconfirmed(state, "set_state");
+  // SX-590: only a report received after the confirmed `set_state(0)`
+  // shows its result.
+  const auto ready_since = calls.now();
+  while (!port.ReportsServoReady(calls.now(), ready_since)) {
+    if (cancellation.stop_requested() ||
+        calls.now() - ready_since >= kXArmReengageReadyNs) {
+      port.SettleOwnPrimitive(XArmLifecycleCommand::kArm, true, calls.now());
+      port.EndRearm();
+      auto result = failure("xarm_reengage_not_ready",
+                            "the robot did not report joint-servo mode and the ready "
+                            "state in time",
+                            true);
+      if (!cancellation.stop_requested())
+        unanswered_wait(port, calls.now(), ready_since, result);
+      return result;
+    }
+    calls.pause();
+  }
+  // The own arming completed: the next commit ends the move latch.
+  port.SettleOwnPrimitive(XArmLifecycleCommand::kArm, true, calls.now());
+  static_cast<void>(port.Observe(calls.now()));
+  return {true, std::nullopt, true};
+}
+
+XArmReengageResult SendTcpOffsetAtRest(
+    XArmBrandLifecyclePort &port, const XArmTcpOffsetCalls &calls,
+    const std::stop_token cancellation,
+    const std::optional<std::chrono::steady_clock::time_point> step_deadline) {
+  const auto failure = [&](std::string reason, std::string message,
+                           const bool effect_possible) {
+    core::ErrorDTO error{
+        std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
+        std::move(message),
+        {{"reason", std::move(reason)},
+         {"effect", effect_possible ? "possible" : "not_started"}}};
+    // SX-584: the re-arm fact ends with this attempt (an effect that may
+    // still come is the caller's rebind-required state).
+    port.EndRearm();
+    port.SettleOwnPrimitive(XArmLifecycleCommand::kArm, effect_possible, calls.now());
+    return XArmReengageResult{false, std::move(error), effect_possible};
+  };
+  // The state 5 the offset causes and the re-arm are ManyForge's own effect.
+  port.BeginRearm();
+  port.BeginOwnPrimitive(XArmLifecycleCommand::kArm);
+  const auto offset = calls.set_tcp_offset();
+  if (!offset.confirmed) {
+    auto result = failure("tool_context_not_applied",
+                          "the robot did not confirm its tcp_offset (" + offset.reason + ")",
+                          offset.sent);
+    if (offset.sent && XArmCallUnanswered(offset.reason))
+      result.error->code = std::string(kRobotControllerUnresponsiveCode);
+    result.error->details.emplace("tool_context_field", "tcp_offset");
+    result.error->details.emplace("vendor_reason", offset.reason);
+    if (offset.vendor_return)
+      result.error->details.emplace("vendor_return", std::to_string(*offset.vendor_return));
+    return result;
+  }
+  const auto state = calls.set_state(0);
+  if (!state.confirmed) {
+    auto result = failure("xarm_reengage_not_confirmed",
+                          "the robot's set_state after its tcp_offset was not confirmed",
+                          true);
+    if (XArmCallUnanswered(state.reason))
+      result.error->code = std::string(kRobotControllerUnresponsiveCode);
+    result.error->details.emplace("step", "set_state");
+    result.error->details.emplace("vendor_reason", state.reason);
+    if (state.vendor_return)
+      result.error->details.emplace("vendor_return", std::to_string(*state.vendor_return));
+    return result;
+  }
+  // SX-590: only a report received after the confirmed `set_state(0)`
+  // shows its result.
+  const auto ready_since = calls.now();
+  std::optional<std::array<double, 6>> ready_offset;
+  while (!port.ReportsServoReady(calls.now(), ready_since, &ready_offset)) {
+    // SX-727: the lifecycle step's time ends the wait too (nobody cancels
+    // at the deadline); the offset was sent, so its effect stays possible.
+    if (step_deadline && std::chrono::steady_clock::now() >= *step_deadline) {
+      auto result = failure("xarm_reengage_not_ready",
+                            "no time was left to see the robot ready after its tcp_offset",
+                            true);
+      result.error->code = "component_lifecycle_deadline_expired";
+      return result;
+    }
+    if (cancellation.stop_requested() ||
+        calls.now() - ready_since >= kXArmReengageReadyNs) {
+      auto result = failure("xarm_reengage_not_ready",
+                            "the robot did not report joint-servo mode and the ready "
+                            "state in time after its tcp_offset",
+                            true);
+      if (!cancellation.stop_requested())
+        unanswered_wait(port, calls.now(), ready_since, result);
+      return result;
+    }
+    calls.pause();
+  }
+  port.SettleOwnPrimitive(XArmLifecycleCommand::kArm, true, calls.now());
+  static_cast<void>(port.Observe(calls.now()));
+  return {true, std::nullopt, true, ready_offset};
 }
 
 } // namespace manyforge::xarm_control

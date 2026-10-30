@@ -131,6 +131,18 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
                                     {"winner_node_instance_id", origin.node_instance_id.value()},
                                     {"winner_node_attempt_id", origin.node_attempt_id}}});
     }
+    // Active TCP (M7, T-MQ2, T-C2c): a preempt keeps the running move's TCP
+    // and never changes the Active TCP; one resolving to another TCP is
+    // refused on every lane, before anything is prepared or sent.
+    // The requests' TCP frames carry their owners (B7), so equal frames are
+    // equal TCP entries.
+    if (candidate.participants.front().motion_request->binding.tcp_frame !=
+        winner->participants.front().motion_request->binding.tcp_frame) {
+      return Outcome::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                   "a preempt cannot change the robot's TCP during motion",
+                                   {{"reason", "tool_context_change_during_motion"},
+                                    {"cause", "tcp_differs"}}});
+    }
     // The Deployment policy is not defaulted here. Final absence handling is
     // selected with the measured default before this feature is qualified.
     if (!candidate.participants.front().takeover_preparation_budget_ns) return busy();
@@ -201,6 +213,8 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
       winner->state = logical_state;
       incumbent->pending_motion_takeover = std::move(prepared_operation);
     }
+    // Item 37: a new operation ends the operator's Force close arm.
+    force_close_stop_generation_.reset();
   }
   const auto accepted_write = attempt_journal_write([&] {
     return journal_.RecordOperationAccepted(config_.request_owner_epoch, prepared_replay.intent,
@@ -602,7 +616,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
     const auto commit_started = clock_.now();
     OperationCommitGuard commit(*this, incumbent_id);
     const auto commit_acquired = clock_.now();
-    std::int64_t state_acquired{}, verify_started{}, verify_finished{};
+    std::int64_t state_acquired{};
     OperationStateDTO dispatch_state = empty_takeover_capture_storage();
     ContentDigest digest{std::string{}};
     const auto state_lock_started = clock_.now();
@@ -620,12 +634,6 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       if (!snapshot.participant || !snapshot.backend_prepare_result)
         return reject<void>("takeover preparation has no exact product",
                             "prepared_motion_observation_invalid", ErrorCode::kInvariantViolation);
-      verify_started = clock_.now();
-      const auto verified = VerifyPreparedOperationParticipant(
-          *snapshot.participant, row.binding, *row.stop_readiness, row.retained_default_stop_limits,
-          row.stop_node_category);
-      verify_finished = clock_.now();
-      if (!verified.ok()) return verified;
       if (snapshot.participant->controller().ordinary_stop_plan != *row.ordinary_stop_plan ||
           !prepared_fault_stop_plan_matches(snapshot.participant->controller().fault_stop_plan,
                                             row.fault_stop_plan) ||
@@ -674,16 +682,13 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
     (void)std::fprintf(stderr,
         "manyforge_moving_owner_phase operation_id=%.160s execution_id=%llu "
         "observe_started_ns=%lld state_updated_ns=%lld observe_wall_ns=%lld "
-        "commit_wait_wall_ns=%lld state_lock_wall_ns=%lld authority_wall_ns=%lld "
-        "verify_wall_ns=%lld post_verify_wall_ns=%lld\n",
+        "commit_wait_wall_ns=%lld state_lock_wall_ns=%lld authority_wall_ns=%lld\n",
         candidate_id.value().c_str(), static_cast<unsigned long long>(candidate_execution_id),
         static_cast<long long>(observe_started), static_cast<long long>(dispatch_state.updated_at_ns),
         static_cast<long long>(observe_finished - observe_started),
         static_cast<long long>(commit_acquired - commit_started),
         static_cast<long long>(state_acquired - state_lock_started),
-        static_cast<long long>(verify_started - state_acquired),
-        static_cast<long long>(verify_finished - verify_started),
-        static_cast<long long>(dispatch_state.updated_at_ns - verify_finished));
+        static_cast<long long>(dispatch_state.updated_at_ns - state_acquired));
     if (!dispatched.ok())
       return begin_motion_takeover_fallback(incumbent_id, candidate_id, dispatched.error());
     return Result<void>::Ok();
@@ -1076,10 +1081,6 @@ Result<bool> ResourceAddressedExecutionKernel::commit_settled_motion_takeover(
                           "motion_takeover_source_not_settled");
     auto& row = candidate->participants.front();
     const auto& product = *observed.value().participant;
-    const auto verified = VerifyPreparedOperationParticipant(
-        product, row.binding, *row.stop_readiness, row.retained_default_stop_limits,
-        row.stop_node_category);
-    if (!verified.ok()) return Result<bool>::Err(verified.error());
     if (product.controller().ordinary_stop_plan != *row.ordinary_stop_plan ||
         !prepared_fault_stop_plan_matches(product.controller().fault_stop_plan,
                                           row.fault_stop_plan) ||

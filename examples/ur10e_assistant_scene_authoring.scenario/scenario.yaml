@@ -7,13 +7,13 @@
   },
   "description": "ur10e_robotiq_assistant_modes_scene_authoring\n\nLocal deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to composer-assistant requests.",
   "members": {
-    "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
-    "deployment.yaml": "sha256:7ada474831aceb711ade4c71291b784f9937cd3fdd6aabdbe75efc912728d853",
-    "program.yaml": "sha256:7c175abbda4dc05771c00ff0cba93beaad9fdd02c32f55634fba5f7430a97081"
+    "assignment.yaml": "sha256:17d2165fd613f8ed9ede8781fe6fa737e1fcc5f12281669d2e599903709c6c97",
+    "deployment.yaml": "sha256:599c1cf526e02adafae4a3c641318b2e5af2a89803403af49822ccbde6559c38",
+    "program.yaml": "sha256:565066875750ecab566c84d5ddfd686144399ae389efcfca1cd21df7008cee8f"
   },
   "name": "ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:40616001fa7872c0f840874e119018ed3b6ec115ecf3a3e746fe6439d6235637",
+    "checked_content_digest": "sha256:aeac97d9af80f50967267fc2246818069575b933b33bbaa38f1b4b87b64642df",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },
@@ -22,39 +22,47 @@
     "entries": [
       {
         "content_digest": "sha256:111e37f13a664989dd54226f80f521b32ea0b71c975282a16696b14be7cc9249",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl"
       },
       {
         "content_digest": "sha256:043901d9c22b38d09b30d11326108ab3ef1445b4bd655ef313f94199f25f57ed",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl"
       },
       {
         "content_digest": "sha256:d341d986aa8aca7262565c039c04fb6b4c0f2f5c93443519eb7ca9bfc67ba17c",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl"
       },
       {
         "content_digest": "sha256:bd7da1b31b73f1aa1d61b26a582cea10f16f17396d54b8937890fa51547d26b0",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl"
       },
       {
         "content_digest": "sha256:37c1779f71fb5504a5898048a36f9f4bfce0f5e7039ff1dce53808b95c229777",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl"
       },
       {
         "content_digest": "sha256:be21c5e18c901d4747cbc8fa1a2af15dad7173ff701482a8517e33278432bb21",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl"
       },
       {
         "content_digest": "sha256:d61e9c5304d8015333856e4a26d99e32b695b6ada993253986b1afe8e396ab11",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl"
       },
       {
         "content_digest": "sha256:666a92ee075f6f320ffb13b39995a5b374657cee90ded4c52c23ede20a812f34",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl"
       },
       {
         "content_digest": "sha256:f042edc44ede9773e7cad00f7d7354d0b7c1c6a6353fe897b2ca2e6ac71107fc",
-        "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl"
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:c4eaf848e2354ce9f3ce26f6dc97d5ab7f91f2945d34fbeda813cc9772fd6f90",
+        "source_id": "component:robotiq_2f_140:srdf"
+      },
+      {
+        "content_digest": "sha256:cd275c8c8b4a8521eea39c793abc79710598cd22724be04f07c80b58eaba8808",
+        "source_id": "component:robotiq_2f_140:urdf"
       },
       {
         "content_digest": "sha256:8a214f3f650e703fa081bd4bd8b1caeb0667598bec22d8b0e572efb97d06e957",
@@ -113,11 +121,11 @@
         "source_id": "component:ur10e_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist3.dae"
       },
       {
-        "content_digest": "sha256:6443713ddfa8a8e64803e9d27e4adeb06823c2c9ec5542bd94dad6e48b8cfbbc",
+        "content_digest": "sha256:6ca086113247713fa5c1a92dfcbb56f30a15420a21d00733b865757f0d0367b2",
         "source_id": "component:ur10e_robot:srdf"
       },
       {
-        "content_digest": "sha256:6a7fcb71888fc49de4faba4e3bad7ba4b2796f91bc71ab8aab9fe7fd8a83f666",
+        "content_digest": "sha256:9528e0b3d7ef949d5212ea74802374ed939c1a16e6d710f7ea10a06de59187f8",
         "source_id": "component:ur10e_robot:urdf"
       }
     ],

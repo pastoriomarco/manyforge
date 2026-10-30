@@ -8,6 +8,7 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -241,6 +242,68 @@ TEST(ActivationAiModel, TwoComponentsCompileToTwoDomainsAndStreams) {
   EXPECT_EQ(configuration.ai_models[0].controllable_component_id.value(),
             "chat_model");
   EXPECT_EQ(configuration.ai_models[1].model, "select");
+}
+
+/// The same component with a lifecycle time budget in its configuration.
+Value WithBudget(Value component, Value seconds) {
+  auto row = component.as_object();
+  for (auto &[name, value] : row) {
+    if (name != "configuration") continue;
+    auto configuration = value.as_object();
+    configuration.emplace_back("lifecycle_command_timeout_s", std::move(seconds));
+    value = Value(std::move(configuration));
+  }
+  return Value(std::move(row));
+}
+
+// Per-component time budget: an authored `lifecycle_command_timeout_s`
+// compiles to the component's own `lifecycle_command_timeouts` row, which is
+// what CCLC and the composition exchange read. Without one nothing is added
+// (defaults unchanged).
+TEST(ActivationAiModel, LifecycleBudgetCompilesToTheComponentsOwnRow) {
+  const auto plain = Materialize(Intent(Array{
+      AiModel("chat_model", "chat"), AiModel("selection_model", "select")}));
+  ASSERT_NE(plain.bundle, nullptr);
+  const auto &plain_graph = plain.bundle->value().cell_graph;
+  EXPECT_FALSE(plain_graph.runtime_units.front().configuration.contains(
+      "lifecycle_command_timeouts"));
+  EXPECT_TRUE(contract::component_lifecycle_budgets_ns(plain_graph).empty());
+  // The composition counts each model's default: the one 10 s budget.
+  EXPECT_EQ(contract::component_composition_budgets_ns(plain_graph),
+            (std::map<std::string, std::int64_t, std::less<>>{
+                {"chat_model", 10'000'000'000LL},
+                {"selection_model", 10'000'000'000LL}}));
+
+  const auto budgeted = Materialize(Intent(Array{
+      WithBudget(AiModel("chat_model", "chat"), Value(120.0)),
+      AiModel("selection_model", "select")}));
+  ASSERT_NE(budgeted.bundle, nullptr);
+  EXPECT_TRUE(d::verify_retained_bundle_identity(*budgeted.bundle));
+  const auto &graph = budgeted.bundle->value().cell_graph;
+  const auto budgets = contract::component_lifecycle_budgets_ns(graph);
+  EXPECT_EQ(budgets, (std::map<std::string, std::int64_t, std::less<>>{
+                         {"chat_model", 120'000'000'000LL}}));
+  EXPECT_EQ(contract::component_composition_budgets_ns(graph),
+            (std::map<std::string, std::int64_t, std::less<>>{
+                {"chat_model", 120'000'000'000LL},
+                {"selection_model", 10'000'000'000LL}}));
+  // A component's identity covers only its own budget row; another's budget
+  // leaves it as without any.
+  const auto unit = graph.runtime_units.front().runtime_unit_id;
+  const auto own = contract::component_configuration_projection(
+      *budgeted.bundle, unit, c::ControllableComponentId("chat_model"));
+  const auto other = contract::component_configuration_projection(
+      *budgeted.bundle, unit, c::ControllableComponentId("selection_model"));
+  ASSERT_NE(own.find_object_member("lifecycle_command_timeouts"), nullptr);
+  EXPECT_EQ(own.find_object_member("lifecycle_command_timeouts")->as_array().size(), 1U);
+  EXPECT_EQ(other, contract::component_configuration_projection(
+                       *plain.bundle, plain_graph.runtime_units.front().runtime_unit_id,
+                       c::ControllableComponentId("selection_model")));
+
+  for (const auto &seconds : {Value(0.0), Value(3601.0), Value("120")})
+    EXPECT_THROW((void)detail::parse_activation_deployment_intent(
+                     Intent(Array{WithBudget(AiModel("chat_model"), seconds)}), {}),
+                 std::invalid_argument);
 }
 
 TEST(ActivationAiModel, MappingSelectsTheComponentOfEachAlias) {

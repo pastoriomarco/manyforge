@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <map>
 #include <array>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -11,6 +12,7 @@
 #include <vector>
 
 #include <manyforge_roboplan/controller_robot_description.hpp>
+#include <manyforge_roboplan/vendor_device_adapter.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -38,6 +40,16 @@ public:
 /// The closed Isaac controller profiles (catalog `isaac_profile` values).
 [[nodiscard]] std::vector<std::string> isaac_controller_profile_ids();
 
+/// The Isaac row's arrival tolerance (rad, every arm joint): the stock JTC
+/// `goal` constraint of its controllers file (a placeholder until the Isaac
+/// measurement sets it).
+[[nodiscard]] double isaac_controller_arrival_tolerance_rad(
+    std::string_view isaac_profile);
+
+/// The Isaac row's settle window (s): the JTC `goal_time` of its controllers
+/// file (a placeholder until the Isaac measurement sets it).
+[[nodiscard]] double isaac_controller_goal_time_s(std::string_view isaac_profile);
+
 /// Build-owned facts of one closed mock controller profile.
 struct MockControllerProfileFacts final {
   std::string profile_id;
@@ -57,6 +69,9 @@ struct MockControllerProfileFacts final {
   /// the gripper command's result timeout.
   double hard_stop_completion_timeout_s{};
   double gripper_result_timeout_s{};
+  /// Arrival: every arm joint's stock JTC `goal` constraint (kept on every
+  /// goal), so a successful result is "finished and within tolerance".
+  double arrival_tolerance_rad{};
 };
 
 /// The controller cadence of one retained profile, read from its embedded
@@ -91,9 +106,11 @@ struct RealControllerProfileFacts final {
   double hard_stop_completion_timeout_s{};
   /// R7 D3: the measured joint state's freshness budget, per robot.
   double joint_state_freshness_s{};
-  /// Measured start/terminal state checks of the execution participant.
+  /// Measured start/terminal state checks of the execution participant. The
+  /// terminal check reads the arrival tolerance, which is also every arm
+  /// joint's stock JTC `goal` constraint.
   double start_tolerance_rad{};
-  double final_tolerance_rad{};
+  double arrival_tolerance_rad{};
   double completion_state_timeout_s{};
 };
 
@@ -130,10 +147,14 @@ struct MockControllerArtifactsInput final {
 /// pose; no gripper controller in this package.
 struct RealControllerArtifactsInput final {
   std::string real_profile;
+  /// V-B4: the deployment's vendor adapter family (`VendorAdapterSelection`).
+  std::string adapter_family;
   /// The robot controller's address; required.
   std::string robot_ip;
   /// Q48: the deployment's operator Stop per-joint maximum deceleration.
   std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2;
+  /// Deployment input; the runtime handle owns the TCP offset sync policy.
+  bool controller_tcp_offset_sync{true};
 };
 
 /// One Isaac lane component (amended Q41: backend-commanded initial pose).
@@ -192,37 +213,6 @@ struct MockResetPositionTarget final {
                          const MockResetPositionTarget &) = default;
 };
 
-/// R7 packages 3 and 4: the vendor adapter that observes a Real component's
-/// own unmodified driver status and serves its vendor primitives and Enable
-/// gate. Absent for Mock and Isaac.
-/// D11: the payload of the component's tool (mass and centre of mass in the
-/// flange frame), applied to a Real robot at Enable; Mock and Isaac have no
-/// vendor adapter and ignore it.
-struct VendorToolPayload final {
-  double mass_kg{};
-  std::array<double, 3> center_of_mass_m{};
-
-  friend bool operator==(const VendorToolPayload &,
-                         const VendorToolPayload &) = default;
-};
-
-struct VendorAdapterSelection final {
-  /// The adapter family; "xarm" for every xArm-family robot.
-  std::string vendor;
-  /// The absolute namespace of the component's vendor driver.
-  std::string driver_namespace;
-  /// The robot's joint count.
-  int axis_count{};
-  /// R7 §3.6: the Enable gate's largest measured-versus-reported joint
-  /// difference while stopped (per robot data).
-  double joint_agreement_tolerance_rad{};
-  /// D11: set by the host from the component's controller profile row.
-  std::optional<VendorToolPayload> tool_payload{};
-
-  friend bool operator==(const VendorAdapterSelection &,
-                         const VendorAdapterSelection &) = default;
-};
-
 struct ControllerLaunchArtifacts final {
   ControllerLaunchLane lane{};
   std::string controllable_component_id;
@@ -266,6 +256,11 @@ struct ControllerLaunchArtifacts final {
 [[nodiscard]] std::string_view retained_isaac_controllers_yaml(
     std::string_view isaac_profile);
 
+/// The Isaac controllers file the host writes: the retained file with every
+/// arm joint's `goal` constraint set to the row's arrival tolerance and
+/// `goal_time` set to the row's settle window.
+[[nodiscard]] std::string isaac_controllers_yaml(std::string_view isaac_profile);
+
 /// Generate both files, write them below `artifacts_root/<component>/` and
 /// return their paths, hashes and the launch contract.
 [[nodiscard]] ControllerLaunchArtifacts write_controller_launch_artifacts(
@@ -287,6 +282,10 @@ struct ComponentControllerLaunchInput final {
   /// robot's address. Package IDs replace all three in CP8 step 3.
   std::optional<std::string> real_profile;
   std::string robot_ip;
+  /// V-B4: a Real profile's vendor adapter family (deployment).
+  std::string adapter_family;
+  /// M6b: a Real profile's controller TCP offset sync (deployment, default on).
+  bool controller_tcp_offset_sync{true};
   /// Isaac lane facts of `isaac_profile` (retained_isaac_controller_lane).
   std::optional<IsaacControllerLane> isaac_lane;
   /// The component's model asset source URDF.
@@ -317,6 +316,15 @@ struct ComponentControllerLaunchInput final {
 [[nodiscard]] ControllerLaunchArtifacts write_component_controller_launch_artifacts(
     const std::optional<core::RuntimeParticipantBinding> &motion_binding,
     const ComponentControllerLaunchInput &input);
+
+/// An Isaac tool (gripper-only) component: only its model description. The
+/// tool's joints are in the robot's Isaac articulation, so it has no
+/// controller manager and no controllers file; its launch publishes the
+/// description and runs the profile's gripper bridge, if any.
+[[nodiscard]] ControllerLaunchArtifacts write_isaac_gripper_launch_artifacts(
+    const std::filesystem::path &artifacts_root,
+    std::string_view controllable_component_id, std::string_view isaac_profile,
+    const std::string &model_urdf, const std::string &frame_prefix);
 
 /// One-line JSON evidence record of written artifacts (paths, hashes, launch
 /// contract) for activation diagnostics.

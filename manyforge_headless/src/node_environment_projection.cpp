@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 
 namespace manyforge::headless {
@@ -380,6 +381,33 @@ CanonicalValue StringArray(std::vector<std::string> values) {
   return CanonicalValue(std::move(result));
 }
 
+// Project only offers for the capability versions understood by this build.
+// Both collections belong to the same verified active retained bundle.
+CanonicalValue CapabilityOffers(const manyforge::core::RetainedBundleDTO &bundle) {
+  std::vector<std::string> offers;
+  const auto add = [&offers](const auto &binding, const auto kind) {
+    const auto *definition = manyforge::core::find_builtin_capability_definition(
+        binding.capability_id.value());
+    if (definition != nullptr &&
+        definition->capability_definition_revision ==
+            binding.capability_definition_revision.value() &&
+        definition->provider_binding_kind == kind) {
+      offers.push_back(binding.capability_id.value());
+    }
+  };
+  for (const auto &binding : bundle.cell_graph.control_bindings) {
+    add(binding, manyforge::core::CapabilityProviderBindingKind::kControlBinding);
+  }
+  for (const auto &binding : bundle.capability_provider_bindings) {
+    const auto *definition = manyforge::core::find_builtin_capability_definition(
+        binding.capability_id.value());
+    if (definition != nullptr && definition->scope == binding.scope) {
+      add(binding, manyforge::core::CapabilityProviderBindingKind::kCapabilityProviderBinding);
+    }
+  }
+  return StringArray(std::move(offers));
+}
+
 struct DeferredAdapter final {
   std::string_view node_id;
   std::string_view reason_code;
@@ -544,6 +572,7 @@ CanonicalValue ActiveNodeEnvironmentProjection::Project(
        Availability(storage_->current_identity.registry,
                     storage_->catalog_identity.owner_neutral_node_ids,
                     manager_runtime_converged)},
+      {"capability_offers", CapabilityOffers(active_bundle.value())},
       {"catalog", storage_->catalog},
       {"catalog_digest",
        CanonicalValue(storage_->catalog_identity.catalog_digest)},

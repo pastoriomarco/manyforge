@@ -187,3 +187,32 @@ describe('value-source menu', () => {
     expect(menu.formulaType).toBeNull();
   });
 });
+
+describe('Set TCP value source', () => {
+  it('offers only readable whole tcp_entry keys, with no parameters or formula', () => {
+    const setTcp: CatalogEntry = {
+      ...entry,
+      id: 'motion.set_tcp',
+      parameters: [{ id: 'tcp', required: true, hasDefault: false,
+        schema: { type: 'object' }, schemaHash: 'sha256:tcp' }],
+      requiredCapabilities: [],
+    };
+    const source = model({
+      entry: setTcp, path: 'tcp', schema: { type: 'object' },
+      keys: [
+        { key: 'active_tcp.arm', type: 'tcp_entry', access: 'read', persistence: 'run' },
+        { key: 'selection', type: 'tcp_entry', access: 'read_write', persistence: 'run' },
+        { key: 'write_only', type: 'tcp_entry', access: 'write', persistence: 'run' },
+        { key: 'text', type: 'string', access: 'read', persistence: 'run',
+          fields: [{ field: 'tcp', type: 'tcp_entry' }] },
+      ],
+    })!;
+    expect(source.keyChoices.map((choice) => choice.source)).toEqual([
+      { kind: 'blackboard_key', reference: 'active_tcp.arm' },
+      { kind: 'blackboard_key', reference: 'selection' },
+    ]);
+    expect(source.parameterChoices).toEqual([]);
+    expect(source.formulaType).toBeNull();
+    expect(labels(valueSourceMenuEntries(source, actions))).toEqual(['Type values', 'Use key…']);
+  });
+});

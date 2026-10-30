@@ -26,6 +26,8 @@
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
+
+using Outcome = RetainedRos2ControlSwitchOutcome;
 const core::ContentDigest kDigest("sha256:" + std::string(64U, 'a'));
 const core::ControlDomainId kDomain("io.domain");
 const core::RuntimeUnitId kUnit("shared.host");
@@ -215,7 +217,7 @@ protected:
         core::RuntimeEpoch(epoch),
         catalog.value().catalog_digest};
     auto created = IoProviderDriverRecord::Create(
-        scope, occurrence, provider_manifest, clock, 1000);
+        scope, occurrence, provider_manifest, clock, 1000, 1'000'000);
     ASSERT_TRUE(created.ok()) << created.error().message;
     driver = std::move(created.value());
     descriptor = core::IoSignalDescriptorDTO{
@@ -261,7 +263,8 @@ protected:
         core::LifecyclePrimitiveId(std::string("io.provider.") + primitive),
         core::LifecyclePrimitiveAttemptId(std::string("attempt.") + primitive),
         generation,
-        1'000'000};
+        1'000'000,
+        core::ComponentLifecycleStateDTO::kUndeclared};
   }
 
   RetainedExternallyManagedPrimitiveOutcome Step(const char *primitive) {
@@ -289,23 +292,23 @@ TEST_F(IoProviderLifecycleProductTest,
        ActualResourcesAndFreshDriverGenerationFenceLifecycleEffects) {
   Build();
   EXPECT_FALSE(driver->resources_installed());
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
   InstallInput();
   EXPECT_TRUE(driver->resources_installed());
   EXPECT_TRUE(ingress->frames.empty());
-  EXPECT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
   const auto stale = driver->ReadLifecycleSnapshot(kDomain, clock->now())
                          .value()
                          .source_generation;
-  EXPECT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   ASSERT_EQ(ingress->frames.size(), 1U);
   EXPECT_EQ(ingress->frames.back().updates.front().value,
             std::optional<bool>(false));
-  EXPECT_EQ(driver->Dispatch(Intent("disable", stale), {}).dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(driver->Dispatch(Intent("disable", stale), {}).outcome,
+            Outcome::kNotSent);
   EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
                 .value()
                 .component_state,
@@ -316,8 +319,8 @@ TEST_F(IoProviderLifecycleProductTest,
                            .value()
                            .source_generation;
   EXPECT_EQ(
-      driver->Dispatch(Intent("disable", current), stop.get_token()).dispatch,
-      core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+      driver->Dispatch(Intent("disable", current), stop.get_token()).outcome,
+      Outcome::kNotSent);
   EXPECT_EQ(cancellations, 2U);
 }
 
@@ -325,12 +328,12 @@ TEST_F(IoProviderLifecycleProductTest,
        DisabledManualModelSurvivesEnableWithoutFabricatedDelivery) {
   Build();
   InstallInput();
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   const auto before = ingress->frames.size();
   {
     auto lock = driver->AcquireDelivery();
@@ -340,10 +343,10 @@ TEST_F(IoProviderLifecycleProductTest,
     EXPECT_FALSE(changed.value().enqueued_source_sequence);
   }
   EXPECT_EQ(ingress->frames.size(), before);
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   ASSERT_EQ(ingress->frames.size(), before + 1U);
   EXPECT_EQ(ingress->frames.back().updates.front().value,
             std::optional<bool>(true));
@@ -376,10 +379,10 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_FALSE(initial.value().latest_sample);
   ASSERT_TRUE(initial.value().installed_incarnation);
   const auto incarnation = *initial.value().installed_incarnation;
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   ASSERT_TRUE(runtime->DrainPending().ok());
   scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
   const auto enabled = runtime->ReadSignal(kSignal).value();
@@ -432,8 +435,8 @@ TEST_F(IoProviderLifecycleProductTest,
   scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
   ASSERT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
             1U);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   ASSERT_TRUE(runtime->DrainPending().ok());
   scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
   EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
@@ -451,10 +454,10 @@ TEST_F(IoProviderLifecycleProductTest,
   // The canceled node script cannot overwrite the preserved manual model.
   clock->set(250'000'000LL);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::RuntimeSafety);
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   ASSERT_TRUE(runtime->DrainPending().ok());
   const auto resumed = runtime->ReadSignal(kSignal).value();
   ASSERT_EQ(resumed.availability, core::IoSignalAvailability::kFresh);
@@ -468,10 +471,10 @@ TEST_F(IoProviderLifecycleProductTest,
        RealApplyRebindPreservesDriverAndBrandSequenceResetsModelOnce) {
   Build();
   InstallInput();
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   const auto registration = driver->brand_registration();
   const auto &provider = driver->occurrence();
   const core::BrandLifecycleObservationQueryDTO query{
@@ -555,10 +558,10 @@ TEST_F(IoProviderLifecycleProductTest,
         driver->InstallResourcesLocked({}, {{resource, {row}, output}}, {})
             .ok());
   }
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   EXPECT_TRUE(ingress->frames.empty());
   const core::IoOutputWriteRequestDTO write{
       {{core::OperationId("write"), core::OperationRevision(1U),
@@ -575,8 +578,8 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(accepted.value().evidence, core::IoOutputEvidence::kSourceAccepted);
   EXPECT_EQ(output->model_value(), std::optional<bool>(true));
   ASSERT_TRUE(output->RetireOutput(write.identity).ok());
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   auto disabled_write = write;
   disabled_write.identity.command.operation_id =
       core::OperationId("write.disabled");
@@ -649,10 +652,10 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_FALSE(driver->ReadLifecycleHealth(kDomain, clock->now())
                    .value()
                    .diagnostic.has_value());
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   service.reset(); // Actual remote service disappears; local connection owner
                    // survives.
   ASSERT_TRUE(wait_ready(false));
@@ -679,8 +682,8 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(
       cause(driver->ReadLifecycleHealth(kDomain, clock->now()).value().facts),
       core::LifecycleBlockingCauseClassDTO::kProviderLost);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
                 .value()
                 .component_state,
@@ -689,18 +692,18 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
       core::LifecycleBlockingCauseClassDTO::kAvailability);
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(Step("enable").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(Step("recover").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
+  EXPECT_EQ(Step("enable").outcome,
+            Outcome::kNotSent);
+  EXPECT_EQ(Step("recover").outcome,
+            Outcome::kNotSent);
   service = server->create_service<Service>("/test/local_disable", answer);
   ASSERT_TRUE(wait_ready(true));
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   driver->Shutdown();
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
@@ -788,8 +791,10 @@ TEST_F(IoProviderLifecycleProductTest,
             "availability");
   EXPECT_EQ(decision.error().details.at("observed_diagnostic_code"),
             "io_provider_transport_unavailable");
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(decision.error().details.at("decisive_fact"),
+            "io.driver.transport_ready=false");
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
 
   // The service appears: the same observation clears the diagnostic and
   // Prepare becomes eligible and succeeds.
@@ -819,8 +824,8 @@ TEST_F(IoProviderLifecycleProductTest,
   ASSERT_TRUE(decision.ok());
   EXPECT_EQ(decision.value().kind,
             core::LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
-  EXPECT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
   driver->Shutdown();
   executor.remove_node(node);
   executor.remove_node(server);
@@ -890,10 +895,10 @@ TEST_F(IoProviderLifecycleProductTest,
     const auto installed = driver->InstallResourcesLocked({input}, {}, {});
     ASSERT_TRUE(installed.ok()) << installed.error().message;
   }
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   EXPECT_TRUE(ingress->frames.empty()); // connected is not a fabricated reading
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
@@ -917,8 +922,8 @@ TEST_F(IoProviderLifecycleProductTest,
   ASSERT_TRUE(spin([&] { return ingress->frames.size() == 1U; }));
   EXPECT_EQ(ingress->frames.back().trusted_received_at_ns, 20);
   EXPECT_EQ(ingress->frames.back().updates.front().value, true);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   publisher->publish(message);
   executor.spin_some();
   EXPECT_EQ(ingress->frames.size(), 1U);
@@ -958,10 +963,10 @@ TEST_F(
     ASSERT_TRUE(driver->InstallResourcesLocked({input}, {}, {}).ok());
   }
   ASSERT_TRUE(driver->domain().resource_ids().empty());
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   EXPECT_TRUE(ingress->frames.empty());
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
@@ -973,8 +978,8 @@ TEST_F(
   EXPECT_EQ(
       cause(driver->ReadLifecycleHealth(kDomain, clock->now()).value().facts),
       core::LifecycleBlockingCauseClassDTO::kProviderLost);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
       core::LifecycleBlockingCauseClassDTO::kAvailability);
@@ -1010,7 +1015,7 @@ TEST_F(IoProviderLifecycleProductTest,
   // This exercises the real failure path; no fault setter or fabricated cause.
   ASSERT_TRUE(output->ShutdownOccurrence(driver->occurrence(), driver).ok());
   const auto attempted = Step("prepare");
-  EXPECT_EQ(attempted.known, core::LifecyclePrimitiveKnownResultDTO::kFailed);
+  EXPECT_EQ(attempted.outcome, Outcome::kFailedEffectObserved);
   const auto snapshot = driver->ReadLifecycleSnapshot(kDomain, clock->now());
   ASSERT_TRUE(snapshot.ok());
   EXPECT_EQ(snapshot.value().component_state,
@@ -1078,22 +1083,22 @@ TEST_F(IoProviderLifecycleProductTest,
                     .ok());
   }
   runtime->Start();
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   {
     auto delivery = driver->AcquireDelivery();
     ASSERT_TRUE(driver->SetMockValueLocked(kSignal, true).ok());
   }
   // No explicit drain: Disable must see the queued true acquisition, and
   // immediate Enable must consume Pause loss before removing the arm fence.
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   ASSERT_TRUE(runtime->DrainPending().ok());
   EXPECT_EQ(runtime->ReadSignal(kSignal).value().availability,
             core::IoSignalAvailability::kFresh);
@@ -1111,10 +1116,7 @@ TEST_F(IoProviderLifecycleProductTest,
   deployment::IoSignalProviderConfiguration config;
   config.profile = "geometric_contact";
   config.ingress_depth = 8;
-  config.endpoint =
-      deployment::IoSignalProviderConfiguration::GeometricContactEndpoint{
-          kSignal.controllable_component_id, core::CommandTargetId("arm"),
-          core::FrameRoleId("tool")};
+  config.robot_component_id = kSignal.controllable_component_id;
   config.target_scene_resource_id = core::SceneResourceId("fixture");
   input.rows.front().provider = std::move(config);
 
@@ -1132,38 +1134,22 @@ TEST_F(IoProviderLifecycleProductTest,
   auto scheduler = std::make_shared<core::ManualScheduler>();
   auto publisher = std::make_shared<GeometricSnapshotPublisher>();
   auto engine = std::make_shared<AdvancingCollisionEngine>(*clock);
-  const core::CollisionBodyRoleId body_role("tool");
-  const core::ModelInstanceId model("arm");
-  const core::ModelRevision model_revision("model.1");
-  core::RuntimeMotionEndpointBindingDTO endpoint{
-      core::TargetRoleId("motion"),
-      core::CommandTargetId("arm"),
-      {core::FrameRoleId("tool"),
-       model,
-       model_revision,
-       "tool_link",
-       {body_role}},
-      {{core::ComponentRoleId("robot"),
-        core::TargetRoleId("motion"),
-        kSignal.controllable_component_id,
-        core::CommandTargetId("arm"),
-        std::nullopt,
-        body_role,
-        model,
-        model_revision,
-        {kGeometricEndpoint}}}};
   input.geometric_contact = GeometricContactInputBinding{
       kSource,
       core::IoSourceIncarnation("installation-owned"),
       {*descriptor},
-      std::move(endpoint),
+      [] {
+        return core::Result<std::vector<core::CollisionBodyId>>::Ok({kGeometricEndpoint});
+      },
       core::SceneResourceId("fixture"),
       {observed},
       publisher,
       engine,
       scheduler,
       10,
-      5};
+      5,
+      [](const core::CollisionWorldSnapshot &, const core::CollisionBodyId &)
+          -> std::optional<bool> { return false; }};
 
   std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
   sources.emplace(kSource,
@@ -1203,23 +1189,23 @@ TEST_F(IoProviderLifecycleProductTest,
                     .ok());
   }
   runtime->Start();
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   EXPECT_EQ(engine->queries, 2U);
   const auto newer = runtime->ReadSignal(kSignal).value();
   ASSERT_TRUE(newer.latest_sample);
   EXPECT_EQ(newer.latest_sample->publication.source_sequence, 2U);
   EXPECT_EQ(newer.availability, core::IoSignalAvailability::kFresh);
 
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
   engine->duration_ns = 30;
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
                 .value()
                 .component_state,
@@ -1254,13 +1240,13 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(armed.error().details.at("reason"),
             "io_rule_baseline_unavailable");
 
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
   engine->duration_ns = 0;
   const auto failed = Step("enable");
-  EXPECT_EQ(failed.known, core::LifecyclePrimitiveKnownResultDTO::kFailed);
+  EXPECT_EQ(failed.outcome, Outcome::kFailedEffectObserved);
   EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
                 .value()
                 .component_state,
@@ -1294,20 +1280,15 @@ TEST_F(IoProviderLifecycleProductTest,
                   })
               .ok());
     }
-    ASSERT_EQ(Step("prepare").known,
-              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-    ASSERT_EQ(Step("enable").known,
-              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+    ASSERT_EQ(Step("prepare").outcome,
+              Outcome::kSucceeded);
+    ASSERT_EQ(Step("enable").outcome,
+              Outcome::kSucceeded);
     const auto before =
         driver->ReadLifecycleSnapshot(kDomain, clock->now()).value();
     const auto refused = Step("disable");
-    EXPECT_EQ(refused.dispatch,
-              partial
-                  ? core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown
-                  : core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-    EXPECT_EQ(refused.effect, partial
-                                  ? core::LifecyclePrimitiveEffectDTO::kObserved
-                                  : core::LifecyclePrimitiveEffectDTO::kNone);
+    EXPECT_EQ(refused.outcome,
+              partial ? Outcome::kFailedEffectObserved : Outcome::kNotSent);
     EXPECT_TRUE(
         ingress->losses.empty()); // Neither outcome claims Pause happened.
     const auto after =
@@ -1331,8 +1312,8 @@ TEST_F(IoProviderLifecycleProductTest,
   Build(false, "runtime.1", streams);
   ASSERT_TRUE(driver->stream_observer());
   EXPECT_FALSE(driver->resources_installed());
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
 
   core::ManualScheduler scheduler;
   core::ComponentStreamHealth health(*clock, scheduler);
@@ -1368,10 +1349,10 @@ TEST_F(IoProviderLifecycleProductTest,
 
   auto exit_fault = std::make_shared<std::optional<core::ErrorDTO>>();
   driver->SetSupervisedProcessFaultSource([exit_fault] { return *exit_fault; });
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   const auto running = driver->ReadLifecycleHealth(kDomain, clock->now());
   ASSERT_TRUE(running.ok());
   EXPECT_EQ(running.value().observed_state,
@@ -1394,8 +1375,8 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(faulted.value().diagnostic->code, "pose_source_config_invalid");
   EXPECT_EQ(faulted.value().diagnostic->details.at("output_tail"),
             "isaac_pose_observer_failed");
-  EXPECT_EQ(Step("recover").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("recover").outcome,
+            Outcome::kNotSent);
 
   // Retirement releases the recorders, which undeclares the streams.
   driver->Shutdown();
@@ -1406,8 +1387,8 @@ TEST_F(IoProviderLifecycleProductTest,
        AiModelDriverOwnsItsEndpointStreamAndReportsTheTypedProcessFault) {
   Build(false, "runtime.1", {"endpoint"}, core::kAiModelLifecycleManifestId);
   ASSERT_TRUE(driver->stream_observer());
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
 
   core::ManualScheduler scheduler;
   core::ComponentStreamHealth health(*clock, scheduler);
@@ -1431,10 +1412,10 @@ TEST_F(IoProviderLifecycleProductTest,
   // has no sample yet and both still succeed.
   auto exit_fault = std::make_shared<std::optional<core::ErrorDTO>>();
   driver->SetSupervisedProcessFaultSource([exit_fault] { return *exit_fault; });
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
 
   *exit_fault = core::ErrorDTO{"ai_model_config_invalid",
                                "ai model probe exited with status 78",
@@ -1461,10 +1442,10 @@ TEST_F(IoProviderLifecycleProductTest,
           return std::nullopt;
         return core::ErrorDTO{"simulated_plc_exited", **exit_reason, {}};
       });
-  ASSERT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome,
+            Outcome::kSucceeded);
   const auto running = driver->ReadLifecycleHealth(kDomain, clock->now());
   ASSERT_TRUE(running.ok());
   EXPECT_EQ(running.value().observed_state,
@@ -1494,12 +1475,12 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(cause(snapshot.value().facts),
             core::LifecycleBlockingCauseClassDTO::kFault);
   // No local recovery while the process is gone; only Apply restarts it.
-  EXPECT_EQ(Step("recover").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  ASSERT_EQ(Step("disable").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  EXPECT_EQ(Step("prepare").dispatch,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(Step("recover").outcome,
+            Outcome::kNotSent);
+  ASSERT_EQ(Step("disable").outcome,
+            Outcome::kSucceeded);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kNotSent);
 
   // The next Apply installs the restarted process's source.
   driver->SetSupervisedProcessFaultSource(
@@ -1510,8 +1491,8 @@ TEST_F(IoProviderLifecycleProductTest,
             core::ComponentLifecycleStateDTO::kDisabled);
   EXPECT_EQ(cause(restarted.value().facts),
             core::LifecycleBlockingCauseClassDTO::kNone);
-  EXPECT_EQ(Step("prepare").known,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("prepare").outcome,
+            Outcome::kSucceeded);
 }
 
 TEST_F(IoProviderLifecycleProductTest,
@@ -1565,8 +1546,8 @@ TEST_F(IoProviderLifecycleProductTest,
   // Installed (fresh drivers observe their process), then the PLC crashes.
   const auto installed = StartSimulatedPlcCandidate(
       supervisor, *plan, artifacts, "", installed_drivers, false, nullptr, ready);
-  ASSERT_EQ(Step("prepare").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
-  ASSERT_EQ(Step("enable").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").outcome, Outcome::kSucceeded);
+  ASSERT_EQ(Step("enable").outcome, Outcome::kSucceeded);
   const auto crashed_pid = std::to_string(installed.process->pid());
   ASSERT_EQ(::kill(-installed.process->pid(), SIGKILL), 0);
   std::optional<std::string> original;
@@ -1613,8 +1594,8 @@ TEST_F(IoProviderLifecycleProductTest,
     for (const char *primitive : {"prepare", "enable", "recover"})
       EXPECT_EQ(installed_driver
                     ->Dispatch(Intent(primitive, snapshot.value().source_generation), {})
-                    .dispatch,
-                core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched)
+                    .outcome,
+                Outcome::kNotSent)
           << primitive;
   }
 
@@ -1623,7 +1604,7 @@ TEST_F(IoProviderLifecycleProductTest,
       supervisor, *plan, artifacts, "", fresh_drivers, false, nullptr, ready);
   EXPECT_NE(restarted.process, installed.process);
   EXPECT_FALSE(fault_message(driver).has_value());
-  EXPECT_EQ(Step("prepare").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("prepare").outcome, Outcome::kSucceeded);
   // An unchanged retained device keeps exactly that process.
   const auto kept = StartSimulatedPlcCandidate(
       supervisor, *plan, artifacts, "", fresh_drivers, true, restarted.process, ready);

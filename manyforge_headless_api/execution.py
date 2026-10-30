@@ -62,6 +62,7 @@ from .execution_event_stream import follow_execution_events, open_event_subscrip
 EXECUTION_SOCKET_FILE = "execution-command.sock"
 EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
+ACTIVE_TCP_EVENT_KIND = "active_tcp_changed"
 EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
 VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v1"
@@ -80,6 +81,9 @@ OPERATION_EVENT_KINDS = frozenset(
         # Kernel global rule state rows (contract 64): folded by the global
         # rule status projection and ingested by the historian unchanged.
         STATE_EVENT_KIND,
+        # Active TCP (M7): one row per confirmed change; the Runner's mirror
+        # reads it, the historian ingests it unchanged (History event).
+        ACTIVE_TCP_EVENT_KIND,
     }
 )
 
@@ -98,7 +102,11 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
             and isinstance(request_id, str)
             and bool(request_id)
         )
-    if event.get("record_kind") in {"stop_terminal_projected", STATE_EVENT_KIND}:
+    if event.get("record_kind") in {
+        "stop_terminal_projected",
+        STATE_EVENT_KIND,
+        ACTIVE_TCP_EVENT_KIND,
+    }:
         return (
             operation_id is None
             and operation_revision is None
@@ -236,6 +244,7 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
 
 
 class ExecutionPort(Protocol):
+
     def diagnostics(self) -> dict[str, Any]: ...
 
     def identity(self) -> dict[str, Any]: ...
@@ -340,6 +349,10 @@ class ExecutionPort(Protocol):
     def recover_stop_fault(
         self,
         request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
+    ) -> dict[str, Any]: ...
+
+    def force_close(
+        self, *, step: str, stop_generation: int | None = None
     ) -> dict[str, Any]: ...
 
     def set_runtime_scale_control(
@@ -719,15 +732,13 @@ class ExecutionCommandClient:
                 "request": _sparse_request_with_complete_context(request),
             }
         )
-        accepted = response.get("accepted")
         if response.get("ok") is True and (
             response.get("command") != "stop_program_run"
-            or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Program-run Stop acceptance does not match its request",
+                "execution_command_response_invalid",
+                "Program-run Stop acceptance has the wrong kind or shape",
             )
         return response
 
@@ -774,8 +785,8 @@ class ExecutionCommandClient:
             "release_program_run_stop_fence"
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Program-run Stop release response changed its command identity",
+                "execution_command_response_invalid",
+                "Program-run Stop release response has the wrong command kind",
             )
         return response
 
@@ -823,7 +834,7 @@ class ExecutionCommandClient:
             or status.get("terminal_projection", "pending")
             not in ("pending", "recorded", "failed")
             or status.get("schema_version") != "manyforge.execution_stop_status.v1"
-            or status.get("stop_id") != stop_id
+            or not isinstance(status.get("stop_id"), str)
             or not isinstance(status.get("request_id"), str)
             or not status["request_id"]
             or status.get("state")
@@ -946,11 +957,7 @@ class ExecutionCommandClient:
         operation = response.get("operation")
         if (
             response.get("command") != "query_operation"
-            or response.get("owner_epoch") != request.owner_epoch
-            or response.get("target_role_id") != request.target_role_id
             or not isinstance(operation, dict)
-            or operation.get("program_run_id") != request.program_run_id
-            or operation.get("program_binding_id") != request.program_binding_id
             or not isinstance(operation.get("operation_id"), str)
             or not operation["operation_id"]
             or len(operation["operation_id"].encode("utf-8")) > MAX_IDENTITY_BYTES
@@ -962,7 +969,7 @@ class ExecutionCommandClient:
         ):
             raise HeadlessApiError(
                 "execution_operation_context_invalid",
-                "operation context does not match its exact query",
+                "operation context response is malformed",
             )
         return response
 
@@ -986,17 +993,11 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "set_operation_runtime_scale"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
-            or accepted.get("operation_id") != request.operation_id
-            or accepted.get("operation_revision") != request.expected_operation_revision
             or type(accepted.get("runtime_scale_generation")) is not int
-            or accepted["runtime_scale_generation"]
-            != request.expected_runtime_scale_generation + 1
-            or accepted.get("requested_scale") != request.scale
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "operation scaling acceptance does not match its request",
+                "execution_command_response_invalid",
+                "operation scaling acceptance has the wrong kind or shape",
             )
         return response
 
@@ -1024,7 +1025,7 @@ class ExecutionCommandClient:
             or not isinstance(observation, dict)
             or set(observation)
             != set(expected) | {"source_epoch", "source_sequence", "value"}
-            or any(observation.get(key) != value for key, value in expected.items())
+            or observation.get("schema_version") != expected["schema_version"]
             or not isinstance(observation.get("source_epoch"), str)
             or not observation["source_epoch"]
             or len(observation["source_epoch"].encode("utf-8")) > 256
@@ -1035,7 +1036,7 @@ class ExecutionCommandClient:
         ):
             raise HeadlessApiError(
                 "execution_target_observation_invalid",
-                "native target query returned a mismatched observation",
+                "native target query returned a malformed observation",
             )
         try:
             if request.kind == "frame_pose":
@@ -1152,9 +1153,9 @@ class ExecutionCommandClient:
                 response.get("command") != command
                 or not isinstance(observation, dict)
                 or set(observation) != set(expected) | {"evaluated_at_ns", "value"}
-                or any(observation.get(key) != value for key, value in expected.items())
+                or observation.get("schema_version") != expected["schema_version"]
             ):
-                raise ValueError("I/O signal answer does not echo its query")
+                raise ValueError("I/O signal answer has the wrong kind or shape")
             nonnegative_int64(observation["evaluated_at_ns"])
             IoSignalObservation.model_validate(observation["value"])
         except (TypeError, ValueError) as error:
@@ -1183,9 +1184,9 @@ class ExecutionCommandClient:
                     "scene_revision",
                     "value",
                 }
-                or any(observation.get(key) != value for key, value in expected.items())
+                or observation.get("schema_version") != expected["schema_version"]
             ):
-                raise ValueError("frame transform answer does not echo its query")
+                raise ValueError("frame transform answer has the wrong kind or shape")
             nonnegative_int64(observation["evaluated_at_ns"])
             SceneRevisionRequest.model_validate(observation["scene_revision"])
             digests = observation["resolution_evidence_digests"]
@@ -1236,9 +1237,14 @@ class ExecutionCommandClient:
             and isinstance(error.get("message"), str)
             and error["message"]
             and isinstance(error.get("details", {}), dict)
+            and (
+                "producer" not in error
+                or (isinstance(error.get("producer"), str) and error["producer"])
+            )
         ):
             raise HeadlessApiError(
-                error["code"], error["message"], details=error.get("details")
+                error["code"], error["message"], details=error.get("details"),
+                producer=error.get("producer", "kernel"),
             )
         raise HeadlessApiError(
             "execution_command_response_invalid",
@@ -1426,6 +1432,7 @@ class ExecutionCommandClient:
             page["interrupt_rule_state_baseline"] = response.get(
                 "interrupt_rule_state_baseline"
             )
+            page["active_tcp_baseline"] = response.get("active_tcp_baseline")
             return page
         except Exception as error:
             error.runtime_fault_snapshot = runtime_snapshot
@@ -1445,15 +1452,13 @@ class ExecutionCommandClient:
                 "operation": request.model_dump(mode="json"),
             }
         )
-        accepted = response.get("accepted")
         if response.get("ok") is True and (
             response.get("command") != "submit"
-            or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "execution acceptance does not match the submitted request",
+                "execution_command_response_invalid",
+                "execution acceptance has the wrong kind or shape",
             )
         return response
 
@@ -1488,15 +1493,10 @@ class ExecutionCommandClient:
                 "request_owner_epoch",
             }
             or response.get("command") != "read_manual_handover"
-            or response.get("request_id") != request.request_context.request_id
-            or response.get("request_owner_epoch")
-            != request.request_context.request_owner_epoch
-            or response.get("intent_digest")
-            != "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "manual handover response differs from its request",
+                "execution_command_response_invalid",
+                "manual handover response has the wrong kind or shape",
             )
         try:
             availability = ManualControlAvailability.model_validate(
@@ -1519,7 +1519,7 @@ class ExecutionCommandClient:
                 ) from error
             if parsed.context.program_run_id == request.program_run_id:
                 raise HeadlessApiError(
-                    "execution_command_response_identity_mismatch",
+                    "execution_command_response_invalid",
                     "manual operation cannot be its own Program parent",
                 )
         return response
@@ -1543,9 +1543,6 @@ class ExecutionCommandClient:
             return response
         receipt = response.get("preview_receipt")
         participant = operation["participants"][0]
-        expected_intent_digest = (
-            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
-        )
         if (
             set(response) != MOTION_PREVIEW_RESPONSE_KEYS
             or not isinstance(receipt, dict)
@@ -1560,25 +1557,10 @@ class ExecutionCommandClient:
             or receipt.get("schema_version")
             != "manyforge.direct_control_motion_preview.v1"
             or receipt.get("commit_eligible") is not True
-            or receipt.get("intent_digest") != expected_intent_digest
-            or receipt.get("request_id") != operation["request_context"]["request_id"]
-            or receipt.get("request_owner_epoch")
-            != operation["request_context"]["request_owner_epoch"]
-            or receipt.get("program_id") != operation["program_id"]
-            or receipt.get("program_revision") != operation["program_revision"]
-            or receipt.get("program_binding_id") != operation["program_binding_id"]
-            or receipt.get("program_run_id") != operation["program_run_id"]
-            or receipt.get("graph_revision") != operation["expected_graph_revision"]
-            or receipt.get("retained_bundle_id")
-            != operation["expected_retained_bundle_id"]
-            or receipt.get("component_role_id") != participant["component_role_id"]
-            or receipt.get("target_role_id") != participant["target_role_id"]
-            or receipt.get("required_capability_id")
-            != participant["required_capability_id"]
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "motion preview receipt does not match its submitted intent",
+                "execution_command_response_invalid",
+                "motion preview response has the wrong kind or is not commit eligible",
             )
         source_names = receipt.get("source_joint_names")
         submitted_motion = participant["payload"].get("motion")
@@ -1665,9 +1647,6 @@ class ExecutionCommandClient:
         position = (
             command_value.get("position") if isinstance(command_value, dict) else None
         )
-        expected_intent_digest = (
-            "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
-        )
         if (
             set(response) != CAPABILITY_COMMAND_PREVIEW_RESPONSE_KEYS
             or not isinstance(receipt, dict)
@@ -1682,28 +1661,10 @@ class ExecutionCommandClient:
             or receipt.get("schema_version")
             != "manyforge.direct_control_capability_command_preview.v1"
             or receipt.get("commit_eligible") is not True
-            or receipt.get("intent_digest") != expected_intent_digest
-            or receipt.get("request_id") != operation["request_context"]["request_id"]
-            or receipt.get("request_owner_epoch")
-            != operation["request_context"]["request_owner_epoch"]
-            or receipt.get("program_id") != operation["program_id"]
-            or receipt.get("program_revision") != operation["program_revision"]
-            or receipt.get("program_binding_id") != operation["program_binding_id"]
-            or receipt.get("program_run_id") != operation["program_run_id"]
-            or receipt.get("graph_revision") != operation["expected_graph_revision"]
-            or receipt.get("retained_bundle_id")
-            != operation["expected_retained_bundle_id"]
-            or receipt.get("component_role_id") != participant["component_role_id"]
-            or receipt.get("target_role_id") != participant["target_role_id"]
-            or receipt.get("required_capability_id")
-            != participant["required_capability_id"]
-            or receipt.get("command_schema_id") != payload.get("command_schema_id")
-            or receipt.get("command_schema_revision")
-            != payload.get("command_schema_revision")
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "capability-command preview does not match its submitted intent",
+                "execution_command_response_invalid",
+                "capability-command preview has the wrong kind or is not commit eligible",
             )
         coordinate_kind = receipt.get("coordinate_kind")
         source_kind = receipt.get("source_kind")
@@ -1768,15 +1729,13 @@ class ExecutionCommandClient:
                 "operation_id": operation_id,
             }
         )
-        operation = response.get("operation")
         if response.get("ok") is True and (
             response.get("command") != "read"
-            or not isinstance(operation, dict)
-            or operation.get("operation_id") != operation_id
+            or not isinstance(response.get("operation"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "execution observation does not match the requested operation",
+                "execution_command_response_invalid",
+                "execution observation has the wrong kind or shape",
             )
         if response.get("ok") is True and type(response.get("resident")) is not bool:
             raise HeadlessApiError(
@@ -1928,14 +1887,12 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "apply_operation_recovery"
             or not isinstance(result, dict)
-            or result.get("request_id") != request.request_id
-            or result.get("action") != request.action
             or type(result.get("accepted")) is not bool
             or not isinstance(result.get("resulting_assessment"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "native operation recovery result changed request identity",
+                "execution_command_response_invalid",
+                "native operation recovery result has the wrong kind or shape",
             )
         return response
 
@@ -1962,9 +1919,7 @@ class ExecutionCommandClient:
                 or not isinstance(result, dict)
                 or result.get("schema_version")
                 != "manyforge.pick_place_planning_result.v1"
-                or result.get("sequence_id") != request.sequence_id
                 or result.get("kind") != expected_kind
-                or result.get("selected_object_id") != request.selected_object_id
                 or result.get("status") not in {"planned", "no_feasible_candidate"}
                 or type(result.get("attempted_candidate_count")) is not int
                 or not 0 <= result["attempted_candidate_count"] <= 4096
@@ -1989,8 +1944,8 @@ class ExecutionCommandClient:
                 )
             ):
                 raise HeadlessApiError(
-                    "execution_command_response_identity_mismatch",
-                    "pick/place planning result does not match its submitted intent",
+                    "execution_command_response_invalid",
+                    "pick/place planning result has the wrong kind or shape",
                 )
         return response
 
@@ -2033,19 +1988,13 @@ class ExecutionCommandClient:
                 "request": request.model_dump(mode="json"),
             }
         )
-        accepted = response.get("accepted")
         if response.get("ok") is True and (
             response.get("command") != command
-            or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
-            or accepted.get("operation_id") != request.operation_id
-            or accepted.get("control") != command
-            or accepted.get("accepted_against_revision")
-            != request.expected_operation_revision
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "execution control acceptance does not match its request",
+                "execution_command_response_invalid",
+                "execution control acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2085,15 +2034,13 @@ class ExecutionCommandClient:
                 "request": _sparse_request_with_complete_context(request),
             }
         )
-        accepted = response.get("accepted")
         if response.get("ok") is True and (
             response.get("command") != "stop"
-            or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "execution Stop acceptance does not match its request",
+                "execution_command_response_invalid",
+                "execution Stop acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2115,12 +2062,11 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "full_stop"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
             or accepted.get("resolution_reason") != "explicit_full_stop"
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Full Stop acceptance does not match its request",
+                "execution_command_response_invalid",
+                "Full Stop acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2146,12 +2092,11 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "stop"
             or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request_id
             or accepted.get("resolution_disposition") != "promoted_to_full"
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "recognized malformed Stop acceptance does not match its adapter identity",
+                "execution_command_response_invalid",
+                "recognized malformed Stop acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2402,24 +2347,53 @@ class ExecutionCommandClient:
         if response.get("ok") is True and (
             response.get("command") != "recover_stop_fault"
             or not isinstance(result, dict)
-            or result.get("request_id") != request.request_context.request_id
             or type(result.get("accepted")) is not bool
             or (
-                not self._valid_global_rule_recovery_result(request, result)
+                not self._valid_global_rule_recovery_result(result)
                 if global_rule
                 else not isinstance(result.get("latch"), dict)
             )
         ):
             raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "Stop-fault recovery result has the wrong kind or shape",
+            )
+        return response
+
+    def force_close(
+        self, *, step: str, stop_generation: int | None = None
+    ) -> dict[str, Any]:
+        """Item 37: one Kernel step of an operator Force close.
+
+        ``arm`` names the operator's Full Stop generation; ``close_operations``
+        moves the resident operations into history. A refusal is returned as
+        the owner's ``ok: false`` reply.
+        """
+
+        command: dict[str, Any] = {
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "command": "force_close",
+            "step": step,
+        }
+        if step == "arm":
+            command["stop_generation"] = stop_generation
+        response = self._exchange(command)
+        result = response.get("result")
+        if response.get("ok") is True and (
+            response.get("command") != "force_close"
+            or not isinstance(result, dict)
+            or result.get("step") != step
+            or not isinstance(result.get("operations"), list)
+            or (step == "arm" and result.get("stop_generation") != stop_generation)
+        ):
+            raise HeadlessApiError(
                 "execution_command_response_identity_mismatch",
-                "Stop-fault recovery result does not match its request",
+                "Force close result does not match its request",
             )
         return response
 
     @staticmethod
-    def _valid_global_rule_recovery_result(
-        request: GlobalIoRuleRecoveryIntentRequest, result: dict[str, Any]
-    ) -> bool:
+    def _valid_global_rule_recovery_result(result: dict[str, Any]) -> bool:
         if set(result) != {
             "accepted",
             "context",
@@ -2429,17 +2403,12 @@ class ExecutionCommandClient:
             "rule",
         }:
             return False
-        # The exact requested selector context (SX-2216), also for a replay of
-        # a historical request after the current Applied context changed.
-        if result["context"] != request.selector.context.model_dump(mode="json"):
-            return False
         rule = result["rule"]
         if rule is None:
             return result["accepted"] is False
         return (
             isinstance(rule, dict)
             and set(rule) == {"rule_id", "state", "triggering_acquisition"}
-            and rule["rule_id"] == request.selector.rule_id
             and rule["state"] in ("clear", "tripped", "latched")
         )
 
@@ -2457,18 +2426,13 @@ class ExecutionCommandClient:
                 "request": request.model_dump(mode="json"),
             }
         )
-        accepted = response.get("accepted")
-        selector = request.selector.model_dump(mode="json")
         if response.get("ok") is True and (
             response.get("command") != "set_runtime_scale_control"
-            or not isinstance(accepted, dict)
-            or accepted.get("request_id") != request.request_context.request_id
-            or accepted.get("selector") != selector
-            or accepted.get("requested_scale") != request.scale
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "runtime-scale control acceptance does not match its request",
+                "execution_command_response_invalid",
+                "runtime-scale control acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2482,15 +2446,13 @@ class ExecutionCommandClient:
                 "selector": selector.model_dump(mode="json"),
             }
         )
-        status = response.get("runtime_scale_control")
         if response.get("ok") is True and (
             response.get("command") != "get_runtime_scale_control"
-            or not isinstance(status, dict)
-            or status.get("selector") != selector.model_dump(mode="json")
+            or not isinstance(response.get("runtime_scale_control"), dict)
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "runtime-scale control observation does not match its selector",
+                "execution_command_response_invalid",
+                "runtime-scale control observation has the wrong kind or shape",
             )
         return response
 
@@ -3354,9 +3316,12 @@ class ExecutionEventPump:
                     )
                     after_sequence = event["sequence"]
                     source_high_water = after_sequence
+                    if event["record_kind"] == ACTIVE_TCP_EVENT_KIND:
+                        # A changed robot TCP is part of the control projection.
+                        control_projection_changed = True
+                        continue
                     if event["record_kind"] == STATE_EVENT_KIND:
-                        # Rule state is not a control projection fact; the
-                        # global rule status model already folded it.
+                        # The global rule status model already folded rule state.
                         continue
                     operation_id = event.get("operation_id")
                     if isinstance(operation_id, str):

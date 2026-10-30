@@ -684,24 +684,20 @@ def test_wire_accepts_the_full_uint64_index(monkeypatch, tmp_path) -> None:
 @pytest.mark.parametrize(
     "mutation",
     [
-        {"node_start_index": "2"},
-        {"node_attempt_id": "attempt:other"},
+        {"command": "end_mock_io_node_simulation"},
         {"started_at_ns": 1000000},
         {"status": "superseded"},
-        {"signals": []},
         {"result": {}},
     ],
 )
-def test_wire_refuses_an_ack_for_another_start(monkeypatch, tmp_path, mutation) -> None:
+def test_wire_refuses_a_malformed_start_ack(monkeypatch, tmp_path, mutation) -> None:
     from manyforge_headless_api.native import HeadlessApiError
 
     wire, host = _wire(monkeypatch, tmp_path)
     host.script["start_mock_io_node_simulation"] = [{**_ACK, **mutation}]
     with pytest.raises(HeadlessApiError) as caught:
         wire.start_mock_io_node_simulation(deepcopy(_START["request"]))
-    assert caught.value.code in {
-        "execution_command_response_invalid", "execution_command_response_identity_mismatch"
-    }
+    assert caught.value.code == "execution_command_response_invalid"
 
 
 def test_native_port_builds_the_canonical_request_with_a_decimal_index(
@@ -827,7 +823,7 @@ def test_native_port_maps_a_closed_refusal(monkeypatch, tmp_path) -> None:
 def test_native_port_leaves_an_unknown_reply_unknown(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     port.mock_simulation.set_run_paused("run.1", 1, False)
-    host.script["start_mock_io_node_simulation"] = [{**_ACK, "node_start_index": "9"}]
+    host.script["start_mock_io_node_simulation"] = [{**_ACK, "status": "superseded"}]
     with pytest.raises(Exception) as caught:
         port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
     assert not isinstance(caught.value, MockSimulationRefusedError)

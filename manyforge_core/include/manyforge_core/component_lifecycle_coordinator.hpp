@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <functional>
+#include <map>
 #include <manyforge_core/cclc_domain_reservation_table.hpp>
 #include <manyforge_core/configured_robot_measured_state.hpp>
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
@@ -90,6 +91,9 @@ struct ComponentLifecycleProductContext final {
   /// association is checked both before and after health/measured reads.
   const std::function<Result<ComponentLifecycleReadinessSourceView>(
       const ComponentLifecycleCurrentSnapshotDTO&)> capture_readiness_sources{};
+  /// Per-component lifecycle time budgets (ns) authored in this product's
+  /// Deployment. A component without one keeps its plan's bound.
+  const std::map<std::string, std::int64_t, std::less<>> lifecycle_budgets_ns{};
 };
 
 /// One accounted product operation. The shared lease safely encloses the
@@ -210,6 +214,15 @@ class ComponentLifecycleCoordinator final {
   /// split an already admitted pass.
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent, const ComponentLifecycleProductPin& product_pin);
+  /// M6: a submission with one caller precondition. Exact journal replay is
+  /// classified first (a retry of an accepted request replays it). The
+  /// precondition then runs inside admission, after the domain reservation
+  /// and immediately before the durable Kernel claim; its refusal is retained
+  /// as this request's no-effect rejection (`effect=not_started`).
+  using LifecycleAdmissionPrecondition = std::function<Result<void>()>;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
+      const ComponentLifecycleIntentDTO& intent,
+      const LifecycleAdmissionPrecondition& precondition);
 
   /// Owner-private follower acceptance fenced by its actual target row.
   /// Exact request replay is classified before current-target validation.
@@ -244,16 +257,6 @@ class ComponentLifecycleCoordinator final {
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
   ReadApplyComponentBringUpRequestResult(const ComponentLifecycleIntentDTO& intent,
                                          const ContentDigest& stable_digest);
-
-  /// Owner-local accepted-new delegation. Exact replay precedes live checks;
-  /// acceptance reserves the union but schedules no provider work.
-  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptApplyComponentBringUp(
-      const ComponentLifecycleIntentDTO& intent, const ApplyComponentBringUpEvidenceDTO& evidence,
-      const std::optional<ComponentLifecycleCurrentSnapshotDTO>& genuine_predecessor,
-      const std::vector<BrandLifecyclePlanCatalogDTO>& candidate_catalogs,
-      const std::vector<ResolvedLifecycleControlDomainScopeDTO>& qualified_candidate_domains,
-      const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& candidate_provider_occurrences,
-      ComponentLifecycleCoordinatorApplyBringUpServices services);
 
   /// Pure original-owner candidate facts under the caller's existing Apply
   /// installation guard. Reads the actual journal and immutable accepted

@@ -34,6 +34,9 @@
 #include <vector>
 
 #include "manyforge_headless/headless_api_core.hpp"
+#include "manyforge_headless/assistant_mode_projection.hpp"
+#include "manyforge_headless/event_historian.hpp"
+#include "manyforge_headless/operator_alarm_owner.hpp"
 #include "manyforge_headless/node_environment_projection.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_contract.hpp"
@@ -47,6 +50,24 @@ using content_identity::CanonicalValue;
 using namespace std::chrono_literals;
 
 constexpr std::string_view kCellId = "c1_build_authority_cell";
+
+TEST(HeadlessTypedErrors, ExistingRuntimeErrorsKeepTheirCodesAndMessages) {
+  const EventHistorianError historian("historian_error", "history unavailable");
+  const OperatorAlarmError alarm("alarm_error", "alarm unavailable");
+  const AssistantModeProjectionError assistant("assistant_error", "mode unavailable");
+  for (const auto *error : std::vector<const std::runtime_error *>{&historian, &alarm, &assistant}) {
+    const auto cause = core::CauseOf(*error, "fallback", "headless_api");
+    EXPECT_EQ(cause.producer, "headless_api");
+    EXPECT_NE(cause.error.code, "fallback");
+    EXPECT_EQ(cause.error.message, error->what());
+  }
+  EXPECT_EQ(core::CauseOf(historian, "fallback", "headless_api").error.code, "historian_error");
+  EXPECT_EQ(core::CauseOf(alarm, "fallback", "headless_api").error.code, "alarm_error");
+  EXPECT_EQ(core::CauseOf(assistant, "fallback", "headless_api").error.code, "assistant_error");
+  EXPECT_STREQ(historian.what(), "historian_error: history unavailable");
+  EXPECT_STREQ(alarm.what(), "alarm_error: alarm unavailable");
+  EXPECT_STREQ(assistant.what(), "mode unavailable");
+}
 
 class TemporaryDirectory final {
 public:
@@ -2993,6 +3014,31 @@ std::vector<manyforge::core::OperationJournalEventDTO> NativeRuleStateEvents(
   return page.value().events;
 }
 
+TEST(HeadlessApiCore, NotifyUnknownWithTypedReasonPassesEventValidation) {
+  TemporaryDirectory directory;
+  namespace native = manyforge::core;
+  const std::string owner = "execution-host.epoch.notify";
+  native::SqliteOperationJournal journal(directory.path() / "notify.sqlite3",
+                                         native::CellId(std::string(kCellId)), 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(native::RequestOwnerEpoch(owner), 0, 8U, {}).ok());
+  native::IoRuleStateChangeDTO change{
+      {native::RequestOwnerEpoch(owner), 4U, native::ActiveBundlePublicationGeneration(3U),
+       native::RetainedBundleId("retained.global"), native::GraphRevision("graph.global")},
+      {native::InterruptPolicyId("door.guard"), native::IoGlobalRuleState::kUnknown,
+       std::nullopt, native::ErrorDTO{"io_rule_source_unavailable", "lost", {{"source", "door"}}}},
+      100};
+  ASSERT_TRUE(journal.RecordInterruptRuleStateChanged(change).ok());
+  const auto page = journal.ReadOperationalEvents(native::RequestOwnerEpoch(owner), 0U);
+  ASSERT_TRUE(page.ok());
+  ASSERT_EQ(page.value().events.size(), 1U);
+  const auto &event = page.value().events.front();
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  EXPECT_EQ(Text(core.IngestOperationEvent(
+      owner, event.sequence, event.record_kind, std::nullopt, std::nullopt, std::nullopt,
+      event.occurred_at_ns, event.occurred_at_wall, event.effect_pending,
+      content_identity::parse_canonical_json(event.payload_json), event.payload_digest), "status"), "ingested");
+}
+
 TEST(HeadlessApiCore,
      ActualCoreRuleTransitionsReachHistoryWithNoFakeOperationAndReplaySafely) {
   TemporaryDirectory directory;
@@ -3276,6 +3322,87 @@ TEST(HeadlessApiCore,
   const auto &returned = OnlyAlarm(returned_snapshot);
   EXPECT_EQ(Text(returned, "definition_id"),
             "manyforge.motion.runtime_collision");
+  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
+  EXPECT_EQ(Text(Member(returned, "details"), "reason"),
+            "operation_reset_accepted");
+}
+
+TEST(HeadlessApiCore,
+     KernelRuntimeMonitorObservationLossDrivesItsOwnAlarmUntilAcceptedReset) {
+  // Live incident 2026-10-29: the containment Stop for lost measured robot
+  // state was annunciated as a runtime collision. It keeps the same Stop
+  // source and outcome but raises its own alarm.
+  TemporaryDirectory directory;
+  const auto configurations = LoadRegistryConfigurations();
+  const auto resource = ResourceIds(*configurations.single).front();
+  PublishActiveConfiguration(directory, *configurations.single, 1U);
+  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
+  const std::string source_epoch = "execution-host.epoch.observation-lost";
+  auto projection =
+      RuntimeCollisionStopAcceptanceProjectionPayload(source_epoch, resource);
+  const auto intent = Member(projection, "intent");
+  projection = JournalField(
+      projection, "intent",
+      JournalField(intent, "value",
+                   JournalField(Member(intent, "value"), "reason",
+                                CanonicalValue("runtime_monitor_observation_lost"))));
+  const auto projection_digest = content_identity::sha256_digest(
+      content_identity::canonical_json(projection));
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 1U, "stop_acceptance_projected", "stop-request.collision.1",
+      std::nullopt, std::nullopt, 300U, "2026-08-07T10:00:00.000000007Z", true,
+      projection, projection_digest));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
+
+  const auto active_snapshot = core.AlarmSnapshot();
+  const auto &active = OnlyAlarm(active_snapshot);
+  EXPECT_EQ(Text(active, "definition_id"),
+            "manyforge.motion.runtime_monitor_observation_lost");
+  EXPECT_EQ(Text(active, "title"), "Robot position feedback lost");
+  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(active, "priority"), "critical");
+  EXPECT_EQ(Text(Member(active, "details"), "reason"),
+            "runtime_monitor_observation_lost");
+  EXPECT_EQ(Text(Member(active, "correlations"), "program_run_id"),
+            "program-run.test");
+
+  // Its InterventionRequired outcome raises no execution-fault alarm.
+  const auto intervention = OperationJournalPayload(
+      source_epoch, "state_observed", "intervention_required",
+      CanonicalValue(CanonicalValue::Object{
+          {"code", CanonicalValue("runtime_monitor_observation_lost")},
+          {"details",
+           CanonicalValue(CanonicalValue::Object{
+               {"reason", CanonicalValue("runtime_monitor_observation_lost")}})},
+          {"message",
+           CanonicalValue(
+               "Runtime monitor stopped the operation: measured robot state was lost")},
+      }),
+      std::nullopt, resource);
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 2U, "state_observed", std::nullopt, "operation.test.1", 1U,
+      301U, "2026-08-07T10:00:00.000000008Z", false, intervention,
+      content_identity::sha256_digest(
+          content_identity::canonical_json(intervention))));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
+  const auto intervention_snapshot = core.AlarmSnapshot();
+  EXPECT_EQ(Text(OnlyAlarm(intervention_snapshot), "definition_id"),
+            "manyforge.motion.runtime_monitor_observation_lost");
+
+  // The accepted Reset returns exactly this alarm.
+  const auto reset = OperationJournalPayload(
+      source_epoch, "control_accepted", "intervention_required",
+      CanonicalValue(CanonicalValue::Object{}), "reset", resource);
+  static_cast<void>(core.IngestOperationEvent(
+      source_epoch, 3U, "control_accepted", "request.reset.collision.1",
+      "operation.test.1", 1U, 302U, "2026-08-07T10:00:00.000000009Z", true,
+      reset,
+      content_identity::sha256_digest(content_identity::canonical_json(reset))));
+  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 3U));
+  const auto returned_snapshot = core.AlarmSnapshot();
+  const auto &returned = OnlyAlarm(returned_snapshot);
+  EXPECT_EQ(Text(returned, "definition_id"),
+            "manyforge.motion.runtime_monitor_observation_lost");
   EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
   EXPECT_EQ(Text(Member(returned, "details"), "reason"),
             "operation_reset_accepted");

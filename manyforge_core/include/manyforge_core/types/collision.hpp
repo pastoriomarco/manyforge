@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -203,6 +204,62 @@ enum class CollisionDistanceRequestMode {
   return "unknown";
 }
 
+/// Collision settings defaults (Deployment `collision_clearance_m` and
+/// `collision_check_step_rad`; tune them here).
+/// - Clearance: a validated or planned move keeps at least this from every
+///   body its collision policy does not allow it to touch. 0 (the default)
+///   disables it: contact-only checks. A motion's own `clearance_m` replaces
+///   it for that move, within [0, kMaxCollisionClearanceM].
+/// - Check step: the joint-space distance (Euclidean, as RoboPlan's
+///   `collision_check_step_size`) between two collision-checked
+///   configurations, for the planner's first attempt and for pre-dispatch
+///   validation of the executed curve.
+inline constexpr double kDefaultCollisionClearanceM = 0.0;
+inline constexpr double kMaxCollisionClearanceM = 0.05;
+inline constexpr double kDefaultCollisionCheckStepRad = 0.05;
+inline constexpr double kMaxCollisionCheckStepRad = 0.2;
+inline constexpr double kCollisionRetryCheckStepRad = 0.01;
+
+/// The collision-check step of one planning attempt, used by the planner and
+/// by validation of that attempt's trajectory: the configured step on the
+/// first attempt, the finer of it and kCollisionRetryCheckStepRad on a retry
+/// (requested only after validation rejected a candidate; the same
+/// resolution could reproduce the same missed narrow contact).
+[[nodiscard]] inline constexpr double collision_check_step_for_attempt(
+    const double configured_step_rad, const std::uint32_t planning_attempt_index) noexcept {
+  return planning_attempt_index == 0U || configured_step_rad < kCollisionRetryCheckStepRad
+             ? configured_step_rad
+             : kCollisionRetryCheckStepRad;
+}
+
+/// Collision clearance (coal security margin) of one canonical logical pair.
+struct CollisionPairMargin {
+  CollisionPairId pair;
+  double margin_m = 0.0;
+
+  friend bool operator==(const CollisionPairMargin&,
+                         const CollisionPairMargin&) = default;
+};
+
+/// Collision clearance for one move: two bodies of a listed pair closer than
+/// its margin collide. Pairs not listed keep margin 0. `margin_m` is the
+/// move's clearance the list was derived from (reported with a clearance
+/// refusal). Immutable once built and shared by every query of the move.
+struct CollisionClearanceMargins {
+  double margin_m = 0.0;
+  /// Sorted by pair, unique, every margin in (0, margin_m].
+  std::vector<CollisionPairMargin> pairs;
+
+  [[nodiscard]] double margin_for(const CollisionPairId& pair) const noexcept {
+    const auto found = std::lower_bound(
+        pairs.begin(), pairs.end(), pair,
+        [](const CollisionPairMargin& entry, const CollisionPairId& selected) {
+          return entry.pair < selected;
+        });
+    return found != pairs.end() && found->pair == pair ? found->margin_m : 0.0;
+  }
+};
+
 /// Normalized collision query (spec §3.8.1).
 ///
 /// Superset of CollisionCheckRequestDTO. Chunk 1 mirrors the existing
@@ -234,6 +291,9 @@ struct CollisionQuery {
   /// kSelectedCollidingPairs. Other modes require this list to be empty.
   std::vector<CollisionPairId> selected_distance_pairs;
   std::optional<std::int64_t> max_contacts;
+  /// Clearance margins for this query. Null means margin 0 for every pair,
+  /// as on the runtime surfaces.
+  std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
 };
 
 /// Engine result status (spec §3.8.1).
@@ -301,6 +361,11 @@ struct CollisionResult {
   /// active policy requested signed release evidence or bounded penetration
   /// for that pair.
   std::vector<CollisionPairClearance> pair_clearances;
+
+  /// Colliding pairs reported only because of their clearance margin: the
+  /// engine's signed clearance is positive but below the pair's margin.
+  /// Sorted by pair; a subset of `normalized_pairs`.
+  std::vector<CollisionPairClearance> clearance_violations;
 
   /// Per-pair classification produced by the Chunk 3 policy evaluator.
   /// Includes observed-pair classifications and may include policy-state

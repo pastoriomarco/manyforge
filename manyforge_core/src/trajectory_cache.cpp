@@ -34,7 +34,8 @@ std::string TrajectoryCache::encoded_key(const TrajectoryCacheKey& key) {
 }
 
 void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory,
-                            std::string intent_identity) {
+                            std::string intent_identity,
+                            const std::uint32_t planning_attempt_index) {
   if (!key.valid() || intent_identity.empty()) {
     throw std::invalid_argument("trajectory cache store requires a complete slot and intent");
   }
@@ -47,6 +48,7 @@ void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO traject
     it->second.key = key;
     it->second.trajectory = std::move(shared_trajectory);
     it->second.intent_identity = std::move(intent_identity);
+    it->second.planning_attempt_index = planning_attempt_index;
     return;
   }
 
@@ -54,7 +56,8 @@ void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO traject
     entries_.erase(insertion_order_.front());
     insertion_order_.pop_front();
   }
-  entries_.emplace(encoded, Entry{key, std::move(shared_trajectory), std::move(intent_identity)});
+  entries_.emplace(encoded, Entry{key, std::move(shared_trajectory), std::move(intent_identity),
+                                  planning_attempt_index});
   insertion_order_.push_back(encoded);
 }
 
@@ -101,8 +104,9 @@ TrajectoryCacheLookupResult TrajectoryCache::lookup(const TrajectoryCacheKey& ke
   }
 
   auto found = it->second.trajectory;
+  const auto planning_attempt_index = it->second.planning_attempt_index;
   lock.unlock();
-  return {TrajectoryCacheLookupDisposition::kFound, *found};
+  return {TrajectoryCacheLookupDisposition::kFound, *found, planning_attempt_index};
 }
 
 void TrajectoryCache::invalidate(const TrajectoryCacheKey& key) {

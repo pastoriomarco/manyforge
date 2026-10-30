@@ -1,10 +1,16 @@
 #pragma once
 
 #include <optional>
+#include <span>
+#include <string_view>
 #include <vector>
 
 #include <manyforge_core/types/catalog.hpp>
+#include <manyforge_core/types/component_type.hpp>
+#include <manyforge_core/types/model_asset.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 
@@ -25,7 +31,10 @@ namespace manyforge::deployment::detail {
 /// assistant profile becomes the `assistant` member; each model alias is
 /// served by the AI model component `assistant_model_components` names, else
 /// by the only one (typed refusals `assistant_ai_model_component_missing`,
-/// `assistant_model_component_unresolved`).
+/// `assistant_model_component_unresolved`). Each physical component's graph
+/// row carries its default TCP (`compiled_default_tcp`, read from its
+/// qualified type in `component_types`); an authored mount's `primary`
+/// carries over.
 [[nodiscard]] CanonicalValue compile_activation_deployment(
     const ActivationDeploymentIntent &intent,
     const core::CellId &runtime_cell_id,
@@ -36,6 +45,27 @@ namespace manyforge::deployment::detail {
     const std::vector<ActivationPreparedIoType> &io_types = {},
     std::span<const QualifiedProviderManifest> provider_manifests = {},
     const std::optional<ActivationAssistantProfile> &assistant_profile =
-        std::nullopt);
+        std::nullopt,
+    std::span<const QualifiedComponentType> component_types = {});
+
+/// B5 [C-P1]: the default TCP compiled into a component's graph row. Its
+/// TCPs are `{target, role}` pairs: on each target that declares a default
+/// TCP, the roles the type tags as TCPs and the row's custom TCPs (a merely
+/// named `tcp` is no TCP, C-P3). An authored `default_tcp` must be one of
+/// them (`component_default_tcp_unknown`). Without one, the single target
+/// that declares a default gives it; TCPs on several such targets refuse
+/// with `component_default_tcp_required`. None when the component has no TCP.
+[[nodiscard]] std::optional<core::ComponentDefaultTcpDTO> compiled_default_tcp(
+    const ActivationDeploymentComponent &component,
+    const core::ComponentTypeDTO &type);
+
+/// Under `tcp_speed_check: active_tcp_and_flange` (the default) the TCP-speed
+/// maximum also holds at the robot's `flange` frame. A robot model without a
+/// `flange` frame role is refused here, at Apply, with the typed
+/// `robot_flange_frame_missing` (the runtime host would refuse it at
+/// activation). `active_tcp` needs no flange.
+void require_speed_check_flange(
+    std::string_view component_id, std::string_view tcp_speed_check,
+    std::span<const core::ModelFrameRoleBindingDTO> frame_role_bindings);
 
 } // namespace manyforge::deployment::detail

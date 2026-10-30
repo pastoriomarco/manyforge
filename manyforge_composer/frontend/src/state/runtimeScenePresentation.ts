@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { Nanoseconds } from '../types/nanoseconds';
+import { selectedTcpOf } from './robotControl';
 
 import type {
   CarriedObjectAttachment,
@@ -68,6 +69,8 @@ export interface MeasuredRobotPresentation {
   sourceSequence: number;
   observedAtNs: Nanoseconds | null;
   linkTransforms: Record<string, RuntimeLinkTransform>;
+  /** G2-b: links the measured ghost does not draw (no stream, or no data yet). */
+  hiddenLinkNames?: readonly string[];
 }
 
 export interface MeasuredRobotPresentationReader {
@@ -90,6 +93,11 @@ export interface MeasuredPosePresentation {
 
 export interface RuntimeScenePresentation {
   measuredRobot: MeasuredRobotPresentation | null;
+  /**
+   * G2: the fresh outside measured robot sources (`viewer.measured_robot`).
+   * With none, the measured ghost follows the execution owner's measured rows.
+   */
+  measuredRobotSources: JointObservationSource[];
   measuredTcp: MeasuredPosePresentation | null;
   measuredObjects: MeasuredPosePresentation[];
   attachedObjects: AttachedObjectPresentation[];
@@ -130,8 +138,7 @@ export interface AttachmentPresentationDiagnostic {
     | 'attachment_missing'
     | 'attachment_ambiguous'
     | 'attachment_identity_mismatch'
-    | 'carrier_descriptor_unavailable'
-    | 'carrier_target_mismatch'
+    | 'carrier_model_unavailable'
     | 'carrier_frame_missing'
     | 'carrier_frame_ambiguous'
     | 'carrier_model_mismatch'
@@ -266,6 +273,49 @@ export function executionRobotPresentation(
 }
 
 /**
+ * Viewer-joint positions of observed execution targets, each mapped through
+ * its own target's model group onto its owner's occurrence. Null when any
+ * row crosses its retained join.
+ */
+function observedTargetPositions(
+  targets: readonly ExecutionObservationTarget[],
+  sourceModel: SourceModelProjection,
+): Map<string, number> | null {
+  const compiledPositions = new Map<string, number>();
+  for (const observed of targets) {
+    const target = sourceModel.targets.find((candidate) => (
+      candidate.component_id === observed.controllableComponentId
+      && candidate.target_id === observed.commandTargetId
+    ));
+    if (target === undefined || observed.sourceJointNames.length !== observed.compiledJointNames.length
+      || observed.sourceJointNames.length !== observed.positionsSi.length
+      || observed.sourceJointNames.length !== observed.coordinateKinds.length) return null;
+    const groups = target.model_groups.filter((group) => (
+      group.commandable_source_joint_names.length === observed.sourceJointNames.length
+      && group.commandable_source_joint_names.every((name, index) => name === observed.sourceJointNames[index])
+    ));
+    if (groups.length !== 1) return null;
+    const occurrence = sourceModel.occurrences.find((candidate) => (
+      candidate.component_id === observed.controllableComponentId
+      && candidate.model_instance_id === groups[0].model_instance_id
+    ));
+    if (occurrence === undefined) return null;
+    for (const [index, sourceName] of observed.sourceJointNames.entries()) {
+      const compiledName = observed.compiledJointNames[index];
+      const value = observed.positionsSi[index];
+      const coordinates = occurrence.coordinates.filter((coordinate) => (
+        coordinate.source_joint_name === sourceName && coordinate.viewer_joint_name === compiledName
+      ));
+      if (coordinates.length !== 1 || coordinates[0].coordinate_kind !== observed.coordinateKinds[index]
+        || coordinates[0].unit !== (observed.coordinateKinds[index] === 'angular' ? 'radians' : 'meters')
+        || !Number.isFinite(value) || compiledPositions.has(compiledName)) return null;
+      compiledPositions.set(compiledName, value);
+    }
+  }
+  return compiledPositions;
+}
+
+/**
  * Project one compact owner observation through the retained source/model map.
  * The frame contains presentation facts only; every identity is checked again
  * before it can move a retained Three.js link.
@@ -307,37 +357,8 @@ export function executionObservationRobotPresentation(
       || joint.compiledJointName !== motion.compiledJointNames[index]
     ))
   )) return null;
-  const compiledPositions = new Map<string, number>();
-  for (const observed of frame.targets) {
-    const target = sourceModel.targets.find((candidate) => (
-      candidate.component_id === observed.controllableComponentId
-      && candidate.target_id === observed.commandTargetId
-    ));
-    if (target === undefined || observed.sourceJointNames.length !== observed.compiledJointNames.length
-      || observed.sourceJointNames.length !== observed.positionsSi.length
-      || observed.sourceJointNames.length !== observed.coordinateKinds.length) return null;
-    const groups = target.model_groups.filter((group) => (
-      group.commandable_source_joint_names.length === observed.sourceJointNames.length
-      && group.commandable_source_joint_names.every((name, index) => name === observed.sourceJointNames[index])
-    ));
-    if (groups.length !== 1) return null;
-    const occurrence = sourceModel.occurrences.find((candidate) => (
-      candidate.component_id === observed.controllableComponentId
-      && candidate.model_instance_id === groups[0].model_instance_id
-    ));
-    if (occurrence === undefined) return null;
-    for (const [index, sourceName] of observed.sourceJointNames.entries()) {
-      const compiledName = observed.compiledJointNames[index];
-      const value = observed.positionsSi[index];
-      const coordinates = occurrence.coordinates.filter((coordinate) => (
-        coordinate.source_joint_name === sourceName && coordinate.viewer_joint_name === compiledName
-      ));
-      if (coordinates.length !== 1 || coordinates[0].coordinate_kind !== observed.coordinateKinds[index]
-        || coordinates[0].unit !== (observed.coordinateKinds[index] === 'angular' ? 'radians' : 'meters')
-        || !Number.isFinite(value) || compiledPositions.has(compiledName)) return null;
-      compiledPositions.set(compiledName, value);
-    }
-  }
+  const compiledPositions = observedTargetPositions(frame.targets, sourceModel);
+  if (compiledPositions === null) return null;
   const linkTransforms = measuredLinkTransforms(manifest, compiledPositions);
   return linkTransforms === null ? null : {
     objectId: motion.controllableComponentId,
@@ -404,22 +425,36 @@ export function createExecutionRobotPresentationReader(
  * the same retained-model projection as the solid robot. Each measured row
  * replaces its commanded row; every other coordinate keeps the solid robot's
  * value, so the comparison differs only where measurement does. A frame with
- * no measured row has no comparison robot. This reader never credits or
- * rejects frames: the solid robot reader owns the capacity-one stream.
+ * no measured row has no comparison robot. With an outside measured source
+ * (G2) it draws that source's robot and each other element's own state in the
+ * frame instead. This reader never credits or rejects frames: the solid robot
+ * reader owns the capacity-one stream.
  */
 export function createMeasuredComparisonPresentationReader(
   reader: ExecutionObservationReader,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
+  _measuredRobotSources: readonly JointObservationSource[] = [],
 ): MeasuredRobotPresentationReader {
   let cachedFrame: ExecutionObservationFrame | null | undefined;
   let cachedPresentation: MeasuredRobotPresentation | null = null;
   return {
     readMeasuredRobotPresentation: () => {
       const frame = reader.getLatestExecutionObservation();
-      if (frame === cachedFrame) return cachedPresentation;
+      if (frame === cachedFrame && !outsideExpired(frame)) return cachedPresentation;
       cachedFrame = frame;
       cachedPresentation = null;
+      const measuredRobotSources = measuredRobotSourcesOfFrame(sourceModel === null ? null : frameOfModel(frame, sourceModel));
+      // G2 (C-G2): with an outside measured source the ghost follows it and
+      // every other element's own state in this frame; more than one is off.
+      if (measuredRobotSources.length > 0) {
+        if (measuredRobotSources.length === 1 && sourceModel !== null && manifest !== null) {
+          cachedPresentation = outsideMeasuredRobot(
+            measuredRobotSources[0], frameOfModel(frame, sourceModel), sourceModel, manifest,
+          ).presentation;
+        }
+        return cachedPresentation;
+      }
       const measured = frame?.measuredTargets[0];
       if (frame === null || measured === undefined) return null;
       const sameTarget = (left: ExecutionObservationTarget, right: ExecutionObservationTarget) => (
@@ -470,6 +505,7 @@ export function frozenMeasuredRobotPresentationReader(
 
 const EMPTY_PRESENTATION: RuntimeScenePresentation = {
   measuredRobot: null,
+  measuredRobotSources: [],
   measuredTcp: null,
   measuredObjects: [],
   attachedObjects: [],
@@ -501,12 +537,16 @@ function attachmentDiagnostic(
  * Join one owner attachment to one exact retained target/frame/viewer link.
  * No source or compiled name is guessed: a missing or crossed join remains a
  * visible diagnostic and the object is not rendered at an invented pose.
+ *
+ * G4 (C-P5): the part is always drawn at its holder's frame, whatever Robot
+ * control selects. The holder's target names the frame's source link, and
+ * the holder's own occurrence maps that link to its viewer link; no
+ * Robot-control descriptor takes part.
  */
 export function attachedScenePresentation(
   logicalScene: LogicalSceneProjection | null,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
-  descriptor: ManualControlMotionDescriptor | null,
 ): AttachedScenePresentationResult {
   const snapshot = logicalScene?.snapshot;
   if (snapshot === null || snapshot === undefined) {
@@ -556,97 +596,57 @@ export function attachedScenePresentation(
       ));
       continue;
     }
-    if (descriptor === null || sourceModel === null || manifest === null) {
+    if (sourceModel === null || manifest === null) {
       diagnostics.push(attachmentDiagnostic(
-        'carrier_descriptor_unavailable',
+        'carrier_model_unavailable',
         object.scene_resource_id,
-        `Attached object ${object.scene_resource_id} is waiting for its retained carrier descriptor.`,
+        `Attached object ${object.scene_resource_id} is waiting for the retained model of its holder.`,
       ));
       continue;
     }
-    if (descriptor.controllableComponentId !== attachment.controllable_component_id) {
-      diagnostics.push(attachmentDiagnostic(
-        'carrier_target_mismatch',
-        object.scene_resource_id,
-        `Attached object ${object.scene_resource_id} does not address the displayed carrier component.`,
-      ));
-      continue;
-    }
-    const sourceTargets = sourceModel.targets.filter((target) => (
+    const frameRef = attachment.carrier_frame_ref;
+    // The same join as the scene's collision world: the holder's command
+    // target lists the frame by owner, model occurrence and role.
+    const holderTargets = sourceModel.targets.filter((target) => (
       target.component_id === attachment.controllable_component_id
       && target.target_id === attachment.command_target_id
     ));
-    if (sourceTargets.length !== 1) {
-      diagnostics.push(attachmentDiagnostic(
-        sourceTargets.length === 0 ? 'carrier_frame_missing' : 'carrier_frame_ambiguous',
-        object.scene_resource_id,
-        `Attached object ${object.scene_resource_id} has no singular retained carrier target.`,
-      ));
-      continue;
-    }
-    const sourceFrames = sourceTargets[0].frames.filter((frame) => (
-      frame.model_instance_id === attachment.carrier_frame_ref.model_instance_id
+    const holderFrames = holderTargets.length !== 1 ? [] : holderTargets[0].frames.filter((frame) => (
+      frame.frame_role_id === frameRef.frame_role_id
+      && frame.model_instance_id === frameRef.model_instance_id
       && frame.source_link_name !== null
     ));
-    const descriptorTargets = sourceModel.targets.filter((target) => (
-      target.component_id === descriptor.controllableComponentId
-      && target.target_id === descriptor.commandTargetId
-    ));
-    if (sourceFrames.length === 0 || descriptorTargets.length !== 1) {
+    if (holderTargets.length > 1 || holderFrames.length > 1) {
       diagnostics.push(attachmentDiagnostic(
-        sourceFrames.length === 0 || descriptorTargets.length === 0
-          ? 'carrier_frame_missing'
-          : 'carrier_frame_ambiguous',
+        'carrier_frame_ambiguous',
         object.scene_resource_id,
         `Attached object ${object.scene_resource_id} has no singular retained carrier frame.`,
       ));
       continue;
     }
-    const descriptorFrames = descriptor.frames.filter((frame) => {
-      if (frame.modelInstanceId !== attachment.carrier_frame_ref.model_instance_id) {
-        return false;
-      }
-      const descriptorSourceFrames = descriptorTargets[0].frames.filter((sourceFrame) => (
-        sourceFrame.frame_role_id === frame.frameRoleId
-        && sourceFrame.model_instance_id === frame.modelInstanceId
-        && sourceFrame.source_link_name !== null
-      ));
-      return descriptorSourceFrames.length === 1 && sourceFrames.some((sourceFrame) => (
-        sourceFrame.model_instance_id === descriptorSourceFrames[0].model_instance_id
-        && sourceFrame.source_link_name === descriptorSourceFrames[0].source_link_name
-      ));
-    });
-    const uniqueDescriptorFrames = [...new Map(descriptorFrames.map((frame) => [
-      `${frame.modelInstanceId}\u0000${frame.modelRevision}\u0000${frame.compiledFrameName}`,
-      frame,
-    ])).values()];
-    if (uniqueDescriptorFrames.length !== 1) {
+    if (holderFrames.length === 0) {
       diagnostics.push(attachmentDiagnostic(
-        uniqueDescriptorFrames.length === 0
-          ? 'carrier_frame_missing'
-          : 'carrier_frame_ambiguous',
+        'carrier_frame_missing',
         object.scene_resource_id,
         `Attached object ${object.scene_resource_id} has no singular retained carrier frame.`,
       ));
       continue;
     }
-    const carrierFrame = uniqueDescriptorFrames[0];
-    const occurrence = sourceModel.occurrences.filter((candidate) => (
-      candidate.component_id === attachment.controllable_component_id
-      && candidate.model_instance_id === attachment.carrier_frame_ref.model_instance_id
+    const occurrences = sourceModel.occurrences.filter((candidate) => (
+      candidate.model_instance_id === frameRef.model_instance_id
     ));
-    if (
-      occurrence.length !== 1
-      || occurrence[0].model_revision !== carrierFrame.modelRevision
-    ) {
+    if (occurrences.length !== 1 || occurrences[0].component_id !== attachment.controllable_component_id) {
       diagnostics.push(attachmentDiagnostic(
         'carrier_model_mismatch',
         object.scene_resource_id,
-        `Attached object ${object.scene_resource_id} crosses its retained carrier model revision.`,
+        `Attached object ${object.scene_resource_id} names a model its holder does not own.`,
       ));
       continue;
     }
-    if (!viewerLinks.has(carrierFrame.compiledFrameName)) {
+    const links = occurrences[0].links.filter((link) => (
+      link.source_link_name === holderFrames[0].source_link_name
+    ));
+    if (links.length !== 1 || !viewerLinks.has(links[0].viewer_link_name)) {
       diagnostics.push(attachmentDiagnostic(
         'carrier_viewer_link_missing',
         object.scene_resource_id,
@@ -660,9 +660,9 @@ export function attachedScenePresentation(
       attachmentRevision: attachment.carried_object_attachment_revision,
       carrierComponentId: attachment.controllable_component_id,
       commandTargetId: attachment.command_target_id,
-      carrierModelInstanceId: attachment.carrier_frame_ref.model_instance_id,
-      carrierFrameRoleId: attachment.carrier_frame_ref.frame_role_id,
-      carrierCompiledFrameName: carrierFrame.compiledFrameName,
+      carrierModelInstanceId: frameRef.model_instance_id,
+      carrierFrameRoleId: frameRef.frame_role_id,
+      carrierCompiledFrameName: links[0].viewer_link_name,
       poseInCarrierFrame: attachment.pose_in_carrier_frame,
       poseMeasurement: null,
     });
@@ -713,8 +713,10 @@ function attachedPoseMeasurement(
   ));
   const source = matches[0];
   if (matches.length !== 1 || source === undefined || !hasResolvedPoseMeasurement(source)) return null;
+  // Night change 9: the row's policy_id is its observer binding, not the
+  // apply policy, so it does not gate the measurement.
   if (source.measured_against === 'cell frame') {
-    if (source.policy_id !== 'continuous' || source.holder !== undefined) return null;
+    if (source.holder !== undefined) return null;
     return {
       measured_against: 'cell frame',
       frame: source.frame,
@@ -729,8 +731,7 @@ function attachedPoseMeasurement(
     };
   }
   if (
-    source.policy_id !== 'continuous_relative_to_attached'
-    || source.holder === undefined
+    source.holder === undefined
     || source.holder.controllable_component_id !== attached.carrierComponentId
     || source.holder.command_target_id !== attached.commandTargetId
   ) return null;
@@ -756,7 +757,7 @@ type GoodObservationSource = Extract<
   SceneRuntimePoseSource,
   { payload_quality: 'good' }
 >;
-type JointObservationSource = GoodObservationSource & {
+export type JointObservationSource = GoodObservationSource & {
   payload: Extract<
     SceneRuntimeGoodObservationPayload,
     { kind: 'joint_state' }
@@ -792,20 +793,259 @@ function isPoseObservation(
     || source.payload.kind === 'detection3d_pose';
 }
 
+/** The execution frame when it belongs to this retained model, else null. */
+function frameOfModel(
+  frame: ExecutionObservationFrame | null,
+  sourceModel: SourceModelProjection,
+): ExecutionObservationFrame | null {
+  return frame !== null
+    && frame.cellId === sourceModel.cell_id
+    && frame.retainedBundleId === sourceModel.retained_bundle_id
+    && frame.graphRevision === sourceModel.graph_revision
+    ? frame
+    : null;
+}
+
+/** The fresh outside measured robot sources (`viewer.measured_robot`). */
+function outsideExpired(frame: ExecutionObservationFrame | null): boolean {
+  if (frame?.outsideReceivedAtMonotonicMs === undefined) return false;
+  const elapsed = Math.max(0, performance.now() - frame.outsideReceivedAtMonotonicMs) * 1_000_000;
+  return (frame.outsidePoseSources ?? []).some((row) =>
+    row.ageAtDeliveryNs + elapsed > row.freshnessBudgetNs);
+}
+
+function measuredRobotSourcesOfFrame(frame: ExecutionObservationFrame | null): JointObservationSource[] {
+  const elapsed = frame?.outsideReceivedAtMonotonicMs === undefined ? 0
+    : Math.max(0, performance.now() - frame.outsideReceivedAtMonotonicMs) * 1_000_000;
+  return (frame?.outsidePoseSources ?? [])
+    .filter((row) => row.ageAtDeliveryNs + elapsed <= row.freshnessBudgetNs)
+    .map((row) => row.source).filter(isFreshGood).filter(
+    (source): source is JointObservationSource => isJointObservation(source)
+      && source.policy_id === 'viewer.measured_robot',
+  );
+}
+
+const MEASURED_ROBOT_REQUIRES_EXECUTION = 'Measured robot overlay requires execution.';
+const AMBIGUOUS_MEASURED_ROBOT = 'More than one measured robot source is configured; the measured overlay is off.';
+
+function hiddenUntilJointState(componentId: string): string {
+  return `Parts of ${componentId} are hidden in the measured overlay until their joint state arrives.`;
+}
+
+/**
+ * Source joint to viewer joint over the measured robot's own occurrences;
+ * null when the source does not match them.
+ */
+function measuredRobotJointMap(
+  source: JointObservationSource,
+  sourceModel: SourceModelProjection,
+): Map<string, string> | null {
+  const robotOccurrences = sourceModel.occurrences.filter(
+    (occurrence) => occurrence.component_id === source.object_id,
+  );
+  const viewerJointNames = new Map(robotOccurrences.flatMap(
+    (occurrence) => occurrence.coordinates.map((coordinate) => [
+      coordinate.source_joint_name, coordinate.viewer_joint_name,
+    ] as const),
+  ));
+  return robotOccurrences.length === 0
+    || source.payload.joint_names.some((name) => !viewerJointNames.has(name))
+    ? null
+    : viewerJointNames;
+}
+
+/**
+ * Each component's own state in the frame; the measured rows replace their
+ * commanded rows, as in the measured comparison robot.
+ */
+function ownStatePositions(
+  frame: ExecutionObservationFrame | null,
+  sourceModel: SourceModelProjection,
+): Map<string, number> {
+  return (frame === null ? null : observedTargetPositions(
+    frame.targets.map((target) => frame.measuredTargets.find((row) => (
+      row.controllableComponentId === target.controllableComponentId
+      && row.commandTargetId === target.commandTargetId
+    )) ?? target),
+    sourceModel,
+  )) ?? new Map<string, number>();
+}
+
+/**
+ * Viewer-joint positions of the measured overlay: each other component's own
+ * state, and the measured robot's joints only from the outside sample (never
+ * its frame row, which may be commanded).
+ */
+function measuredPositions(
+  source: JointObservationSource,
+  viewerJointNames: ReadonlyMap<string, string>,
+  ownState: ReadonlyMap<string, number>,
+): Map<string, number> {
+  const positions = new Map(ownState);
+  for (const viewerName of viewerJointNames.values()) positions.delete(viewerName);
+  for (const [index, name] of source.payload.joint_names.entries()) {
+    positions.set(viewerJointNames.get(name)!, source.payload.positions[index]);
+  }
+  return positions;
+}
+
+/** Components with a movable joint of their own that is not measured (G2-b). */
+function componentsAwaitingJointState(
+  positions: ReadonlyMap<string, number>,
+  sourceModel: SourceModelProjection,
+): string[] {
+  return [...new Set(sourceModel.occurrences.flatMap((occurrence) => (
+    occurrence.component_id !== null
+      && occurrence.coordinates.some((coordinate) => (
+        coordinate.joint_type !== 'fixed'
+        && coordinate.mimic === null
+        && !positions.has(coordinate.viewer_joint_name)
+      ))
+      ? [occurrence.component_id]
+      : []
+  )))];
+}
+
+/**
+ * G2 (C-G2, G2-b): the measured overlay with one outside measured source.
+ * The source drives its robot's own occurrences; every other component that
+ * streams joints takes them from its own state in the execution owner's frame
+ * (measured rows where present). Only those elements are drawn, and a link
+ * only when every movable joint between it and the root is measured (a mimic
+ * joint follows its master): links downstream of a missing joint, of a
+ * component with no stream, and of static fixtures are hidden, never drawn at
+ * neutral as if measured. Each component with a missing joint of its own gets
+ * one warning line; the presentation still draws everything else.
+ */
+function outsideMeasuredRobot(
+  source: JointObservationSource,
+  frame: ExecutionObservationFrame | null,
+  sourceModel: SourceModelProjection,
+  manifest: SceneUrdfManifest,
+): { presentation: MeasuredRobotPresentation | null; warnings: string[] } {
+  const viewerJointNames = measuredRobotJointMap(source, sourceModel);
+  if (viewerJointNames === null) {
+    return {
+      presentation: null,
+      warnings: ['The measured robot data does not match this cell\'s robot model; the measured overlay is off.'],
+    };
+  }
+  const ownState = ownStatePositions(frame, sourceModel);
+  const positions = measuredPositions(source, viewerJointNames, ownState);
+  const warnings = componentsAwaitingJointState(positions, sourceModel).map(hiddenUntilJointState);
+  const linkTransforms = measuredLinkTransforms(manifest, positions);
+  if (linkTransforms === null) {
+    return {
+      presentation: null,
+      warnings: warnings.length > 0 ? warnings : ['Measured robot coordinates do not resolve on the viewer model.'],
+    };
+  }
+  // G2-b: only the measured robot and the components with own state stream.
+  const drawn = new Set([source.object_id, ...sourceModel.occurrences.flatMap((occurrence) => (
+    occurrence.component_id !== null
+      && occurrence.coordinates.some((coordinate) => ownState.has(coordinate.viewer_joint_name))
+      ? [occurrence.component_id]
+      : []
+  ))]);
+  const drawnLinks = new Set(sourceModel.occurrences.flatMap((occurrence) => (
+    occurrence.component_id !== null && drawn.has(occurrence.component_id)
+      ? occurrence.links.map((link) => link.viewer_link_name)
+      : []
+  )));
+  // The FK above resolved this tree, so the walk to the root terminates.
+  const jointByName = new Map(manifest.joints.map((joint) => [joint.name, joint]));
+  const parentJoint = new Map(manifest.joints.map((joint) => [joint.child_link, joint]));
+  const jointMeasured = (joint: SceneUrdfJoint): boolean => (joint.mimic !== null
+    ? jointMeasured(jointByName.get(joint.mimic.master)!)
+    : joint.type === 'fixed' || positions.has(joint.name));
+  const chainMeasured = (linkName: string): boolean => {
+    const joint = parentJoint.get(linkName);
+    return joint === undefined || (jointMeasured(joint) && chainMeasured(joint.parent_link));
+  };
+  return {
+    presentation: {
+      objectId: source.object_id,
+      sourceId: source.source_id,
+      sourceEpoch: source.source_epoch,
+      sourceSequence: source.source_sequence,
+      observedAtNs: source.observed_at_ns,
+      linkTransforms,
+      hiddenLinkNames: manifest.links.map((link) => link.name)
+        .filter((name) => !drawnLinks.has(name) || !chainMeasured(name)),
+    },
+    warnings,
+  };
+}
+
+/**
+ * The measured-overlay lines that follow the owner frames, as
+ * `runtimeScenePresentation` words them: execution is required with no live
+ * position at all, and each component waiting for its joint state is hidden.
+ * No FK; cheap enough per frame.
+ */
+function measuredOverlayFrameWarnings(
+  measuredRobotSources: readonly JointObservationSource[],
+  executionFrame: ExecutionObservationFrame | null,
+  sourceModel: SourceModelProjection,
+): string[] {
+  const frame = frameOfModel(executionFrame, sourceModel);
+  if (measuredRobotSources.length === 0) return frame === null ? [MEASURED_ROBOT_REQUIRES_EXECUTION] : [];
+  if (measuredRobotSources.length > 1) return [AMBIGUOUS_MEASURED_ROBOT];
+  const source = measuredRobotSources[0];
+  const viewerJointNames = measuredRobotJointMap(source, sourceModel);
+  if (viewerJointNames === null) return [];
+  return componentsAwaitingJointState(
+    measuredPositions(source, viewerJointNames, ownStatePositions(frame, sourceModel)), sourceModel,
+  ).map(hiddenUntilJointState);
+}
+
+/**
+ * G2: the panel's frame-dependent overlay lines, read through the owner frame
+ * subscription. The result keeps its identity until the lines change, so a
+ * steady stream does not re-render the panel.
+ */
+export function createMeasuredOverlayFrameWarningsReader(
+  reader: ExecutionObservationReader,
+  _sceneRuntime: SceneRuntimeProjection | null,
+  sourceModel: SourceModelProjection | null,
+): {
+  readFrameWarnings: () => readonly string[];
+  subscribeFrameWarnings: (listener: () => void) => () => void;
+} {
+  let cached: readonly string[] = [];
+  return {
+    readFrameWarnings: () => {
+      const next = sourceModel === null ? [] : measuredOverlayFrameWarnings(
+        measuredRobotSourcesOfFrame(frameOfModel(reader.getLatestExecutionObservation(), sourceModel)),
+        reader.getLatestExecutionObservation(), sourceModel,
+      );
+      if (next.length !== cached.length || next.some((line, index) => line !== cached[index])) {
+        cached = next;
+      }
+      return cached;
+    },
+    subscribeFrameWarnings: reader.subscribeExecutionObservation,
+  };
+}
+
 /**
  * Project fresh Manager-owned observations onto one retained viewer model.
  *
- * The retained viewer artifact currently carries no occurrence identity, so a
- * measured robot overlay is admitted only for a one-occurrence cell. A
- * multi-occurrence cell remains visible at retained-neutral coordinates and
- * reports the missing exact mapping instead of cross-driving lookalike models.
+ * G2 (C-G2): the outside measured source (`viewer.measured_robot`) drives the
+ * joints of its robot's own occurrences. Every other component's joints come
+ * from that component's own state, the execution owner's latest frame
+ * (measured rows where present); a component with a movable joint but no own
+ * state holds `measuredRobot` back rather than being drawn at neutral as if
+ * measured. The measured ghost follows the same pose per frame and draws each
+ * element that has data (`createMeasuredComparisonPresentationReader`). With
+ * no live position at all the overlay requires execution.
  */
 export function runtimeScenePresentation(
   sceneRuntime: SceneRuntimeProjection | null,
   logicalScene: LogicalSceneProjection | null,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
-  motionDescriptor: ManualControlMotionDescriptor | null = null,
+  executionFrame: ExecutionObservationFrame | null = null,
 ): RuntimeScenePresentation {
   if (
     sceneRuntime === null
@@ -820,7 +1060,6 @@ export function runtimeScenePresentation(
     logicalScene,
     sourceModel,
     manifest,
-    motionDescriptor,
   );
   warnings.push(...attached.diagnostics.map((diagnostic) => diagnostic.message));
   const identity = sceneRuntime.state.runtime_identity;
@@ -854,53 +1093,20 @@ export function runtimeScenePresentation(
     poseMeasurement: attachedPoseMeasurement(item, sources),
   }));
   const fresh = sources.filter(isFreshGood);
-  const measuredRobotSources = fresh.filter(
-    (source): source is JointObservationSource => isJointObservation(source)
-      && source.policy_id === 'viewer.measured_robot',
+  const measuredRobotSources = measuredRobotSourcesOfFrame(
+    sourceModel === null ? null : frameOfModel(executionFrame, sourceModel),
   );
+  const frame = frameOfModel(executionFrame, sourceModel);
   let measuredRobot: MeasuredRobotPresentation | null = null;
   if (measuredRobotSources.length > 1) {
-    warnings.push('Measured robot observation is ambiguous.');
-  } else if (measuredRobotSources.length === 1) {
-    const source = measuredRobotSources[0];
-    if (sourceModel.occurrences.length !== 1) {
-      warnings.push(
-        'Measured robot overlay requires an occurrence-keyed viewer artifact.',
-      );
-    } else {
-      const occurrence = sourceModel.occurrences[0];
-      const viewerJointNames = new Map(
-        occurrence.coordinates.map((coordinate) => [
-          coordinate.source_joint_name, coordinate.viewer_joint_name,
-        ]),
-      );
-      if (
-        occurrence.component_id !== source.object_id
-        || source.payload.joint_names.some((name) => !viewerJointNames.has(name))
-      ) {
-        warnings.push('Measured robot observation does not match the retained occurrence.');
-      } else {
-        const positions = new Map(
-          source.payload.joint_names.map((name, index) => [
-            viewerJointNames.get(name)!,
-            source.payload.positions[index],
-          ]),
-        );
-        const linkTransforms = measuredLinkTransforms(manifest, positions);
-        if (linkTransforms === null) {
-          warnings.push('Measured robot coordinates do not resolve on the viewer model.');
-        } else {
-          measuredRobot = {
-            objectId: source.object_id,
-            sourceId: source.source_id,
-            sourceEpoch: source.source_epoch,
-            sourceSequence: source.source_sequence,
-            observedAtNs: source.observed_at_ns,
-            linkTransforms,
-          };
-        }
-      }
-    }
+    warnings.push(AMBIGUOUS_MEASURED_ROBOT);
+  } else if (measuredRobotSources.length === 0) {
+    if (frame === null) warnings.push(MEASURED_ROBOT_REQUIRES_EXECUTION);
+  } else {
+    // The solid model takes the overlay only once every element has data.
+    const outside = outsideMeasuredRobot(measuredRobotSources[0], frame, sourceModel, manifest);
+    if (outside.warnings.length === 0) measuredRobot = outside.presentation;
+    warnings.push(...outside.warnings);
   }
 
   const sceneObjectIds = new Set(
@@ -952,6 +1158,7 @@ export function runtimeScenePresentation(
 
   return {
     measuredRobot,
+    measuredRobotSources,
     measuredTcp,
     measuredObjects,
     attachedObjects,
@@ -1149,9 +1356,9 @@ export function candidateToolPresentation(
   // A carried object needs a motion target's TCP.
   const motion = status.directControl;
   if (motion === null) return null;
-  const tcpFrames = motion.targetDescriptor.frames.filter(
-    (frame) => frame.frameRoleId === motion.tcpFrameRoleId,
-  );
+  // TCP-C: the selected TCP (the robot's or its mounted tool's).
+  const selectedTcp = selectedTcpOf(motion);
+  const tcpFrames = selectedTcp === null ? [] : [selectedTcp];
   // An arm-only component carries nothing through a gripper.
   if (status.directControlGripper === null) return null;
   const gripper = status.directControlGripper.targetDescriptor;

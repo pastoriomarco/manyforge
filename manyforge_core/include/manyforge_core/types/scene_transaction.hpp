@@ -50,6 +50,8 @@ struct AddObjectRequestDTO final {
   /// resolves these portable resource ids to instance-scoped collision bodies;
   /// callers never author planner-native body names here.
   std::vector<SupportContactDTO> support_contacts{};
+  /// Object mass (kg, finite, >= 0); copied into the snapshot row.
+  double mass_kg{0.0};
 
   friend bool operator==(const AddObjectRequestDTO&,
                          const AddObjectRequestDTO&) = default;
@@ -64,6 +66,7 @@ struct UpsertObjectRequestDTO final {
   Pose3DTO pose;
   SceneTransactionFrameRefDTO frame_ref;
   std::vector<SupportContactDTO> support_contacts{};
+  double mass_kg{0.0};
 };
 
 struct RemoveObjectRequestDTO final {

@@ -99,7 +99,6 @@ DeriveRetainedNativeApplyPlanRequest(
     const core::NativeApplyPlanDTO &plan,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     std::span<const core::RuntimeParticipantBinding> physical_bindings,
-    const std::filesystem::path &execution_run_root,
     const core::ConfigurationFenceStatusQueryDTO &actual_parent_fence);
 
 /// Construct the CCLC owner and verified observation sources without starting

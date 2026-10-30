@@ -9,7 +9,7 @@ import type {
 } from '../types/cclc';
 import { OverlayPanel } from './OverlayPanel';
 import {
-  type ComponentLifecycleTone,
+  componentLifecycleDotClass,
   componentLifecyclePresentation,
   componentLifecycleToneClass,
   componentReadinessOccurrencePresentation,
@@ -59,13 +59,6 @@ export function lifecycleActionUnavailableReason(
   return null;
 }
 
-const TONE_DOT: Record<ComponentLifecycleTone, string> = {
-  ready: 'status-ready',
-  waiting: 'status-waiting',
-  held: 'status-warning',
-  intervention: 'status-fault',
-};
-
 function factValue(value: CCLCLifecycleFactValue): string {
   return value.kind === 'unknown' ? 'unknown'
     : value.kind === 'boolean' ? String(value.booleanValue)
@@ -78,8 +71,10 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
   const problems = snapshot.readiness.providerOccurrences.flatMap((domain) => {
     const planError = readinessErrorPresentation(domain.error);
     const diagnostic = domain.health?.diagnostic ? readinessErrorPresentation(domain.health.diagnostic) : null;
+    // Each domain names its own cause.
     return [planError, diagnostic !== planError ? diagnostic : null]
-      .filter((text): text is string => text !== null);
+      .filter((text): text is string => text !== null)
+      .map((text) => `${domain.providerOccurrence.controlDomainId}: ${text}`);
   });
   const measured = readinessErrorPresentation(snapshot.readiness.measuredState.error);
   const streams = componentStreamHealthPresentation(snapshot);
@@ -138,19 +133,33 @@ type PendingConfirmation =
   | { kind: 'lifecycle'; intent: CCLCLifecycleIntent; label: string; detail: string }
   | { kind: 'route'; template: CCLCRouteTemplateWire; label: string; detail: string };
 
+/**
+ * `all`: the whole lifecycle surface. The Components section splits it:
+ * `cell` is Activate all with the sequence's progress (above the component
+ * list), `component` the selected component's state, requests and routes (on
+ * its page).
+ */
+export type CCLCPanelPart = 'all' | 'cell' | 'component';
+
 export function CCLCPanelView({
   enabled,
   mutationAvailable,
   mutationUnavailableReason,
   controller,
   componentIds = controller.controllableComponentId ? [controller.controllableComponentId] : [],
+  part = 'all',
 }: {
   enabled: boolean;
   mutationAvailable: boolean;
   mutationUnavailableReason: string | null;
   controller: CCLCController;
   componentIds?: string[];
+  part?: CCLCPanelPart;
 }) {
+  const cellPart = part !== 'component';
+  const componentPart = part !== 'cell';
+  // Both parts are on one Components page: each needs its own heading id.
+  const titleId = part === 'all' ? 'cclc-panel-title' : `cclc-panel-title-${part}`;
   const {
     controllableComponentId, snapshot, routeTemplates, transaction, pendingTransaction,
     busy, readUnavailableReason, error, setControllableComponentId, refresh,
@@ -186,10 +195,10 @@ export function CCLCPanelView({
   };
 
   return (
-    <section className="panel cclc-panel" aria-labelledby="cclc-panel-title">
-      <header className="cclc-header">
+    <section className="panel cclc-panel" aria-labelledby={titleId}>
+      {cellPart && <header className="cclc-header">
         <div>
-          <h4 id="cclc-panel-title">Lifecycle</h4>
+          <h4 id={titleId}>Lifecycle</h4>
           <p className="muted">
             Activate components before executing a Program. Activation prepares and enables each
             component in Deployment order; it does not move anything.
@@ -209,9 +218,10 @@ export function CCLCPanelView({
             Refresh
           </button>
         </div>
-      </header>
+      </header>}
+      {part === 'component' && <h4 id={titleId}>Lifecycle</h4>}
 
-      {(controller.activationProgress !== null || controller.activationRefusal !== null
+      {cellPart && (controller.activationProgress !== null || controller.activationRefusal !== null
         || controller.pendingActivationRequest !== null) && (
         <div className="cclc-activation-status">
           {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
@@ -221,7 +231,7 @@ export function CCLCPanelView({
                 || controller.activationRefusal.error.details.observed_blocking_cause === 'fault'
                 ? 'Fault · intervention required' : 'Not ready'
             }</p>
-            {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready', 'observed_blocking_cause'].map((field) => (
+            {['reason', 'decisive_fact', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready', 'observed_blocking_cause'].map((field) => (
               <p className="muted" key={field}>{field}: {controller.activationRefusal!.error.details[field] ?? 'missing'}</p>
             ))}
           </div>}
@@ -244,7 +254,7 @@ export function CCLCPanelView({
         </div>
       )}
 
-      {componentIds.length === 0 ? (
+      {part !== 'all' ? null : componentIds.length === 0 ? (
         <p className="muted" role="status">No controllable components</p>
       ) : (
         <ul className="cclc-component-list" aria-label="Configured component health">
@@ -261,7 +271,7 @@ export function CCLCPanelView({
                   aria-pressed={selected}
                   disabled={!enabled || busy}
                   onClick={() => { if (!selected) setControllableComponentId(id); }}>
-                  <span className={`component-dot ${presentation === null ? 'status-offline' : TONE_DOT[presentation.tone]}`} aria-hidden="true" />
+                  <span className={`component-dot ${presentation === null ? 'status-offline' : componentLifecycleDotClass(presentation.tone)}`} aria-hidden="true" />
                   <strong>{id}</strong>
                   <span className="cclc-row-state">{rowSnapshot?.lifecycleState ?? 'unknown'}</span>
                   <span className="muted cclc-row-message">
@@ -281,7 +291,7 @@ export function CCLCPanelView({
         </ul>
       )}
 
-      {snapshot === null ? (
+      {!componentPart ? null : snapshot === null ? (
         <p className="muted" role="status">
           {readUnavailableReason ?? 'Select a component to read its current lifecycle.'}
         </p>
@@ -380,7 +390,7 @@ export function CCLCPanelView({
         </div>
       )}
 
-      {pendingTransaction !== null && (
+      {componentPart && pendingTransaction !== null && (
         <div className="cclc-transaction" role="status">
           <span>
             <strong>{pendingTransaction.kind}</strong>{' · '}

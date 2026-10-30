@@ -72,6 +72,73 @@ bool contact_grasp_pair_matches(const CollisionPairId& pair,
           link_matches(pair.body_a));
 }
 
+std::shared_ptr<const CollisionClearanceMargins>
+build_collision_clearance_margins(
+    const CollisionWorldSnapshot& world,
+    const CollisionPolicySnapshot& policy,
+    std::string_view active_contact_policy_id, double margin_m) {
+  if (!(margin_m > 0.0)) {
+    return nullptr;
+  }
+  std::vector<CollisionPairId> exempt;
+  exempt.reserve(policy.allowed_static_static_pairs.size() +
+                 policy.allowed_touch_link_pairs.size() +
+                 policy.support_contacts.size());
+  for (const auto& pair : policy.allowed_static_static_pairs) {
+    exempt.push_back(canonicalize(pair));
+  }
+  for (const auto& pair : policy.allowed_touch_link_pairs) {
+    exempt.push_back(canonicalize(pair));
+  }
+  for (const auto& entry : policy.support_contacts) {
+    exempt.push_back(canonicalize(entry.pair));
+  }
+  std::sort(exempt.begin(), exempt.end());
+  const auto grasp =
+      std::find_if(policy.contact_grasps.begin(), policy.contact_grasps.end(),
+                   [&](const ContactGraspPolicyEntry& entry) {
+                     return !active_contact_policy_id.empty() &&
+                            entry.policy_id == active_contact_policy_id;
+                   });
+  const auto is_robot = [](const CollisionWorldBody& body) {
+    return body.owner_kind == CollisionOwnerKind::kComponentModelBody ||
+           (body.owner_kind == CollisionOwnerKind::kSceneResource &&
+            body.parent_body_id.has_value());
+  };
+  const auto is_environment = [](const CollisionWorldBody& body) {
+    return body.owner_kind == CollisionOwnerKind::kRuntimeObject ||
+           (body.owner_kind == CollisionOwnerKind::kSceneResource &&
+            !body.parent_body_id.has_value());
+  };
+  auto margins = std::make_shared<CollisionClearanceMargins>();
+  margins->margin_m = margin_m;
+  for (const auto& robot : world.bodies) {
+    if (!is_robot(robot)) {
+      continue;
+    }
+    for (const auto& environment : world.bodies) {
+      if (!is_environment(environment)) {
+        continue;
+      }
+      auto pair = canonicalize(CollisionPairId{robot.body_id, environment.body_id});
+      if (std::binary_search(exempt.begin(), exempt.end(), pair) ||
+          (grasp != policy.contact_grasps.end() &&
+           contact_grasp_pair_matches(pair, *grasp))) {
+        continue;
+      }
+      margins->pairs.push_back(CollisionPairMargin{std::move(pair), margin_m});
+    }
+  }
+  if (margins->pairs.empty()) {
+    return nullptr;
+  }
+  std::sort(margins->pairs.begin(), margins->pairs.end(),
+            [](const CollisionPairMargin& left, const CollisionPairMargin& right) {
+              return left.pair < right.pair;
+            });
+  return margins;
+}
+
 std::vector<CollisionPairId> build_selected_collision_distance_pairs(
     const CollisionPolicySnapshot& policy,
     const CollisionWorldSnapshot& world,

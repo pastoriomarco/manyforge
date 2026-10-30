@@ -491,6 +491,18 @@ def test_rejects_invalid_component_stream_health(rows: Any) -> None:
         _validate_lifecycle_target_facts(snapshot)
 
 
+def test_client_preserves_the_incident_retired_active_target_fact(tmp_path: Path) -> None:
+    """M6: CCLC adds it, true, only while Recover cell should re-enable."""
+
+    snapshot = _target_snapshot()
+    snapshot["active_target_retired_by_incident"] = True
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+    for invalid in (False, None, 1):
+        snapshot["active_target_retired_by_incident"] = invalid
+        with pytest.raises(HeadlessApiError, match="active_target_retired_by_incident"):
+            _validate_lifecycle_target_facts(snapshot)
+
+
 def test_client_preserves_diagnostic_bom_and_literal_detail_keys(tmp_path: Path) -> None:
     snapshot = _incident_snapshot()
     diagnostic = _incident_diagnostic()
@@ -765,6 +777,27 @@ class FakeAdmission:
 
     def release(self, _release: dict[str, Any]) -> dict[str, Any]:
         return {"authoring_allowed": True, "admission_generation": 8}
+
+
+def test_http_lifecycle_route_refuses_the_reserved_reenable_label() -> None:
+    """SX-659: only Headless's own Recover cell re-enable may name a request
+    `cell_recover_reenable` (it keeps CCLC's incident re-enable mark)."""
+    fake = FakeCCLC()
+    service = HeadlessService(  # type: ignore[arg-type]
+        object(), object(), cell_admission=FakeAdmission()
+    )
+    client = TestClient(create_app(service=service, cclc=fake))
+    body = _lifecycle_request(confirmed=True)
+    body["request_context"] = {
+        **body["request_context"], "source_label": "cell_recover_reenable",
+    }
+    refused = client.post("/api/cclc/lifecycle/requests", json=body)
+    assert refused.status_code == 400
+    detail = refused.json()["detail"]
+    assert detail["code"] == "invalid_request"
+    assert detail["details"]["field"] == "request_context.source_label"
+    assert detail["details"]["reason"] == "reserved_source_label"
+    assert fake.lifecycle == []
 
 
 def test_http_lifecycle_route_is_thin_and_requires_confirmation() -> None:
@@ -1605,17 +1638,32 @@ def test_lifecycle_point_client_uses_closed_snapshot_without_readiness(tmp_path:
         thread.join(timeout=2)
 
 
-@pytest.mark.parametrize("change", ["foreign", "extra", "bool_generation", "bad_domains"])
-def test_lifecycle_point_client_rejects_foreign_or_malformed_snapshot(tmp_path: Path, change: str) -> None:
+@pytest.mark.parametrize("change", ["extra", "bool_generation", "bad_domains"])
+def test_lifecycle_point_client_rejects_malformed_snapshot(tmp_path: Path, change: str) -> None:
     snapshot = _lifecycle_point_snapshot()
-    if change == "foreign": snapshot["controllable_component_id"] = "component.other"
-    elif change == "extra": snapshot["readiness"] = {}
+    if change == "extra": snapshot["readiness"] = {}
     elif change == "bool_generation": snapshot["component_lifecycle_generation"] = True
     else: snapshot["domains"] = []
     thread = _serve_once(tmp_path, lambda _request: rfc8785.dumps(_response("component_lifecycle_snapshot", snapshot)))
     try:
         with pytest.raises(HeadlessApiError):
             CCLCOpenRequestClient(tmp_path).component_lifecycle_snapshot("component.arm")
+    finally:
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("acceptance", [{"route_selection_transaction_id": "route.other"}, None])
+def test_route_status_checks_shape_not_the_echoed_identity(tmp_path: Path, acceptance) -> None:
+    # Each exchange is its own connection: the echoed identity is not compared.
+    status = {"acceptance": acceptance, "status": None}
+    thread = _serve_once(tmp_path, lambda _request: rfc8785.dumps(_response("route_status", status)))
+    try:
+        if acceptance is None:
+            with pytest.raises(HeadlessApiError) as captured:
+                CCLCOpenRequestClient(tmp_path).route_status("route.1")
+            assert captured.value.code == "cclc_open_response_invalid"
+        else:
+            assert CCLCOpenRequestClient(tmp_path).route_status("route.1") == status
     finally:
         thread.join(timeout=2)
 

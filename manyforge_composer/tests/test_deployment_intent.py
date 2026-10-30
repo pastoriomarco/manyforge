@@ -27,6 +27,102 @@ def test_deployment_intent_is_portable_and_rejects_authored_runtime_identity() -
         validate_deployment_intent(intent, source="test")
 
 
+def test_mounted_child_omits_its_root_pose() -> None:
+    # Merge 6 slice B: a tool mounted through an attachment row takes its
+    # placement from the parent interface and carries no root pose.
+    intent = _intent()
+    intent["attachments"] = [{
+        "parent": {"component_id": "robot_a", "interface": "flange"},
+        "child": {"component_id": "robot_b", "interface": "mount"},
+    }]
+    child = next(row for row in intent["components"] if row["component_id"] == "robot_b")
+    del child["root_pose_in_cell"]
+    normalized = validate_deployment_intent(intent, source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert "root_pose_in_cell" not in rows["robot_b"]
+    assert "root_pose_in_cell" in rows["robot_a"]
+    assert normalized["attachments"] == intent["attachments"]
+    child["root_pose_in_cell"] = {"position_m": [0, 0, 0], "orientation_xyzw": [0, 0, 0, 1]}
+    with pytest.raises(DeploymentIntentError, match="root_pose_in_cell"):
+        validate_deployment_intent(intent, source="test")
+    intent["attachments"] = []
+    del child["root_pose_in_cell"]
+    with pytest.raises(DeploymentIntentError, match="root_pose_in_cell"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_custom_tcps_are_validated_and_sorted() -> None:
+    # TCP-A: a component row's GUI-authored custom TCPs, in the spec 210
+    # authoring pose shape; the compiler resolves parents and chaining.
+    intent = _intent()
+    robot = next(row for row in intent["components"] if row["component_id"] == "robot_a")
+    robot["custom_tcps"] = [
+        {"tcp_id": "probe", "parent_frame": "pen",
+         "pose": {"position_m": [0.01, 0, 0], "orientation": {"xyzw": [0, 0, 0, 1]}}},
+        {"tcp_id": "pen", "parent_frame": "flange",
+         "pose": {"position_m": [0, 0, 0.12], "orientation": {"rpy_deg": [0, 0, 90]}}},
+    ]
+    normalized = validate_deployment_intent(intent, source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert [row["tcp_id"] for row in rows["robot_a"]["custom_tcps"]] == ["pen", "probe"]
+    assert rows["robot_a"]["custom_tcps"][0]["pose"] == {
+        "position_m": [0.0, 0.0, 0.12], "orientation": {"rpy_deg": [0.0, 0.0, 90.0]}}
+    assert "custom_tcps" not in rows["robot_b"]
+
+    for bad, message in (
+        ({"tcp_id": "pen", "parent_frame": "flange",
+          "pose": {"position_m": [0, 0, 0], "orientation": {"xyzw": [0, 0, 0, 2]}}},
+         "unit quaternion"),
+        ({"tcp_id": "Pen", "parent_frame": "flange",
+          "pose": {"position_m": [0, 0, 0], "orientation": {"rpy_deg": [0, 0, 0]}}},
+         "portable identifier"),
+        ({"tcp_id": "pen", "parent_frame": "flange", "offset": {},
+          "pose": {"position_m": [0, 0, 0], "orientation": {"rpy_deg": [0, 0, 0]}}},
+         "custom_tcps"),
+        ({"tcp_id": "pen", "parent_frame": "flange",
+          "pose": {"position_m": [0, 0, 0], "orientation_xyzw": [0, 0, 0, 1]}},
+         "pose"),
+    ):
+        robot["custom_tcps"] = [bad]
+        with pytest.raises(DeploymentIntentError, match=message):
+            validate_deployment_intent(intent, source="test")
+    pen = {"tcp_id": "pen", "parent_frame": "flange",
+           "pose": {"position_m": [0, 0, 0], "orientation": {"rpy_deg": [0, 0, 0]}}}
+    robot["custom_tcps"] = [pen, dict(pen)]
+    with pytest.raises(DeploymentIntentError, match="custom_tcp_duplicate"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_default_tcp_and_primary_mount_pass_through() -> None:
+    # B5: a component's `default_tcp` pair and a mount's `primary` flag are
+    # authored fields; the compiler checks them against the component types.
+    intent = _intent()
+    robot = next(row for row in intent["components"] if row["component_id"] == "robot_a")
+    robot["default_tcp"] = {"command_target_id": "gripper", "frame_role_id": "tcp"}
+    intent["attachments"] = [{
+        "parent": {"component_id": "robot_a", "interface": "flange"},
+        "child": {"component_id": "robot_b", "interface": "mount"},
+        "primary": True,
+    }]
+    child = next(row for row in intent["components"] if row["component_id"] == "robot_b")
+    del child["root_pose_in_cell"]
+    normalized = validate_deployment_intent(intent, source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert rows["robot_a"]["default_tcp"] == {
+        "command_target_id": "gripper", "frame_role_id": "tcp"}
+    assert "default_tcp" not in rows["robot_b"]
+    assert normalized["attachments"][0]["primary"] is True
+
+    for bad, message in (
+        ({"command_target_id": "gripper"}, "frame_role_id"),
+        ({"command_target_id": "gripper", "frame_role_id": "Tcp"}, "portable identifier"),
+        ({"command_target_id": "gripper", "frame_role_id": "tcp", "x": 1}, "unexpected"),
+    ):
+        robot["default_tcp"] = bad
+        with pytest.raises(DeploymentIntentError, match=message):
+            validate_deployment_intent(intent, source="test")
+
+
 def _intent() -> dict:
     return {
         "api_version": DEPLOYMENT_INTENT_API_VERSION,
@@ -186,6 +282,38 @@ def test_intent_rejects_generated_fields_aliases_and_invalid_values(
         validate_deployment_intent(value, source="fixture")
 
 
+@pytest.mark.parametrize("check", [None, "active_tcp", "active_tcp_and_flange"])
+def test_intent_keeps_tcp_speed_check_as_authored(check: str | None) -> None:
+    value = _intent()
+    if check is not None:
+        value["components"][0]["target_settings"]["arm"]["tcp_speed_check"] = check
+
+    arm = validate_deployment_intent(value, source="fixture")["components"][1][
+        "target_settings"
+    ]["arm"]
+
+    # Omitted stays omitted: the Deployment compiler materializes the default.
+    assert arm.get("tcp_speed_check") == check
+
+
+@pytest.mark.parametrize(
+    "target, row",
+    [
+        ("arm", {"maximum_tcp_linear_speed_mps": 0.2, "tcp_speed_check": "flange"}),
+        ("arm", {"maximum_tcp_linear_speed_mps": 0.2, "tcp_speed_check": None}),
+        ("gripper", {"tcp_speed_check": "active_tcp"}),
+    ],
+)
+def test_intent_refuses_invalid_or_unbound_tcp_speed_check(
+    target: str, row: dict
+) -> None:
+    value = _intent()
+    value["components"][1]["target_settings"][target] = row
+
+    with pytest.raises(DeploymentIntentError, match=f"{target}.tcp_speed_check"):
+        validate_deployment_intent(value, source="fixture")
+
+
 def test_source_reference_inventory_is_exact_and_stable() -> None:
     rows = list(iter_source_references(_intent()))
 
@@ -275,6 +403,46 @@ def test_draft_session_edits_intent_target_setting_and_round_trips_state() -> No
         "maximum_tcp_linear_speed_mps"
     ] == 0.4
     assert restored.retained_state() == retained
+
+
+def test_draft_session_sets_and_keeps_tcp_speed_check() -> None:
+    session = DeploymentDraftSession()
+    initial = session.retained_state()
+    opened = session.preview_source(json.dumps(_intent()))
+    session.commit_open(
+        opened,
+        "/tmp/cell/deployment.yaml",
+        draft_id=initial["draft_id"],
+        expected_revision=initial["draft_revision"],
+        confirm_discard=False,
+    )
+
+    def edit(speed: float, check: str | None) -> dict:
+        current = session.retained_state()
+        session.commit_compiled(
+            session.preview_motion_target_limit_update(
+                controllable_component_id="robot_b",
+                command_target_id="arm",
+                maximum_tcp_linear_speed_mps=speed,
+                draft_id=current["draft_id"],
+                expected_revision=current["draft_revision"],
+                tcp_speed_check=check,
+            ),
+            draft_id=current["draft_id"],
+            expected_revision=current["draft_revision"],
+        )
+        return session.snapshot()["draft"]["document"]["components"][1][
+            "target_settings"
+        ]["arm"]
+
+    assert "tcp_speed_check" not in edit(0.3, None)
+    assert edit(0.3, "active_tcp")["tcp_speed_check"] == "active_tcp"
+    kept = edit(0.25, None)
+    assert kept["tcp_speed_check"] == "active_tcp"
+    assert kept["maximum_tcp_linear_speed_mps"] == 0.25
+    assert edit(0.25, "active_tcp_and_flange")["tcp_speed_check"] == (
+        "active_tcp_and_flange"
+    )
 
 
 @pytest.mark.parametrize("stop_mode", ["spring_back_hold", "spring_back_fast"])
@@ -390,7 +558,6 @@ def _io_device() -> dict:
                 "io_provider_devices": [
                     {
                         "controllable_component_id": "station_io",
-                        "lifecycle_command_timeout_s": 30,
                     }
                 ],
                 "io_signals": [],

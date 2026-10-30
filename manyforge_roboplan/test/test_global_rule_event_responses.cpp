@@ -373,5 +373,25 @@ TEST(GlobalRuleEventResponseTest,
                std::exception);
 }
 
+TEST(GlobalRuleEventResponseTest, NotifyUnknownIncludesTypedReasonAndCatalogIdentity) {
+  const auto catalog = Catalog();
+  catalog->rules.front().notify_on_trip = true;
+  core::IoRuleStateBaselineDTO baseline{
+      catalog->context, 2U,
+      {{catalog->rules.front().policy_id, core::IoGlobalRuleState::kUnknown,
+        std::nullopt, core::ErrorDTO{"io_watch_bound_exceeded", "watch unavailable", {{"limit", "4"}}}}}};
+  const auto fields = InterruptRuleEventMetadataFields(
+      core::IoRuleStateProjectionDTO{core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog},
+      catalog->context.owner_epoch);
+  const auto &metadata = Field(fields, "interrupt_rule_catalog");
+  EXPECT_EQ(metadata.find_object_member("notify_rule_ids")->as_array().front().as_string(), "global.door");
+  const auto &row = Field(fields, "interrupt_rule_state_baseline")
+                        .find_object_member("snapshot")->find_object_member("states")->as_array().front();
+  EXPECT_EQ(row.find_object_member("state")->as_string(), "unknown");
+  const auto &reason = *row.find_object_member("unavailable_reason");
+  EXPECT_EQ(reason.find_object_member("code")->as_string(), "io_watch_bound_exceeded");
+  EXPECT_EQ(reason.find_object_member("details")->find_object_member("limit")->as_string(), "4");
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail

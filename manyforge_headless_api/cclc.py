@@ -303,7 +303,9 @@ def _validate_component_readiness(
     try:
         counters = {"dropped_output_lines", "dropped_output_bytes"}
         optional = (counters if counters & set(snapshot) else set()) | (
-            {"stream_health"} if "stream_health" in snapshot else set())
+            {"stream_health"} if "stream_health" in snapshot else set()) | (
+            {"active_target_retired_by_incident"}
+            if "active_target_retired_by_incident" in snapshot else set())
         fields = (_COMPONENT_FIELDS - {"lifecycle_progress", "lifecycle_target", "readiness"}
                   if lifecycle_only else _COMPONENT_FIELDS | optional)
         require(set(snapshot) == fields)
@@ -660,6 +662,9 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
 
     if "stream_health" in snapshot and not _valid_stream_health(snapshot["stream_health"]):
         raise _invalid_lifecycle_fact("stream_health")
+    # M6: present, and true, only while an incident-retired Active target waits.
+    if snapshot.get("active_target_retired_by_incident", True) is not True:
+        raise _invalid_lifecycle_fact("active_target_retired_by_incident")
     output_counter_fields = {"dropped_output_lines", "dropped_output_bytes"}
     present_output_counters = output_counter_fields.intersection(snapshot)
     if present_output_counters and (
@@ -1006,7 +1011,7 @@ class CCLCOpenRequestClient:
             or len(result["request_owner_epoch"].encode("utf-8")) > 256
         ):
             raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
+                "cclc_open_response_invalid",
                 "CCLC owner identity is invalid",
             )
         return result
@@ -1019,11 +1024,6 @@ class CCLCOpenRequestClient:
             ),
             command="component_snapshot",
         )
-        if result.get("controllable_component_id") != component_id:
-            raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
-                "CCLC component snapshot identity does not match its request",
-            )
         _validate_lifecycle_target_facts(result)
         _validate_component_readiness(result)
         return result
@@ -1033,11 +1033,6 @@ class CCLCOpenRequestClient:
             self._exchange("component_lifecycle_snapshot", {"controllable_component_id": component_id}),
             command="component_lifecycle_snapshot",
         )
-        if result.get("controllable_component_id") != component_id:
-            raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
-                "CCLC component snapshot identity does not match its request",
-            )
         _validate_component_readiness(result, lifecycle_only=True)
         return result
 
@@ -1076,7 +1071,6 @@ class CCLCOpenRequestClient:
                 "retained_bundle_id",
                 "templates",
             }
-            or result.get("controllable_component_id") != component_id
             or not isinstance(result.get("graph_revision"), str)
             or not result["graph_revision"]
             or not isinstance(result.get("retained_bundle_id"), str)
@@ -1084,8 +1078,8 @@ class CCLCOpenRequestClient:
             or not isinstance(result.get("templates"), list)
         ):
             raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
-                "CCLC route templates do not match their component request",
+                "cclc_open_response_invalid",
+                "CCLC route templates response is malformed",
             )
         return result
 
@@ -1096,15 +1090,10 @@ class CCLCOpenRequestClient:
             command="lifecycle_submit",
         )
         acceptance = result.get("acceptance")
-        context = intent.get("request_context")
-        request_id = context.get("request_id") if isinstance(context, dict) else None
-        if acceptance is not None and (
-            not isinstance(acceptance, dict)
-            or acceptance.get("request_id") != request_id
-        ):
+        if acceptance is not None and not isinstance(acceptance, dict):
             raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
-                "CCLC lifecycle acceptance does not match its request",
+                "cclc_open_response_invalid",
+                "CCLC lifecycle acceptance is malformed",
             )
         _validate_incident_recovery(result, intent)
         return result
@@ -1147,14 +1136,10 @@ class CCLCOpenRequestClient:
         result = self._exchange(command, intent)
         if result is not None:
             acceptance = result.get("acceptance")
-            if acceptance is not None and (
-                not isinstance(acceptance, dict)
-                or acceptance.get("request_id")
-                != intent["request_context"]["request_id"]
-            ):
+            if acceptance is not None and not isinstance(acceptance, dict):
                 raise HeadlessApiError(
-                    "cclc_open_response_identity_mismatch",
-                    "CCLC result names another request",
+                    "cclc_open_response_invalid",
+                    "CCLC result acceptance is malformed",
                 )
         return result
 
@@ -1164,14 +1149,10 @@ class CCLCOpenRequestClient:
             {"lifecycle_transaction_id": transaction_id},
         )
         if result is not None:
-            acceptance = result.get("acceptance")
-            if (
-                not isinstance(acceptance, dict)
-                or acceptance.get("lifecycle_transaction_id") != transaction_id
-            ):
+            if not isinstance(result.get("acceptance"), dict):
                 raise HeadlessApiError(
-                    "cclc_open_response_identity_mismatch",
-                    "CCLC lifecycle status does not match its request",
+                    "cclc_open_response_invalid",
+                    "CCLC lifecycle status is malformed",
                 )
         return result
 
@@ -1180,15 +1161,10 @@ class CCLCOpenRequestClient:
             self._exchange("route_submit", intent), command="route_submit"
         )
         acceptance = result.get("acceptance")
-        context = intent.get("request_context")
-        request_id = context.get("request_id") if isinstance(context, dict) else None
-        if acceptance is not None and (
-            not isinstance(acceptance, dict)
-            or acceptance.get("request_id") != request_id
-        ):
+        if acceptance is not None and not isinstance(acceptance, dict):
             raise HeadlessApiError(
-                "cclc_open_response_identity_mismatch",
-                "CCLC route acceptance does not match its request",
+                "cclc_open_response_invalid",
+                "CCLC route acceptance is malformed",
             )
         return result
 
@@ -1198,13 +1174,9 @@ class CCLCOpenRequestClient:
             {"route_selection_transaction_id": transaction_id},
         )
         if result is not None:
-            acceptance = result.get("acceptance")
-            if (
-                not isinstance(acceptance, dict)
-                or acceptance.get("route_selection_transaction_id") != transaction_id
-            ):
+            if not isinstance(result.get("acceptance"), dict):
                 raise HeadlessApiError(
-                    "cclc_open_response_identity_mismatch",
-                    "CCLC route status does not match its request",
+                    "cclc_open_response_invalid",
+                    "CCLC route status is malformed",
                 )
         return result

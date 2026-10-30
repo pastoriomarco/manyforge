@@ -312,6 +312,21 @@ find_attachment(const core::LogicalSceneSnapshotDTO &scene,
 
 } // namespace
 
+core::ResolvedComponentModelFrameDTO program_binding_frame(
+    const std::vector<RetainedSceneFrameModelOwnerInput> &model_owners,
+    const core::ControllableComponentId &binding_component,
+    const core::ProgramFrameRoleBindingDTO &frame) {
+  const auto found = std::find_if(
+      model_owners.begin(), model_owners.end(), [&](const auto &row) {
+        return row.model_instance_id == frame.model_instance_id;
+      });
+  auto owner = found != model_owners.end() ? found->controllable_component_id
+                                           : binding_component;
+  return core::ResolvedComponentModelFrameDTO{
+      std::move(owner), frame.model_instance_id, frame.frame_role_id,
+      frame.compiled_frame_name, frame.model_revision};
+}
+
 class RetainedSceneFrameResolver::Impl final {
 public:
   struct Source final {
@@ -340,15 +355,20 @@ public:
                : &*found;
   }
 
-  /// A robot is local only when this resolver owns at least one live state
-  /// source for it.
+  /// A component is local when this resolver owns at least one live state
+  /// source for it, or (G6) when it has none and a component it is mounted on
+  /// has one.
   [[nodiscard]] bool
   HostsRobot(const core::ControllableComponentId &component_id) const {
-    return std::any_of(sources_.begin(), sources_.end(),
-                       [&](const Source &source) {
-                         return source.context.controllable_component_id ==
-                                component_id;
-                       });
+    return retained_scene_frame_component_local(
+        input_.component_mounts, component_id,
+        [&](const core::ControllableComponentId &candidate) {
+          return std::any_of(sources_.begin(), sources_.end(),
+                             [&](const Source &source) {
+                               return source.context.controllable_component_id ==
+                                      candidate;
+                             });
+        });
   }
 
   /// An object carried by a robot hosted elsewhere is refused by name, the
@@ -742,6 +762,7 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
             });
   for (std::size_t index = 0U; index < input.target_frames.size(); ++index) {
     const auto &target = input.target_frames[index];
+    // B2: every target row names a frame of its own component.
     if (target.controllable_component_id.empty() ||
         target.command_target_id.empty() ||
         target.target_frame_role_id.empty() ||
@@ -1013,11 +1034,9 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
           "program_frame_role_missing",
           "Program frame role is absent from the exact binding", about);
     }
-    return core::Result<core::ResolvedFrameDTO>::Ok(
-        core::ResolvedComponentModelFrameDTO{
-            capture.binding.controllable_component_id,
-            selected->model_instance_id, selected->frame_role_id,
-            selected->compiled_frame_name, selected->model_revision});
+    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(
+        impl_->input_.model_owners, capture.binding.controllable_component_id,
+        *selected));
   };
 
   const auto capture_carrier_for_resource =
@@ -1281,11 +1300,9 @@ core::Result<core::Pose3DTO> RetainedSceneFrameResolver::resolve_reference_pose(
           "program_frame_role_missing",
           "Program frame role is absent from the exact binding", about);
     }
-    return core::Result<core::ResolvedFrameDTO>::Ok(
-        core::ResolvedComponentModelFrameDTO{
-            context.binding.controllable_component_id,
-            selected->model_instance_id, selected->frame_role_id,
-            selected->compiled_frame_name, selected->model_revision});
+    return core::Result<core::ResolvedFrameDTO>::Ok(program_binding_frame(
+        impl_->input_.model_owners, context.binding.controllable_component_id,
+        *selected));
   };
 
   const auto start_coordinates =

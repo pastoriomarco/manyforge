@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import replace
 from threading import Event, Thread
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Mapping
 
 import py_trees
@@ -49,6 +49,7 @@ from manyforge_behavior.orchestration_ports import (
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
+from manyforge_behavior.recovery import observed_state_refusal
 from manyforge_behavior.production_ports import (
     HeadlessSceneProgramPort,
     NativeKernelProgramPort,
@@ -766,7 +767,7 @@ def _motion_inputs() -> OwnerNodeInputs:
         parameters={
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+            "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
             "goal": {
                 "position_m": [0.0, 0.0, 0.1],
                 "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
@@ -1043,6 +1044,26 @@ def test_goal_frames_the_owner_cannot_take_fail_before_submission(
         port.operations.start(node_id, _identity(), inputs)
 
     assert transport.submissions == []
+
+
+@pytest.mark.parametrize("clearance_m", [None, 0.0, 0.0005])
+def test_motion_clearance_is_forwarded_only_when_the_node_sets_it(clearance_m) -> None:
+    # M6 decision 16: a motion node's clearance_m reaches the owner as the
+    # move's own clearance; absent keeps the Deployment clearance.
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    if clearance_m is not None:
+        parameters["clearance_m"] = clearance_m
+
+    port.operations.start(
+        "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
+    )
+
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload.get("clearance_m") == clearance_m
+    assert ("clearance_m" in payload) is (clearance_m is not None)
 
 
 def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -> None:
@@ -1353,7 +1374,7 @@ def test_reset_does_not_turn_a_pre_acceptance_lost_reply_into_motion() -> None:
 
 def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = _motion_test_port(transport)
     port.bind(_context())
     identity = _identity()
     started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
@@ -1408,7 +1429,7 @@ def test_operation_identity_change_remains_a_terminal_observation_error() -> Non
 @pytest.mark.parametrize("state", ["failed", "intervention_required"])
 def test_failed_native_operation_is_observed_as_a_failure_with_its_owner_reason(state) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = _motion_test_port(transport)
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     operation = transport.operations[started.task_id]
@@ -1428,7 +1449,7 @@ def test_failed_native_operation_is_observed_as_a_failure_with_its_owner_reason(
 
 def test_owner_failures_name_the_reference_that_failed() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = _motion_test_port(transport)
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     operation = transport.operations[started.task_id]
@@ -2625,6 +2646,34 @@ def test_final_pneumatic_failure_keeps_result_and_exact_ack_revision(reason) -> 
     assert len(transport.submissions) == 1
 
 
+def test_cached_pneumatic_failure_survives_lost_operation_read() -> None:
+    class LostAfterSettlement(_Transport):
+        unavailable = False
+
+        def read(self, operation_id):
+            if self.unavailable:
+                raise RuntimeError("operation read unavailable")
+            return super().read(operation_id)
+
+    transport = LostAfterSettlement()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("settled-pneumatic")
+    started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
+    transport.operations[started.task_id].update({
+        "state": "failed", "operation_revision": 7,
+        "participants": [_final_pneumatic_failure()],
+    })
+    settled = port.operations.observe(started.task_id)
+    assert settled.state is OwnerTaskState.FAILED and settled.settlement_proven
+    reads = transport.operation_reads
+    transport.unavailable = True
+    assert port.operations.observe(started.task_id) == settled
+    assert transport.operation_reads == reads
+    port.operations.acknowledge(started.task_id, identity)
+    assert transport.controls[-1][2]["expected_operation_revision"] == 7
+
+
 @pytest.mark.parametrize("case", [
     "empty", "position_failure", "active_sibling", "interrupted_sibling",
     "unmarked_sibling", "boolean_marker", "intervention_required", "all_completed",
@@ -2854,7 +2903,7 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
             "target_role": "arm",
             "tool_target_role": "gripper",
             "base_frame_role": "base",
-            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+            "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
             "carrier_frame_role": "tcp",
             "selected_object_id": "graspable",
             "synthesis": {
@@ -3100,7 +3149,7 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy(
     recovery_class: str,
 ) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = _motion_test_port(transport)
     port.bind(_context())
     identity = _identity("motion")
     started = port.operations.start(
@@ -3132,6 +3181,68 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy(
     assert observed.metadata["active_stop_generation"] == 2
     assert observed.metadata["authored_failure_policy"] == "pause_for_operator"
     assert observed.metadata["authored_failure_policy_parameter"] == "operator_stop_policy"
+    port.unbind("program-run.1")
+
+
+@pytest.mark.parametrize(
+    ("terminal_error", "reason_code"),
+    [
+        # A first-stage gate Stop: the rule's typed cause on the Stopped row.
+        (
+            {
+                "code": "interrupt_fault",
+                "message": "Global interrupt rule matched",
+                "details": {"reason": "io_global_rule_fault_terminal", "rule_id": "part_lost_guard"},
+            },
+            "interrupt_fault",
+        ),
+        # on_grasp_lost {stop_motion: true}: the carried-object-lost cause.
+        (
+            {
+                "code": "carried_object_lost",
+                "message": "The carried object was lost from its grasp",
+                "details": {"reason": "carried_object_lost"},
+            },
+            "carried_object_lost",
+        ),
+        # A node signal trip (on_signal: failure): no row error; the interrupt
+        # adapter maps the node result itself.
+        (None, "operation_stopped"),
+    ],
+)
+def test_native_motion_program_stop_fails_with_its_cause_and_never_holds(
+    terminal_error: Mapping[str, Any] | None, reason_code: str
+) -> None:
+    """F-6a (D): a Stop the Program's own configuration requested
+    (`ordinary_program_stop`) is no operator hold: no pause_for_operator, and
+    the node fails with the Stop's typed cause so its failure branch runs."""
+
+    transport = _Transport()
+    port = _motion_test_port(transport)
+    port.bind(_context())
+    started = port.operations.start("motion.move_to_pose", _identity("motion"), _motion_inputs())
+    operation = transport.operations[started.task_id]
+    operation.update(
+        {
+            "state": "stopped",
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 2,
+            "participants": [{"state": "stopped", "terminal_error": terminal_error}],
+        }
+    )
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": operation["operation_revision"],
+        "participants": [{"operation_participant_id": "participant.1"}],
+        "recovery_assessment": {"recovery_class": "ordinary_program_stop"},
+        "stop_generation": 2,
+        "stop_id": "stop.1",
+    }
+    observed = port.operations.observe(started.task_id)
+    assert observed.state is OwnerTaskState.INTERRUPTED
+    assert "authored_failure_policy" not in observed.metadata
+    assert "authored_failure_policy_parameter" not in observed.metadata
+    assert observed.reason_code == reason_code
     port.unbind("program-run.1")
 
 
@@ -3459,38 +3570,6 @@ class _SceneTransport:
             "scene_runtime": {},
         }
 
-    def manager_graph(self) -> dict[str, Any]:
-        return {
-            "schema_version": "manyforge.manager_graph_projection.v1",
-            "source": {
-                "available": True,
-                "freshness": "fresh",
-                "known_gaps": [],
-            },
-            "retained_bundle_id": _DIGEST_B,
-            "graph_revision": _DIGEST_C,
-            "cell_graph": {
-                "controllable_components": [
-                    {"controllable_component_id": "pedestal.1"},
-                    {"controllable_component_id": "robot.1"},
-                ],
-                "component_attachments": [
-                    {
-                        "component_attachment_id": "robot-on-pedestal",
-                        "component_attachment_revision": _DIGEST_A,
-                        "parent": {
-                            "controllable_component_id": "pedestal.1",
-                            "attachment_interface_id": "top",
-                        },
-                        "child": {
-                            "controllable_component_id": "robot.1",
-                            "attachment_interface_id": "base",
-                        },
-                    }
-                ],
-            },
-        }
-
     def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         request = deepcopy(dict(body))
         assert request["expected_projection_revision"] == self.revision
@@ -3815,6 +3894,153 @@ def test_simulation_reset_latches_once_after_successful_terminal_observation() -
     assert calls == [(identity, None)]
 
 
+def test_simulation_reset_calls_tcp_hook_before_latch_and_success() -> None:
+    class ResetTaskPort:
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(task_id="reset-task", state=OwnerTaskState.ACTIVE)
+        def observe(self, task_id):
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.SUCCEEDED)
+        def cancel(self, _task_id, _identity):
+            pass
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    calls = []
+    identity = _identity("reset")
+    scene = SimpleNamespace(latch_between_nodes=lambda who, **_kwargs: calls.append(("latch", who)))
+    port = SimulationResetPoseSourceTaskPort(
+        ResetTaskPort(), scene, lambda who: calls.append(("tcp", who))
+    )
+    task = port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    assert calls == []
+    assert port.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
+    assert calls == [("tcp", identity), ("latch", identity)]
+    assert port.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
+    assert calls == [("tcp", identity), ("latch", identity)]
+    port.acknowledge(task.task_id, identity)
+
+
+def test_simulation_reset_does_not_replay_unknown_tcp_completion() -> None:
+    class ResetTaskPort:
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(task_id="reset-task", state=OwnerTaskState.ACTIVE)
+        def observe(self, task_id):
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.SUCCEEDED)
+        def cancel(self, _task_id, _identity):
+            pass
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    calls = []
+    def unknown(_identity):
+        calls.append("reset")
+        raise RuntimeError("reset reply unavailable")
+    port = SimulationResetPoseSourceTaskPort(ResetTaskPort(), None, unknown)
+    identity = _identity("reset")
+    task = port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    for _ in range(2):
+        result = port.observe(task.task_id)
+        assert result.state is OwnerTaskState.FAILED
+        assert result.reason_code == "active_tcp_reset_failed"
+        assert "reset reply unavailable" in result.message
+        assert result.settlement_proven is True
+    assert calls == ["reset"]
+    port.acknowledge(task.task_id, identity)
+    assert port._finished_resets == {}
+    assert port._reset_errors == {}
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+def test_simulation_reset_reports_failed_tcp_reset_without_replaying(immediate) -> None:
+    class ResetTaskPort:
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(
+                "reset-task", OwnerTaskState.SUCCEEDED if immediate else OwnerTaskState.ACTIVE
+            )
+        def observe(self, task_id):
+            return OwnerTaskSnapshot(task_id, OwnerTaskState.SUCCEEDED)
+        def cancel(self, _task_id, _identity):
+            pass
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    calls = []
+    def reset(_identity):
+        calls.append("reset")
+        raise RuntimeError("reset reply lost")
+    scene = SimpleNamespace(latch_between_nodes=lambda *_args, **_kwargs: calls.append("latch"))
+    port = SimulationResetPoseSourceTaskPort(ResetTaskPort(), scene, reset)
+    identity = _identity("reset")
+    task = port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    assert task.state is (OwnerTaskState.FAILED if immediate else OwnerTaskState.ACTIVE)
+    if immediate:
+        assert task.reason_code == "active_tcp_reset_failed"
+        assert task.settlement_proven is True
+    for _ in range(2):
+        result = port.observe(task.task_id)
+        assert result.state is OwnerTaskState.FAILED
+        assert result.reason_code == "active_tcp_reset_failed"
+        assert result.settlement_proven is True
+    assert calls == ["reset"]
+    port.acknowledge(task.task_id, identity)
+    assert port._finished_resets == {}
+    assert port._reset_errors == {}
+
+
+def test_simulation_reset_hook_only_runs_for_known_success() -> None:
+    class TaskPort:
+        def __init__(self):
+            self.state = OwnerTaskState.ACTIVE
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(task_id="task", state=self.state,
+                                     reason_code="failed" if self.state is OwnerTaskState.FAILED else None)
+        def observe(self, task_id):
+            return OwnerTaskSnapshot(task_id=task_id, state=self.state,
+                                     reason_code="failed" if self.state is OwnerTaskState.FAILED else None)
+        def cancel(self, _task_id, _identity):
+            pass
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    delegate = TaskPort()
+    calls = []
+    port = SimulationResetPoseSourceTaskPort(delegate, None, lambda who: calls.append(who))
+    identity = _identity("reset")
+    task = port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    delegate.state = OwnerTaskState.FAILED
+    assert port.observe(task.task_id).state is OwnerTaskState.FAILED
+    assert calls == []
+    delegate.state = OwnerTaskState.SUCCEEDED
+    other = port.start("simulation.step", identity, OwnerNodeInputs(parameters={}))
+    assert other.state is OwnerTaskState.SUCCEEDED
+    assert calls == []
+    port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    assert calls == [identity]
+    port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    assert calls == [identity]
+
+
+def test_cancelled_simulation_reset_does_not_call_tcp_hook() -> None:
+    class TaskPort:
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(task_id="task", state=OwnerTaskState.ACTIVE)
+        def observe(self, task_id):
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.INTERRUPTED,
+                                     reason_code="simulation_request_cancelled")
+        def cancel(self, _task_id, _identity):
+            pass
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    calls = []
+    port = SimulationResetPoseSourceTaskPort(TaskPort(), None, lambda who: calls.append(who))
+    identity = _identity("reset")
+    task = port.start("simulation.reset", identity, OwnerNodeInputs(parameters={}))
+    port.cancel(task.task_id, identity)
+    assert port.observe(task.task_id).state is OwnerTaskState.INTERRUPTED
+    assert calls == []
+
+
 def _scene_rejection(body, code, message):
     from manyforge_behavior.scene_client import SceneTransactionRejectedError
 
@@ -3833,21 +4059,6 @@ def _scene_rejection(body, code, message):
             "update_status": None,
         }
     )
-
-
-def _scene_compaction_no_effect_rejection(body, expected_owner_epoch):
-    error = _scene_rejection(
-        body,
-        "stale_request_owner_epoch",
-        "Scene request owner epoch changed during history compaction",
-    )
-    error.response["error"]["details"] = {
-        "reason": "scene_history_compaction_no_effect",
-        "previous_request_owner_epoch": body["request_context"]["request_owner_epoch"],
-        "expected_request_owner_epoch": expected_owner_epoch,
-    }
-    error.response["replay_status"] = "stale_request_owner_epoch"
-    return error
 
 
 def _scene_stale_owner_epoch_rejection(body, expected_owner_epoch):
@@ -3958,44 +4169,6 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
     assert transport.objects["graspable"]["support_contacts"] == [support_contact]
 
 
-def test_scene_initialization_retries_concurrent_pose_revision_without_losing_shape() -> None:
-    class _ConcurrentPoseTransport(_SceneTransport):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rejected_requests: list[dict[str, Any]] = []
-            self.injected_stale = False
-
-        def _advance_pose_revision(self) -> None:
-            revision_id = self.revision["scene_revision"]["revision_id"] + 1
-            self.revision["scene_revision"] = {
-                "scene_id": _DIGEST_D,
-                "revision_id": revision_id,
-                "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
-            }
-
-        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if not self.injected_stale:
-                self.injected_stale = True
-                self.rejected_requests.append(deepcopy(dict(body)))
-                self._advance_pose_revision()
-                raise _scene_rejection(
-                    body, "stale_revision", "external pose update advanced the scene"
-                )
-            return super().commit_scene_transaction(body)
-
-    transport = _ConcurrentPoseTransport()
-    port = _scene_port(transport)
-
-    port.prepare_initial_scene(_scene_context(), _authored_scene())
-
-    assert transport.injected_stale is True
-    assert sorted(transport.objects) == ["graspable", "table"]
-    assert (
-        transport.rejected_requests[0]["request_context"]["request_id"]
-        != transport.submissions[0]["request_context"]["request_id"]
-    )
-
-
 def test_scene_initialization_retries_no_effect_admission_race_with_new_identity() -> None:
     class _AdmissionRaceTransport(_SceneTransport):
         def __init__(self) -> None:
@@ -4023,77 +4196,6 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
     assert rejected["expected_admission_generation"] == 1
     assert committed["expected_admission_generation"] == 2
     assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
-
-
-def test_scene_initialization_retries_proven_compaction_epoch_rotation_once() -> None:
-    class _CompactionTransport(_SceneTransport):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rejected_requests: list[dict[str, Any]] = []
-
-        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if not self.rejected_requests:
-                request = deepcopy(dict(body))
-                self.rejected_requests.append(request)
-                expected_epoch = "scene-owner.epoch.compacted"
-                self.owner_epoch = expected_epoch
-                raise _scene_compaction_no_effect_rejection(body, expected_epoch)
-            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
-            return super().commit_scene_transaction(body)
-
-    transport = _CompactionTransport()
-    port = _scene_port(transport)
-
-    proof = port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
-
-    assert len(transport.rejected_requests) == 1
-    assert len(transport.submissions) == 1
-    rejected = transport.rejected_requests[0]
-    committed = transport.submissions[0]
-    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
-    assert rejected["request_context"]["request_owner_epoch"] == "scene-owner.epoch.1"
-    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
-    assert rejected["expected_projection_revision"] == committed["expected_projection_revision"]
-    # The proof names the prepared scene, not the owner epoch compaction rotates.
-    assert "scene_owner_epoch" not in proof
-
-
-@pytest.mark.parametrize("rejection", ["stale_request_owner_epoch", "stale_revision"])
-def test_scene_initialization_follows_observer_compaction_of_the_same_scene(rejection) -> None:
-    """Reset/run-start preparation continues across another writer's rotation."""
-
-    class _ObserverTransport(_SceneTransport):
-        def __init__(self) -> None:
-            super().__init__()
-            self.rejected_requests: list[dict[str, Any]] = []
-
-        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if not self.rejected_requests:
-                self.rejected_requests.append(deepcopy(dict(body)))
-                # Pose-source commits advanced the revision and compacted.
-                self.owner_epoch = "scene-owner.epoch.compacted"
-                revision_id = self.revision["scene_revision"]["revision_id"] + 2
-                self.revision["scene_revision"] = {
-                    **self.revision["scene_revision"],
-                    "revision_id": revision_id,
-                    "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
-                }
-                if rejection == "stale_revision":
-                    raise _scene_rejection(body, "stale_revision", "revision advanced")
-                raise _scene_stale_owner_epoch_rejection(body, self.owner_epoch)
-            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
-            return super().commit_scene_transaction(body)
-
-    transport = _ObserverTransport()
-    port = _scene_port(transport)
-
-    proof = port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
-
-    assert len(transport.rejected_requests) == 1
-    assert len(transport.submissions) == 1
-    committed = transport.submissions[0]
-    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
-    assert proof["scene_identity"]["scene_id"] == transport.revision["scene_revision"]["scene_id"]
 
 
 def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
@@ -4461,7 +4563,8 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     attach = transport.submissions[0]["operation"]
     assert attach["controllable_component_id"] == "robot.1"
     assert attach["command_target_id"] == "arm.command"
-    assert attach["expected_component_attachment_revisions"] == [_DIGEST_A]
+    # The owner resolves the carrier against its current attachments.
+    assert attach["expected_component_attachment_revisions"] == []
     assert detached.succeeded is True
     detach = transport.submissions[1]["operation"]
     assert detach["kind"] == "detach_carried_object_at_current_pose"
@@ -4606,16 +4709,15 @@ def test_scene_node_failure_keeps_the_owner_reason() -> None:
 
 
 @pytest.mark.parametrize(
-    "code,reason,retry",
+    "code,reason",
     [
-        ("stale_revision", "scene_advanced", True),
-        ("stale_generation", "expected_generation_stale", True),
-        ("stale_generation", "claim_owner_epoch_stale", False),
+        # Only another Deployment or Scene is refused as stale. The admission
+        # generation is not compared, so no refusal is retried.
+        ("stale_revision", "scene_advanced"),
+        ("stale_generation", "claim_owner_epoch_stale"),
     ],
 )
-def test_scene_node_retries_a_concurrent_revision_with_one_correlation(
-    code, reason, retry
-) -> None:
+def test_scene_node_never_retries_a_refused_commit(code, reason) -> None:
     class _ConcurrentPoseTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -4659,171 +4761,37 @@ def test_scene_node_retries_a_concurrent_revision_with_one_correlation(
         ),
     )
 
-    if not retry:
-        assert not result.succeeded
-        assert result.reason_code == code
-        assert len(transport.rejected_requests) == 1
-        assert not transport.submissions
-        return
-    assert result.succeeded is True
-    assert result.metadata["stale_revision_retry_count"] == 1
+    assert not result.succeeded
+    assert result.reason_code == code
     assert len(transport.rejected_requests) == 1
-    assert len(transport.submissions) == 1
-    rejected_context = transport.rejected_requests[0]["request_context"]
-    committed_context = transport.submissions[0]["request_context"]
-    assert rejected_context["request_id"] != committed_context["request_id"]
-    assert rejected_context["correlation_id"] == committed_context["correlation_id"]
-    assert transport.submissions[0]["expected_admission_generation"] == (
-        transport.rejected_requests[0]["expected_admission_generation"] + 1
-    )
+    assert not transport.submissions
 
 
-def test_scene_node_retries_one_proven_compaction_epoch_rotation() -> None:
-    class _CompactionTransport(_SceneTransport):
-        def __init__(self) -> None:
-            super().__init__()
-            self.reject_next_node = False
-            self.rejected_requests: list[dict[str, Any]] = []
+def test_scene_node_does_not_retry_a_stale_owner_epoch() -> None:
+    """The scene owner epoch never rotates within one Scene; no epoch retry."""
 
-        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if self.reject_next_node:
-                self.reject_next_node = False
-                self.rejected_requests.append(deepcopy(dict(body)))
-                expected_epoch = "scene-owner.epoch.compacted"
-                self.owner_epoch = expected_epoch
-                raise _scene_compaction_no_effect_rejection(body, expected_epoch)
-            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
-            return super().commit_scene_transaction(body)
-
-    transport = _CompactionTransport()
-    port = _scene_port(transport)
-    port.prepare_initial_scene(_scene_context(), _authored_scene())
-    transport.submissions.clear()
-    transport.reject_next_node = True
-
-    result = port.invoke(
-        "scene.attach_carried_object",
-        _identity("attach-after-compaction"),
-        OwnerNodeInputs(
-            parameters={
-                "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
-            }
-        ),
-    )
-
-    assert result.succeeded is True
-    assert result.metadata["stale_revision_retry_count"] == 0
-    assert len(transport.rejected_requests) == 1
-    assert len(transport.submissions) == 1
-    rejected = transport.rejected_requests[0]
-    committed = transport.submissions[0]
-    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
-    assert rejected["request_context"]["correlation_id"] == committed["request_context"]["correlation_id"]
-    assert rejected["request_context"]["request_owner_epoch"] == "scene-owner.epoch.1"
-    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
-    assert rejected["expected_projection_revision"] == committed["expected_projection_revision"]
-
-
-@pytest.mark.parametrize("receipt", ["observer_compaction", "foreign_epoch_detail"])
-def test_scene_node_retries_once_after_compaction_by_another_writer(receipt) -> None:
-    """A pose source's commit compacted history; this request had no effect."""
-
-    class _CompactionTransport(_SceneTransport):
-        def __init__(self) -> None:
-            super().__init__()
-            self.reject_next_node = False
-            self.rejected_requests: list[dict[str, Any]] = []
-
-        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if self.reject_next_node:
-                self.reject_next_node = False
-                self.rejected_requests.append(deepcopy(dict(body)))
-                self.owner_epoch = "scene-owner.epoch.compacted"
-                # The observer's commits also advanced the revision.
-                revision_id = self.revision["scene_revision"]["revision_id"] + 3
-                self.revision["scene_revision"] = {
-                    **self.revision["scene_revision"],
-                    "revision_id": revision_id,
-                    "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
-                }
-                if receipt == "observer_compaction":
-                    raise _scene_stale_owner_epoch_rejection(body, self.owner_epoch)
-                # Details are not trusted; the re-read view names the epoch.
-                raise _scene_compaction_no_effect_rejection(body, "scene-owner.epoch.other")
-            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
-            return super().commit_scene_transaction(body)
-
-    transport = _CompactionTransport()
-    port = _scene_port(transport)
-    port.prepare_initial_scene(_scene_context(), _authored_scene())
-    transport.submissions.clear()
-    transport.reject_next_node = True
-
-    result = port.invoke(
-        "scene.attach_carried_object",
-        _identity(f"attach-after-{receipt}"),
-        OwnerNodeInputs(
-            parameters={
-                "scene_resource_id": "graspable",
-                "target_role": "arm",
-                "carrier_frame_role": "tcp",
-                "touch_body_roles": ["tool_collision"],
-            }
-        ),
-    )
-
-    assert result.succeeded is True
-    assert len(transport.rejected_requests) == 1
-    assert len(transport.submissions) == 1
-    rejected = transport.rejected_requests[0]
-    committed = transport.submissions[0]
-    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
-    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
-    # The retry names the re-read (newer) revision of the same Scene.
-    assert (
-        committed["expected_projection_revision"]["scene_revision"]["revision_id"]
-        == rejected["expected_projection_revision"]["scene_revision"]["revision_id"] + 3
-    )
-
-
-@pytest.mark.parametrize("fault", ["effect_unproven", "scene_changed", "second_rotation"])
-def test_scene_node_blocks_unproven_or_repeated_compaction_epoch_rotation(fault) -> None:
-    class _CompactionTransport(_SceneTransport):
+    class _StaleEpochTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
             self.rejected_requests: list[dict[str, Any]] = []
-            self.reject_compaction = False
+            self.reject_node = False
 
         def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            if not self.reject_compaction:
+            if not self.reject_node:
                 return super().commit_scene_transaction(body)
-            request = deepcopy(dict(body))
-            self.rejected_requests.append(request)
-            old_epoch = self.owner_epoch
-            expected_epoch = f"scene-owner.epoch.compacted.{len(self.rejected_requests)}"
-            self.owner_epoch = expected_epoch
-            if fault == "scene_changed" and len(self.rejected_requests) == 1:
-                self.revision["scene_revision"] = {
-                    **self.revision["scene_revision"],
-                    "scene_id": _DIGEST_E,
-                }
-            error = _scene_stale_owner_epoch_rejection(body, expected_epoch)
-            if fault == "effect_unproven":
-                error.response["projection_status"] = "rejected_rollback_proven"
-            raise error
+            self.rejected_requests.append(deepcopy(dict(body)))
+            self.owner_epoch = "scene-owner.epoch.other"
+            raise _scene_stale_owner_epoch_rejection(body, self.owner_epoch)
 
-    transport = _CompactionTransport()
+    transport = _StaleEpochTransport()
     port = _scene_port(transport)
     port.prepare_initial_scene(_scene_context(), _authored_scene())
     transport.submissions.clear()
-    transport.reject_compaction = True
+    transport.reject_node = True
 
     result = port.invoke(
         "scene.attach_carried_object",
-        _identity(f"attach-compaction-{fault}"),
+        _identity("attach-stale-owner-epoch"),
         OwnerNodeInputs(
             parameters={
                 "scene_resource_id": "graspable",
@@ -4836,15 +4804,8 @@ def test_scene_node_blocks_unproven_or_repeated_compaction_epoch_rotation(fault)
 
     assert result.succeeded is False
     assert result.reason_code == "stale_request_owner_epoch"
+    assert len(transport.rejected_requests) == 1
     assert not transport.submissions
-    if fault == "second_rotation":
-        assert len(transport.rejected_requests) == 2
-        assert (
-            transport.rejected_requests[0]["request_context"]["request_id"]
-            != transport.rejected_requests[1]["request_context"]["request_id"]
-        )
-    else:
-        assert len(transport.rejected_requests) == 1
 
 
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
@@ -5440,11 +5401,14 @@ class _HeldPreparationTransport(_Transport):
         if self.cleanup_mode == "borrow":
             raise RuntimeError("operation_effect_in_flight")
         self.controls.append(("reset",opid,deepcopy(body)))
+        # "resolved": the Kernel resolved Reset to a newer current revision.
+        against = 4 if self.cleanup_mode == "resolved" else 3
         self.last_control = {
             "operation_id":opid,"request_id":body["request_context"]["request_id"],"control":"reset",
-            "accepted_against_revision":3,"operation_revision_after_acceptance":4,"replay_status":"accepted_new",
+            "accepted_against_revision":against,"operation_revision_after_acceptance":against + 1,
+            "replay_status":"accepted_new",
         }
-        self.operations[opid]["operation_revision"] = 4
+        self.operations[opid]["operation_revision"] = against + 1
         self.resident[opid] = self.cleanup_mode == "pending"
         if self.cleanup_mode == "lost_reply": raise RuntimeError("reset reply lost")
         if self.cleanup_mode == "new_hold": self.selection_revision += 1
@@ -5518,6 +5482,14 @@ def test_actual_behavior_owner_keeps_prepared_cancel_running_then_retires_before
     assert node.status is py_trees.common.Status.SUCCESS
     assert transport.events == ["cleanup","release"]
     assert [item[0] for item in transport.controls] == ["reset","acknowledge"]
+
+
+def test_held_preparation_retirement_accepts_reset_resolved_to_the_current_revision():
+    transport,port,node,held,state,attempts,now = _prepared_held_behavior()
+    list(held.tick()); transport.cleanup_mode = "resolved"
+    port.scope.retire_held_preparations("program-run.1",frozenset({"command"}),1)
+    assert port._tasks == {} and not transport.resident["operation-1"]
+    assert [row[0] for row in transport.controls] == ["reset"]
 
 
 @pytest.mark.parametrize("mode", ["pending","lost_reply","borrow","new_hold"])
@@ -5619,7 +5591,7 @@ def test_reset_scene_authorization_rejects_malformed_claim_before_commit(authori
 
 def _stopped_motion_for_recovery(*, lost_replies: int = 0):
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = _motion_test_port(transport)
     port.bind(_context())
     identity = _identity("motion-recovery-body")
     started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
@@ -5775,6 +5747,99 @@ def test_a_refused_close_keeps_the_operation_retained_for_reset() -> None:
         fixture.started.task_id, fixture.identity, request_id="program-close:4"
     ) is False
     assert fixture.started.task_id in fixture.port._tasks
+
+
+@pytest.mark.parametrize(
+    ("previous", "current", "reason"),
+    [
+        # SX-667: a deadline of 0 is no exemption once the hold had an
+        # observation; losing it is refused.
+        ({"observed_state_available": True, "observed_state_valid_until_ns": 0},
+         {"observed_state_available": False}, "observed_state_unavailable"),
+        ({"observed_state_available": True, "observed_state_valid_until_ns": 0},
+         {"observed_state_available": True, "observed_state_fresh": True,
+          "observed_state_at_rest": True}, None),
+        # SX-674: still reported fresh, but its positive deadline elapsed.
+        ({"observed_state_available": True},
+         {"observed_state_available": True, "observed_state_fresh": True,
+          "observed_state_at_rest": True, "observed_state_valid_until_ns": 1},
+         "observed_state_stale"),
+        # A deadline still ahead, and 0 (unbounded), stay current.
+        ({"observed_state_available": True},
+         {"observed_state_available": True, "observed_state_fresh": True,
+          "observed_state_at_rest": True,
+          "observed_state_valid_until_ns": 2**62}, None),
+        ({"observed_state_available": True},
+         {"observed_state_available": True, "observed_state_fresh": True,
+          "observed_state_at_rest": True, "observed_state_valid_until_ns": 0}, None),
+        # A hold whose owner never had a robot observation needs none.
+        ({"observed_state_available": False}, {"observed_state_available": False}, None),
+        (None, {}, None),
+    ],
+)
+def test_observed_state_refusal_follows_the_observation_not_its_deadline(
+    previous, current, reason
+) -> None:
+    assert observed_state_refusal(previous, current) == reason
+
+
+@pytest.mark.parametrize(
+    ("fresh", "at_rest", "reason"),
+    [
+        (False, False, "observed_state_stale"),
+        (True, False, "observed_state_not_at_rest"),
+        (True, True, None),
+    ],
+)
+def test_manual_result_press_reads_the_owner_fresh_not_the_cached_terminal(
+    fresh, at_rest, reason
+) -> None:
+    """SX-655: the manual-result press re-reads the Kernel's assessment; a
+    cached terminal claiming a fresh, at-rest robot is never the answer."""
+
+    fixture = _stopped_motion_for_recovery()
+    task_id = fixture.started.task_id
+    cached = {
+        **fixture.transport.operation_recovery(task_id)["recovery_assessment"],
+        "observed_state_available": True,
+        "observed_state_fresh": True,
+        "observed_state_at_rest": True,
+        "observed_state_valid_until_ns": 1_000,
+    }
+    fixture.port._tasks[task_id].terminal = OwnerTaskSnapshot(
+        task_id=task_id,
+        state=OwnerTaskState.INTERRUPTED,
+        metadata={"recovery_assessment": cached},
+    )
+    # The ordinary observation answers from the cached terminal.
+    assert (
+        fixture.port.operations.observe(task_id).metadata["recovery_assessment"] == cached
+    )
+    previous = fixture.transport.operation_recovery
+    reads: list[str] = []
+
+    def current(operation_id):
+        reads.append(operation_id)
+        response = deepcopy(previous(operation_id))
+        response["recovery_assessment"].update(
+            {
+                "observed_state_available": True,
+                "observed_state_fresh": fresh,
+                "observed_state_at_rest": at_rest,
+            }
+        )
+        return response
+
+    fixture.transport.operation_recovery = current
+    assessment = fixture.port.operations.current_recovery_assessment(
+        task_id, fixture.identity
+    )
+    assert reads == [task_id]
+    assert assessment["observed_state_fresh"] is fresh
+    assert assessment["observed_state_at_rest"] is at_rest
+    assert observed_state_refusal(cached, assessment) == reason
+    with pytest.raises(ProductionPortError, match="changed node attempt"):
+        fixture.port.operations.current_recovery_assessment(task_id, _identity("foreign"))
 
 
 def test_a_transient_assessment_absence_is_not_a_failure_and_a_malformed_read_is_surfaced() -> None:
@@ -5999,6 +6064,74 @@ def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
     assert retired.metadata["resident"] is False
 
 
+@pytest.mark.parametrize(
+    ("selector", "expected"),
+    [
+        ({"kind": "current"}, {"kind": "entry", "entry": {
+            "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip",
+        }}),
+        ({"kind": "default_of_role", "role": "gripper"},
+         {"kind": "default_of_role", "role": "gripper"}),
+        ({"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
+         {"kind": "entry", "entry": {
+             "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tcp",
+         }}),
+    ],
+)
+def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_endpoint"] = selector
+    inputs = OwnerNodeInputs(parameters, blackboard={"active_tcp": {
+        "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip",
+    }})
+    assert isinstance(inputs.parameters["tcp_endpoint"], MappingProxyType)
+
+    port.operations.start("motion.move_to_pose", _identity("frozen-tcp"), inputs)
+
+    assert transport.submissions[0]["participants"][0]["payload"]["tcp_endpoint"] == expected
+
+
+@pytest.mark.parametrize(
+    ("selector", "message"),
+    [
+        (None, "must be a mapping"),
+        (["current"], "must be a mapping"),
+        ({"kind": "unsupported"}, "unsupported TCP selector kind"),
+        ({"kind": "current", "role": "gripper"}, "unknown fields"),
+        ({"kind": "default_of_role"}, "missing required fields"),
+        ({"kind": "entry", "target_role": "gripper", "frame_role": "INVALID"},
+         "portable lower-case identifier"),
+    ],
+)
+def test_motion_start_rejects_invalid_frozen_tcp_selectors(selector, message) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_endpoint"] = selector
+
+    with pytest.raises(ProductionPortError, match=message):
+        port.operations.start("motion.move_to_pose", _identity("invalid-tcp"), OwnerNodeInputs(parameters))
+
+    assert transport.submissions == []
+
+
+def test_motion_start_rejects_legacy_tcp_frame_role_before_submission() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_frame_role"] = "tcp"
+
+    with pytest.raises(ProductionPortError, match="tcp_frame_role is unsupported"):
+        port.operations.start("motion.move_to_pose", _identity("legacy-tcp"), OwnerNodeInputs(parameters))
+
+    assert transport.submissions == []
+
+
 @pytest.mark.parametrize('node_id', ['motion.move_to_pose', 'motion.probe_search'])
 def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) -> None:
     transport = _Transport()
@@ -6006,11 +6139,13 @@ def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) 
     port.bind(_context())
     inputs = _contact_pose_inputs() if node_id == 'motion.move_to_pose' else _interrupt_inputs(node_id)
     parameters = dict(inputs.parameters)
-    parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+    parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}
     identity = _identity('endpoint-preview')
     port.operations.start(node_id, identity, OwnerNodeInputs(parameters))
     payload = transport.submissions[0]['participants'][0]['payload']
-    assert payload['tcp_endpoint'] == {'target_role_id': 'gripper', 'frame_role_id': 'tcp'}
+    assert payload['tcp_endpoint'] == {'kind': 'entry', 'entry': {
+        'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
+    }}
     assert 'tcp_frame_role_id' not in payload
     # Exercise the first real strict ingress, rather than only our recording
     # transport: the previous legacy-only model rejected this emitted payload.
@@ -6030,10 +6165,13 @@ def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) 
 
 
 def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
-    parameters = {'base_frame_role': 'base', 'tcp_endpoint': {'target_role': 'gripper', 'frame_role': 'tcp'}}
+    parameters = {'base_frame_role': 'base'}
+    tcp_endpoint = {'kind': 'entry', 'entry': {
+        'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
+    }}
     payload = NativeKernelProgramPort._phase_motion_payload(
         identity=_identity('pick-endpoint'), parameters=parameters,
-        phase='approach', motion={
+        phase='approach', tcp_endpoint=tcp_endpoint, motion={
             'kind': 'pose_goal',
             'goal': {
                 'position_m': {'x_m': 0.0, 'y_m': 0.0, 'z_m': 0.1},
@@ -6041,19 +6179,13 @@ def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
             },
         },
     )
-    assert payload['tcp_endpoint'] == {'target_role_id': 'gripper', 'frame_role_id': 'tcp'}
+    assert payload['tcp_endpoint'] == tcp_endpoint
     assert 'tcp_frame_role_id' not in payload
     from manyforge_headless_api.models import MotionParticipantRequest
 
     wire = MotionParticipantRequest.model_validate(payload).model_dump(mode="json")
     assert wire["tcp_endpoint"] == payload["tcp_endpoint"]
     assert "tcp_frame_role_id" not in wire
-    parameters['tcp_frame_role'] = ''
-    with pytest.raises(ProductionPortError, match='tcp_frame_role is unsupported'):
-        NativeKernelProgramPort._phase_motion_payload(
-            identity=_identity('pick-endpoint'), parameters=parameters,
-            phase='approach', motion={'kind': 'pose_goal'},
-        )
 
 
 @pytest.mark.parametrize('missing', [None, 'contact_policy_id', 'contact_scene_resource_id'])
@@ -6061,7 +6193,7 @@ def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(
     parameters = dict(_motion_inputs().parameters)
     parameters.update(
         target_mode='absolute', target_reference=None, offset_reference=None,
-        tcp_endpoint={'target_role': 'gripper', 'frame_role': 'tcp'},
+        tcp_endpoint={'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'},
         goal=[{'joint_name': 'joint1', 'position_rad': 0.0}],
         contact_policy_id='pick.contact', contact_scene_resource_id='part.7',
     )
@@ -6086,7 +6218,9 @@ def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(
 
     parsed = MotionParticipantRequest.model_validate(payload)
     assert parsed.model_dump(mode='json')['tcp_endpoint'] == {
-        'target_role_id': 'gripper', 'frame_role_id': 'tcp',
+        'kind': 'entry', 'entry': {
+            'component_id': 'tool.1', 'target_id': 'gripper.command', 'frame_role_id': 'tcp',
+        },
     }
 
 
@@ -6171,6 +6305,74 @@ def test_pneumatic_output_steps_have_distinct_kernel_request_ids():
 
 
 
+@pytest.mark.parametrize("required,position_request,expected", [
+    (False, {"kind": "named_preset", "name": "closed"}, None),
+    (True, {"kind": "named_preset", "name": "open"}, None),
+    (True, {"kind": "named_preset", "name": "closed"},
+     {"node_id": "gripper.check_status",
+      "parameters": {"target_role": "gripper", "expected_state": "reached"}}),
+    (True, {"kind": "linear_m", "value_m": 0.2},
+     {"node_id": "gripper.check_status",
+      "parameters": {"target_role": "gripper", "expected_state": "reached"}}),
+])
+def test_position_grasp_confirmation_rides_the_existing_descriptor_read(
+        required, position_request, expected):
+    transport = _preset_transport(kind="linear_m")
+    if required:
+        transport.preset_descriptor["grasp_confirmation"] = "required"
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters.update(position=position_request)
+    started = port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters))
+    assert started.metadata.get("grasp_confirmation_check") == expected
+    if expected is None:
+        assert "grasp_confirmation_check" not in started.metadata
+    # The policy comes from the one descriptor read every Program gripper command already does.
+    assert transport.target_reads == 1
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("open", None),
+    ("closed", {"node_id": "io.check_input", "parameters": {
+        "target_role": "io.c", "resource_role": "part", "expected_value": True}}),
+])
+def test_pneumatic_grasp_confirmation_reads_the_mapped_workpiece_input(name, expected):
+    transport = _preset_transport(kind="linear_m")
+    transport.preset_descriptor.update(actuation_kind="pneumatic", output_mode="commanded",
+        completion_policy="no_output", grasp_confirmation_policy="not_required",
+        grasp_confirmation="required")
+    transport.preset_descriptor["named_presets"][0]["master_position"] = 0.5
+    transport.preset_descriptor["named_presets"][1]["master_position"] = 0.0
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_pneumatic_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters.update(position={"kind": "named_preset", "name": name})
+    started = port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters))
+    assert started.metadata.get("grasp_confirmation_check") == expected
+    assert transport.target_reads == 1
+
+
+@pytest.mark.parametrize("confirmed", [True, False, None])
+def test_gripper_status_read_carries_typed_grasp_evidence(confirmed):
+    class QueryTransport(_Transport):
+        def query_target(self, query):
+            return {"ok": True, "target_observation": {
+                **query, "schema_version": "manyforge.target_observation.v1",
+                "source_epoch": "source.1", "source_sequence": 7,
+                "value": {"state": "completed", "grasp_confirmed": confirmed, "command_id": 1,
+                          "generation": 2, "source_id": "binding.gripper", "source_revision": _DIGEST_A,
+                          "source_epoch": "provider.1", "active_control_configuration_id": "route.1",
+                          "active_control_configuration_generation": 3}}}
+
+    port = NativeKernelProgramPort(KernelClient(QueryTransport()))
+    port.bind(_context())
+    result = port.queries.invoke("gripper.check_status", _identity("grasp"), OwnerNodeInputs(
+        parameters={"target_role": "gripper", "expected_state": "reached"}))
+    assert result.succeeded
+    assert result.metadata["grasp_confirmed"] is confirmed
+
+
 def _release_bound_context():
     context = _context()
     binding = _thawed(context.program_binding)
@@ -6185,7 +6387,7 @@ def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
     parameters = dict(_motion_inputs().parameters)
     parameters.update(
         target_mode="absolute", target_reference=None, offset_reference=None,
-        tcp_endpoint={"target_role": "gripper", "frame_role": "tcp"},
+        tcp_endpoint={"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
         goal=[{"joint_name": "joint1", "position_rad": 0.0}],
         contact_policy_id="pick.contact", contact_scene_resource_id="part.7",
     )
@@ -6194,7 +6396,9 @@ def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
     )
     payload = transport.submissions[0]["participants"][0]["payload"]
     assert payload["motion"]["kind"] == "joint_goal"
-    assert payload["tcp_endpoint"] == {"target_role_id": "gripper", "frame_role_id": "tcp"}
+    assert payload["tcp_endpoint"] == {"kind": "entry", "entry": {
+        "component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tcp",
+    }}
     assert payload["contact_policy_id"] == "pick.contact"
     assert payload["runtime_object_bindings"] == [
         {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"},
@@ -6212,3 +6416,458 @@ def test_contact_release_binding_cannot_be_used_for_pick_synthesis():
         port.operations.start("planning.plan_pick_sequence", _identity("pick"), _pick_inputs())
     assert transport.submissions == []
     assert transport.pick_requests == []
+
+
+def test_set_tcp_current_lowers_blackboard_entry_before_submission() -> None:
+    class RefusingTransport(_Transport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.submissions.append(deepcopy(body))
+            return {"ok": False, "error": {
+                "code": "invalid_request", "message": "entry rejected",
+                "details": {"reason": "entry_rejected"},
+            }}
+
+    transport = RefusingTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    entry = {"component_id": "tool.1", "target_id": "gripper.command", "frame_role_id": "tip"}
+    with pytest.raises(KernelOperationAdmissionRejectedError) as refused:
+        port.operations.start(
+            "motion.set_tcp", _identity("set-tcp-current"),
+            OwnerNodeInputs({"target_role": "arm", "tcp": {"kind": "current"}},
+                            blackboard={"active_tcp": entry}),
+        )
+    assert refused.value.details["reason"] == "entry_rejected"
+    assert transport.submissions[0]["participants"][0]["payload"]["tcp"] == {
+        "kind": "entry", "entry": entry,
+    }
+
+    with pytest.raises(ProductionPortError, match="active_tcp.arm.*has no value"):
+        port.operations.start(
+            "motion.set_tcp", _identity("set-tcp-unavailable"),
+            OwnerNodeInputs({"target_role": "arm", "tcp": {"kind": "current"}}),
+        )
+    assert len(transport.submissions) == 1
+
+
+def test_set_tcp_result_is_applied_before_success() -> None:
+    rows = [{"component_id": "robot.1", "entry": None, "owner_epoch": "kernel.epoch.7",
+             "registration_generation": 1, "sequence": 4}]
+
+    class ImmediateTransport(_Transport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.submissions.append(deepcopy(body))
+            return {"ok": True, "accepted": {
+                "request_id": body["request_context"]["request_id"], "operation_id": "immediate.1",
+            }, "active_tcp": rows}
+
+    applied = []
+    transport = ImmediateTransport()
+    port = NativeKernelProgramPort(KernelClient(transport),
+        active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
+    port.bind(_context())
+    result = port.operations.start("motion.set_tcp", _identity("tcp-success"), OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.SUCCEEDED
+    assert applied == [("program-run.1", "robot.1", rows)]
+    port.operations.acknowledge(result.task_id, _identity("tcp-success"))
+    assert transport.operation_reads == 0
+
+
+def _tcp_result_runtime():
+    """The real Runner mirror and callback, with a small observable Run store."""
+    from threading import Lock
+    from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror
+    from manyforge_program_runner.runtime import ProgramRuntime
+
+    class Store:
+        def __init__(self):
+            self.values = {}
+
+        def write_active_tcp(self, role, entry):
+            if entry is None:
+                self.values.pop(role, None)
+            else:
+                self.values[role] = deepcopy(entry)
+
+    runtime = object.__new__(ProgramRuntime)
+    runtime._active_tcp_stores_lock = Lock()
+    store = Store()
+    runtime._active_tcp_stores = {"program-run.1": (store, {"robot.1": ("arm",)})}
+    runtime._active_tcp_mirror = ActiveTcpMirror(on_change=runtime._write_active_tcp)
+    runtime._active_tcp_mirror.set_owner("kernel.epoch.7")
+    return runtime, store
+
+
+def _tcp_result_row(owner, entry, sequence=1):
+    return {"component_id": "robot.1", "owner_epoch": owner,
+            "registration_generation": 1, "sequence": sequence, "entry": entry}
+
+
+def _motion_test_port(transport):
+    """Use the real Runner result consumer for terminal motion observations."""
+    runtime, _store = _tcp_result_runtime()
+    entry = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+    rows = [_tcp_result_row("kernel.epoch.7", entry)]
+    runtime._active_tcp_mirror.apply_rows(rows)
+    read = transport.read
+
+    def read_with_tcp(operation_id):
+        return {**read(operation_id), "active_tcp": deepcopy(rows)}
+
+    transport.read = read_with_tcp
+    return NativeKernelProgramPort(KernelClient(transport),
+                                   active_tcp_result=runtime._apply_active_tcp_result)
+
+
+@pytest.mark.parametrize("new_owner_has_value", [False, True])
+def test_stale_set_tcp_receipt_preserves_new_owner_store_and_operation_outcome(
+    new_owner_has_value,
+) -> None:
+    runtime, store = _tcp_result_runtime()
+    old = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "old"}
+    new = {**old, "frame_role_id": "new"}
+    runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", old)])
+
+    class DelayedReceipt(_Transport):
+        def submit(self, body):
+            self.submissions.append(deepcopy(body))
+            # The old owner's valid receipt arrives after the mirror changes owner.
+            runtime._active_tcp_mirror.set_owner("kernel.epoch.new")
+            if new_owner_has_value:
+                runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.new", new)])
+            return {"ok": True, "accepted": {
+                "request_id": body["request_context"]["request_id"], "operation_id": "immediate.1",
+            }, "active_tcp": [_tcp_result_row("kernel.epoch.7", old, sequence=2)]}
+
+    transport = DelayedReceipt()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=runtime._apply_active_tcp_result)
+    port.bind(_context())
+    identity = _identity("stale-tcp-result")
+    result = port.operations.start("motion.set_tcp", identity, OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.SUCCEEDED
+    assert result.settlement_proven is True
+    assert store.values == ({"arm": new} if new_owner_has_value else {})
+    assert runtime._active_tcp_mirror.owner_epoch == "kernel.epoch.new"
+    port.operations.acknowledge(result.task_id, identity)
+    assert transport.operation_reads == 0
+
+
+def test_same_owner_tcp_result_conflict_does_not_settle_as_success() -> None:
+    from manyforge_program_runner.active_tcp_mirror import ActiveTcpWireError
+
+    runtime, store = _tcp_result_runtime()
+    current = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "current"}
+    conflict = {**current, "frame_role_id": "conflict"}
+    runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", current, sequence=4)])
+    rows = [_tcp_result_row("kernel.epoch.7", conflict, sequence=4)]
+    with pytest.raises(ActiveTcpWireError):
+        runtime._apply_active_tcp_result("program-run.1", "robot.1", rows)
+    assert store.values == {"arm": current}
+
+    class ConflictingReceipt(_Transport):
+        def submit(self, body):
+            self.submissions.append(deepcopy(body))
+            return {"ok": True, "accepted": {
+                "request_id": body["request_context"]["request_id"], "operation_id": "immediate.1",
+            }, "active_tcp": rows}
+
+    transport = ConflictingReceipt()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=runtime._apply_active_tcp_result)
+    port.bind(_context())
+    result = port.operations.start("motion.set_tcp", _identity("conflicting-tcp-result"), OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.FAILED
+    assert result.settlement_proven is False
+    assert store.values == {"arm": current}
+    assert len(transport.submissions) == 1
+
+
+def test_stale_move_tcp_row_keeps_existing_owner_scoped_acknowledgement() -> None:
+    runtime, store = _tcp_result_runtime()
+    old = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "old"}
+    new = {**old, "frame_role_id": "new"}
+    runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", old)])
+
+    class ReplacedOwnerTransport(_Transport):
+        def read(self, operation_id):
+            return {**super().read(operation_id),
+                    "active_tcp": [_tcp_result_row("kernel.epoch.7", old, sequence=2)]}
+
+        def acknowledge_completed(self, operation_id, body):
+            self.controls.append(("acknowledge", operation_id, deepcopy(body)))
+            # Model an owner rejecting the old-epoch acknowledgement. The test
+            # checks the existing request and propagation, not native fencing.
+            raise RuntimeError("old owner acknowledgement refused")
+
+    transport = ReplacedOwnerTransport()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=runtime._apply_active_tcp_result)
+    port.bind(_context())
+    identity = _identity("stale-move-result")
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    started = port.operations.start("motion.move_to_pose", identity, OwnerNodeInputs(parameters))
+    transport.operations[started.task_id]["state"] = "completed"
+    runtime._active_tcp_mirror.set_owner("kernel.epoch.new")
+    runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.new", new)])
+    assert port.operations.observe(started.task_id).state is OwnerTaskState.SUCCEEDED
+    assert store.values == {"arm": new}
+    with pytest.raises(RuntimeError, match="old owner acknowledgement refused"):
+        port.operations.acknowledge(started.task_id, identity)
+    assert transport.controls[-1][2]["request_context"]["request_owner_epoch"] == "kernel.epoch.7"
+    assert store.values == {"arm": new}
+
+
+@pytest.mark.parametrize("action", ["scope", "cancel", "acknowledge", "unbind"])
+def test_non_node_observations_ignore_unavailable_active_tcp_result(action) -> None:
+    runtime, store = _tcp_result_runtime()
+    entry = {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+    runtime._active_tcp_mirror.apply_rows([_tcp_result_row("kernel.epoch.7", entry, sequence=5)])
+    runtime._active_tcp_mirror.stream_lost()
+    assert store.values == {}
+
+    class OldResultTransport(_Transport):
+        def read(self, operation_id):
+            return {**super().read(operation_id),
+                    "active_tcp": [_tcp_result_row("kernel.epoch.7", entry, sequence=4)]}
+
+    calls = []
+    def apply_result(*args):
+        calls.append(args)
+        return runtime._apply_active_tcp_result(*args)
+
+    transport = OldResultTransport()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=apply_result)
+    port.bind(_context())
+    identity = _identity("unavailable-tcp")
+    started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
+    transport.operations[started.task_id]["state"] = "completed"
+
+    with pytest.raises(OwnerTaskObservationUnavailableError):
+        port.operations.observe(started.task_id)
+    assert len(calls) == 1
+    calls.clear()
+    if action == "scope":
+        assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+    elif action == "cancel":
+        port.operations.cancel(started.task_id, identity)
+    elif action == "acknowledge":
+        port.operations.acknowledge(started.task_id, identity)
+        assert transport.controls[-1][0] == "acknowledge"
+    else:
+        port.unbind("program-run.1")
+        assert transport.controls[-1][0] == "acknowledge"
+    assert calls == []
+    assert store.values == {}
+
+
+def test_unknown_set_tcp_reset_reads_status_without_replay_and_retries_failed_read() -> None:
+    rows = [{"component_id": "robot.1", "entry": None, "owner_epoch": "kernel.epoch.7",
+             "registration_generation": 1, "sequence": 4}]
+
+    class LostReply(_Transport):
+        def __init__(self):
+            super().__init__()
+            self.fail_read = True
+            self.status_reads = 0
+
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.submissions.append(deepcopy(body))
+            raise TimeoutError("reply lost")
+
+        def read_active_tcp(self, *, ordered=False):
+            assert ordered is True
+            self.status_reads += 1
+            if self.fail_read:
+                raise TimeoutError("status unavailable")
+            return {"ok": True, "robots": rows}
+
+    transport = LostReply()
+    applied = []
+    fail_apply = True
+    stale_during_apply = False
+
+    def apply_result(run, robot, value):
+        if fail_apply:
+            raise RuntimeError("store unavailable")
+        if stale_during_apply:
+            return False
+        applied.append((run, robot, deepcopy(value)))
+        return True
+
+    port = NativeKernelProgramPort(KernelClient(transport),
+        active_tcp_result=apply_result)
+    port.bind(_context())
+    result = port.operations.start("motion.set_tcp", _identity("tcp-unknown"), OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.FAILED and not result.settlement_proven
+    port.scope.request_stop("program-run.1", "stop-tcp-unknown", "reset")
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    with pytest.raises(ProductionPortError, match="unknown Set TCP could not be reconciled"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    transport.fail_read = False
+    with pytest.raises(ProductionPortError, match="unknown Set TCP could not be reconciled"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    fail_apply = False
+    rows[0]["owner_epoch"] = "kernel.epoch.new"
+    with pytest.raises(ProductionPortError, match="unknown Set TCP could not be reconciled"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    rows[0]["owner_epoch"] = "kernel.epoch.7"
+    stale_during_apply = True
+    with pytest.raises(ProductionPortError, match="unknown Set TCP could not be reconciled"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    stale_during_apply = False
+    assert port.scope.reset("program-run.1").state is ProgramRunScopeState.SETTLED
+    assert applied == [("program-run.1", "robot.1", rows)]
+    assert len(transport.submissions) == 1
+    assert transport.status_reads == 5
+
+
+def test_reset_retires_old_owner_unknown_set_tcp_without_claiming_effect(caplog) -> None:
+    class ReplacedOwner(_Transport):
+        replaced = False
+
+        def identity(self):
+            result = super().identity()
+            if self.replaced:
+                result["identity"]["owner_epoch"] = "kernel.epoch.new"
+            return result
+
+        def submit(self, body):
+            self.submissions.append(deepcopy(body))
+            raise TimeoutError("reply lost")
+
+        def read_active_tcp(self, *, ordered=False):
+            raise AssertionError("new owner baseline cannot settle the old effect")
+
+    transport = ReplacedOwner()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=lambda *_: True)
+    port.bind(_context())
+    result = port.operations.start("motion.set_tcp", _identity("tcp-replaced"), OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.FAILED and not result.settlement_proven
+    port.scope.request_stop("program-run.1", "stop-tcp-replaced", "reset")
+    transport.replaced = True
+    transport.stop_states["scope-stop-1"] = "stopping"
+    with pytest.raises(ProductionPortError, match="before settlement"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    assert "retired unknown Set TCP at Reset: owner replaced" not in caplog.text
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    read_stop = transport.stop_status
+    def overlapping_stop(stop_id):
+        status = read_stop(stop_id)
+        with port._lock:
+            port._scope_stops["program-run.1"].pending += 1
+        return status
+    transport.stop_status = overlapping_stop
+    with pytest.raises(ProductionPortError, match="Stop changed"):
+        port.scope.reset("program-run.1")
+    assert port._task(result.task_id).unknown_admission is not None
+    with port._lock:
+        port._scope_stops["program-run.1"].pending -= 1
+    transport.stop_status = read_stop
+    assert port.scope.reset("program-run.1").state is ProgramRunScopeState.SETTLED
+    assert "retired unknown Set TCP at Reset: owner replaced" in caplog.text
+    assert len(transport.submissions) == 1
+
+
+def test_admitted_set_tcp_failure_applies_confirmed_value_before_failure() -> None:
+    rows = [{"component_id": "robot.1", "entry": {
+        "component_id": "robot.1", "target_id": "arm", "frame_role_id": "flange"},
+        "owner_epoch": "kernel.epoch.7", "registration_generation": 1, "sequence": 4}]
+
+    class FailedStep(_Transport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.submissions.append(deepcopy(body))
+            return {"ok": False, "error": {
+                "code": "execution_rejected", "message": "offset not applied",
+                "details": {"reason": "tcp_offset_not_applied", "immediate_step": "admitted",
+                            "request_id": body["request_context"]["request_id"],
+                            "operation_id": "immediate.1"},
+            }, "active_tcp": rows}
+
+    applied = []
+    transport = FailedStep()
+    port = NativeKernelProgramPort(KernelClient(transport),
+        active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
+    port.bind(_context())
+    result = port.operations.start("motion.set_tcp", _identity("tcp-failure"), OwnerNodeInputs({
+        "target_role": "arm", "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+    }))
+    assert result.state is OwnerTaskState.FAILED
+    assert result.settlement_proven is True
+    assert result.reason_code == "execution_rejected"
+    assert result.details["reason"] == "tcp_offset_not_applied"
+    assert applied == [("program-run.1", "robot.1", rows)]
+    assert transport.operation_reads == 0
+
+
+def test_failed_move_applies_confirmed_tcp_before_terminal_failure() -> None:
+    rows = [{"component_id": "robot.1", "entry": None, "owner_epoch": "kernel.epoch.7",
+             "registration_generation": 1, "sequence": 5}]
+
+    class TcpReadTransport(_Transport):
+        def read(self, operation_id: str) -> dict[str, Any]:
+            return {**super().read(operation_id), "active_tcp": rows}
+
+    applied = []
+    transport = TcpReadTransport()
+    port = NativeKernelProgramPort(KernelClient(transport),
+        active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    started = port.operations.start("motion.move_to_pose", _identity("tcp-failed-move"),
+                                    OwnerNodeInputs(parameters))
+    transport.operations[started.task_id]["state"] = "failed"
+    result = port.operations.observe(started.task_id)
+    assert result.state is OwnerTaskState.FAILED
+    assert applied == [("program-run.1", "robot.1", rows)]
+
+
+@pytest.mark.parametrize(("native_state", "expected_state"), [
+    ("completed", OwnerTaskState.SUCCEEDED), ("failed", OwnerTaskState.FAILED),
+])
+def test_motion_terminal_waits_when_confirmed_tcp_cannot_be_applied(
+    native_state, expected_state
+) -> None:
+    rows = [{"component_id": "robot.1", "entry": None, "owner_epoch": "kernel.epoch.7",
+             "registration_generation": 1, "sequence": 5}]
+
+    class TcpReadTransport(_Transport):
+        def read(self, operation_id: str) -> dict[str, Any]:
+            return {**super().read(operation_id), "active_tcp": rows}
+
+    applied = []
+    fail = [True]
+
+    def update(run, robot, value):
+        if fail[0]:
+            raise ValueError("store unavailable")
+        applied.append((run, robot, deepcopy(value)))
+
+    transport = TcpReadTransport()
+    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=update)
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": "gripper"}
+    started = port.operations.start("motion.move_to_pose", _identity("tcp-apply-retry"),
+                                    OwnerNodeInputs(parameters))
+    transport.operations[started.task_id]["state"] = native_state
+    with pytest.raises(OwnerTaskObservationUnavailableError):
+        port.operations.observe(started.task_id)
+    fail[0] = False
+    assert port.operations.observe(started.task_id).state is expected_state
+    assert applied == [("program-run.1", "robot.1", rows)]
+    assert len(transport.submissions) == 1

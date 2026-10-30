@@ -15,6 +15,7 @@ CANDIDATE = {"retained_bundle_id": "bundle", "graph_revision": "graph"}
 APPLY = {
     "apply_id": "apply", "apply_generation": 2, "request_owner_epoch": "owner",
     "state": "succeeded", "ok": True, "candidate_projection_revision": CANDIDATE,
+    "failure_acknowledgement": "unavailable",
     "prepared_activation": {"deployment_artifact_id": "deployment-id",
                             "deployment_revision": "deployment", "program_binding_id": "binding"},
 }

@@ -20,12 +20,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <numbers>
 #include <random>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <rclcpp/executors/multi_threaded_executor.hpp>
@@ -132,7 +137,7 @@ TEST(XArmDriverServices, EachRecoverStepIsOneCallAndOnlyZeroReturnSucceeds) {
   EXPECT_EQ(world.clean_error_calls.load(), 1);
 }
 
-// D11: the tool payload reaches `set_tcp_load` once, in kg and millimetres.
+// TOOLCTX: the payload reaches `set_tcp_load` once, in kg and millimetres.
 TEST(XArmDriverServices, SetTcpLoadSendsKilogramsAndMillimetresOnce) {
   using SetTcpLoad = xarm_msgs::srv::SetTcpLoad;
   World world;
@@ -166,6 +171,82 @@ TEST(XArmDriverServices, SetTcpLoadSendsKilogramsAndMillimetresOnce) {
   EXPECT_EQ(refused.outcome, Outcome::kUnknown);
   EXPECT_EQ(refused.reason, "xarm_service_returned_nonzero");
   EXPECT_EQ(calls.load(), 2);
+}
+
+// TOOLCTX: the TCP reaches `set_tcp_offset` once, in mm and radians.
+TEST(XArmDriverServices, SetTcpOffsetSendsMillimetresAndRadiansOnce) {
+  using SetFloat32List = xarm_msgs::srv::SetFloat32List;
+  World world;
+  std::atomic<int> calls{0};
+  std::vector<float> data;
+  std::atomic<int> vendor_return{0};
+  const auto server = world.server_node->create_service<SetFloat32List>(
+      world.ns + "/set_tcp_offset",
+      [&](const SetFloat32List::Request::SharedPtr request,
+          SetFloat32List::Response::SharedPtr response) {
+        ++calls;
+        data = request->datas;
+        response->ret = static_cast<std::int16_t>(vendor_return.load());
+      });
+  ASSERT_TRUE(world.client_node->create_client<SetFloat32List>(world.ns + "/set_tcp_offset")
+                  ->wait_for_service(10s));
+  const double h = std::sqrt(0.5);
+  const auto sent = world.services->SetTcpOffset(
+      {{0.0, 0.01, 0.12}, {0.0, 0.0, h, h}}, kXArmServiceResponseTimeout,
+      std::stop_token{});
+  EXPECT_EQ(sent.outcome, Outcome::kSucceeded);
+  EXPECT_EQ(calls.load(), 1);
+  ASSERT_EQ(data.size(), 6U);
+  EXPECT_FLOAT_EQ(data[0], 0.0F);
+  EXPECT_FLOAT_EQ(data[1], 10.0F);
+  EXPECT_FLOAT_EQ(data[2], 120.0F);
+  EXPECT_NEAR(data[3], 0.0F, 1e-6F);
+  EXPECT_NEAR(data[4], 0.0F, 1e-6F);
+  EXPECT_NEAR(data[5], static_cast<float>(std::numbers::pi / 2.0), 1e-6F);
+  vendor_return = 1;
+  const auto refused = world.services->SetTcpOffset(
+      {}, kXArmServiceResponseTimeout, std::stop_token{});
+  EXPECT_EQ(refused.outcome, Outcome::kUnknown);
+  EXPECT_EQ(refused.reason, "xarm_service_returned_nonzero");
+  EXPECT_EQ(calls.load(), 2);
+}
+
+// M6 ADAPTERM: the re-engage sends `set_mode(1)` then `set_state(0)`, each
+// once; a non-zero vendor return is an unknown outcome, never retried.
+TEST(XArmDriverServices, SetModeAndSetStateSendOneRequestEach) {
+  using SetInt16 = xarm_msgs::srv::SetInt16;
+  World world;
+  std::vector<std::pair<std::string, int>> received;
+  std::mutex mutex;
+  std::atomic<int> vendor_return{0};
+  const auto serve = [&](const std::string &name) {
+    return world.server_node->create_service<SetInt16>(
+        world.ns + "/" + name,
+        [&, name](const SetInt16::Request::SharedPtr request,
+                  SetInt16::Response::SharedPtr response) {
+          std::lock_guard lock(mutex);
+          received.emplace_back(name, request->data);
+          response->ret = static_cast<std::int16_t>(vendor_return.load());
+        });
+  };
+  const auto mode_server = serve("set_mode");
+  const auto state_server = serve("set_state");
+  ASSERT_TRUE(world.client_node->create_client<SetInt16>(world.ns + "/set_mode")
+                  ->wait_for_service(10s));
+  ASSERT_TRUE(world.client_node->create_client<SetInt16>(world.ns + "/set_state")
+                  ->wait_for_service(10s));
+  EXPECT_EQ(world.services->SetMode(1, kXArmServiceResponseTimeout, std::stop_token{}).outcome,
+            Outcome::kSucceeded);
+  EXPECT_EQ(world.services->SetState(0, kXArmServiceResponseTimeout, std::stop_token{}).outcome,
+            Outcome::kSucceeded);
+  vendor_return = 1;
+  const auto refused =
+      world.services->SetState(0, kXArmServiceResponseTimeout, std::stop_token{});
+  EXPECT_EQ(refused.outcome, Outcome::kUnknown);
+  EXPECT_EQ(refused.reason, "xarm_service_returned_nonzero");
+  std::lock_guard lock(mutex);
+  EXPECT_EQ(received, (std::vector<std::pair<std::string, int>>{
+                          {"set_mode", 1}, {"set_state", 0}, {"set_state", 0}}));
 }
 
 TEST(XArmDriverServices, NoAnswerInTimeIsAnUnknownOutcomeAndIsNeverRetried) {

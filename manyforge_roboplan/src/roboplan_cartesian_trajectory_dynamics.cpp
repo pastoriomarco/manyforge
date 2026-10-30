@@ -368,9 +368,14 @@ resolve_cartesian_kinematic_motion_bounds(
       std::move(*resolved));
 }
 
+namespace {
+
+// One tip frame relative to the base. Without a path only linear speed is
+// qualified, against the TCP linear-speed limit.
 core::Result<CartesianFrameDynamicsEnvelope>
-measure_cartesian_frame_dynamics_envelope(
+measure_one_frame_dynamics_envelope(
     const CartesianTrajectoryContractInput &request,
+    const std::string &tip_frame,
     const core::CartesianPathDTO *path,
     const std::shared_ptr<roboplan::Scene> &scene,
     const roboplan::JointTrajectory &trajectory,
@@ -387,7 +392,7 @@ measure_cartesian_frame_dynamics_envelope(
         std::move(envelope));
   }
   const auto group_info = scene->getJointGroupInfo(request.compiled_group_name);
-  const auto tip_frame_id = scene->getFrameId(request.compiled_tcp_frame);
+  const auto tip_frame_id = scene->getFrameId(tip_frame);
   const auto base_frame_id = scene->getFrameId(request.compiled_base_frame);
   if (!group_info.has_value() || !tip_frame_id.has_value() ||
       !base_frame_id.has_value() ||
@@ -823,6 +828,36 @@ measure_cartesian_frame_dynamics_envelope(
     }
   }
   return core::Result<CartesianFrameDynamicsEnvelope>::Ok(std::move(envelope));
+}
+
+}  // namespace
+
+core::Result<CartesianFrameDynamicsEnvelope>
+measure_cartesian_frame_dynamics_envelope(
+    const CartesianTrajectoryContractInput &request,
+    const core::CartesianPathDTO *path,
+    const std::shared_ptr<roboplan::Scene> &scene,
+    const roboplan::JointTrajectory &trajectory,
+    const CartesianPlanningControl &control) {
+  auto envelope = measure_one_frame_dynamics_envelope(
+      request, request.compiled_tcp_frame, path, scene, trajectory, control);
+  // The TCP linear-speed limit also holds at every other speed-check point
+  // (the robot flange under `active_tcp_and_flange`); the retime keeps the
+  // highest ratio. Angular speed and acceleration stay TCP path constraints.
+  for (const auto &frame : request.compiled_speed_frames) {
+    if (!envelope.ok() || !envelope.value().complete)
+      return envelope;
+    if (frame == request.compiled_tcp_frame)
+      continue;
+    auto point = measure_one_frame_dynamics_envelope(request, frame, nullptr,
+                                                     scene, trajectory, control);
+    if (!point.ok() || !point.value().complete)
+      return point;
+    envelope.value().linear_speed_ratio = std::max(
+        envelope.value().linear_speed_ratio, point.value().linear_speed_ratio);
+    envelope.value().interval_checks += point.value().interval_checks;
+  }
+  return envelope;
 }
 
 } // namespace manyforge::roboplan_backend::detail

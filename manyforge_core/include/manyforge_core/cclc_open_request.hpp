@@ -46,6 +46,31 @@ class ICCLCOpenRequestPort {
   }
   [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) = 0;
+  /// M6 (`acknowledge_incident: false`): the lifecycle request never
+  /// acknowledges an incident or a stream latch. With one open it is refused
+  /// `cclc_incident_open` (effect not started); otherwise ordinary CCLC
+  /// admission decides, exactly as `SubmitLifecycle` without its
+  /// authorization-only incident Recover. Fails closed where not composed.
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO>
+  SubmitLifecycleWithoutIncidentAcknowledgement(const ComponentLifecycleIntentDTO&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"cclc_incident_check_unavailable",
+         "a lifecycle request without incident acknowledgement is not composed",
+         {{"effect", "not_started"}}});
+  }
+  /// M6 (item 36, `expected_incident_id`): the operator's Recover acknowledges
+  /// only the incident it names. When the component's open incident is
+  /// another one it is refused `cclc_incident_changed` (effect not started,
+  /// nothing acknowledged); otherwise, also with none open (item 26), exactly
+  /// `SubmitLifecycle`.
+  /// Fails closed where not composed.
+  [[nodiscard]] virtual Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleExpectingIncident(
+      const ComponentLifecycleIntentDTO&, const std::string&) {
+    return Result<CCLCLifecycleRequestResultDTO>::Err(
+        {"cclc_incident_check_unavailable",
+         "a lifecycle request with an expected incident is not composed",
+         {{"effect", "not_started"}}});
+  }
   [[nodiscard]] virtual Result<std::optional<CCLCLifecycleRequestResultDTO>>
   ReadLifecycleRequestResult(const ComponentLifecycleIntentDTO&) {
     return Result<std::optional<CCLCLifecycleRequestResultDTO>>::Err(
@@ -112,6 +137,10 @@ class ComponentLifecycleCoordinatorOpenRequestPort final : public ICCLCOpenReque
   [[nodiscard]] RequestOwnerEpoch ReadRequestOwnerEpoch() const override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycle(
       const ComponentLifecycleIntentDTO& intent) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleWithoutIncidentAcknowledgement(
+      const ComponentLifecycleIntentDTO& intent) override;
+  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleExpectingIncident(
+      const ComponentLifecycleIntentDTO& intent, const std::string& expected_incident_id) override;
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> ReadLifecycleRequestResult(
       const ComponentLifecycleIntentDTO& intent) override;
   [[nodiscard]] Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(

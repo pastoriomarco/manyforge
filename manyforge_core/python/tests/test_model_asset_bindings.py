@@ -10,7 +10,7 @@ import pytest
 core = pytest.importorskip("manyforge_core_py")
 
 MODEL_ASSET_SCHEMA_REVISION = (
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
 )
 
 
@@ -190,8 +190,28 @@ def test_model_asset_dto_round_trip_is_typed_and_read_only():
         "joint2",
     ]
 
+    assert asset.payload is None
+
     with pytest.raises(AttributeError):
         asset.root_frame_role_id = core.FrameRoleId("other")
+
+    payload = core.ModelAssetPayloadDTO(mass_kg=0.6, center_of_mass_m=[0.0, 0.0, 0.05])
+    with_payload = core.ModelAssetDTO(
+        model_asset_id=asset.model_asset_id,
+        model_revision=asset.model_revision,
+        instance_cardinality=asset.instance_cardinality,
+        expanded_source=expanded,
+        root_frame_role_id=asset.root_frame_role_id,
+        frame_role_bindings=frame_bindings,
+        model_group_role_bindings=group_bindings,
+        resource_role_bindings=resource_bindings,
+        collision_body_role_bindings=collision_bindings,
+        payload=payload,
+    )
+    assert with_payload.payload == payload
+    assert with_payload.payload.mass_kg == 0.6
+    assert list(with_payload.payload.center_of_mass_m) == [0.0, 0.0, 0.05]
+    assert with_payload != asset
 
 
 def test_expanded_source_requires_the_artifact_closure_argument():

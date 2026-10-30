@@ -109,7 +109,7 @@ export interface ResetApplySequence {
 /** The authoritative facts each step re-reads; never a cached owner state. */
 export interface ResetApplyFacts {
   cycle: Pick<ProgramCycleStatus,
-    | 'state' | 'programRunnerOwnerEpoch' | 'cycleGeneration' | 'programRunId'
+    | 'state' | 'cycleGeneration' | 'programRunId'
     | 'causalCorrelationId' | 'failure'> | null;
   /** The ordinary Apply of this document is admitted (Idle, fences current). */
   applyAvailable: boolean;
@@ -154,9 +154,6 @@ export function nextResetApplyStep(
   if (phase.kind === 'awaiting_idle') {
     const cycle = facts.cycle;
     if (cycle === null) return { kind: 'wait' };
-    if (cycle.programRunnerOwnerEpoch !== phase.reset.programRunnerOwnerEpoch) {
-      return failed('reset', 'The Program runner restarted before Reset settled. Its outcome is unknown; review the run state. Nothing was Applied.', true);
-    }
     if (cycle.causalCorrelationId === plan.correlationId) {
       if (cycle.state === 'idle_after_reset'
         && cycle.cycleGeneration > phase.reset.cycleGeneration) {
@@ -181,14 +178,10 @@ export function nextResetApplyStep(
   }
   if (phase.kind === 'applying') {
     if (phase.sent) return { kind: 'wait' };
-    // The settled Reset's identity is rechecked on every observation while
-    // waiting for admission and immediately before Apply is sent: the same
-    // runner owner, the same correlated Idle cycle and no run since.
+    // The settled Reset's Runner cycle is rechecked on every observation while
+    // waiting for admission and immediately before Apply is sent.
     const cycle = facts.cycle;
     if (cycle !== null) {
-      if (cycle.programRunnerOwnerEpoch !== phase.reset.programRunnerOwnerEpoch) {
-        return failed('apply', 'The Program runner restarted after Reset settled. Apply was not sent; review the run state and Apply again.');
-      }
       if (
         cycle.state !== 'idle_after_reset'
         || cycle.cycleGeneration !== phase.idle.cycleGeneration

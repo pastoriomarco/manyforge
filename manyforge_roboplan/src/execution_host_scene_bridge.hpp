@@ -54,10 +54,10 @@ public:
   [[nodiscard]] core::Result<core::Pose3DTO>
   GetObjectPose(const core::SceneResourceId &scene_resource_id) const override;
 
-private:
   [[nodiscard]] ManagerSceneRead
   Read(const std::stop_token stop_token = {}) const;
 
+private:
   std::filesystem::path manager_run_root_;
   std::shared_ptr<core::IPlannerSceneProjection> projection_;
 };
@@ -85,8 +85,6 @@ private:
   Failure(std::string code, std::string message) const;
 
   [[nodiscard]] CanonicalValue RuntimeIdentityValue() const;
-
-  void RequireRuntimeIdentity(const CanonicalValue &value) const;
 
   std::filesystem::path manager_run_root_;
   core::RetainedBundleId retained_bundle_id_;

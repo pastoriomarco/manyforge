@@ -1030,8 +1030,9 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
   const core::MotionParticipantIntentDTO motion{
       core::MoveId("move.ros2_control.stop." + suffix),
       core::FrameRoleId("base"),
-      core::MotionEndpointReferenceDTO{value.target_role_id,
-                                       core::FrameRoleId("tcp")},
+      core::TcpSelectorDTO(core::TcpEntryDTO{value.controllable_component_id,
+                                             value.command_target_id,
+                                             core::FrameRoleId("tcp")}),
       core::TolerancesDTO{0.01, 0.001, 0.01},
       core::SpeedProfileDTO{},
       core::TimeoutsDTO{},
@@ -1148,9 +1149,9 @@ public:
                                              const core::TrajectoryDTO &trajectory) override {
     return adapter_.Submit(key, Rename(trajectory));
   }
-  core::ExecutionPortCommandResultDTO Replace(const core::ExecutionGoalKey &active,
-                                              const core::ExecutionGoalKey &next,
-                                              const core::TrajectoryDTO &trajectory) override {
+  core::ExecutionPortCommandResultDTO Replace(
+      const core::ExecutionGoalKey &active, const core::ExecutionGoalKey &next,
+      const core::TrajectoryDTO &trajectory) override {
     return adapter_.Replace(active, next, Rename(trajectory));
   }
   core::ExecutionPortCommandResultDTO Cancel(const core::ExecutionGoalKey &key) override {

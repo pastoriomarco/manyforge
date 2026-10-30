@@ -326,4 +326,18 @@ struct PreparedOperationParticipantDTO final {
   }
 };
 
+/// Active TCP (M7): the TCP entry of a prepared motion, for the lane's TCP
+/// step (`ExecutionPortParticipantConfig::apply_tool_context`): its
+/// endpoint's target and frame role, owned by the component the Kernel
+/// stamped on the request's TCP frame (B7). Absent without a motion endpoint.
+[[nodiscard]] inline std::optional<TcpEntryDTO> prepared_motion_tcp_entry(
+    const PreparedOperationParticipantDTO& participant) {
+  const auto* motion = std::get_if<PreparedMotionExecutionDTO>(&participant.payload);
+  const auto* tcp = motion == nullptr ? nullptr
+                                      : std::get_if<ResolvedComponentModelFrameDTO>(
+                                            &motion->plan_request.tcp_frame);
+  if (tcp == nullptr || !participant.motion_endpoint) return std::nullopt;
+  return tcp_entry_of(*participant.motion_endpoint, tcp->controllable_component_id);
+}
+
 }  // namespace manyforge::core

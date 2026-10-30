@@ -7,8 +7,9 @@ The mirror installs a ready baseline whose context the same reply's catalog
 proves (SX-2216), then applies only same-context sparse
 ``interrupt_rule_state_changed`` events whose existing event sequence is
 strictly after the baseline's ``through_sequence``. Pending keeps an already
-qualified mirror of the same context (it keeps following its sparse events)
-and otherwise leaves the states unavailable, retried on the next poll. An
+qualified mirror of the same context (it keeps following its sparse events),
+except notify rules become unavailable until a ready cut. It otherwise leaves
+the states unavailable, retried on the next poll. An
 owner change, an unknown catalog or one proving another full context
 (SX-2207/2216),
 an unreadable page or a malformed row drops the mirror (unavailable, never
@@ -205,11 +206,14 @@ class InterruptRuleStateMirror:
         # Streamed rule rows at or below it are covered by the installed
         # baseline.
         self._state_boundary = 0
+        self._notify_boundary = 0
+        self._notify_sequences: dict[str, int] = {}
         self._lock = Lock()
         self._owner: str | None = None
         self._context: RuleStateContext | None = None
         self._cursor = 0
         self._states: dict[str, str] = {}
+        self._notify_pending = False
         self._published: Mapping[str, str] | None | bool = False
         # The latest installed global catalog read (None: none installed or
         # unreadable); `catalog_read` is False until a reply was read.
@@ -247,7 +251,8 @@ class InterruptRuleStateMirror:
         if context is None or self._catalog is None or not _proves(self._catalog, context):
             return None
         waiting = self._catalog.waiting_rule_ids
-        return {rule_id: state for rule_id, state in self._states.items() if rule_id not in waiting}
+        return {rule_id: state for rule_id, state in self._states.items()
+                if rule_id not in waiting and state != "unknown"}
 
     def catalog(self) -> RuleCatalog | None:
         """The installed global rule catalog, polling once if none was read."""
@@ -297,6 +302,9 @@ class InterruptRuleStateMirror:
     def _drop(self) -> None:
         self._context = None
         self._states = {}
+        self._notify_boundary = 0
+        self._notify_sequences = {}
+        self._notify_pending = False
 
     def poll(self, *, wait: bool = False) -> None:
         """One bounded read on the existing cadence (never concurrent); with
@@ -320,7 +328,11 @@ class InterruptRuleStateMirror:
 
     # Event subscription (contract §8.1) -------------------------------------
 
-    def follow(self, stop: Event, *, on_read: Callable[[], None] | None = None) -> None:
+    def follow(
+        self, stop: Event, *, on_read: Callable[[], None] | None = None,
+        on_message: Callable[[Mapping[str, Any]], None] | None = None,
+        on_disconnect: Callable[[BaseException], None] | None = None,
+    ) -> None:
         """Apply the event subscription until ``stop`` (reconnecting from the
         last cursor, dead link after three missed heartbeats). ``on_read`` runs
         after every message but a row or progress: a reading, also when
@@ -329,13 +341,20 @@ class InterruptRuleStateMirror:
         if self._subscribe is None:
             return
 
-        def on_message(message: Mapping[str, Any]) -> None:
+        def apply_message(message: Mapping[str, Any]) -> None:
             self.apply_stream_message(message)
+            if on_message is not None:
+                on_message(message)
             if message["type"] not in ("event", "progress") and on_read is not None:
                 on_read()
 
+        def stream_lost(error: BaseException) -> None:
+            self._stream_lost(error)
+            if on_disconnect is not None:
+                on_disconnect(error)
+
         follow_execution_events(
-            self._subscribe, on_message, stop, on_disconnect=self._stream_lost
+            self._subscribe, apply_message, stop, on_disconnect=stream_lost
         )
 
     def apply_stream_message(self, message: Mapping[str, Any]) -> None:
@@ -418,6 +437,8 @@ class InterruptRuleStateMirror:
         baseline = parse_baseline(state.get("interrupt_rule_state_baseline"))
         if baseline is None:
             self._drop()
+        elif baseline == "projection_pending":
+            self._invalidate_pending_notify_locked(catalog)
         elif isinstance(baseline, RuleStateBaseline):
             if baseline.context.owner_epoch != owner:
                 raise InterruptStateWireError("baseline names another Kernel owner")
@@ -428,6 +449,36 @@ class InterruptRuleStateMirror:
                 self._context = baseline.context
                 self._states = dict(baseline.states)
                 self._state_boundary = baseline.through_sequence
+                self._notify_boundary = baseline.through_sequence
+                self._notify_pending = False
+            elif baseline.through_sequence >= self._notify_boundary:
+                self._restore_notify_locked(catalog, baseline)
+
+    def _notify_needs_cut_locked(self, catalog: RuleCatalog, baseline: RuleStateBaseline) -> bool:
+        return self._notify_pending or any(
+            self._notify_sequences.get(rule_id, 0) <= baseline.through_sequence
+            and self._states.get(rule_id) != baseline.states.get(rule_id)
+            for rule_id in catalog.notify_rule_ids
+        )
+
+    def _invalidate_pending_notify_locked(self, catalog: RuleCatalog | None) -> None:
+        if catalog is not None and catalog.notify_rule_ids:
+            for rule_id in catalog.notify_rule_ids:
+                self._states.pop(rule_id, None)
+                self._notify_sequences.pop(rule_id, None)
+            self._notify_pending = True
+
+    def _restore_notify_locked(self, catalog: RuleCatalog, baseline: RuleStateBaseline) -> None:
+        for rule_id in catalog.notify_rule_ids:
+            if self._notify_sequences.get(rule_id, 0) > baseline.through_sequence:
+                continue
+            if rule_id in baseline.states:
+                self._states[rule_id] = baseline.states[rule_id]
+            else:
+                self._states.pop(rule_id, None)
+            self._notify_sequences.pop(rule_id, None)
+        self._notify_boundary = baseline.through_sequence
+        self._notify_pending = False
 
     def _apply_stream_event_locked(self, owner: str, event: Mapping[str, Any]) -> None:
         sequence = event.get("sequence")
@@ -447,7 +498,12 @@ class InterruptRuleStateMirror:
         if context != self._context:
             self._drop()  # Replacement before its baseline arrived.
             return
+        if (self._catalog is not None and rule_id in self._catalog.notify_rule_ids
+                and (self._notify_pending or sequence <= self._notify_boundary)):
+            return
         self._states[rule_id] = state
+        if self._catalog is not None and rule_id in self._catalog.notify_rule_ids:
+            self._notify_sequences[rule_id] = sequence
 
     def carried_object_last_losses(self) -> tuple[Mapping[str, Any], ...] | None:
         """The latest validated ``carried_object_last_losses`` (contract §10
@@ -497,6 +553,8 @@ class InterruptRuleStateMirror:
         if baseline is None:
             # No installed global rule catalog: unknown, never clear.
             self._drop()
+        elif baseline == "projection_pending":
+            self._invalidate_pending_notify_locked(catalog)
         elif isinstance(baseline, RuleStateBaseline):
             if baseline.context.owner_epoch != owner:
                 raise InterruptStateWireError("baseline names another Kernel owner")
@@ -512,7 +570,15 @@ class InterruptRuleStateMirror:
                     return True
                 self._context = baseline.context
                 self._states = dict(baseline.states)
+                self._notify_boundary = baseline.through_sequence
+                self._notify_pending = False
                 boundary = baseline.through_sequence
+            elif baseline.through_sequence >= self._notify_boundary:
+                needs_cut = self._notify_needs_cut_locked(catalog, baseline)
+                self._restore_notify_locked(catalog, baseline)
+                if needs_cut and self._cursor > baseline.through_sequence:
+                    self._cursor = baseline.through_sequence
+                    return True
         for event in page["events"]:
             if event.get("record_kind") == STOP_TERMINAL_EVENT_KIND:
                 self._retain_stop_terminal(owner, event)
@@ -527,7 +593,12 @@ class InterruptRuleStateMirror:
                 # Replacement before its baseline arrived: recapture.
                 self._drop()
                 continue
+            if (catalog is not None and rule_id in catalog.notify_rule_ids
+                    and (self._notify_pending or event["sequence"] <= self._notify_boundary)):
+                continue
             self._states[rule_id] = state
+            if catalog is not None and rule_id in catalog.notify_rule_ids:
+                self._notify_sequences[rule_id] = event["sequence"]
         self._cursor = max(page["next_after_sequence"], boundary)
         self._has_more = page["has_more"]
         return page["has_more"]

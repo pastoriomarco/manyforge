@@ -98,6 +98,9 @@ def _applied_binding() -> dict[str, Any]:
                 "component_role_id": "robot",
                 "controllable_component_id": "lite6_arm",
                 "command_target_id": "arm",
+                "robot_tcps": [{"entry": {"component_id": "mounted_tool",
+                                           "target_id": "gripper", "frame_role_id": "tip"},
+                                "end_effector": True}],
                 "capability_bindings": [
                     _capability("execution.trajectory.execute", None)
                 ],
@@ -146,6 +149,11 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
     participant = request["participants"][0]
     assert participant["component_role_id"] == "robot"
     assert participant["target_role_id"] == "arm"
+    assert participant["payload"]["tcp_endpoint"] == {
+        "kind": "entry", "entry": {
+            "component_id": "mounted_tool", "target_id": "gripper", "frame_role_id": "tip",
+        },
+    }
     assert participant["payload"]["motion"] == {
         "kind": "joint_goal",
         "joint_names": ["joint2", "joint1"],
@@ -153,6 +161,20 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
     }
     assert "robot_id" not in repr(request)
     assert "group_id" not in repr(request)
+
+
+def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
+    transport = RecordingTransport()
+    binding = _applied_binding()
+    binding["target_role_bindings"][0]["robot_tcps"] = []
+    runner = OrchestratorRunner(KernelClient(transport), binding)
+    with pytest.raises(ValueError, match="no unique end-effector TCP"):
+        runner.submit_joint_goal(
+            request_id="request-1", program_run_id="run-1", component_role_id="robot",
+            target_role_id="arm", node_instance_id="move", node_attempt_id="attempt",
+            move_id="move-1", joint_names=("joint1",), positions_rad=(0.1,),
+        )
+    assert transport.submitted is None
 
 
 def test_runner_reads_owner_projection_without_reducing_it() -> None:

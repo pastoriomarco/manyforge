@@ -3,16 +3,20 @@
 #include "retained_lifecycle_product_fixture.hpp"
 
 #include <gtest/gtest.h>
+#include <manyforge_core/component_lifecycle_admission_query.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
+#include <manyforge_roboplan/retained_vendor_device_status.hpp>
 #include <manyforge_xarm_control/lifecycle_profile.hpp>
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -124,7 +128,7 @@ void check_owned_process_health(bool with_pure_projection) {
   const deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
       root.path());
   auto product = RetainedHostLifecycleProduct::Create(
-      fixture.bundle, manifests, {binding}, {handle}, clock, 1000);
+      fixture.bundle, manifests, {binding}, {handle}, clock, 1000, 1'000'000);
   ASSERT_TRUE(product.ok()) << product.error().message;
   ASSERT_EQ(product.value()->brand_ports().size(), 1U);
   const auto occurrence =
@@ -215,11 +219,11 @@ TEST(RetainedRos2ControlLifecycleProductTest,
       epoch,
       provider.lifecycle_plan_catalog_digest};
   auto made = host_detail::IoProviderDriverRecord::Create(
-      scope, occurrence, manifest->value(), clock, 1000);
+      scope, occurrence, manifest->value(), clock, 1000, 1'000'000);
   ASSERT_TRUE(made.ok());
   auto driver = std::move(made.value());
   EXPECT_FALSE(RetainedHostLifecycleProduct::Create(
-                   fixture.bundle, manifests, {}, {}, *clock, 1000, {driver})
+                   fixture.bundle, manifests, {}, {}, *clock, 1000, 1'000'000, {driver})
                    .ok());
   const auto rows = deployment::ResolveRetainedIoSignalCatalog(
       fixture.bundle->value().cell_graph);
@@ -249,7 +253,7 @@ TEST(RetainedRos2ControlLifecycleProductTest,
                     .ok());
   }
   auto product = RetainedHostLifecycleProduct::Create(
-      fixture.bundle, manifests, {}, {}, *clock, 1000, {driver});
+      fixture.bundle, manifests, {}, {}, *clock, 1000, 1'000'000, {driver});
   ASSERT_TRUE(product.ok()) << product.error().message;
   ASSERT_EQ(product.value()->brand_ports().size(), 1U);
   EXPECT_EQ(product.value()->brand_ports().front().provider_occurrence,
@@ -303,7 +307,22 @@ Cause(core::LifecycleBlockingCauseClassDTO cause) {
            std::string(core::to_string(cause))}};
 }
 
-[[nodiscard]] core::LifecycleRecoverSelectionInput
+/// One domain's catalog and fresh observation.
+struct RecoverInput final {
+  core::BrandLifecyclePlanCatalogDTO lifecycle_plan_catalog;
+  core::BrandLifecycleObservationDTO fresh_observation;
+};
+
+/// V-B2: the domain's per-target answers from its adapter's admission.
+[[nodiscard]] std::array<core::LifecyclePostconditionResultDTO, 3>
+Targets(const RecoverInput &input) {
+  const auto targets = core::CatalogLifecycleAdmission(input.lifecycle_plan_catalog)
+                           .RecoverTargets(input.fresh_observation);
+  if (!targets.ok()) throw std::logic_error(targets.error().message);
+  return targets.value();
+}
+
+[[nodiscard]] RecoverInput
 Input(std::string_view domain, std::string_view instance,
       core::BrandLifecyclePlanCatalogDTO catalog,
       core::ComponentLifecycleStateDTO state,
@@ -338,11 +357,11 @@ Input(std::string_view domain, std::string_view instance,
       30,
       state,
       std::move(facts)};
-  return {std::move(occurrence), std::move(catalog), std::move(observation)};
+  return {std::move(catalog), std::move(observation)};
 }
 
 /// The Real arm after an emergency stop at start-up: not armed, vendor error.
-[[nodiscard]] core::LifecycleRecoverSelectionInput EmergencyStoppedArm() {
+[[nodiscard]] RecoverInput EmergencyStoppedArm() {
   return Input(
       "lite6_robot.arm.control", "lite6_robot.ros2_control",
       Catalog(xarm_control::kXArmRos2ControlLifecycleProviderManifestId,
@@ -365,7 +384,7 @@ Input(std::string_view domain, std::string_view instance,
 }
 
 /// The no-output pneumatic gripper: its logical owner is ready (active).
-[[nodiscard]] core::LifecycleRecoverSelectionInput
+[[nodiscard]] RecoverInput
 NoOutputGripper(std::string_view manifest, std::string_view instance,
                 std::vector<core::LifecycleIntentPlanDTO> plans) {
   return Input("lite6_robot.gripper.control", instance,
@@ -387,7 +406,7 @@ TEST(RetainedRos2ControlLifecycleProductTest,
   using State = core::ComponentLifecycleStateDTO;
   const auto arm = real_recover::EmergencyStoppedArm();
   const auto gripper = real_recover::NoOutputGripper(
-      kXArmRos2ControlGripperLifecycleProviderManifestId,
+      xarm_control::kXArmRos2ControlGripperLifecycleProviderManifestId,
       "lite6_robot.ros2_control.gripper",
       retained_ros2_control_gripper_lifecycle_plans());
 
@@ -396,13 +415,15 @@ TEST(RetainedRos2ControlLifecycleProductTest,
       xarm_control::kXArmRos2ControlLifecycleProviderManifestId,
       "lite6_robot.ros2_control",
       xarm_control::make_xarm_ros2_control_lifecycle_plans());
-  const auto refused = core::SelectCommonRecoverTarget({arm, shared});
+  const auto refused = core::SelectCommonRecoverTarget(
+      {real_recover::Targets(arm), real_recover::Targets(shared)});
   ASSERT_FALSE(refused.ok());
   EXPECT_EQ(refused.error().code, "component_lifecycle_recover_target_missing");
   EXPECT_EQ(refused.error().details.at("reason"), "no_common_recover_target");
 
   // Fixed: the gripper's own provider shares the arm's `disabled` target.
-  const auto target = core::SelectCommonRecoverTarget({arm, gripper});
+  const auto target = core::SelectCommonRecoverTarget(
+      {real_recover::Targets(arm), real_recover::Targets(gripper)});
   ASSERT_TRUE(target.ok()) << target.error().message;
   EXPECT_EQ(target.value(), State::kDisabled);
   // The arm dispatches the vendor `clean_error`...
@@ -415,7 +436,7 @@ TEST(RetainedRos2ControlLifecycleProductTest,
             core::LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
   ASSERT_TRUE(arm_step.value().selected_transition.has_value());
   EXPECT_EQ(arm_step.value().selected_transition->lifecycle_primitive_id.value(),
-            xarm_control::kXArmClearErrorPrimitiveId);
+            core::kDeviceClearErrorPrimitiveId);
   // ...while the healthy gripper has nothing to clear and dispatches nothing.
   const auto gripper_step =
       core::EvaluateLifecycleDomainPlan(Intent::kRecover, target.value(),
@@ -444,12 +465,12 @@ TEST(RetainedRos2ControlLifecycleProductTest,
   // plans; resources/maintained/catalog/provider_manifest/
   // manyforge.provider.ros2_control.xarm.gripper.json carries this digest.
   const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId(
-          std::string(kXArmRos2ControlGripperLifecycleProviderManifestId)),
+      core::ProviderManifestId(std::string(
+          xarm_control::kXArmRos2ControlGripperLifecycleProviderManifestId)),
       retained_ros2_control_gripper_lifecycle_plans());
   ASSERT_TRUE(semantic.ok()) << semantic.error().message;
   EXPECT_EQ(semantic.value().value(),
-            "sha256:4146867fc28c6f84d1167879a54dd189edd208a175dfcb31dfc061e5f082bc97");
+            "sha256:0ee1390f57b4c69e521124f96068fd4b7903ad0d423b7aadef66bf1dfcd37d4f");
   // Only the Recover row differs from the shared plans.
   auto plans = retained_ros2_control_gripper_lifecycle_plans();
   auto shared = retained_ros2_control_lifecycle_plans();
@@ -460,6 +481,139 @@ TEST(RetainedRos2ControlLifecycleProductTest,
   plans.pop_back();
   shared.pop_back();
   EXPECT_EQ(plans, shared);
+}
+
+// V-A: the vendor registry has the xArm family's row, from its library; the
+// persisted provider ids are unchanged.
+TEST(RetainedRos2ControlLifecycleProductTest, VendorRegistryHoldsTheXArmFamilyRow) {
+  const auto *xarm = find_vendor_adapter_family("xarm");
+  ASSERT_NE(xarm, nullptr);
+  EXPECT_EQ(xarm->vendor, "xarm");
+  EXPECT_EQ(xarm->arm_provider_manifest_id, "manyforge.provider.ros2_control.xarm");
+  EXPECT_EQ(xarm->gripper_provider_manifest_id,
+            "manyforge.provider.ros2_control.xarm.gripper");
+  ASSERT_NE(xarm->make_adapter, nullptr);
+  ASSERT_NE(xarm->make_arm_catalog, nullptr);
+  EXPECT_EQ(find_vendor_adapter_family("ur"), nullptr);
+  EXPECT_EQ(find_vendor_adapter_family(""), nullptr);
+
+  const auto arm = find_vendor_lifecycle_provider(
+      xarm_control::kXArmRos2ControlLifecycleProviderManifestId);
+  ASSERT_TRUE(arm.has_value());
+  EXPECT_EQ(arm->family, xarm);
+  EXPECT_EQ(arm->role, VendorLifecycleProviderRole::kArm);
+  const auto gripper = find_vendor_lifecycle_provider(
+      xarm_control::kXArmRos2ControlGripperLifecycleProviderManifestId);
+  ASSERT_TRUE(gripper.has_value());
+  EXPECT_EQ(gripper->family, xarm);
+  EXPECT_EQ(gripper->role, VendorLifecycleProviderRole::kGripper);
+  EXPECT_FALSE(find_vendor_lifecycle_provider(kRos2ControlLifecycleProviderManifestId)
+                   .has_value());
+  EXPECT_FALSE(find_vendor_lifecycle_provider("xarm_arm_provider").has_value());
+}
+
+// V-A: the adapter factory routes by family; an unknown family still throws,
+// and the xArm adapter still validates its data before any ROS effect.
+TEST(RetainedRos2ControlLifecycleProductTest, VendorAdapterFactoryRoutesByFamily) {
+  const VendorAdapterSelection xarm{.vendor = "xarm",
+                                    .driver_namespace = "/lite6_robot/xarm",
+                                    .axis_count = 6,
+                                    .joint_agreement_tolerance_rad = 0.01};
+  const auto adapter = make_retained_vendor_device_status_adapter(xarm);
+  ASSERT_NE(adapter, nullptr);
+  // Not started: the status is unavailable.
+  EXPECT_EQ(adapter->ReadHealth(0).cause,
+            core::LifecycleBlockingCauseClassDTO::kAvailability);
+
+  auto unknown = xarm;
+  unknown.vendor = "ur";
+  EXPECT_THROW(static_cast<void>(make_retained_vendor_device_status_adapter(unknown)),
+               std::invalid_argument);
+  auto no_axes = xarm;
+  no_axes.axis_count = 0;
+  EXPECT_THROW(static_cast<void>(make_retained_vendor_device_status_adapter(no_axes)),
+               std::invalid_argument);
+  auto relative = xarm;
+  relative.driver_namespace = "lite6_robot/xarm";
+  EXPECT_THROW(static_cast<void>(make_retained_vendor_device_status_adapter(relative)),
+               std::invalid_argument);
+}
+
+namespace vendor_catalog {
+
+/// A lifecycle provider manifest anchoring `plans` under `id`.
+[[nodiscard]] core::ProviderManifestDTO
+Manifest(const std::string_view id,
+         const std::vector<core::LifecycleIntentPlanDTO> &plans) {
+  const core::ProviderManifestId manifest_id{std::string(id)};
+  const auto semantic =
+      core::ComputeBrandLifecyclePlanCatalogSemanticDigest(manifest_id, plans);
+  if (!semantic.ok()) throw std::logic_error(semantic.error().message);
+  std::vector<core::ProviderCapabilityOfferDTO> offers;
+  for (const std::string_view capability :
+       {"component.lifecycle.disable", "component.lifecycle.enable",
+        "component.lifecycle.observe", "component.lifecycle.prepare",
+        "component.lifecycle.recover"}) {
+    const auto *definition = core::find_builtin_capability_definition(capability);
+    if (definition == nullptr) throw std::logic_error("missing definition");
+    offers.push_back({core::CapabilityId(std::string(capability)),
+                      core::CapabilityDefinitionRevision(
+                          std::string(definition->capability_definition_revision)),
+                      {}});
+  }
+  return {manifest_id,
+          core::ProviderManifestRevision(
+              "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+          std::move(offers),
+          {},
+          core::ProviderLifecyclePlanCatalogDeclarationDTO{
+              core::SchemaId(std::string(core::kBrandLifecyclePlanCatalogApiVersion)),
+              semantic.value()}};
+}
+
+} // namespace vendor_catalog
+
+// R7 package 4 through the V-A registry: the xArm arm provider gets the xArm
+// catalog, its gripper provider the Real gripper plans, the shared provider
+// the shared catalog; an unregistered vendor provider is refused.
+TEST(RetainedRos2ControlLifecycleProductTest,
+     PhysicalCatalogFollowsTheVendorRegistry) {
+  const auto arm_manifest = vendor_catalog::Manifest(
+      xarm_control::kXArmRos2ControlLifecycleProviderManifestId,
+      xarm_control::make_xarm_ros2_control_lifecycle_plans());
+  const auto arm = make_retained_physical_ros2_control_lifecycle_catalog(arm_manifest);
+  ASSERT_TRUE(arm.ok()) << arm.error().message;
+  const auto xarm = xarm_control::make_xarm_ros2_control_lifecycle_catalog(arm_manifest);
+  ASSERT_TRUE(xarm.ok()) << xarm.error().message;
+  EXPECT_EQ(arm.value(), xarm.value());
+
+  const auto gripper_manifest = vendor_catalog::Manifest(
+      xarm_control::kXArmRos2ControlGripperLifecycleProviderManifestId,
+      retained_ros2_control_gripper_lifecycle_plans());
+  const auto gripper =
+      make_retained_physical_ros2_control_lifecycle_catalog(gripper_manifest);
+  ASSERT_TRUE(gripper.ok()) << gripper.error().message;
+  const auto real_gripper = core::MakeBrandLifecyclePlanCatalog(
+      gripper_manifest.provider_manifest_id,
+      gripper_manifest.provider_manifest_revision,
+      retained_ros2_control_gripper_lifecycle_plans());
+  ASSERT_TRUE(real_gripper.ok()) << real_gripper.error().message;
+  EXPECT_EQ(gripper.value(), real_gripper.value());
+
+  const auto shared_manifest = vendor_catalog::Manifest(
+      kRos2ControlLifecycleProviderManifestId, retained_ros2_control_lifecycle_plans());
+  const auto shared =
+      make_retained_physical_ros2_control_lifecycle_catalog(shared_manifest);
+  ASSERT_TRUE(shared.ok()) << shared.error().message;
+  const auto expected_shared = make_retained_ros2_control_lifecycle_catalog(shared_manifest);
+  ASSERT_TRUE(expected_shared.ok()) << expected_shared.error().message;
+  EXPECT_EQ(shared.value(), expected_shared.value());
+
+  const auto unregistered = make_retained_physical_ros2_control_lifecycle_catalog(
+      vendor_catalog::Manifest("manyforge.provider.ros2_control.ur",
+                               retained_ros2_control_lifecycle_plans()));
+  ASSERT_FALSE(unregistered.ok());
+  EXPECT_EQ(unregistered.error().code, "ros2_control_lifecycle_product_unsupported");
 }
 
 } // namespace

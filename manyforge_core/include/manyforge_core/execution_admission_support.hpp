@@ -3,6 +3,7 @@
 #include <manyforge_core/types/trajectory_dto.hpp>
 
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <stop_token>
 #include <string>
@@ -15,6 +16,8 @@ struct PreparedExecutionStart {
   bool cache_invalidated = false;
   std::string cache_invalidation_reason;
   TrajectoryDTO trajectory;
+  /// Planning attempt of a cached trajectory (its validation step).
+  std::uint32_t cache_planning_attempt_index = 0;
 };
 
 class WorkerStartGate {

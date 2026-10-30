@@ -192,6 +192,7 @@ describe('hardware-acting node rule', () => {
     }
     expect([...HARDWARE_ACTING_NODE_IDS].sort()).toEqual([...derived].sort());
     expect(derived.has('gripper.check_status')).toBe(false);
+    expect(derived.has('motion.set_tcp')).toBe(true);
     expect(derived.has('kernel.reset_operation')).toBe(true);
     expect(derived.has('kernel.full_stop')).toBe(true);
   });
@@ -225,6 +226,34 @@ describe('hardware-acting node rule', () => {
     tree.children = [...tree.children, reset];
     expect(executionGroupDisplay(['all', 'arm'], undefined, executionGroupScopes([tree], ['arm'])).fallback)
       .toBe('uncovered');
+  });
+
+  it('covers Set TCP visibility without treating it as a velocity-scaling target', () => {
+    const tree: ProgramTreeNode = {
+      ...leaf('root', 'parallel'),
+      children: [leaf('set-tcp', 'motion.set_tcp', ['tcp'], 'left-arm')],
+    };
+    const scopes = executionGroupScopes([tree], ['other', 'tcp']);
+    const all = scopes.find((scope) => scope.groupId === 'all')!;
+    expect(all.hardwareNodeIds).toEqual(['set-tcp']);
+    expect(all.targetRoleIds).toEqual(['left-arm']);
+    expect(all.motionTargetRoleIds).toEqual([]);
+
+    const groupIds = scopes.map((scope) => scope.groupId);
+    expect(executionGroupDisplay(groupIds, ['all', 'tcp'], scopes)).toEqual({
+      preferred: ['other'], shown: ['all', 'other'], fallback: 'uncovered',
+    });
+    expect(executionGroupVisibilityChange(groupIds, ['all'], scopes, 'tcp', false))
+      .toEqual({ refused: expect.stringContaining('Show All') });
+
+    const applied = appliedProgram();
+    applied.program.execution_groups = { tcp: { execution_policy: 'independent' } };
+    applied.program.tree = leaf('set-tcp', 'motion.set_tcp', ['tcp'], 'left-arm');
+    expect(appliedExecutionSelectionRows(applied).find((row) => row.groupId === 'tcp'))
+      .toMatchObject({
+        runtimeScaleSelector: null,
+        runtimeScaleUnavailableReason: 'selection_has_no_motion_targets',
+      });
   });
 
   it('sorts group IDs canonically by code point', () => {

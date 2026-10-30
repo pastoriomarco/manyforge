@@ -182,7 +182,7 @@ describe('ComponentStreamsSection', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('reports an owner rejection', async () => {
+  it('leaves an owner rejection to the yellow notice row, with no inline alert', async () => {
     const controller = controllerWith(undefined, null);
     const mounted = await mount(controller);
     try {
@@ -190,7 +190,7 @@ describe('ComponentStreamsSection', () => {
       // Let the owner's refusal settle.
       await act(() => new Promise((resolve) => { setTimeout(resolve, 0); }));
       expect(controller.mutate).toHaveBeenCalledOnce();
-      expect(mounted.find((props) => props.role === 'alert').children).toBe('Value was rejected.');
+      expect(() => mounted.find((props) => props.role === 'alert')).toThrow();
     } finally { await mounted.unmount(); }
   });
 

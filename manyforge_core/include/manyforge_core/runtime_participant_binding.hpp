@@ -10,6 +10,7 @@
 #include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
 #include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/program_binding.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -121,6 +122,30 @@ struct RuntimeMotionEndpointBindingDTO final {
   friend bool operator==(const RuntimeMotionEndpointBindingDTO&,
                          const RuntimeMotionEndpointBindingDTO&) = default;
 };
+
+/// Active TCP (M7): the TCP entry of a resolved endpoint. `owner` is the
+/// component owning the endpoint's frame (B7: the registration's
+/// `motion_endpoint_owner`, else the motion component itself).
+[[nodiscard]] inline TcpEntryDTO tcp_entry_of(const RuntimeMotionEndpointBindingDTO& endpoint,
+                                              const ControllableComponentId& owner) {
+  return TcpEntryDTO{owner, endpoint.command_target_id, endpoint.frame.frame_role_id};
+}
+
+/// Active TCP (M7): whether a move's or a Set TCP's selector admits the
+/// resolved endpoint. Current and form 2 are resolved by the owner's resolver
+/// (from the robot's Active TCP and the Program binding). An entry must name
+/// the endpoint's target and frame and, where the owner is known (the Kernel,
+/// from its registration), its owner; the sealed binding alone does not carry
+/// the owner (B7), so the registry passes none.
+[[nodiscard]] inline bool tcp_selector_admits(const TcpSelectorDTO& selector,
+                                              const RuntimeMotionEndpointBindingDTO& endpoint,
+                                              const std::optional<ControllableComponentId>& owner) {
+  const auto* entry = std::get_if<TcpEntryDTO>(&selector);
+  return entry == nullptr ||
+         (entry->target_id == endpoint.command_target_id &&
+          entry->frame_role_id == endpoint.frame.frame_role_id &&
+          (!owner || entry->component_id == *owner));
+}
 
 /// Complete owner-to-owner value before sealing. Public operation callers
 /// never construct or submit this record.

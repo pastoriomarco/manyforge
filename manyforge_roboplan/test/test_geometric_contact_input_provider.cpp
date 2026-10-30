@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <future>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -22,6 +23,8 @@ const core::IoSignalId kSignal{core::ControllableComponentId("sensor.contact"),
                                "contact"};
 const core::CollisionBodyId kEndpoint(
     "component/robot.arm/model/arm/body/tool/collision/0");
+const core::CollisionBodyId kRobotBody(
+    "component/robot.arm/model/arm/body/flange/collision/0");
 const core::CollisionBodyId kTarget("scene/fixture.target/shape/0");
 
 core::IoSignalDescriptorDTO descriptor(core::Duration age = 25) {
@@ -152,6 +155,10 @@ protected:
     ingress = std::shared_ptr<core::IoSignalIngress>(std::move(queued.value()));
     auto binding = make_binding(kIncarnation, kEndpoint, publisher_, engine,
                                 {motion, gripper}, age);
+    binding.read_contact_bodies = [this] {
+      if (selection_error) return core::Result<std::vector<core::CollisionBodyId>>::Err(*selection_error);
+      return core::Result<std::vector<core::CollisionBodyId>>::Ok(selected_bodies);
+    };
     auto made = GeometricContactInputProvider::Create(
         ingress, clock, scheduler, std::move(binding), 1U);
     ASSERT_TRUE(made.ok()) << made.error().message;
@@ -184,7 +191,10 @@ protected:
     endpoint_body.body_id = endpoint_body_id;
     core::CollisionWorldBody target_body{};
     target_body.body_id = kTarget;
+    core::CollisionWorldBody robot_body{};
+    robot_body.body_id = kRobotBody;
     world->bodies = {std::move(endpoint_body), std::move(target_body)};
+    if (endpoint_body_id != kRobotBody) world->bodies.push_back(std::move(robot_body));
     std::sort(world->bodies.begin(), world->bodies.end(),
               [](const auto &a, const auto &b) { return a.body_id < b.body_id; });
     auto bundle = std::make_shared<core::RuntimeCollisionQueryBundle>();
@@ -201,21 +211,12 @@ protected:
       std::vector<std::shared_ptr<const core::ObservedRobotStatePublication>>
           observed,
       core::Duration age = 25) {
-    const core::CollisionBodyRoleId body_role("tool");
-    const core::ModelInstanceId model("arm");
-    const core::ModelRevision model_revision("model.1");
-    core::RuntimeMotionEndpointBindingDTO endpoint{
-        core::TargetRoleId("motion"), core::CommandTargetId("arm"),
-        {core::FrameRoleId("tool"), model, model_revision, "tool_link",
-         {body_role}},
-        {{core::ComponentRoleId("robot"), core::TargetRoleId("motion"),
-          core::ControllableComponentId("robot.arm"),
-          core::CommandTargetId("arm"), std::nullopt, body_role, model,
-          model_revision, {endpoint_body_id}}}};
     return {kSource,
             std::move(incarnation),
             {descriptor(age)},
-            std::move(endpoint),
+            [endpoint_body_id] {
+              return core::Result<std::vector<core::CollisionBodyId>>::Ok({endpoint_body_id});
+            },
             core::SceneResourceId("fixture.target"),
             std::move(observed),
             std::move(selected_publisher),
@@ -223,7 +224,13 @@ protected:
             std::shared_ptr<core::IScheduler>(&scheduler,
                                               [](core::IScheduler *) {}),
             10,
-            5};
+            5,
+            [this](const core::CollisionWorldSnapshot &,
+                   const core::CollisionBodyId &body) -> std::optional<bool> {
+              const auto found = body_classes.find(body);
+              return found == body_classes.end() ? std::optional<bool>(false)
+                                                 : found->second;
+            }};
   }
 
   void Successor(
@@ -246,6 +253,9 @@ protected:
 
   core::FakeClock clock;
   core::ManualScheduler scheduler;
+  std::vector<core::CollisionBodyId> selected_bodies{kEndpoint};
+  std::optional<core::ErrorDTO> selection_error;
+  std::map<core::CollisionBodyId, std::optional<bool>> body_classes;
   std::shared_ptr<core::ObservedRobotStatePublication> motion, gripper;
   std::shared_ptr<Publisher> publisher_;
   std::shared_ptr<Engine> engine;
@@ -272,6 +282,124 @@ TEST_F(GeometricContactInputProviderTest, ImmediateContactUsesBothReportedStates
   clock.set(126);
   EXPECT_EQ(signals->ReadSignal(kSignal).value().availability,
             core::IoSignalAvailability::kStale);
+}
+
+// A new Active TCP changes the endpoint body set on the next sample while
+// the provider remains enabled. The engine keeps reporting the same gripper
+// collision, so only the selected body set changes the observed level.
+TEST_F(GeometricContactInputProviderTest, ActiveTcpChangeSelectsCurrentBodiesEverySample) {
+  Build();
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.latest_sample->publication.value, std::optional<bool>(true));
+
+  selected_bodies = {kRobotBody};
+  clock.set(110);
+  scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kFresh);
+  EXPECT_EQ(observed.latest_sample->publication.value, std::optional<bool>(false));
+  EXPECT_EQ(engine->queries, 2U);
+
+  selected_bodies = {kEndpoint};
+  clock.set(120);
+  scheduler.advance_to(120, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.latest_sample->publication.value, std::optional<bool>(true));
+  EXPECT_EQ(engine->queries, 3U);
+}
+
+TEST_F(GeometricContactInputProviderTest, StaticAndUnknownBodiesAreUnavailableThenMovingResumes) {
+  Build();
+  body_classes[kEndpoint] = true;
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_FALSE(observed.latest_sample->publication.value.has_value());
+  ASSERT_TRUE(observed.latest_sample->publication.error);
+  EXPECT_EQ(observed.latest_sample->publication.error->code, "io_source_unavailable");
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"), "contact_bodies_static");
+  EXPECT_EQ(engine->queries, 0U);
+
+  body_classes[kEndpoint] = std::nullopt;
+  clock.set(110);
+  scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  ASSERT_TRUE(observed.latest_sample->publication.error);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"), "collision_geometry_unresolved");
+  EXPECT_EQ(engine->queries, 0U);
+
+  body_classes[kEndpoint] = false;
+  clock.set(120);
+  scheduler.advance_to(120, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kFresh);
+  EXPECT_EQ(observed.latest_sample->publication.value, std::optional<bool>(true));
+  EXPECT_EQ(engine->queries, 1U);
+
+  selected_bodies = {kEndpoint, kRobotBody};
+  body_classes[kRobotBody] = true;
+  clock.set(130);
+  scheduler.advance_to(130, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  ASSERT_TRUE(observed.latest_sample->publication.error);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"), "contact_bodies_static");
+  EXPECT_EQ(engine->queries, 1U);
+}
+
+TEST_F(GeometricContactInputProviderTest, UnavailableSelectionNeverPublishesFalse) {
+  Build();
+  selection_error = core::ErrorDTO{"execution_rejected", "no Active TCP", {{"reason", "active_tcp_unavailable"}}};
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  auto initial = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(initial.latest_sample);
+  EXPECT_EQ(initial.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_FALSE(initial.latest_sample->publication.value.has_value());
+  ASSERT_TRUE(initial.latest_sample->publication.error);
+  EXPECT_EQ(initial.latest_sample->publication.error->code, "io_source_unavailable");
+  EXPECT_EQ(initial.latest_sample->publication.error->details.at("reason"), "active_tcp_unavailable");
+  ASSERT_TRUE(provider->Pause(3));
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  selection_error = core::ErrorDTO{"execution_rejected", "tool not mounted", {{"reason", "tcp_tool_not_mounted"}}};
+  ASSERT_TRUE(provider->Resume(4).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_FALSE(observed.latest_sample->publication.value.has_value());
+  ASSERT_TRUE(observed.latest_sample->publication.error);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"), "tcp_tool_not_mounted");
+  ASSERT_TRUE(provider->Pause(5));
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  selection_error.reset();
+  selected_bodies.clear();
+  ASSERT_TRUE(provider->Resume(6).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_FALSE(observed.latest_sample->publication.value.has_value());
+  ASSERT_TRUE(observed.latest_sample->publication.error);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"),
+            "active_tcp_contact_bodies_unavailable");
+  EXPECT_EQ(engine->queries, 0U);
 }
 
 TEST_F(GeometricContactInputProviderTest, StateReceivedAfterTheQueryClockIsCurrent) {

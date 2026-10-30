@@ -299,7 +299,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "lite6_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:3ad8900613ada4ed9a89d3605a27a750a71b320a3e17100954795daeceb81866",
+      "capability_provider_binding_revision": "sha256:bbb6ee9cdadcdccd819b5b88f2cbe39ab3bd33973cecbb9ac86cfc22386565e8",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -310,13 +310,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -324,7 +324,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "lite6_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:723bd022bf2138d43a1b18087da9e5c43a3cff50598741aecd0e43c4a8bfde39",
+      "capability_provider_binding_revision": "sha256:60a7d9ee8969a5db2f462d89a6dd9fe6b78debd432d59ad880baaa0206fb5957",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -335,13 +335,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -349,7 +349,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:d37d921a0d097ed960a49409f0130796888986521778bf0e50a9f7c3dd93e26e",
+      "capability_provider_binding_revision": "sha256:9c2ea78e8345952e7e92d08fae5ce1f1c3e2aa1bdfa7a46670c1d57f6c54e3a4",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -360,13 +360,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -374,7 +374,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:3b99d9747b9735c98250e676ea49073da6fe2286d1e310d3fc57450f74dd75d0",
+      "capability_provider_binding_revision": "sha256:1b8b8247dad10695e973478c7658e4b9033b60db1e052cd9db77a78e36b9b61f",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -385,13 +385,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -399,7 +399,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:a01d6afaddce1d892dfc7513cd8c418dea6b1b00deb1fbcdc72d6fbeaa9d6634",
+      "capability_provider_binding_revision": "sha256:c20390b5b0f52e24f7710371a7587811141756d9a6460f1d2faa0e6b8095bca9",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -410,13 +410,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -424,7 +424,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:5bd3ee5e094ab798e79acf495ca1fb5ddf26757b1252abd73f4171d3708a3e12",
+      "capability_provider_binding_revision": "sha256:87c73a81a82087dc532fdf9a825fc7a6bac7db94cba98175f17545158db48c19",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -435,13 +435,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -449,7 +449,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:a037d51408dc02765df7e44bea0ebad16d6fa50035bb1a28413230b0d2ad5997",
+      "capability_provider_binding_revision": "sha256:a132918ca3249596146ae8b7e0b126b8603f51a2d8c542f69517439eba89f516",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -460,13 +460,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -474,7 +474,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:6dd13a2b6280bbd8ef1a2d60035e2219a930872f0db4201285e8609970405cf5",
+      "capability_provider_binding_revision": "sha256:85b497768885b23d04492bc2f0e663496a5a6842c26a0f7b087a257bc9a62222",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -485,13 +485,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -499,7 +499,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "lite6_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:f3d3a986946e2bcd0b7c4746a561334df951fbff8760fa20944085a3ad62f948",
+      "capability_provider_binding_revision": "sha256:133e22020896a05be11beee0d7f45c8f6a6ae37b61e3aae1f4e5071dda9d827c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -510,13 +510,13 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -524,7 +524,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "lite6_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:375d32c75368074b5ddcee3a243c84ff13b16febbe768552ac0faae135da3f82",
+      "capability_provider_binding_revision": "sha256:36eb6f23f43318d1eb77a99c1c4b4ed2d7a4fa881efbcf2b4a4b89228f2edc97",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -535,21 +535,21 @@
       ],
       "provider_instance_id": "lite6_robot.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "controllable_component_id": "lite6_robot"
       }
     },
     {
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
-      "capability_provider_binding_id": "lite6_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:dc00561cd338d6185192edd554178427c5cff30a4f16aa9662ed8c8a8a25be8f",
+      "capability_provider_binding_id": "lite_gripper.gripper.model-kinematics-fk.provider",
+      "capability_provider_binding_revision": "sha256:1637acb4cdb3f4f0a8fe0c2f9b668feee267bee2bfe1f0b69ed53c4b59809548",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -558,23 +558,23 @@
           "source_kind": "runtime_unit"
         }
       ],
-      "provider_instance_id": "lite6_robot.ros2_control",
+      "provider_instance_id": "lite_gripper.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
-        "controllable_component_id": "lite6_robot"
+        "component_type_revision": "sha256:406be5c93696a12dba1740c6051f5323a3448fde5b140c1b1e96d88e411d6de8",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-command",
+        "control_binding_revision": "sha256:7f71d68f3f4277ccd14ed57fd2f0d207867601b7816541ea485f1584facd89c3",
+        "controllable_component_id": "lite_gripper"
       }
     },
     {
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
-      "capability_provider_binding_id": "lite6_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:0957476b02583a10b2d4ba9b1ea2ad5397c822e0d33c2054f5f5c3323a9509c1",
+      "capability_provider_binding_id": "lite_gripper.gripper.model-limits-joint.provider",
+      "capability_provider_binding_revision": "sha256:152fab9a6156237bd70a423ec3ccfa16cedd68a19da5cb7bac1e27fc566920db",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -583,16 +583,16 @@
           "source_kind": "runtime_unit"
         }
       ],
-      "provider_instance_id": "lite6_robot.ros2_control",
+      "provider_instance_id": "lite_gripper.ros2_control",
       "provider_manifest_id": "manyforge.provider.ros2_control",
-      "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+      "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
-        "controllable_component_id": "lite6_robot"
+        "component_type_revision": "sha256:406be5c93696a12dba1740c6051f5323a3448fde5b140c1b1e96d88e411d6de8",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-command",
+        "control_binding_revision": "sha256:7f71d68f3f4277ccd14ed57fd2f0d207867601b7816541ea485f1584facd89c3",
+        "controllable_component_id": "lite_gripper"
       }
     }
   ],
@@ -959,13 +959,22 @@
         "schema_revision": "sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.fixed_scale.component/e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
-        "content_digest": "sha256:43e5a9b609b07b0419d8f8fc6382b231758c66e4d59488bdb7742560df672af1",
-        "record_id": "lite6_lite_gripper.fixed_scale.component",
+        "content_addressed_store_key": "catalog/maintained/component_type/lite6.fixed_scale.component/d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
+        "content_digest": "sha256:3009855a3651bd8832f28c145c380363b40ad5ddd0ef5d4d3da3fb404664d7c0",
+        "record_id": "lite6.fixed_scale.component",
         "record_kind": "component_type",
-        "record_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "record_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
+        "schema_revision": "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde"
+      },
+      {
+        "content_addressed_store_key": "catalog/maintained/component_type/lite_gripper.fixed_scale.component/406be5c93696a12dba1740c6051f5323a3448fde5b140c1b1e96d88e411d6de8",
+        "content_digest": "sha256:ed13fe98c73fc01420d32d62437f68a4b966768f3ae26be49516ef8c7ee942b8",
+        "record_id": "lite_gripper.fixed_scale.component",
+        "record_kind": "component_type",
+        "record_revision": "sha256:406be5c93696a12dba1740c6051f5323a3448fde5b140c1b1e96d88e411d6de8",
+        "schema_id": "manyforge.component_type.v1",
+        "schema_revision": "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1004,13 +1013,22 @@
         "schema_revision": "sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/model_asset/lite6_lite_gripper/7fecf93ef1b79a9f045607bd24642c4f0b6b8009808c8aaec4075eb1d10cfc6e",
-        "content_digest": "sha256:6551537245232c5292a01090d65ef7d2db28d7d05ec46865cd2cb0cbf76a81bf",
-        "record_id": "lite6_lite_gripper",
+        "content_addressed_store_key": "catalog/maintained/model_asset/lite6/fdcb5ec818f0c2a41ec8de94cc99c9f2e55aae6d3a0e66f3a609f722a41c1930",
+        "content_digest": "sha256:f35ea54f6e81ef8dc23e2743d92c3994bbe206825c98c17534f56009343d2837",
+        "record_id": "lite6",
         "record_kind": "model_asset",
-        "record_revision": "sha256:7fecf93ef1b79a9f045607bd24642c4f0b6b8009808c8aaec4075eb1d10cfc6e",
+        "record_revision": "sha256:fdcb5ec818f0c2a41ec8de94cc99c9f2e55aae6d3a0e66f3a609f722a41c1930",
         "schema_id": "manyforge.model_asset.v1",
-        "schema_revision": "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
+        "schema_revision": "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
+      },
+      {
+        "content_addressed_store_key": "catalog/maintained/model_asset/lite_gripper/4874ba0e2d06983323d520a793af17119b8d73c2f90899a37e075d739dbba4ef",
+        "content_digest": "sha256:b079a155706603bf78d6b84625948b2e4f5588fa3fe4e583d0b2f70d4193251c",
+        "record_id": "lite_gripper",
+        "record_kind": "model_asset",
+        "record_revision": "sha256:4874ba0e2d06983323d520a793af17119b8d73c2f90899a37e075d739dbba4ef",
+        "schema_id": "manyforge.model_asset.v1",
+        "schema_revision": "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
       },
       {
         "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.logical_scene/352903171f0341c0f5c018fd2a363eb7b3a69ecdb3180dbc41772ad86908ec60",
@@ -1022,20 +1040,20 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.ros2_control/c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
-        "content_digest": "sha256:ea67d75525ce152be5c7a313e21eb6d53259b312d9082dc110b5160439e72348",
+        "content_addressed_store_key": "catalog/maintained/provider_manifest/manyforge.provider.ros2_control/793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
+        "content_digest": "sha256:daca26dd0823207211946bc49c5e64571a0bd65bd898a26c94981867cb2f0cb1",
         "record_id": "manyforge.provider.ros2_control",
         "record_kind": "provider_manifest",
-        "record_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "record_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "schema_id": "manyforge.provider_manifest.v1",
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
-        "content_digest": "sha256:f650c84f2498f701b31a4cb4fa86cda385aecad50a17cbd6e10231724e30cddd",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/76a672d97c93e6e99a6dc9dc9e846c87612a0693d558b4e135c0f28326e99d00",
+        "content_digest": "sha256:8572fea6146d19e812a336996f5dc77c98e8f484edc4f8ff53d306659df6f597",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
+        "record_revision": "sha256:76a672d97c93e6e99a6dc9dc9e846c87612a0693d558b4e135c0f28326e99d00",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1071,7 +1089,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:b7593f5cf822b07c8a7a55d87ba82221461d3baa025232c198a6103c8d04f4ef",
+  "deployment_revision": "sha256:872bc1d040c048564af52512ce796d79b2dd72aef18fde452f6e537134ab63a7",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -1079,42 +1097,42 @@
       "binding_routes": [
         {
           "control_binding_id": "lite6_robot.arm.execution-contact-geometric",
-          "control_binding_revision": "sha256:41e761cb590544416b386dab6e7e37fd758b6b9c91114aefc6c253551bbebe2c",
+          "control_binding_revision": "sha256:2c749f6769d4fc4cef1670e6b12f5204fa65e84447fdcaa69fbd1e813824451b",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-contact-geometric_signed_penetration",
-          "control_binding_revision": "sha256:9a4b27fa15523d71730cb763be0cbf73e5480c8454c067229821473d187fbaa0",
+          "control_binding_revision": "sha256:8c48fb8c4dfe18ea9568674d825982c71cfad2b2cd62d86d03d7680cdc6e8444",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-feedback-phase_events",
-          "control_binding_revision": "sha256:4dff43b527d71e1cffb049bd352639db842139113f8d37adc1c9286b0db7ca83",
+          "control_binding_revision": "sha256:1491bb6b38cb5d457d9ecbbec0b87d1eedf44c27ce8da9935b75335ae6a1018d",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-feedback-state_snapshots",
-          "control_binding_revision": "sha256:9b5f5334e3c356c65fe80999b61beb503ca7234ab6e2aeb9f2990ac44646595f",
+          "control_binding_revision": "sha256:f51c8e8553a80bb3a99985f1f598348a4a8ec57074f9a85208df088ef36d1287",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-reset",
-          "control_binding_revision": "sha256:5bf213819adbb697ddcade3dc05af11dc4ea3374ff5272083d17ded4d4e59b35",
+          "control_binding_revision": "sha256:bc731b2518516b8531c37b4d2ac28efaef8fe9ca7489cdb2f48ebf7917c8e084",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-stop-soft",
-          "control_binding_revision": "sha256:d0a1c8d11c972e139ee2fd35248a1ea2e5ba8726f7e78f61cd534e762106f86e",
+          "control_binding_revision": "sha256:2b069d9d8ce602d346482fe884e05f8174b94fedee65ad265b9b380e9dada3d1",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-          "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+          "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "lite6_robot.arm.state-observed-current",
-          "control_binding_revision": "sha256:11153242acc8454a6f01e88e257aa491efef743c150e60eac0086bb1dcdb9ec1",
+          "control_binding_revision": "sha256:cfb9b6e7dabbdffbf482cee7bcfbeeb712dae5afb0b39f8c7ddcb11f63576f44",
           "control_route_id": "arm_position"
         }
       ],
@@ -1127,24 +1145,50 @@
       "activation_set_id": "gripper_direct",
       "binding_routes": [
         {
-          "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-          "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
+          "control_binding_id": "lite_gripper.gripper.tool-gripper-command",
+          "control_binding_revision": "sha256:7f71d68f3f4277ccd14ed57fd2f0d207867601b7816541ea485f1584facd89c3",
           "control_route_id": "gripper_position"
         },
         {
-          "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-          "control_binding_revision": "sha256:cb4799bffaa7851f228b0df588eca969c5e90e61ba358e6e4cb58329b30e03b9",
+          "control_binding_id": "lite_gripper.gripper.tool-gripper-feedback",
+          "control_binding_revision": "sha256:65864c428308252bd2861a728098d7c8d6b5d0f3a74b43d89acfe9251fe9c6d4",
           "control_route_id": "gripper_position"
         }
       ],
-      "control_domain_id": "lite6_robot.gripper.control",
-      "control_domain_revision": "sha256:4a5ac21af0f675ee824cc47a2efc205344bf5f78d9e9da0c54ff91bb60bd89b0",
+      "control_domain_id": "lite_gripper.gripper.control",
+      "control_domain_revision": "sha256:cc49be59fbf9daf79b89179ac143de6c5ab64caa3c42e103997a1ec6467fff47",
       "controller_topology_id": "manyforge.ros2_control_gripper_direct",
       "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
     }
   ],
   "graph": {
-    "component_attachments": [],
+    "component_attachments": [
+      {
+        "child": {
+          "attachment_interface_id": "mount",
+          "controllable_component_id": "lite_gripper"
+        },
+        "child_interface_pose_in_parent_interface": {
+          "orientation_xyzw": [
+            0,
+            0,
+            0,
+            1
+          ],
+          "position_m": [
+            0,
+            0,
+            0
+          ]
+        },
+        "component_attachment_id": "lite_gripper",
+        "component_attachment_revision": "sha256:1288e22c5f4c7cd9d400a93a8fd32067786bea60c1e141ba948f64803af82faa",
+        "parent": {
+          "attachment_interface_id": "flange",
+          "controllable_component_id": "lite6_robot"
+        }
+      }
+    ],
     "control_bindings": [
       {
         "capability_definition_revision": "sha256:63a3d877d78d71a5932cce5c92d2932b740fbba6e88d00ca3b5dd94429e3eb3d",
@@ -1152,7 +1196,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:41e761cb590544416b386dab6e7e37fd758b6b9c91114aefc6c253551bbebe2c",
+        "control_binding_revision": "sha256:2c749f6769d4fc4cef1670e6b12f5204fa65e84447fdcaa69fbd1e813824451b",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1163,7 +1207,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1214,7 +1258,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:9a4b27fa15523d71730cb763be0cbf73e5480c8454c067229821473d187fbaa0",
+        "control_binding_revision": "sha256:8c48fb8c4dfe18ea9568674d825982c71cfad2b2cd62d86d03d7680cdc6e8444",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1225,7 +1269,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1276,7 +1320,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:4dff43b527d71e1cffb049bd352639db842139113f8d37adc1c9286b0db7ca83",
+        "control_binding_revision": "sha256:1491bb6b38cb5d457d9ecbbec0b87d1eedf44c27ce8da9935b75335ae6a1018d",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1287,7 +1331,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1338,7 +1382,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9b5f5334e3c356c65fe80999b61beb503ca7234ab6e2aeb9f2990ac44646595f",
+        "control_binding_revision": "sha256:f51c8e8553a80bb3a99985f1f598348a4a8ec57074f9a85208df088ef36d1287",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1349,7 +1393,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1400,7 +1444,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:5bf213819adbb697ddcade3dc05af11dc4ea3374ff5272083d17ded4d4e59b35",
+        "control_binding_revision": "sha256:bc731b2518516b8531c37b4d2ac28efaef8fe9ca7489cdb2f48ebf7917c8e084",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1411,7 +1455,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1462,7 +1506,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d0a1c8d11c972e139ee2fd35248a1ea2e5ba8726f7e78f61cd534e762106f86e",
+        "control_binding_revision": "sha256:2b069d9d8ce602d346482fe884e05f8174b94fedee65ad265b9b380e9dada3d1",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1473,7 +1517,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1524,7 +1568,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1535,7 +1579,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1597,7 +1641,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:11153242acc8454a6f01e88e257aa491efef743c150e60eac0086bb1dcdb9ec1",
+        "control_binding_revision": "sha256:cfb9b6e7dabbdffbf482cee7bcfbeeb712dae5afb0b39f8c7ddcb11f63576f44",
         "control_domain_id": "lite6_robot.arm.control",
         "control_interface_contract_id": "manyforge.ros2_control_arm_position",
         "control_interface_revision": "sha256:d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1608,7 +1652,7 @@
         ],
         "provider_instance_id": "lite6_robot.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
@@ -1658,23 +1702,23 @@
         "capability_id": "tool.gripper.command",
         "command_target_id": "gripper",
         "containment_granularity": "resource",
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
-        "control_domain_id": "lite6_robot.gripper.control",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-command",
+        "control_binding_revision": "sha256:7f71d68f3f4277ccd14ed57fd2f0d207867601b7816541ea485f1584facd89c3",
+        "control_domain_id": "lite_gripper.gripper.control",
         "control_interface_contract_id": "manyforge.ros2_control_gripper_position",
         "control_interface_revision": "sha256:c2842924f7caea9978d19db8cd6a3d9eb45700cc77008e36e7edf7b1fae79d6e",
-        "controllable_component_id": "lite6_robot",
+        "controllable_component_id": "lite_gripper",
         "controller_topology_id": "manyforge.ros2_control_gripper_direct",
         "legal_control_route_ids": [
           "gripper_position"
         ],
-        "provider_instance_id": "lite6_robot.ros2_control",
+        "provider_instance_id": "lite_gripper.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
-            "resource_id": "lite6_robot.gripper.coordinate.000000",
+            "resource_id": "lite_gripper.gripper.coordinate.000000",
             "resource_role_id": "fingers"
           }
         ],
@@ -1690,7 +1734,7 @@
           }
         ],
         "state_authority_class": "commanded",
-        "state_authority_id": "lite6_robot.gripper.commanded_sim_state",
+        "state_authority_id": "lite_gripper.gripper.commanded_sim_state",
         "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
         "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
@@ -1700,23 +1744,23 @@
         "capability_id": "tool.gripper.feedback",
         "command_target_id": "gripper",
         "containment_granularity": "resource",
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:cb4799bffaa7851f228b0df588eca969c5e90e61ba358e6e4cb58329b30e03b9",
-        "control_domain_id": "lite6_robot.gripper.control",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-feedback",
+        "control_binding_revision": "sha256:65864c428308252bd2861a728098d7c8d6b5d0f3a74b43d89acfe9251fe9c6d4",
+        "control_domain_id": "lite_gripper.gripper.control",
         "control_interface_contract_id": "manyforge.ros2_control_gripper_position",
         "control_interface_revision": "sha256:c2842924f7caea9978d19db8cd6a3d9eb45700cc77008e36e7edf7b1fae79d6e",
-        "controllable_component_id": "lite6_robot",
+        "controllable_component_id": "lite_gripper",
         "controller_topology_id": "manyforge.ros2_control_gripper_direct",
         "legal_control_route_ids": [
           "gripper_position"
         ],
-        "provider_instance_id": "lite6_robot.ros2_control",
+        "provider_instance_id": "lite_gripper.ros2_control",
         "provider_manifest_id": "manyforge.provider.ros2_control",
-        "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263",
+        "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32",
         "provider_runtime_unit_id": "robot_cell.ros2_control_execution",
         "resource_bindings": [
           {
-            "resource_id": "lite6_robot.gripper.coordinate.000000",
+            "resource_id": "lite_gripper.gripper.coordinate.000000",
             "resource_role_id": "fingers"
           }
         ],
@@ -1732,7 +1776,7 @@
           }
         ],
         "state_authority_class": "commanded",
-        "state_authority_id": "lite6_robot.gripper.commanded_sim_state",
+        "state_authority_id": "lite_gripper.gripper.commanded_sim_state",
         "stop_evidence_policy_id": "manyforge.gripper_logical_cancellation",
         "stop_evidence_policy_revision": "sha256:0e22817d03b2c68f3a338483b87ea016646435531a21980b18c05ecbe01cb4cc",
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
@@ -1753,8 +1797,8 @@
       {
         "containment_granularity": "resource",
         "control_coordinator_endpoint_role": "ros2_control_execution_status",
-        "control_domain_id": "lite6_robot.gripper.control",
-        "control_domain_revision": "sha256:4a5ac21af0f675ee824cc47a2efc205344bf5f78d9e9da0c54ff91bb60bd89b0",
+        "control_domain_id": "lite_gripper.gripper.control",
+        "control_domain_revision": "sha256:cc49be59fbf9daf79b89179ac143de6c5ab64caa3c42e103997a1ec6467fff47",
         "controller_topology_id": "manyforge.ros2_control_gripper_direct",
         "runtime_unit_ids": [
           "robot_cell.ros2_control_execution"
@@ -1764,9 +1808,13 @@
     ],
     "controllable_components": [
       {
-        "component_type_id": "lite6_lite_gripper.fixed_scale.component",
-        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "component_type_id": "lite6.fixed_scale.component",
+        "component_type_revision": "sha256:d50e7dabfca5c6bff8eda515ad5b73aeac23877c08d88fdc476b8db14326600b",
         "controllable_component_id": "lite6_robot",
+        "default_tcp": {
+          "command_target_id": "arm",
+          "frame_role_id": "flange"
+        },
         "model_role_bindings": [
           {
             "model_instance_id": "lite6_robot.model",
@@ -1789,13 +1837,36 @@
         "runtime_unit_ids": [
           "robot_cell.ros2_control_execution"
         ]
+      },
+      {
+        "component_type_id": "lite_gripper.fixed_scale.component",
+        "component_type_revision": "sha256:406be5c93696a12dba1740c6051f5323a3448fde5b140c1b1e96d88e411d6de8",
+        "controllable_component_id": "lite_gripper",
+        "default_tcp": {
+          "command_target_id": "gripper",
+          "frame_role_id": "tcp"
+        },
+        "model_role_bindings": [
+          {
+            "model_instance_id": "lite_gripper.model",
+            "model_role_id": "tool_model"
+          }
+        ],
+        "runtime_unit_ids": [
+          "robot_cell.ros2_control_execution"
+        ]
       }
     ],
     "model_instances": [
       {
-        "model_asset_id": "lite6_lite_gripper",
+        "model_asset_id": "lite6",
         "model_instance_id": "lite6_robot.model",
-        "model_revision": "sha256:7fecf93ef1b79a9f045607bd24642c4f0b6b8009808c8aaec4075eb1d10cfc6e"
+        "model_revision": "sha256:fdcb5ec818f0c2a41ec8de94cc99c9f2e55aae6d3a0e66f3a609f722a41c1930"
+      },
+      {
+        "model_asset_id": "lite_gripper",
+        "model_instance_id": "lite_gripper.model",
+        "model_revision": "sha256:4874ba0e2d06983323d520a793af17119b8d73c2f90899a37e075d739dbba4ef"
       }
     ],
     "runtime_units": [
@@ -1804,15 +1875,22 @@
           "collision_monitor_period_ms": 50,
           "component_streams": [
             {
-              "budget_ns": 1000000000,
+              "budget_ns": 250000000,
               "controllable_component_id": "lite6_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "measured_joints"
+            },
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "lite_gripper",
               "recovery": "ack",
               "severity": "fault",
               "stream_id": "gripper_feedback"
             },
             {
               "budget_ns": 250000000,
-              "controllable_component_id": "lite6_robot",
+              "controllable_component_id": "lite_gripper",
               "recovery": "ack",
               "severity": "fault",
               "stream_id": "measured_joints"
@@ -1822,7 +1900,12 @@
             {
               "controllable_component_id": "lite6_robot",
               "frame_prefix": "",
-              "mock_profile": "lite6_lite_gripper"
+              "mock_profile": "lite6"
+            },
+            {
+              "controllable_component_id": "lite_gripper",
+              "frame_prefix": "",
+              "mock_profile": "lite_gripper"
             }
           ],
           "default_fault_stop_profiles": [
@@ -1872,10 +1955,10 @@
               "closed_state_ref": "closed",
               "command_duration_s": 0.8,
               "command_target_id": "gripper",
-              "controllable_component_id": "lite6_robot",
+              "controllable_component_id": "lite_gripper",
               "delivery_result_timeout_s": 1,
               "description": "Native simulated UFACTORY lite pneumatic gripper.",
-              "mount_frame": "link_eef",
+              "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
               "tcp_frame": "link_tcp",
@@ -1898,14 +1981,15 @@
             {
               "command_target_id": "arm",
               "controllable_component_id": "lite6_robot",
-              "maximum_tcp_linear_speed_mps": 0.15
+              "maximum_tcp_linear_speed_mps": 0.15,
+              "tcp_speed_check": "active_tcp_and_flange"
             }
           ],
           "planner_rng_seed": 12345
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
+        "runtime_profile_revision": "sha256:76a672d97c93e6e99a6dc9dc9e846c87612a0693d558b4e135c0f28326e99d00",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]
@@ -1925,7 +2009,7 @@
     "stop_stage_parameters": [
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:41e761cb590544416b386dab6e7e37fd758b6b9c91114aefc6c253551bbebe2c",
+        "control_binding_revision": "sha256:2c749f6769d4fc4cef1670e6b12f5204fa65e84447fdcaa69fbd1e813824451b",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2016,7 +2100,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:41e761cb590544416b386dab6e7e37fd758b6b9c91114aefc6c253551bbebe2c",
+        "control_binding_revision": "sha256:2c749f6769d4fc4cef1670e6b12f5204fa65e84447fdcaa69fbd1e813824451b",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2034,7 +2118,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:9a4b27fa15523d71730cb763be0cbf73e5480c8454c067229821473d187fbaa0",
+        "control_binding_revision": "sha256:8c48fb8c4dfe18ea9568674d825982c71cfad2b2cd62d86d03d7680cdc6e8444",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2125,7 +2209,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:9a4b27fa15523d71730cb763be0cbf73e5480c8454c067229821473d187fbaa0",
+        "control_binding_revision": "sha256:8c48fb8c4dfe18ea9568674d825982c71cfad2b2cd62d86d03d7680cdc6e8444",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2143,7 +2227,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:4dff43b527d71e1cffb049bd352639db842139113f8d37adc1c9286b0db7ca83",
+        "control_binding_revision": "sha256:1491bb6b38cb5d457d9ecbbec0b87d1eedf44c27ce8da9935b75335ae6a1018d",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2234,7 +2318,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:4dff43b527d71e1cffb049bd352639db842139113f8d37adc1c9286b0db7ca83",
+        "control_binding_revision": "sha256:1491bb6b38cb5d457d9ecbbec0b87d1eedf44c27ce8da9935b75335ae6a1018d",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2252,7 +2336,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9b5f5334e3c356c65fe80999b61beb503ca7234ab6e2aeb9f2990ac44646595f",
+        "control_binding_revision": "sha256:f51c8e8553a80bb3a99985f1f598348a4a8ec57074f9a85208df088ef36d1287",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2343,7 +2427,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:9b5f5334e3c356c65fe80999b61beb503ca7234ab6e2aeb9f2990ac44646595f",
+        "control_binding_revision": "sha256:f51c8e8553a80bb3a99985f1f598348a4a8ec57074f9a85208df088ef36d1287",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2361,7 +2445,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:5bf213819adbb697ddcade3dc05af11dc4ea3374ff5272083d17ded4d4e59b35",
+        "control_binding_revision": "sha256:bc731b2518516b8531c37b4d2ac28efaef8fe9ca7489cdb2f48ebf7917c8e084",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2452,7 +2536,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:5bf213819adbb697ddcade3dc05af11dc4ea3374ff5272083d17ded4d4e59b35",
+        "control_binding_revision": "sha256:bc731b2518516b8531c37b4d2ac28efaef8fe9ca7489cdb2f48ebf7917c8e084",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2470,7 +2554,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d0a1c8d11c972e139ee2fd35248a1ea2e5ba8726f7e78f61cd534e762106f86e",
+        "control_binding_revision": "sha256:2b069d9d8ce602d346482fe884e05f8174b94fedee65ad265b9b380e9dada3d1",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2561,7 +2645,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:d0a1c8d11c972e139ee2fd35248a1ea2e5ba8726f7e78f61cd534e762106f86e",
+        "control_binding_revision": "sha256:2b069d9d8ce602d346482fe884e05f8174b94fedee65ad265b9b380e9dada3d1",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2579,7 +2663,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2670,7 +2754,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
+        "control_binding_revision": "sha256:a23ef1b003a167db47c55a3c7ee19b677d7c2d7c80640cc3db0aae1973c310e8",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2688,7 +2772,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:11153242acc8454a6f01e88e257aa491efef743c150e60eac0086bb1dcdb9ec1",
+        "control_binding_revision": "sha256:cfb9b6e7dabbdffbf482cee7bcfbeeb712dae5afb0b39f8c7ddcb11f63576f44",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2779,7 +2863,7 @@
       },
       {
         "control_binding_id": "lite6_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:11153242acc8454a6f01e88e257aa491efef743c150e60eac0086bb1dcdb9ec1",
+        "control_binding_revision": "sha256:cfb9b6e7dabbdffbf482cee7bcfbeeb712dae5afb0b39f8c7ddcb11f63576f44",
         "control_domain_id": "lite6_robot.arm.control",
         "control_domain_revision": "sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c",
         "control_route_id": "arm_position",
@@ -2796,10 +2880,10 @@
         "topology_revision": "sha256:299f321da75dc2279ca2cebf66887ae13fb365a8a9db07d5c93d8aae6303352a"
       },
       {
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
-        "control_domain_id": "lite6_robot.gripper.control",
-        "control_domain_revision": "sha256:4a5ac21af0f675ee824cc47a2efc205344bf5f78d9e9da0c54ff91bb60bd89b0",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-command",
+        "control_binding_revision": "sha256:7f71d68f3f4277ccd14ed57fd2f0d207867601b7816541ea485f1584facd89c3",
+        "control_domain_id": "lite_gripper.gripper.control",
+        "control_domain_revision": "sha256:cc49be59fbf9daf79b89179ac143de6c5ab64caa3c42e103997a1ec6467fff47",
         "control_route_id": "gripper_position",
         "controller_topology_id": "manyforge.ros2_control_gripper_direct",
         "default_contract_parameters": {},
@@ -2814,10 +2898,10 @@
         "topology_revision": "sha256:18c0f8df032cfbbd1bbfe7723252d4ddde6eb3ac9670ccba9597cec059af287b"
       },
       {
-        "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:cb4799bffaa7851f228b0df588eca969c5e90e61ba358e6e4cb58329b30e03b9",
-        "control_domain_id": "lite6_robot.gripper.control",
-        "control_domain_revision": "sha256:4a5ac21af0f675ee824cc47a2efc205344bf5f78d9e9da0c54ff91bb60bd89b0",
+        "control_binding_id": "lite_gripper.gripper.tool-gripper-feedback",
+        "control_binding_revision": "sha256:65864c428308252bd2861a728098d7c8d6b5d0f3a74b43d89acfe9251fe9c6d4",
+        "control_domain_id": "lite_gripper.gripper.control",
+        "control_domain_revision": "sha256:cc49be59fbf9daf79b89179ac143de6c5ab64caa3c42e103997a1ec6467fff47",
         "control_route_id": "gripper_position",
         "controller_topology_id": "manyforge.ros2_control_gripper_direct",
         "default_contract_parameters": {},

@@ -5,6 +5,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/component_stream_health.hpp>
+#include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/io_signal.hpp>
@@ -96,16 +97,6 @@ struct Configuration final {
                            const FaultStopProfile &) = default;
   };
 
-  /// D11: the payload of a component's tool: mass and centre of mass in the
-  /// robot flange frame. Only a Real component's vendor adapter applies it
-  /// (at Enable); Mock and Isaac carry it unchanged and ignore it.
-  struct ToolPayload final {
-    double mass_kg{};
-    std::array<double, 3> center_of_mass_m{};
-
-    friend bool operator==(const ToolPayload &, const ToolPayload &) = default;
-  };
-
   /// Q68: the controller profile each hosted controllable component selects
   /// inside the one ROS runtime unit (one controller manager per component,
   /// Q66). Exactly one of the lane selectors is present.
@@ -122,7 +113,17 @@ struct Configuration final {
     /// robot's address. The address itself is a site fact, never compiled.
     std::optional<std::string> real_profile{};
     std::optional<std::string> device_address_ref{};
-    std::optional<ToolPayload> tool_payload{};
+    /// V-B4: a real robot's vendor adapter family (e.g. `xarm`), which
+    /// selects its vendor adapter; present exactly with `real_profile`.
+    std::optional<std::string> adapter_family{};
+    /// Where this component's soft Stop lead-in starts when its trip state is
+    /// measured (Real): the controller's command position (absent or
+    /// `commanded`) or the measured position (`measured`).
+    std::optional<core::StopLeadInAnchor> stop_lead_in_anchor{};
+    /// M6b: whether TCP updates are sent to the robot's controller (Real,
+    /// default on). Off: its vendor adapter keeps the controller's TCP offset
+    /// at zero. Lanes without a vendor adapter ignore it.
+    bool controller_tcp_offset_sync{true};
 
     friend bool operator==(const ControllerProfile &,
                            const ControllerProfile &) = default;
@@ -154,6 +155,22 @@ struct Configuration final {
 
     friend bool operator==(const PneumaticIo &, const PneumaticIo &) = default;
   };
+  /// Opt-in typed grasp confirmation. Absence (or `not_required`) keeps the
+  /// unconfirmed Close. A position gripper's evidence is its terminal position
+  /// inside the stall window; a pneumatic gripper's is its mapped
+  /// `workpiece_grasped` input at Close completion.
+  struct GraspStallWindow final {
+    double min_position{};
+    double max_position{};
+
+    friend bool operator==(const GraspStallWindow &, const GraspStallWindow &) = default;
+  };
+  struct GraspConfirmation final {
+    bool required{};
+    std::optional<GraspStallWindow> stall_window;
+
+    friend bool operator==(const GraspConfirmation &, const GraspConfirmation &) = default;
+  };
   struct GripperTargetConfiguration final
       : execution_runtime_contract::Configuration::GripperTargetConfiguration {
     core::GripperOutputMode output_mode;
@@ -165,15 +182,18 @@ struct Configuration final {
     /// Signal identities and output levels; the Program selects which inputs
     /// are required for a particular open or close command.
     std::optional<PneumaticIo> pneumatic_io;
+    std::optional<GraspConfirmation> grasp_confirmation;
 
     GripperTargetConfiguration(
         execution_runtime_contract::Configuration::GripperTargetConfiguration value,
         core::GripperOutputMode mode,
         std::optional<double> delivery_timeout = std::nullopt,
-        std::optional<PneumaticIo> io = std::nullopt)
+        std::optional<PneumaticIo> io = std::nullopt,
+        std::optional<GraspConfirmation> grasp = std::nullopt)
         : execution_runtime_contract::Configuration::GripperTargetConfiguration(
               std::move(value)), output_mode(mode),
-          delivery_result_timeout_s(delivery_timeout), pneumatic_io(std::move(io)) {}
+          delivery_result_timeout_s(delivery_timeout), pneumatic_io(std::move(io)),
+          grasp_confirmation(std::move(grasp)) {}
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;
@@ -189,6 +209,10 @@ struct Configuration final {
   std::optional<std::uint32_t> runtime_collision_lookahead_workers;
   std::optional<double> runtime_dynamic_body_max_age_cap_ms;
   std::optional<std::uint32_t> validation_collision_workers;
+  /// Collision clearance (m) and the planner/validation collision-check
+  /// step (rad); absent keeps the kernel defaults.
+  std::optional<double> collision_clearance_m;
+  std::optional<double> collision_check_step_rad;
 
   /// CP9: one row per model-free pose-source component (runtime kind
   /// `pose_source`, profile `pose_source_v0`), sorted by component. The
@@ -277,6 +301,21 @@ require_configuration(const RetainedBundle &retained_bundle,
 [[nodiscard]] CanonicalValue component_configuration_projection(
     const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
     const core::ControllableComponentId &component_id);
+
+/// Each component's lifecycle time budget (ns) authored in the Deployment as
+/// `lifecycle_command_timeout_s`: the `lifecycle_command_timeouts` rows
+/// (robots, tools, pose sources, AI models) and the I/O devices'
+/// `io_provider_devices` rows. CCLC bounds each of the component's lifecycle
+/// steps with it; without one, its plans' own bound (the same default) applies.
+[[nodiscard]] std::map<std::string, std::int64_t, std::less<>>
+component_lifecycle_budgets_ns(const core::CellGraphDTO &graph);
+
+/// The budget of every component of the graph, for a composition exchange:
+/// the authored one (an I/O device's always is), else the default component
+/// lifecycle budget `core::kDefaultLifecycleBudgetNs`, the bound its plans
+/// use.
+[[nodiscard]] std::map<std::string, std::int64_t, std::less<>>
+component_composition_budgets_ns(const core::CellGraphDTO &graph);
 
 /// CP9: the stream id of one pose-source binding,
 /// `poses/<object_id>/<policy_id>` (the compiler keeps it a valid stream id).

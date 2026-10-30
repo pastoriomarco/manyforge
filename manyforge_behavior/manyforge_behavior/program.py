@@ -57,6 +57,7 @@ from manyforge_behavior.value_path import (
     value_at_path,
 )
 from manyforge_behavior.skill_loader import SkillCatalog
+from manyforge_behavior.tcp_migration import migrate_tcp_selectors
 
 _MAX_TREE_DEPTH: Final = 256
 _MAX_TREE_NODES: Final = 100_000
@@ -106,6 +107,19 @@ _PROGRAM_MOTION_CEILINGS: Final = frozenset(
 
 class ProgramValidationError(ValueError):
     """A Program artifact or retained tree-document value is malformed."""
+
+
+class TcpEndpointAliasAmbiguous(ProgramValidationError):
+    """Legacy aliases whose exact TCP needs an explicit authoring choice."""
+
+    code: Final = "tcp_endpoint_alias_ambiguous"
+
+    def __init__(self, affected: Iterable[tuple[str, str]]) -> None:
+        self.affected = tuple(affected)
+        super().__init__("; ".join(
+            f"move {instance} on role {role}: choose its TCP"
+            for instance, role in self.affected
+        ))
 
 
 class ProgramNodeValidationError(ProgramValidationError):
@@ -1303,6 +1317,19 @@ def is_node_outcome_key(key: str) -> bool:
     return key.startswith(f"{NODE_OUTCOME_NAMESPACE}.")
 
 
+ACTIVE_TCP_NAMESPACE: Final = "active_tcp"
+
+
+def active_tcp_key(target_role: str) -> str:
+    """The system-owned Active TCP key for a motion target role."""
+
+    return f"{ACTIVE_TCP_NAMESPACE}.{target_role}"
+
+
+def is_active_tcp_key(key: str) -> bool:
+    return key.startswith(f"{ACTIVE_TCP_NAMESPACE}.")
+
+
 # System-owned global-rule state keys (contract items 63, 64): each Deployment
 # global rule publishes `interrupt_state.<rule_id>`, read-only, readable like
 # any key. Reserved like node_outcome: never authored nor written by nodes.
@@ -1528,6 +1555,7 @@ _RESERVED_NAMESPACES: Final = MappingProxyType(
     {
         NODE_OUTCOME_NAMESPACE: "node outcome keys",
         INTERRUPT_STATE_NAMESPACE: "interrupt rule state keys",
+        ACTIVE_TCP_NAMESPACE: "active TCP keys",
     }
 )
 
@@ -1538,6 +1566,37 @@ def _reserved_namespace(name: str) -> str | None:
 
     namespace = name.split(".", 1)[0]
     return namespace if namespace in _RESERVED_NAMESPACES else None
+
+
+def _declare_active_tcp_selector_keys(
+    keys: dict[str, BlackboardKeyDeclaration], roots: Iterable[Any],
+    target_roles: Mapping[str, dict[str, Any]],
+) -> dict[str, BlackboardKeyDeclaration]:
+    """Declare portable Current reads for roles selected by motion or planning nodes."""
+    selector_nodes = MOTION_NODE_IDS | INTERRUPT_MOTION_NODE_IDS | frozenset({
+        "planning.plan_pick_sequence", "planning.plan_place_sequence",
+    })
+    pending = list(roots)
+    seen = 0
+    while pending and seen <= _MAX_TREE_NODES:
+        node = pending.pop()
+        seen += 1
+        if type(node) is not dict:
+            continue
+        parameters = node.get("parameters")
+        role = parameters.get("target_role") if type(parameters) is dict else None
+        node_id = node.get("node_id")
+        if type(node_id) is str and node_id in selector_nodes and type(role) is str and role in target_roles:
+            key = active_tcp_key(role)
+            keys[key] = BlackboardKeyDeclaration(
+                key=key, type="tcp_entry", access="read", persistence="run",
+                fields=MappingProxyType({}),
+                description=f"Active TCP of target role {role}",
+            )
+        children = node.get("children")
+        if type(children) is list:
+            pending.extend(children)
+    return dict(sorted(keys.items()))
 
 
 def _node_outcome_declaration(instance_id: str) -> BlackboardKeyDeclaration:
@@ -2030,6 +2089,7 @@ _PROGRAM_PARAMETER_TYPES: Final = frozenset(
         "scene_selection_context",
         "scene_selection_result",
         "stored_pose",
+        "tcp_entry",
         "string",
         "string_list",
     }
@@ -2704,6 +2764,13 @@ def _validate_declared_type_value(
     if declared_type == "string_list":
         _bounded_text_list(value, path=path)
         return
+    if declared_type == "tcp_entry":
+        row = _program_mapping(value, path=path)
+        fields = frozenset({"component_id", "target_id", "frame_role_id"})
+        _program_closed(row, required=fields, path=path)
+        for name in fields:
+            _program_text(row[name], path=f"{path}.{name}", max_chars=_MAX_IDENTIFIER_CHARS)
+        return
     if declared_type == "stored_pose":
         row = _program_mapping(value, path=path)
         _program_closed(
@@ -3115,24 +3182,26 @@ def _validate_blackboard(
 def motion_tcp_selection(
     parameters: Mapping[str, Any], *, path: str = "parameters"
 ) -> dict[str, Any]:
-    """Validate the portable TCP selector without resolving deployment frames.
-
-    Program validation additionally checks the selected target/frame requirements;
-    lowering uses this same shape check on immutable captured inputs.
-    """
+    """Return the portable selector, defaulting a motion to Current."""
     if "tcp_frame_role" in parameters:
         _program_error(path, "tcp_frame_role is unsupported; select tcp_endpoint")
-    if "tcp_endpoint" not in parameters:
-        _program_error(path, "requires tcp_endpoint")
-    value = parameters["tcp_endpoint"]
-    if not isinstance(value, Mapping) or set(value) != {"target_role", "frame_role"}:
-        _program_error(f"{path}.tcp_endpoint", "requires exactly target_role and frame_role")
-    return {
-        "tcp_endpoint": {
-            name: _program_identifier(value[name], path=f"{path}.tcp_endpoint.{name}")
-            for name in ("target_role", "frame_role")
-        }
+    raw = parameters.get("tcp_endpoint", {"kind": "current"})
+    value = _program_mapping(
+        dict(raw) if isinstance(raw, Mapping) else raw,
+        path=f"{path}.tcp_endpoint",
+    )
+    kind = value.get("kind")
+    fields = {
+        "current": frozenset({"kind"}),
+        "default_of_role": frozenset({"kind", "role"}),
+        "entry": frozenset({"kind", "target_role", "frame_role"}),
     }
+    if type(kind) is not str or kind not in fields:
+        _program_error(f"{path}.tcp_endpoint.kind", "has an unsupported TCP selector kind")
+    _program_closed(value, required=fields[kind], path=f"{path}.tcp_endpoint")
+    for name in fields[kind] - {"kind"}:
+        _program_identifier(value[name], path=f"{path}.tcp_endpoint.{name}")
+    return {"tcp_endpoint": dict(value)}
 
 
 def _validate_contact_selector(
@@ -4001,6 +4070,12 @@ def _validate_node_value_sources(
     for key, segments in source_paths.items():
         entry_path = f"{path}.value_sources.{key}"
         catalog_parameter = by_id[segments[0]]
+        if entry.id == "motion.set_tcp" and segments == ("tcp",):
+            source = _program_mapping(value_sources[key], path=entry_path)
+            source_type = _source_declared_type(source, path=entry_path, context=context)
+            if source.get("kind") != "blackboard_key" or source_type != "tcp_entry":
+                _program_error(entry_path, "Set TCP requires a tcp_entry blackboard key")
+            continue
         schema, key_type = _value_source_destination(
             catalog_parameter,
             segments,
@@ -4139,6 +4214,10 @@ def _validate_node_cross_fields(
     when its value is resolved at node start."""
 
     if node_id == "scene.attach_carried_object":
+        selected = {name for name in ("carrier_frame_role", "carrier_frame")
+                    if name in parameters or name in sourced}
+        if len(selected) != 1:
+            _program_error(f"{path}.parameters", "requires exactly one carrier frame selector")
         _validate_on_grasp_lost(parameters, path=path, context=context)
     goal = parameters.get("goal")
     if node_id == "motion.move_to_joint_target" and type(goal) is list:
@@ -4842,6 +4921,46 @@ def _validate_program_document(
             "does not select a compatible active v2 catalog version (same "
             f"major, minor not above {catalog.content_version})",
         )
+    if (
+        authoring_load
+        and catalog_ref["content_version"] == "2.8.0"
+        and catalog.content_version == "2.9.0"
+    ):
+        # Copy the bounded tree before converting; never modify the caller's
+        # source or reinterpret an identity mismatch as a migration edit.
+        clean_identity = False
+        try:
+            verify_content_identity(
+                root, own_field="program_revision", identity_domain="program-revision",
+                api_version=api_version, label=source,
+            )
+            clean_identity = True
+        except StrictArtifactError:
+            pass
+        root = _remove_explicit_default_policy_spelling(
+            root, execution_groups_supported=api_version == _PROGRAM_API_VERSION
+        )
+        pending = [root.get("tree")]
+        nodes = []
+        while pending:
+            node = pending.pop()
+            if type(node) is not dict:
+                continue
+            if type(node.get("parameters")) is dict:
+                node["parameters"] = dict(node["parameters"])
+            nodes.append(node)
+            children = node.get("children")
+            if type(children) is list:
+                pending.extend(children)
+        root["target_roles"] = deepcopy(root.get("target_roles"))
+        ambiguous = migrate_tcp_selectors(nodes, root)
+        if ambiguous:
+            raise TcpEndpointAliasAmbiguous(ambiguous)
+        if clean_identity:
+            root["program_revision"] = compute_content_identity(
+                root, own_field="program_revision", identity_domain="program-revision",
+                api_version=api_version,
+            )
     if "compatibility" in root:
         _validate_compatibility(root["compatibility"], path=f"{source}.compatibility")
     component_roles = _validate_component_roles(
@@ -4878,6 +4997,20 @@ def _validate_program_document(
         path=f"{source}.blackboard",
         scene_resource_ids=scene_resource_ids,
         target_roles=target_roles,
+    )
+    for role, target in target_roles.items():
+        if any(
+            item["capability_id"] == "execution.trajectory.execute"
+            for item in target["required_capabilities"]
+        ):
+            key = active_tcp_key(role)
+            blackboard_keys[key] = BlackboardKeyDeclaration(
+                key=key, type="tcp_entry", access="read", persistence="run",
+                fields=MappingProxyType({}),
+                description=f"Active TCP of target role {role}",
+            )
+    blackboard_keys = _declare_active_tcp_selector_keys(
+        blackboard_keys, [root.get("tree")], target_roles
     )
     blackboard_keys = _declare_node_outcome_keys(blackboard_keys, [root.get("tree")])
     blackboard_keys = _declare_interrupt_state_keys(
@@ -5130,6 +5263,35 @@ class Program:
             if is_interrupt_state_key(key)
         )
 
+    def with_active_tcp_binding(self, binding: Mapping[str, Any]) -> "Program":
+        """Declare Active TCP keys for motion targets in the captured binding.
+
+        Presence of robot_tcps, including an empty list, identifies a motion
+        target; absence identifies a target with no Active TCP.
+        """
+        keys = {
+            key: declaration for key, declaration in self.blackboard_keys.items()
+            if not is_active_tcp_key(key)
+        }
+        for row in binding.get("target_role_bindings", ()):
+            if not isinstance(row, Mapping) or "robot_tcps" not in row:
+                continue
+            role = row.get("target_role_id")
+            if type(role) is not str or role not in self._data["target_roles"]:
+                continue
+            key = active_tcp_key(role)
+            keys[key] = BlackboardKeyDeclaration(
+                key=key,
+                type="tcp_entry",
+                access="read",
+                persistence="run",
+                fields=MappingProxyType({}),
+                description=f"Active TCP of target role {role}",
+            )
+        clone = copy(self)
+        clone.blackboard_keys = MappingProxyType(dict(sorted(keys.items())))
+        return clone
+
     def with_interrupt_state_keys(self, rule_ids: Iterable[str]) -> "Program":
         """This Program plus the reserved ``interrupt_state.<rule_id>`` key of
         each Applied global rule (contract 64).
@@ -5324,6 +5486,7 @@ __all__ = [
     "ProgramParameterDeclaration",
     "ProgramTreeNode",
     "ProgramValidationError",
+    "TcpEndpointAliasAmbiguous",
     "TreeNode",
     "apply_tree_param_overrides",
     "check_draft_formulas",
@@ -5335,6 +5498,9 @@ __all__ = [
     "program_node_policies",
     "program_value_declarations",
     "INTERRUPT_MOTION_NODE_IDS",
+    "ACTIVE_TCP_NAMESPACE",
+    "active_tcp_key",
+    "is_active_tcp_key",
     "INTERRUPT_STATE_NAMESPACE",
     "INTERRUPT_STATE_VALUES",
     "interrupt_state_declaration",

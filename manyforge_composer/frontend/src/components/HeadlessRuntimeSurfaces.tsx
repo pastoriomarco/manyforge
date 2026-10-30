@@ -170,8 +170,9 @@ interface RuntimeAttentionFence {
 }
 
 /**
- * One item per failure: each attention alarm whose definition a current
- * notice represents goes inside that notice; the others stand alone.
+ * One item per failure: each attention alarm whose definition (or definition
+ * and subject) a current notice represents goes inside that notice; the
+ * others stand alone.
  */
 export function partitionRepresentedAlarms(
   alarms: readonly OperatorAlarmRecord[],
@@ -182,6 +183,8 @@ export function partitionRepresentedAlarms(
   for (const alarm of alarms) {
     const notice = conditions.find((condition) => (
       condition.alarmDefinitionIds?.includes(alarm.definitionId) === true
+      || condition.alarmSubjects?.some(({ definitionId, subjectId }) => (
+        definitionId === alarm.definitionId && subjectId === alarm.subject.subjectId)) === true
     ));
     if (notice === undefined) standalone.push(alarm);
     else represented.set(notice.id, [...(represented.get(notice.id) ?? []), alarm]);

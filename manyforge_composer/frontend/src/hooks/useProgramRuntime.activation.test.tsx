@@ -11,6 +11,7 @@ import { heldRun } from '../testFixtures/heldRun';
 import { useCCLC, type CCLCController } from './useCCLC';
 import { useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
 import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
+import { CommandRefusalError } from '../state/commandRefusal';
 
 const apiMock = vi.hoisted(() => ({
   programs: { currentScenario: vi.fn(), applied: vi.fn() },
@@ -102,7 +103,8 @@ async function mount(states: Record<string, CCLCComponentSnapshot['lifecycleStat
   let { snapshot, workspace } = facts();
   if (resumed) snapshot = { ...snapshot, programCycle: { ...snapshot.programCycle,
     state: 'running', programRunId: 'run.1', run: { ...heldRun(), state: 'full_stopped' } } };
-  apiMock.programs.currentScenario.mockResolvedValue({ ready: true, unavailableReasons: [], currentScenario: null });
+  apiMock.programs.currentScenario.mockResolvedValue({ ready: false,
+    unavailableReasons: ['scenario_not_ready'], currentScenario: null });
   apiMock.programs.applied.mockResolvedValue({ scenarioId: 'scenario', sourceDocumentDigest: 'source',
     programRevision: 'program.revision', retainedBundleId: 'bundle', graphRevision: 'graph',
     recordDigest: 'record.1', sourceOwnerEpoch: 'applied.1',
@@ -175,6 +177,19 @@ it('all-Active sends one ordinary Execute, and an authoritative refusal does not
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
   expect(test.runtime.activationOffer).toBeNull();
   expect(test.runtime.state.error).toContain('Simulator unavailable');
+});
+
+it('retains the owner refusal code for a motion wait until dismissed', async () => {
+  const test = await mount({ 'robot.z': 'active', 'robot.a': 'active' });
+  const refusal = { code: 'invalid_state_transition', message: 'waiting',
+    details: { reason: 'global_interrupt_source_not_ready', rule_id: 'door' }, origin: null };
+  test.send.mockRejectedValueOnce(new CommandRefusalError(refusal));
+  await act(async () => { await test.runtime.run(); });
+  expect(test.runtime.state.error).toContain('Motion waits:');
+  expect(test.runtime.state.errorRefusal).toEqual(refusal);
+  await act(async () => { test.runtime.dismissError(); });
+  expect(test.runtime.state.error).toBeNull();
+  expect(test.runtime.state.errorRefusal).toBeNull();
 });
 
 it('keeps an exact selection refusal visible and projects the next owner snapshot without resending', async () => {
@@ -279,7 +294,7 @@ it.each(['failed', 'unknown'])('a lifecycle %s outcome stops the sequence withou
   apiMock.cclc.submitLifecycle.mockImplementationOnce(async () => {
     if (failure === 'unknown') throw new Error('Lifecycle reply lost');
     const result = accepted('failed');
-    return { ...result, status: { ...result.status, terminalResult: 'failed_known_no_effect',
+    return { ...result, status: { ...result.status, terminalResult: 'failed',
       error: { code: 'activation_failed', message: 'Provider refused', details: {} } } };
   });
   await act(async () => { await test.runtime.confirmActivationExecute(); });
@@ -289,7 +304,7 @@ it.each(['failed', 'unknown'])('a lifecycle %s outcome stops the sequence withou
   expect(test.cclc.error).toContain(failure === 'unknown' ? 'Lifecycle reply lost' : 'Provider refused');
 });
 
-it.each(['draft', 'owner', 'unmount'])('an intervening %s fences the pending Execute', async (change) => {
+it.each(['draft', 'unmount'])('an intervening %s fences the pending Execute', async (change) => {
   const test = await mount();
   await act(async () => { await test.runtime.run(); });
   if (change === 'draft') {
@@ -298,14 +313,39 @@ it.each(['draft', 'owner', 'unmount'])('an intervening %s fences the pending Exe
       workspace.draft.draftRevision += 1;
       workspace.draft.programRevision = 'changed-program';
     });
-  } else if (change === 'owner') {
-    apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: 'cclc.replacement' });
   } else {
     await test.unmount(); cleanup = null;
   }
   await act(async () => { await test.runtime.confirmActivationExecute(); });
   expect(test.send).not.toHaveBeenCalled();
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+});
+
+// F1-ACT / F1-CYCLE: a server-owned owner change alone is not a GUI change; the
+// lifecycle requests carry the current CCLC owner and Execute is sent once.
+it.each(['cclc-owner', 'runner-owner'])('an intervening %s change alone does not fence the pending Execute', async (change) => {
+  const test = await mount();
+  await act(async () => { await test.runtime.run(); });
+  const prepare = deferred<void>();
+  apiMock.cclc.submitLifecycle.mockImplementationOnce((request: CCLCLifecycleRequestBody) => (
+    prepare.promise.then(() => test.completeLifecycle(request))
+  ));
+  if (change === 'cclc-owner') apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: 'cclc.replacement' });
+  let confirmation!: Promise<void>;
+  await act(async () => { confirmation = test.runtime.confirmActivationExecute(); });
+  expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+  if (change === 'runner-owner') await test.observe(({ snapshot }) => {
+    snapshot.programCycle.programRunnerOwnerEpoch = 'replacement.runner';
+  });
+  await act(async () => { prepare.resolve(); await confirmation; });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(test.effectOrder).toEqual(['robot.z:prepare', 'robot.z:enable']);
+  if (change === 'cclc-owner') {
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.request_context.request_owner_epoch))
+      .toEqual(['cclc.replacement', 'cclc.replacement']);
+  }
+  expect(test.send).toHaveBeenCalledTimes(1);
+  expect(test.send.mock.calls[0]?.[0]).toBe('program_run');
 });
 
 it('unknown fresh component observation shows an error with no offer or effects', async () => {
@@ -316,6 +356,28 @@ it('unknown fresh component observation shows an error with no offer or effects'
   expect(test.runtime.state.error).toContain('Current component source is stale');
   expect(test.send).not.toHaveBeenCalled();
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+});
+
+it('keeps the clicked Applied configuration when an Applied read becomes unavailable during the offer read', async () => {
+  const test = await mount();
+  let releaseRead!: () => void;
+  let signalReadStarted!: () => void;
+  const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+  const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+  apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+    signalReadStarted();
+    await readGate;
+    return component(id, 'disabled');
+  });
+  let readOffer!: Promise<void>;
+  await act(async () => { readOffer = test.runtime.run(); });
+  await readStarted;
+  apiMock.programs.applied.mockRejectedValueOnce(new Error('Applied projection temporarily unavailable'));
+  await act(async () => { await test.runtime.refresh(); });
+  releaseRead();
+  await act(async () => { await readOffer; });
+  expect(test.runtime.activationOffer?.components.map((row) => row.controllableComponentId)).toEqual(ORDER);
+  expect(test.runtime.state.error).toBeNull();
 });
 
 it('Resume keeps its ordinary command and never enters activation precheck', async () => {
@@ -357,7 +419,8 @@ it.each(['runner', 'unmount'])('an intervening %s during accepted lifecycle work
   await act(async () => { confirmation = test.runtime.confirmActivationExecute(); });
   expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
   if (change === 'runner') await test.observe(({ snapshot }) => {
-    snapshot.programCycle.programRunnerOwnerEpoch = 'replacement.runner';
+    // F1-CYCLE: a new Runner cycle (not an owner epoch alone) is the GUI-owned change.
+    snapshot.programCycle.cycleGeneration += 1;
   });
   else { await test.unmount(); cleanup = null; }
   await act(async () => { prepare.resolve(); await confirmation; });
@@ -402,8 +465,17 @@ it.each(['graph', 'bundle'])('a fresh CCLC %s differing from the displayed Appli
 });
 
 
-it.each(['scenario', 'configuration', 'execution-owner'])('a changed %s while waiting for permission consumes the continuation without Execute', async (change) => {
+const KNOWN_SCENARIO = { ready: true, unavailableReasons: [], currentScenario: { scenarioId: 'scenario',
+  sourceDocumentDigest: 'source', deploymentRevision: 'deployment.revision', retainedBundleId: 'bundle',
+  graphRevision: 'graph', programRevision: 'program.revision', programBindingId: 'binding' } };
+
+it.each(['scenario', 'draft', 'runner-cycle'])('a changed %s while waiting for permission consumes the continuation without Execute', async (change) => {
   const test = await mount();
+  if (change === 'scenario') {
+    // F1-EXEC: an unknown Scenario becoming known is not a change, so start from a known one.
+    apiMock.programs.currentScenario.mockResolvedValue(KNOWN_SCENARIO);
+    await act(async () => { await test.runtime.refresh(); });
+  }
   await act(async () => { await test.runtime.run(); });
   await test.observe(({ snapshot }) => {
     snapshot.authoringAdmission = { authoringAllowed: false, admissionGeneration: 20 };
@@ -417,10 +489,11 @@ it.each(['scenario', 'configuration', 'execution-owner'])('a changed %s while wa
         deploymentRevision: 'another-deployment', retainedBundleId: 'bundle', graphRevision: 'graph',
         programRevision: 'program.revision', programBindingId: 'another-binding' } });
     await act(async () => { await test.runtime.refresh(); });
-  } else await test.observe(({ snapshot }) => {
-    if (change === 'configuration') snapshot.runtime.activeConfiguration!.graphRevision = 'another.graph';
-    else snapshot.executionControlStatus = { ownerEpoch: 'replacement.execution' } as unknown as
-      NonNullable<ComposerHeadlessState['executionControlStatus']>;
+  } else await test.observe(({ snapshot, workspace }) => {
+    if (change === 'draft') {
+      snapshot.authoringWorkspace.programDraftRevision += 1;
+      workspace.draft.draftRevision += 1;
+    } else snapshot.programCycle.cycleGeneration += 1;
   });
   expect(test.runtime.activationWaiting).toBe(false);
   expect(test.runtime.state.error).toContain('changed');
@@ -431,6 +504,64 @@ it.each(['scenario', 'configuration', 'execution-owner'])('a changed %s while wa
   expect(test.send).not.toHaveBeenCalled();
 });
 
+// F1-EXEC: server-owned configuration and execution-owner projections are not
+// part of Execute's identity; the waiting continuation survives them.
+it.each(['configuration', 'execution-owner'])('a changed %s while waiting for permission keeps the continuation', async (change) => {
+  const test = await mount();
+  if (change === 'execution-owner') {
+    await test.observe(({ snapshot }) => { snapshot.executionControlStatus = executionOwner('execution.1'); });
+  }
+  await act(async () => { await test.runtime.run(); });
+  await test.observe(({ snapshot }) => {
+    snapshot.authoringAdmission = { authoringAllowed: false, admissionGeneration: 20 };
+  });
+  await act(async () => { await test.runtime.confirmActivationExecute(); });
+  expect(test.runtime.activationWaiting).toBe(true);
+  await test.observe(({ snapshot }) => {
+    if (change === 'configuration') snapshot.runtime.activeConfiguration!.graphRevision = 'another.graph';
+    else snapshot.executionControlStatus = executionOwner('replacement.execution');
+  });
+  expect(test.runtime.activationWaiting).toBe(true);
+  expect(test.runtime.state.error ?? '').not.toContain('changed');
+  expect(test.send).not.toHaveBeenCalled();
+});
+
+
+function executionOwner(ownerEpoch: string) {
+  return { ownerEpoch } as unknown as NonNullable<ComposerHeadlessState['executionControlStatus']>;
+}
+
+// Execute keeps its GUI-owned identity while a robot Prepare changes the
+// execution owner projection.
+it.each([
+  ['becomes available', null, ['execution.1'], 1],
+  ['is briefly unavailable', 'execution.1', [null, 'execution.1'], 1],
+  ['changes to another owner', 'execution.1', [null, 'replacement.execution'], 1],
+] as const)('an execution owner that %s during Execute\'s own Prepare', async (_case, initial, during, sends) => {
+  const test = await mount({ 'robot.z': 'disabled', 'robot.a': 'active' });
+  if (initial !== null) {
+    const owner = executionOwner(initial);
+    await test.observe(({ snapshot }) => { snapshot.executionControlStatus = owner; });
+  }
+  await act(async () => { await test.runtime.run(); });
+  const prepare = deferred<void>();
+  apiMock.cclc.submitLifecycle.mockImplementationOnce((request: CCLCLifecycleRequestBody) => (
+    prepare.promise.then(() => test.completeLifecycle(request))
+  ));
+  let confirmation!: Promise<void>;
+  await act(async () => { confirmation = test.runtime.confirmActivationExecute(); });
+  expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+  for (const epoch of during) {
+    const owner = epoch === null ? null : executionOwner(epoch);
+    await test.observe(({ snapshot }) => { snapshot.executionControlStatus = owner; });
+  }
+  await act(async () => { prepare.resolve(); await confirmation; });
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  expect(test.send).toHaveBeenCalledTimes(sends);
+  expect(test.effectOrder).toEqual(['robot.z:prepare', 'robot.z:enable']);
+  expect(test.send.mock.calls[0]?.[0]).toBe('program_run');
+  expect(test.runtime.state.error ?? '').not.toContain('changed');
+});
 
 it.each([
   [false, false], [true, false], [false, true], [true, true],
@@ -451,6 +582,25 @@ it.each([
     requestId: (test.send.mock.calls[0]?.[1] as { request_id: string }).request_id,
     correlationId: 'reset.correlation', programRunId: null,
     programRunnerOwnerEpoch: 'runner.epoch.1', cycleGeneration: 1,
+  } });
+});
+
+it('Reset ignores a confirmation-time owner change and keeps the send-time owner fence', async () => {
+  const test = await mount({ 'robot.z': 'active', 'robot.a': 'active' });
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle.allowedCommands = [{ commandKind: 'program_reset',
+      allowed: true, disabledReason: null, semanticTarget: {} }];
+    snapshot.programCycle.programRunnerOwnerEpoch = 'runner.epoch.2';
+  });
+  let result;
+  await act(async () => {
+    result = await test.runtime.reset({ expected: { programRunId: null, cycleGeneration: 1 } });
+  });
+  expect(test.send).toHaveBeenCalledExactlyOnceWith('program_reset', expect.objectContaining({
+    expected_owner_epoch: 'runner.epoch.2', expected_cycle_generation: 1,
+  }), expect.any(String));
+  expect(result).toMatchObject({ status: 'sent', reset: {
+    programRunnerOwnerEpoch: 'runner.epoch.2', cycleGeneration: 1,
   } });
 });
 

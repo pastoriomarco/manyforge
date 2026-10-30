@@ -292,7 +292,16 @@ void replace_file_atomically(const std::filesystem::path &path,
     constexpr std::array<std::string_view, 5U> kFamilyFields{
         "catalog_source", "model_asset_id", "model_family_id", "semantics",
         "source"};
-    require_shape(row, kFamilyFields, label);
+    // A descriptor-registered family may also record its TCPs (optional);
+    // the component types read them, the model asset does not.
+    constexpr std::array<std::string_view, 6U> kFamilyFieldsWithTcps{
+        "catalog_source", "model_asset_id",     "model_family_id",
+        "semantics",      "source",             "tcp_frame_role_ids"};
+    if (row.find_object_member("tcp_frame_role_ids") != nullptr) {
+      require_shape(row, kFamilyFieldsWithTcps, label);
+    } else {
+      require_shape(row, kFamilyFields, label);
+    }
     const auto &source = require_member(row, "source", label);
     constexpr std::array<std::string_view, 8U> kSourceFields{
         "accepted_package_uri_prefix",
@@ -310,7 +319,18 @@ void replace_file_atomically(const std::filesystem::path &path,
         "collision_body_role_bindings", "frame_role_bindings",
         "instance_cardinality",         "model_group_role_bindings",
         "resource_role_bindings",       "root_frame_role_id"};
-    require_shape(semantics, kSemanticFields, label + ".semantics");
+    // A tool family may also carry its own `payload` (optional).
+    constexpr std::array<std::string_view, 7U> kSemanticFieldsWithPayload{
+        "collision_body_role_bindings", "frame_role_bindings",
+        "instance_cardinality",         "model_group_role_bindings",
+        "payload",                      "resource_role_bindings",
+        "root_frame_role_id"};
+    if (semantics.find_object_member("payload") != nullptr) {
+      require_shape(semantics, kSemanticFieldsWithPayload,
+                    label + ".semantics");
+    } else {
+      require_shape(semantics, kSemanticFields, label + ".semantics");
+    }
 
     const auto root_local = [&options, &label](const std::string &value,
                                                std::string_view field) {

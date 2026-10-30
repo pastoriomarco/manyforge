@@ -1,9 +1,12 @@
 #pragma once
 
-#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
+#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <string>
 #include <string_view>
@@ -14,21 +17,29 @@ namespace manyforge::component_manager::detail {
 inline constexpr std::size_t kMaximumSelectedRuntimeCompositionRpcPacketBytes =
     256U * 1024U;
 
-/// Budget per component a runtime-composition request installs (kAdd or
-/// kReplace in its delta). The whole exchange waits for that many budgets,
-/// at least one.
-inline constexpr std::chrono::seconds kRuntimeCompositionPerComponentTimeout{10};
-
+/// A runtime-composition request installs its kAdd and kReplace components
+/// inside one exchange, which waits for the sum of their lifecycle time
+/// budgets (`budgets_ns`, by component id: the authored budget, else the
+/// default, see `component_composition_budgets_ns`). An exchange that
+/// installs nothing (finalize, retain-only) waits one default budget.
 [[nodiscard]] inline std::chrono::milliseconds SelectedRuntimeCompositionTimeout(
-    const manyforge::deployment::ApplyComponentDeltaDTO &delta) noexcept {
+    const manyforge::deployment::ApplyComponentDeltaDTO &delta,
+    const std::map<std::string, std::int64_t, std::less<>> &budgets_ns) {
   using manyforge::deployment::ApplyComponentDisposition;
-  const auto &rows = delta.components;
-  const auto composed = std::count_if(rows.begin(), rows.end(), [](const auto &row) {
-    return row.disposition == ApplyComponentDisposition::kAdd ||
-           row.disposition == ApplyComponentDisposition::kReplace;
-  });
-  return kRuntimeCompositionPerComponentTimeout *
-         std::max<std::ptrdiff_t>(composed, 1);
+  std::chrono::nanoseconds total{0};
+  bool installs = false;
+  for (const auto &row : delta.components) {
+    if (row.disposition != ApplyComponentDisposition::kAdd &&
+        row.disposition != ApplyComponentDisposition::kReplace)
+      continue;
+    installs = true;
+    const auto budget = budgets_ns.find(row.controllable_component_id.value());
+    total += std::chrono::nanoseconds(budget == budgets_ns.end()
+                                          ? manyforge::core::kDefaultLifecycleBudgetNs
+                                          : budget->second);
+  }
+  return std::chrono::ceil<std::chrono::milliseconds>(
+      installs ? total : std::chrono::nanoseconds(manyforge::core::kDefaultLifecycleBudgetNs));
 }
 
 struct SelectedRuntimeCompositionRpcFailure final {

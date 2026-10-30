@@ -45,8 +45,7 @@ namespace {
               runtime.resources.empty() ||
               find_frame(runtime, payload.base_frame_role_id) == nullptr ||
               !runtime.motion_endpoint ||
-              runtime.motion_endpoint->target_role_id != payload.tcp_endpoint.target_role_id ||
-              runtime.motion_endpoint->frame.frame_role_id != payload.tcp_endpoint.frame_role_id) {
+              !tcp_selector_admits(payload.tcp_endpoint, *runtime.motion_endpoint, std::nullopt)) {
             return reject("motion participant lacks an exact runtime mapping",
                           "runtime_motion_mapping_incomplete");
           }
@@ -56,6 +55,16 @@ namespace {
                           })) {
             return reject("motion participant selects a non-angular trajectory resource",
                           "runtime_motion_resource_not_angular");
+          }
+          return Result<RuntimeParticipantBinding>::Ok(binding);
+        } else if constexpr (std::is_same_v<Payload, SetTcpParticipantIntentDTO>) {
+          // Active TCP (M7): the robot's motion target, its endpoint resolved
+          // from the selector exactly as a move's.
+          if (!runtime.control_path.has_value() || runtime.resources.empty() ||
+              runtime.io_output_binding || !runtime.motion_endpoint ||
+              !tcp_selector_admits(payload.tcp, *runtime.motion_endpoint, std::nullopt)) {
+            return reject("Set TCP lacks the robot's exact runtime mapping",
+                          "runtime_motion_mapping_incomplete");
           }
           return Result<RuntimeParticipantBinding>::Ok(binding);
         } else {

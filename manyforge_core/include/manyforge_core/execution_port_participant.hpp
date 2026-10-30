@@ -58,10 +58,12 @@ struct ExecutionPortParticipantConfig final {
   /// authority (§4.1): kMeasured on real robots, kCommanded on Isaac (item
   /// 20) and offline.
   StopStageHelperConfig stop;
-  /// Measured authority only (`main`'s terminal state gate): the final
-  /// measured position must lie within this tolerance of the trajectory end,
+  /// Measured authority only (`main`'s terminal state gate): the lane's
+  /// arrival tolerance (also the controller's JTC `goal` constraint). The
+  /// final measured position must lie within it of the trajectory end,
   /// observed in a sample received after the successful result within
-  /// `completion_state_timeout_ns` (`main`'s `wait_for_state_timeout_s`).
+  /// `completion_state_timeout_ns` (`main`'s `wait_for_state_timeout_s`);
+  /// the check is `robot_at_target`.
   std::optional<double> final_tolerance_rad;
   Duration completion_state_timeout_ns{0};
   /// Measured authority only (`main`'s start-state check, §2.2): before the
@@ -87,6 +89,18 @@ struct ExecutionPortParticipantConfig final {
   // Observation only: failures must never change dispatch or authorization.
   std::function<void(const ExecutionGoalKey&, const PreparedOperationParticipantDTO&,
                      ExecutionBindingEpoch)> observe_goal_context{};
+  /// TOOLCTX (M6b: the separate apply-tool-context action, `ApplyToolContext`):
+  /// run before a new goal is sent and before it counts as running, with no
+  /// goal or Stop in flight (the robot at rest), never for a replacement. It
+  /// runs without the participant lock; a Stop that starts meanwhile refuses
+  /// the goal (`execution_port_stop_in_flight`). Active TCP (M7): the lane
+  /// sets the robot's Active TCP to the move's TCP entry,
+  /// `prepared_motion_tcp_entry(participant)`: nothing when it already is,
+  /// otherwise its confirmed TCP step, then the commit. An error refuses the
+  /// motion before effect (`tool_context_not_applied`). Absent: nothing to
+  /// apply. A moving replacement never reaches it: the Kernel refuses a
+  /// preempt naming another TCP (`tool_context_change_during_motion`).
+  std::function<Result<void>(const PreparedOperationParticipantDTO&)> apply_tool_context{};
 };
 
 /// Host-owned state authority: the addressed observed-state publication the
@@ -176,6 +190,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& source,
                                 std::uint64_t candidate_id,
                                 PreparedMotionReplacementCommitDTO commit) override;
+  Result<void> ApplyToolContext(const PreparedOperationParticipantDTO& participant) override;
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
                            const ControllerGoalId& controller_goal_id,
                            ControllerGoalGeneration controller_goal_generation) override;
@@ -285,6 +300,14 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   std::unique_ptr<Replacement> replacement_;
   std::uint64_t next_execution_generation_{1U};
   std::uint32_t stop_stages_in_flight_{0U};
+  /// Stop stages ever entered: compared across the unlocked tool-context
+  /// action up to Dispatch, so a Stop that started (and maybe ended) meanwhile wins.
+  std::uint64_t stop_stages_started_{0U};
+  /// M6b: the Stop count when the latest tool-context action started; the
+  /// next Dispatch refuses its goal when a Stop started since.
+  std::optional<std::uint64_t> tool_context_stops_before_;
+  /// M6b: the goal a Stop stage found unsent and contained; Dispatch refuses it.
+  std::optional<ExecutionGoalKey> stopped_before_dispatch_;
   ExecutionPortTimingMetrics timing_{};
   ExecutionLaneFactsDTO lane_;
 

@@ -1441,12 +1441,11 @@ rebind_runtime_participant_to_active_configuration(
 }
 
 core::Result<core::RuntimeParticipantStopReadiness>
-store_and_verify_runtime_participant_stop_readiness(
+seal_runtime_participant_stop_readiness(
     const RetainedBundle &retained_bundle, core::ResolvedStopBasePlanDTO plan,
     core::ComponentLifecycleGeneration component_lifecycle_generation,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
-    const core::RuntimeParticipantBinding &participant_binding,
-    core::IResolvedStopBasePlanRepository &repository) {
+    const core::RuntimeParticipantBinding &participant_binding) {
   if (!verify_retained_bundle_identity(retained_bundle) ||
       plan.retained_bundle_id != retained_bundle.retained_bundle_id())
     return readiness_error<core::RuntimeParticipantStopReadiness>(
@@ -1457,51 +1456,23 @@ store_and_verify_runtime_participant_stop_readiness(
     return core::Result<core::RuntimeParticipantStopReadiness>::Err(
         verified.error());
   }
-  const auto expected_id = plan.resolved_stop_base_plan_id;
-  const auto stored = repository.PutIfAbsent(plan);
-  if (!stored.ok()) {
-    return core::Result<core::RuntimeParticipantStopReadiness>::Err(
-        stored.error());
-  }
-  if (stored.value() != expected_id) {
-    return core::Result<core::RuntimeParticipantStopReadiness>::Err(
-        core::ErrorDTO{
-            std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
-            "resolved Stop base-plan repository returned a different identity",
-            {{"reason",
-              "resolved_stop_base_plan_repository_identity_mismatch"}}});
-  }
-  const auto loaded = repository.LoadVerified(expected_id);
-  if (!loaded.ok()) {
-    return core::Result<core::RuntimeParticipantStopReadiness>::Err(
-        loaded.error());
-  }
-  if (loaded.value() != plan) {
-    return core::Result<core::RuntimeParticipantStopReadiness>::Err(
-        core::ErrorDTO{
-            std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
-            "resolved Stop base-plan repository readback disagrees",
-            {{"reason",
-              "resolved_stop_base_plan_repository_readback_mismatch"}}});
-  }
   return core::verify_runtime_participant_stop_readiness(
       core::RuntimeParticipantStopReadinessDTO{
           participant_binding.value().controllable_component_id,
           component_lifecycle_generation, expected_domain.value(),
-          std::move(loaded.value())},
+          std::move(plan)},
       participant_binding, expected_domain);
 }
 
 core::Result<std::vector<VerifiedRouteReadinessParticipant>>
-resolve_store_and_verify_route_readiness_batch(
+resolve_and_verify_route_readiness_batch(
     const RetainedBundle &retained_bundle,
     const IVerifiedRetainedProductArtifactSource &artifact_source,
     const core::ControllerLifecycleExpectedDomain &expected_domain,
     const core::ActiveControlConfigurationDTO &active_configuration,
     const std::span<const core::RouteSelectionComponentExpectationDTO>
         component_expectations,
-    const std::span<const core::RuntimeParticipantBinding> participant_bindings,
-    core::IResolvedStopBasePlanRepository &repository) {
+    const std::span<const core::RuntimeParticipantBinding> participant_bindings) {
   struct Pending final {
     core::RuntimeParticipantBinding binding;
     core::ComponentLifecycleGeneration component_generation;
@@ -1615,10 +1586,9 @@ resolve_store_and_verify_route_readiness_batch(
     result.reserve(pending.size());
     for (auto &candidate : pending) {
       const auto plan_id = candidate.plan.resolved_stop_base_plan_id;
-      auto readiness = store_and_verify_runtime_participant_stop_readiness(
+      auto readiness = seal_runtime_participant_stop_readiness(
           retained_bundle, std::move(candidate.plan),
-          candidate.component_generation, expected_domain, candidate.binding,
-          repository);
+          candidate.component_generation, expected_domain, candidate.binding);
       if (!readiness.ok()) {
         return core::Result<std::vector<VerifiedRouteReadinessParticipant>>::
             Err(readiness.error());

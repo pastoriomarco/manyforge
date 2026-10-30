@@ -319,7 +319,10 @@ void require_digest(std::string_view value, std::string reason) {
        (!std::isfinite(*metrics.peak_tcp_linear_speed_mps) ||
         *metrics.peak_tcp_linear_speed_mps < 0.0)) ||
       (metrics.cartesian_fidelity_metrics.has_value() &&
-       !valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics))) {
+       !valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics)) ||
+      (metrics.peak_tcp_linear_speed_frame.has_value() &&
+       (metrics.peak_tcp_linear_speed_frame->empty() ||
+        !metrics.peak_tcp_linear_speed_mps.has_value()))) {
     fail("trajectory_validation_metrics_invalid");
   }
   CanonicalValue::Object metrics_fields{
@@ -336,18 +339,23 @@ void require_digest(std::string_view value, std::string reason) {
   if (metrics.cartesian_fidelity_metrics)
     metrics_fields.emplace_back("cartesian_fidelity_metrics",
                                 cartesian_fidelity_value(metrics.cartesian_fidelity_metrics));
+  if (metrics.peak_tcp_linear_speed_frame)
+    metrics_fields.emplace_back("peak_tcp_linear_speed_frame",
+                                CanonicalValue(*metrics.peak_tcp_linear_speed_frame));
   return CanonicalValue(std::move(metrics_fields));
 }
 
 [[nodiscard]] TrajectoryValidationMetricsDTO parse_metrics(const CanonicalValue& metrics_value) {
   const auto* fidelity_value = metrics_value.find_object_member("cartesian_fidelity_metrics");
-  if (fidelity_value)
-    exact(metrics_value,
-          {"cartesian_fidelity_metrics", "peak_abs_joint_acceleration_rad_s2",
-           "peak_abs_joint_velocity_rad_s", "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
-  else
-    exact(metrics_value, {"peak_abs_joint_acceleration_rad_s2", "peak_abs_joint_velocity_rad_s",
-                          "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
+  const auto* speed_frame_value =
+      metrics_value.find_object_member("peak_tcp_linear_speed_frame");
+  if (!metrics_value.is_object() ||
+      metrics_value.as_object().size() !=
+          4U + (fidelity_value ? 1U : 0U) + (speed_frame_value ? 1U : 0U))
+    fail("unknown_or_missing_member");
+  for (const auto name : {"peak_abs_joint_acceleration_rad_s2", "peak_abs_joint_velocity_rad_s",
+                          "peak_tcp_linear_speed_mps", "trajectory_duration_s"})
+    static_cast<void>(member(metrics_value, name));
   const auto& acceleration_value = member(metrics_value, "peak_abs_joint_acceleration_rad_s2");
   const auto& tcp_value = member(metrics_value, "peak_tcp_linear_speed_mps");
   TrajectoryValidationMetricsDTO metrics{
@@ -356,6 +364,11 @@ void require_digest(std::string_view value, std::string reason) {
       acceleration_value.is_null() ? std::vector<double>{} : number_array(acceleration_value),
       tcp_value.is_null() ? std::nullopt : std::optional<double>{finite_number(tcp_value)},
       fidelity_value ? parse_cartesian_fidelity(*fidelity_value) : std::nullopt};
+  if (speed_frame_value) {
+    metrics.peak_tcp_linear_speed_frame = text(*speed_frame_value);
+    if (metrics.peak_tcp_linear_speed_frame->empty() || !metrics.peak_tcp_linear_speed_mps)
+      fail("trajectory_validation_metrics_invalid");
+  }
   const auto metrics_valid = [](const std::vector<double>& values) {
     return std::all_of(values.begin(), values.end(), [](const double item) { return item >= 0.0; });
   };

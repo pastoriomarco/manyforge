@@ -1,0 +1,34 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/xarm_gripper`.
+# Mounts on a robot's `flange` interface as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: tool
+id: ufactory.xarm_gripper
+version: 1.0.0
+title: UFACTORY xArm gripper
+license: BSD-3-Clause
+model:
+  urdf: xarm_gripper.urdf
+  srdf: xarm_gripper.srdf
+mount:
+  frame: xarm_gripper_mount
+tcps:                             # the first is the default TCP
+  - {id: tcp, frame: link_tcp}
+roles:
+  groups: {gripper: uf850_gripper}
+  joints: {fingers: [drive_joint]}
+  collision_bodies:
+    gripper_collision: [left_finger, left_inner_knuckle, left_outer_knuckle, right_finger, right_inner_knuckle, right_outer_knuckle, xarm_gripper_base_link]
+gripper:
+  actuation: position_commanded
+  states: {open: open, closed: closed}
+  attach_frame: link_tcp
+  touch_links: [left_finger, left_inner_knuckle, left_outer_knuckle, right_finger, right_inner_knuckle, right_outer_knuckle, xarm_gripper_base_link]
+lanes:
+  mock:
+    controllers:                  # its gripper-only Mock row (no arm controller)
+      template: ufactory
+      hardware_component_name: MockXArmGripperSystem
+      gripper_controller: xarm_gripper_controller
+      hard_stop_completion_timeout_s: 1.5
+      gripper_result_timeout_s: 5.0

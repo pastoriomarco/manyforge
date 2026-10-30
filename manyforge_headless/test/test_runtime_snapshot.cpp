@@ -607,5 +607,26 @@ TEST(RuntimeSnapshotAggregator, RejectsMalformedComponentSimulatorDependencies) 
   }
 }
 
+TEST(ViewerSceneSource, ValidatesOwnerAndPayloadBeforeReturningEpoch) {
+  TemporaryDirectory directory;
+  AtomicSourceSnapshotChannel source(directory.path(), "scene-runtime-source.json");
+  const auto path = directory.path() / "scene-runtime-source.json";
+  EXPECT_FALSE(ReadViewerSceneSource(path, "cell-a"));
+  static_cast<void>(source.Publish("scene_runtime", "scene-runtime.cell-a", "epoch-1",
+                                   1, SceneRuntimePayload("cell-a")));
+  const auto valid = ReadViewerSceneSource(path, "cell-a");
+  ASSERT_TRUE(valid);
+  EXPECT_EQ(std::get<1>(*valid), "epoch-1");
+  EXPECT_FALSE(ReadViewerSceneSource(path, "cell-b"));
+  TemporaryDirectory foreign_directory;
+  AtomicSourceSnapshotChannel foreign(foreign_directory.path(), "scene-runtime-source.json");
+  static_cast<void>(foreign.Publish("scene_runtime", "scene-runtime.cell-b", "epoch-2",
+                                    2, SceneRuntimePayload("cell-a")));
+  EXPECT_FALSE(ReadViewerSceneSource(foreign_directory.path() / "scene-runtime-source.json", "cell-a"));
+  static_cast<void>(source.Publish("scene_runtime", "scene-runtime.cell-a", "epoch-3",
+                                   3, SceneRuntimePayload("cell-b")));
+  EXPECT_FALSE(ReadViewerSceneSource(path, "cell-a"));
+}
+
 } // namespace
 } // namespace manyforge::headless

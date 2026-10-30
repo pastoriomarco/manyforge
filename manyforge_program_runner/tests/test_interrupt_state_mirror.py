@@ -585,7 +585,9 @@ def test_verified_empty_with_no_program_key_is_w0_no_sender_no_baseline() -> Non
     from types import SimpleNamespace
 
     runtime = _hook_runtime(parse_catalog(_VERIFIED_EMPTY))
-    runtime._owner = SimpleNamespace(value_store=lambda run_id: object())  # noqa: SLF001
+    # The runtime clears the store's notify-rule reader (NOTIFY-1).
+    runtime._owner = SimpleNamespace(value_store=lambda run_id: SimpleNamespace(  # noqa: SLF001
+        set_interrupt_notify_rule_reader=lambda _reader: None))
     created: list[Any] = []
     runtime._new_bbkey_publisher = lambda scope: created.append(scope)  # type: ignore[method-assign]  # noqa: SLF001
     runtime._retire_bbkey_publishers = lambda **_kwargs: None  # type: ignore[method-assign]  # noqa: SLF001
@@ -710,6 +712,31 @@ def test_seeding_is_context_checked() -> None:
         other.read("interrupt_state.door")
 
 
+def test_notify_rule_reader_tracks_catalog_arrival_and_exact_run_context() -> None:
+    kernel = _Kernel()
+    kernel.catalog = None
+    mirror, _changes = _mirror(kernel)
+    store = _store()
+    runtime = _state_runtime(mirror, store)
+    runtime._seed_interrupt_states(store, _CONTEXT_W)  # noqa: SLF001
+
+    assert not store.interrupt_rule_is_notify("door")
+    notify_catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    kernel.catalog = notify_catalog
+    kernel.baseline = _ready(0, {"door": "clear"})
+    mirror.poll()
+    assert store.interrupt_rule_is_notify("door")
+
+    # A newer catalog for another publication cannot lend notify semantics
+    # to a Run bound to the previous publication, even with the same rule id.
+    kernel.catalog = {**notify_catalog, "active_publication_generation": 4}
+    kernel.baseline = _ready(
+        0, {"door": "clear"}, active_publication_generation=4,
+    )
+    mirror.poll()
+    assert not store.interrupt_rule_is_notify("door")
+
+
 def test_known_to_unknown_catalog_makes_declared_keys_unavailable() -> None:
     # SX-2208: an unreadable reply drops the catalog; the store's declared
     # keys become unavailable (never clear, never another id declared).
@@ -819,6 +846,87 @@ class _StreamHost:
 
         host = self
         return opened()
+
+
+def test_notify_rule_state_stream_updates_reserved_key_only() -> None:
+    # The catalog identifies the notify rule; its state stream carries the
+    # ordinary clear/tripped/clear values. Core tests own the motion effects.
+    baseline = _ready(0, {"advisory": "clear"})
+    catalog = _proving_catalog(baseline["snapshot"])
+    catalog["notify_rule_ids"] = ["advisory"]
+    kernel = _Kernel()
+    kernel.catalog = catalog
+    kernel.baseline = baseline
+    host = _StreamHost([
+        _snapshot(0, baseline, catalog),
+        _streamed(_event(1, "advisory", "tripped")),
+        _streamed(_event(2, "advisory", "clear")),
+    ])
+    runtime = _hook_runtime(None)
+    runtime._interrupt_state_stores = lambda: []  # type: ignore[method-assign]  # noqa: SLF001
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: kernel.owner, read_events=kernel, subscribe=host.subscribe,
+        on_change=runtime._apply_interrupt_states,  # noqa: SLF001
+    )
+    runtime._interrupt_state_mirror = mirror  # noqa: SLF001
+    mirror.poll()  # The existing catalog declares the Applied rule's key.
+    program = runtime._with_global_rule_keys(  # noqa: SLF001
+        _store().program, retained_bundle_id="bundle-1", graph_revision="graph-1",
+    )
+    store = _store(program)
+    runtime._interrupt_state_stores = lambda: [store]  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._seed_interrupt_states(store, _CONTEXT_W)  # noqa: SLF001
+    assert store.read("interrupt_state.advisory") == "clear"
+    assert store.read("count") == 0 and store.read("door_open") is False
+
+    changes = []
+    store.subscribe_published_keys(
+        ("count", "door_open", "interrupt_state.advisory"),
+        baseline=lambda _rows: None,
+        on_change=lambda change: changes.append((change.key, change.value)),
+    )
+    observed = []
+    mirror.follow(
+        threading.Event(),
+        on_message=lambda _message: observed.append(store.read("interrupt_state.advisory")),
+    )
+    assert observed == ["clear", "tripped", "clear"]
+    assert changes == [
+        ("interrupt_state.advisory", "tripped"),
+        ("interrupt_state.advisory", "clear"),
+    ]
+    assert store.read("count") == 0 and store.read("door_open") is False
+    with pytest.raises(ProgramValueError):
+        store.write("interrupt_state.advisory", "tripped")
+
+
+def test_shared_stream_callback_sees_each_message_after_interrupt_state() -> None:
+    first = _snapshot(0, _ready(0, {"door": "clear"}), _CATALOG_A)
+    second = _streamed(_event(1, "door", "tripped"))
+    host = _StreamHost([first, second])
+    seen = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(),
+        subscribe=host.subscribe, on_change=lambda _states: None,
+    )
+    mirror.follow(
+        threading.Event(),
+        on_message=lambda message: seen.append((message["type"], mirror.current())),
+    )
+    assert seen == [("snapshot", {"door": "clear"}), ("event", {"door": "tripped"})]
+
+
+def test_shared_stream_disconnect_keeps_existing_unavailable_path() -> None:
+    first = _snapshot(0, _ready(0, {"door": "clear"}), _CATALOG_A)
+    host = _StreamHost([first, HeadlessApiError("execution_owner_unavailable", "closed")], [])
+    lost = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(),
+        subscribe=host.subscribe, on_change=lambda _states: None,
+    )
+    mirror.follow(threading.Event(), on_disconnect=lost.append)
+    assert len(lost) == 1
+    assert mirror.current() is None
 
 
 def test_stream_applies_snapshot_then_rows_as_they_arrive() -> None:
@@ -1402,3 +1510,145 @@ def test_ready_catalog_waiting_rule_is_unavailable_never_clear() -> None:
     kernel.catalog = _CATALOG_A
     mirror.poll()
     assert mirror.current() == {"door": "latched", "zone": "clear"}
+
+
+def test_notify_pending_and_unknown_invalidate_real_store_then_recover() -> None:
+    kernel = _Kernel()
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    kernel.catalog = catalog
+    kernel.baseline = _ready(0, {"door": "tripped", "zone": "latched"})
+    program = _store()._program.with_interrupt_state_keys(("door", "zone"))  # noqa: SLF001
+    store = _store(program)
+    runtime: Any = None
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: kernel.owner, read_events=kernel,
+        on_change=lambda states: runtime._apply_interrupt_states(states),  # noqa: SLF001
+    )
+    runtime = _state_runtime(mirror, store)
+    mirror.poll()
+    assert store.read("interrupt_state.door") == "tripped"
+    kernel.baseline = {"status": "projection_pending"}
+    kernel.events = [_event(1, "door", "tripped"), _event(2, "zone", "clear")]
+    mirror.poll()
+    with pytest.raises(KeyError):
+        store.read("interrupt_state.door")
+    assert store.read("interrupt_state.zone") == "clear"
+    unknown = _ready(2, {"door": "clear", "zone": "clear"})
+    unknown["snapshot"]["states"][0].update(
+        state="unknown", triggering_acquisition=None,
+        unavailable_reason={"code": "io_rule_source_unavailable", "message": "lost", "details": {}},
+    )
+    kernel.baseline = unknown
+    mirror.poll()
+    with pytest.raises(KeyError):
+        store.read("interrupt_state.door")
+    assert store.read("interrupt_state.zone") == "clear"
+    kernel.baseline = {"status": "projection_pending"}
+    kernel.events.append(_event(3, "door", "tripped"))
+    mirror.poll()
+    with pytest.raises(KeyError):
+        store.read("interrupt_state.door")
+    kernel.baseline = _ready(3, {"door": "tripped", "zone": "clear"})
+    mirror.poll()
+    assert store.read("interrupt_state.door") == "tripped"
+    with pytest.raises(ProgramValueError):
+        store.write("interrupt_state.door", "clear")
+
+
+def test_notify_stream_invalidates_pending_and_restores_same_context_cut() -> None:
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    program = _store()._program.with_interrupt_state_keys(("door", "zone"))  # noqa: SLF001
+    store = _store(program)
+    runtime: Any = None
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(),
+        on_change=lambda states: runtime._apply_interrupt_states(states),  # noqa: SLF001
+    )
+    runtime = _state_runtime(mirror, store)
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "tripped", "zone": "latched"}), catalog))
+    mirror.apply_stream_message(_stream("state", state=_state({"status": "projection_pending"}, catalog)))
+    mirror.apply_stream_message(_streamed(_event(1, "door", "tripped")))
+    mirror.apply_stream_message(_streamed(_event(2, "zone", "clear")))
+    with pytest.raises(KeyError):
+        store.read("interrupt_state.door")
+    assert store.read("interrupt_state.zone") == "clear"
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(2, {"door": "clear", "zone": "clear"}), catalog)))
+    assert store.read("interrupt_state.door") == "clear"
+    mirror.apply_stream_message(_streamed(_event(3, "door", "tripped")))
+    assert store.read("interrupt_state.door") == "tripped"
+
+
+def test_unknown_wire_requires_typed_reason_and_no_acquisition() -> None:
+    payload = _event(1, "door", "unknown")["payload"]
+    with pytest.raises(InterruptStateWireError):
+        parse_state_event(payload)
+    payload["unavailable_reason"] = {"code": "io_watch_bound_exceeded", "message": "", "details": {"limit": "4"}}
+    assert parse_state_event(payload)[1:] == ("door", "unknown")
+    for change in ({"triggering_acquisition": _ACQUISITION},
+                   {"unavailable_reason": {"code": "", "message": "", "details": {}}}):
+        with pytest.raises(InterruptStateWireError):
+            parse_state_event({**payload, **change})
+    with pytest.raises(InterruptStateWireError):
+        parse_catalog({**_CATALOG_A, "notify_rule_ids": ["foreign"]})
+
+
+def test_notify_ready_cut_recovers_when_pending_and_journal_row_were_not_seen() -> None:
+    # A bounded journal projection queue may omit a transition. The next ready
+    # cut is authoritative even when the stream coalesced the pending state.
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    program = _store()._program.with_interrupt_state_keys(("door", "zone"))  # noqa: SLF001
+    store = _store(program)
+    runtime: Any = None
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(),
+        on_change=lambda states: runtime._apply_interrupt_states(states),  # noqa: SLF001
+    )
+    runtime = _state_runtime(mirror, store)
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "tripped", "zone": "latched"}), catalog))
+    unknown = _ready(0, {"door": "clear", "zone": "latched"})
+    unknown["snapshot"]["states"][0].update(
+        state="unknown", triggering_acquisition=None,
+        unavailable_reason={"code": "io_rule_source_unavailable", "message": "lost", "details": {}},
+    )
+    mirror.apply_stream_message(_stream("state", state=_state(unknown, catalog)))
+    with pytest.raises(KeyError):
+        store.read("interrupt_state.door")
+    assert store.read("interrupt_state.zone") == "latched"
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(0, {"door": "clear", "zone": "latched"}), catalog)))
+    assert store.read("interrupt_state.door") == "clear"
+
+
+def test_notify_cut_does_not_hide_legacy_rows_still_in_stream() -> None:
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    mirror, _ = _mirror(_Kernel())
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "tripped", "zone": "latched"}), catalog))
+    mirror.apply_stream_message(_stream("state", state=_state({"status": "projection_pending"}, catalog)))
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(2, {"door": "clear", "zone": "clear"}), catalog)))
+    mirror.apply_stream_message(_streamed(_event(1, "door", "tripped")))
+    mirror.apply_stream_message(_streamed(_event(2, "zone", "clear")))
+    assert mirror.current() == {"door": "clear", "zone": "clear"}
+
+
+def test_unchanged_notify_ready_cut_covers_delayed_notify_rows() -> None:
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    mirror, _ = _mirror(_Kernel())
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "tripped", "zone": "latched"}), catalog))
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(2, {"door": "tripped", "zone": "latched"}), catalog)))
+    mirror.apply_stream_message(_streamed(_event(1, "door", "clear")))
+    mirror.apply_stream_message(_streamed(_event(2, "zone", "clear")))
+    assert mirror.current() == {"door": "tripped", "zone": "clear"}
+
+
+def test_older_stream_cut_cannot_undo_later_polled_notify_event() -> None:
+    catalog = {**_CATALOG_A, "notify_rule_ids": ["door"]}
+    kernel = _Kernel()
+    kernel.catalog = catalog
+    kernel.baseline = _ready(0, {"door": "clear", "zone": "clear"})
+    mirror, _ = _mirror(kernel)
+    mirror.apply_stream_message(_snapshot(0, kernel.baseline, catalog))
+    kernel.events = [_event(2, "door", "tripped")]
+    mirror.poll()
+    assert mirror.current()["door"] == "tripped"  # type: ignore[index]
+    # The subscription's older ready fact arrived after the poll.
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(1, {"door": "clear", "zone": "clear"}), catalog)))
+    assert mirror.current()["door"] == "tripped"  # type: ignore[index]

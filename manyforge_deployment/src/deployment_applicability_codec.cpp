@@ -2227,13 +2227,14 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
                                       {"priority", CanonicalValue(priority)}};
     // gate (default): refuse new motion in scope while the condition is true,
     // scoped Stop, released when it clears. full_stop: cell Full Stop and
-    // operator release; only full_stop knows an idle_behaviour.
+    // operator release; notify publishes the rule state without motion effects.
+    // Only full_stop knows an idle_behaviour.
     std::string on_trip = "gate";
     if (const auto *authored = find_member(rule, "on_trip")) {
       on_trip = require_string(*authored, child_path(path, "on_trip"));
-      if (on_trip != "gate" && on_trip != "full_stop")
+      if (on_trip != "gate" && on_trip != "full_stop" && on_trip != "notify")
         fail(child_path(path, "on_trip"),
-             "global on_trip requires gate or full_stop");
+             "global on_trip requires gate, full_stop or notify");
     }
     normalized.emplace_back("on_trip", CanonicalValue(on_trip));
     if (const auto *idle = find_member(rule, "idle_behaviour")) {
@@ -2246,6 +2247,9 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
       normalized.emplace_back("idle_behaviour", *idle);
     }
     if (const auto *entry = find_member(rule, "stop_entry_stage_id")) {
+      if (on_trip == "notify")
+        fail(child_path(path, "stop_entry_stage_id"),
+             "global stop_entry_stage_id is not allowed with on_trip notify");
       (void)require_portable_token_string(*entry, path);
       normalized.emplace_back("stop_entry_stage_id", *entry);
     }

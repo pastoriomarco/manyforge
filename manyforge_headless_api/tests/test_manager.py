@@ -12,6 +12,7 @@ import rfc8785
 from manyforge_headless_api.manager import ManagerCommandClient, MANAGER_RESPONSE_VERSION
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
+    ManagerApplyAcknowledgementContext,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
 )
@@ -228,29 +229,21 @@ def test_manager_client_default_wait_covers_a_bounded_durable_mutation(
     assert not worker.is_alive()
 
 
-def test_manager_client_rejects_a_response_for_another_request(
+def test_manager_client_does_not_compare_the_response_echo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Each exchange is its own connection: the echoed identity is not compared.
     client = ManagerCommandClient(tmp_path)
-    monkeypatch.setattr(
-        client,
-        "_exchange",
-        lambda _command: {
-            "api_version": "manyforge.manager_command_response.v1",
-            "ok": False,
-            "request_id": "request.other",
-            "request_owner_epoch": "client.epoch.1",
-        },
-    )
+    response = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "ok": False,
+        "request_id": "request.other",
+        "request_owner_epoch": "client.epoch.1",
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
 
-    with pytest.raises(
-        HeadlessApiError,
-        match="does not match the submitted request",
-    ) as captured:
-        client.apply(_request())
-
-    assert captured.value.code == "manager_command_response_identity_mismatch"
+    assert client.apply(_request()) == response
 
 
 def test_manager_client_observes_apply_without_replaying_submission(
@@ -310,7 +303,104 @@ def _status_response() -> dict[str, object]:
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",
         "state": "pending",
+        "failure_acknowledgement": "unavailable",
     }
+
+
+def _failed_status_response(
+    *, failure_acknowledgement: str
+) -> dict[str, object]:
+    response = _status_response()
+    response.update(
+        {
+            "state": "failed",
+            "failure_acknowledgement": failure_acknowledgement,
+            "failure": {
+                "cause_code": "manager_apply_preflight_refused",
+                "cause_details": {},
+                "code": "manager_apply_preflight_refused",
+                "effect_boundary": "before_effect",
+                "effect_disposition": "known",
+                "message": "Apply was refused before effect.",
+                "phase": "accepted",
+                "producer": "component_manager",
+            },
+        }
+    )
+    return response
+
+
+def test_manager_client_sends_one_exact_apply_acknowledgement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    commands: list[dict[str, object]] = []
+
+    def exchange(command: dict[str, object]) -> dict[str, object]:
+        commands.append(command)
+        return _failed_status_response(failure_acknowledgement="acknowledged")
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    context = ManagerApplyAcknowledgementContext.model_validate({
+        "request_id": "composer-ack.request.3",
+        "source_label": "manyforge_composer",
+    })
+    response = client.acknowledge_apply("apply.3", 3, context)
+
+    assert response["state"] == "failed"
+    assert response["failure_acknowledgement"] == "acknowledged"
+    assert commands == [{
+        "api_version": "manyforge.manager_command.v1",
+        "apply_generation": 3,
+        "apply_id": "apply.3",
+        "command": "apply_acknowledge",
+        "request_context": {
+            "request_id": "composer-ack.request.3",
+            "source_label": "manyforge_composer",
+        },
+    }]
+
+
+def test_apply_acknowledgement_preserves_pre_attempt_refusal_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    refusal = {
+        "api_version": MANAGER_RESPONSE_VERSION,
+        "ok": False,
+        "error": {
+            "code": "stale_generation", "message": "The predecessor changed.",
+            "details": {"effect": "none"}, "producer": "kernel",
+        },
+    }
+    monkeypatch.setattr(client, "_exchange", lambda _command: refusal)
+    context = ManagerApplyAcknowledgementContext.model_validate({
+        "request_id": "composer-ack.request.3", "source_label": "manyforge_composer",
+    })
+    assert client.acknowledge_apply("apply.3", 3, context) == refusal
+
+
+def test_manager_client_rejects_malformed_acknowledgement_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        response = _failed_status_response(failure_acknowledgement="unavailable")
+        response["failure_acknowledgement"] = "maybe"
+        return response
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.acknowledge_apply(
+            "apply.3",
+            3,
+            ManagerApplyAcknowledgementContext.model_validate({
+                "request_id": "composer-ack.request.3",
+                "source_label": "manyforge_composer",
+            }),
+        )
+    assert captured.value.code == "manager_command_response_invalid"
 
 
 def test_manager_client_keeps_one_bounded_apply_status_contract(
@@ -350,22 +440,6 @@ def test_manager_client_rejects_a_status_that_is_not_one_lifecycle(
     with pytest.raises(HeadlessApiError) as captured:
         client.observe_apply("apply.3", 3)
     assert captured.value.code == "manager_command_response_invalid"
-
-
-def test_manager_client_rejects_a_status_for_another_durable_operation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client = ManagerCommandClient(tmp_path)
-
-    def exchange(_command: dict[str, object]) -> dict[str, object]:
-        response = _status_response()
-        response["apply_id"] = "apply.4"
-        return response
-
-    monkeypatch.setattr(client, "_exchange", exchange)
-    with pytest.raises(HeadlessApiError) as captured:
-        client.observe_apply("apply.3", 3)
-    assert captured.value.code == "manager_command_response_identity_mismatch"
 
 
 def test_manager_client_reports_an_unknown_operation_status_as_a_typed_error(
@@ -435,6 +509,10 @@ def test_manager_client_keeps_the_actual_terminal_failure_phase(
                 "message": "the cell is not idle",
                 "phase": "accepted",
                 "effect_disposition": "known",
+                "cause_code": "planned_maintenance_refused",
+                "cause_details": {},
+                "producer": "component_manager",
+                "effect_boundary": "before_effect",
             },
         }
 
@@ -442,6 +520,7 @@ def test_manager_client_keeps_the_actual_terminal_failure_phase(
     response = client.observe_apply("apply.3", 3)
     assert response["phase"] == "accepted"
     assert response["failure"]["code"] == "planned_maintenance_refused"
+    assert response["failure"]["producer"] == "component_manager"
 
 
 def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
@@ -548,7 +627,7 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
     ]
 
 
-def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
+def test_scene_client_rejects_an_inconsistent_owner_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client = ManagerCommandClient(tmp_path)
@@ -565,13 +644,12 @@ def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
         "update_status": None,
     }
     monkeypatch.setattr(client, "_exchange", lambda _command: valid_failure)
-    with pytest.raises(HeadlessApiError) as captured:
-        client.commit_scene_transaction(
-            _scene_request(), trusted_principal_id=None
-        )
-    assert captured.value.code == "manager_command_response_identity_mismatch"
+    # Each exchange is its own connection: the echoed identity is not compared.
+    assert (
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None)
+        == valid_failure
+    )
 
-    valid_failure["request_id"] = "scene-request.1"
     valid_failure["projection_status"] = "committed"
     with pytest.raises(HeadlessApiError) as captured:
         client.commit_scene_transaction(
@@ -601,11 +679,16 @@ def test_scene_client_rejects_mismatched_or_inconsistent_owner_result(
         "update_status": "geometry_changed",
     }
     monkeypatch.setattr(client, "_exchange", lambda _command: mismatched_success)
+    assert (
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None)
+        == mismatched_success
+    )
+    mismatched_success["extra"] = None
     with pytest.raises(HeadlessApiError) as captured:
         client.commit_scene_transaction(
             _scene_request(), trusted_principal_id=None
         )
-    assert captured.value.code == "manager_command_response_identity_mismatch"
+    assert captured.value.code == "manager_command_response_invalid"
 
 
 def test_scene_result_lookup_is_read_only_and_validates_the_nested_owner_result(
@@ -635,9 +718,6 @@ def test_scene_result_lookup_is_read_only_and_validates_the_nested_owner_result(
         "transaction_sequence": None, "update_status": None,
     }
     assert client.scene_transaction_status(request)["result"]["ok"] is False
-    response["result"]["request_id"] = "another-request"
-    with pytest.raises(HeadlessApiError, match="does not match"):
-        client.scene_transaction_status(request)
     for malformed in ([], 42, {"ok": True}):
         response["result"] = malformed
         with pytest.raises(HeadlessApiError) as captured:
@@ -706,32 +786,13 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
         == newer["projection_revision"]
     )
 
-    same_revision_other_content = {
-        **expected,
-        "scene_revision": {
-            **expected["scene_revision"],
-            "content_hash": "sha256:" + "f" * 64,
-        },
-    }
-    other_scene = {
-        **expected,
-        "scene_revision": {
-            **expected["scene_revision"],
-            "scene_id": "sha256:" + "e" * 64,
-            "revision_id": 2,
-        },
-    }
-    for foreign in (
-        {**expected, "graph_revision": "sha256:" + "e" * 64},
-        same_revision_other_content,
-        other_scene,
-    ):
-        corrupt = exchange({})
-        corrupt["projection_revision"] = foreign
-        monkeypatch.setattr(client, "_exchange", lambda _command, value=corrupt: value)
-        with pytest.raises(HeadlessApiError) as captured:
-            client.resolve_scene_resources(query)
-        assert captured.value.code == "manager_command_response_identity_mismatch"
+    # The owner refuses a lineage change itself; the client checks the shape.
+    corrupt = exchange({})
+    corrupt["poses"][0]["extra"] = None
+    monkeypatch.setattr(client, "_exchange", lambda _command: corrupt)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.resolve_scene_resources(query)
+    assert captured.value.code == "manager_command_response_invalid"
 
     rejected = {
         "api_version": "manyforge.manager_command_response.v1",
@@ -839,21 +900,6 @@ def test_process_stop_launch_ceiling_preserves_receipt_bounds_and_nfc():
     with pytest.raises(ValidationError): ComponentProcessDrainReceipt.model_validate(receipt)
 
 
-@pytest.mark.parametrize("field,value", [
-    ("runtime_epoch", "foreign.epoch"), ("manager_runtime_epoch", "foreign.manager"),
-    ("launch_identity", "foreign.launch"), ("leader_pid", 43),
-    ("expected_predecessor_publication_generation", 5),
-])
-def test_process_stop_rejects_foreign_echo_without_assuming_drain(tmp_path, monkeypatch, field, value):
-    request = _process_stop_request()
-    response = _process_stop_response(request, "pending")
-    response["result"]["request"][field] = value
-    client = ManagerCommandClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _: response)
-    with pytest.raises(HeadlessApiError, match="exact launch request"):
-        client.component_process_stop_result(request)
-
-
 @pytest.mark.parametrize("mutation", ["no_receipt", "wrong_launch", "wrong_pid", "pending_receipt", "missing_error"])
 def test_process_stop_requires_exact_positive_drain_receipt(tmp_path, monkeypatch, mutation):
     request = _process_stop_request()
@@ -905,6 +951,35 @@ def test_process_stop_preserves_legacy_two_field_parse_error(tmp_path, monkeypat
     monkeypatch.setattr(client, "_exchange", lambda _: response)
     with pytest.raises(HeadlessApiError) as caught: client.stop_component_process(request)
     assert caught.value.code == "manager_command_rejected" and caught.value.details == {}
+    assert caught.value.producer == "component_manager"
+
+
+@pytest.mark.parametrize("producer", ["component_manager", "kernel"])
+def test_manager_refusal_keeps_its_typed_producer(tmp_path, monkeypatch, producer):
+    client = ManagerCommandClient(tmp_path)
+    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+                "error": {"code": "stale_generation", "details": {"reason": "expected_generation_stale"},
+                          "message": "cell-admission request rejected", "producer": producer}}
+    monkeypatch.setattr(client, "_exchange", lambda _: response)
+    with pytest.raises(HeadlessApiError) as caught:
+        client.canonical_empty_selection()
+    assert caught.value.code == "stale_generation"
+    assert caught.value.details == {"reason": "expected_generation_stale"}
+    assert caught.value.producer == producer
+
+
+@pytest.mark.parametrize("error", [
+    {"code": "x_refused", "message": "m", "producer": ""},
+    {"code": "x_refused", "message": "m", "producer": 3},
+    {"code": "x_refused", "message": "m", "extra": "field"},
+])
+def test_manager_refusal_with_malformed_producer_is_invalid(tmp_path, monkeypatch, error):
+    client = ManagerCommandClient(tmp_path)
+    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False, "error": error}
+    monkeypatch.setattr(client, "_exchange", lambda _: response)
+    with pytest.raises(HeadlessApiError) as caught:
+        client.canonical_empty_selection()
+    assert caught.value.code == "manager_command_response_invalid"
 
 
 def test_process_stop_keeps_existing_error_grammar_without_readiness_caps(tmp_path, monkeypatch):

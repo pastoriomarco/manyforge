@@ -75,7 +75,9 @@ def test_program_runner_client_preserves_stable_remote_errors() -> None:
             json={
                 "detail": {
                     "code": "program_run_already_active",
+                    "details": {"active_run": "program-cycle.1"},
                     "message": "one active Program run is already present",
+                    "producer": "kernel",
                 }
             },
         )
@@ -94,6 +96,8 @@ def test_program_runner_client_preserves_stable_remote_errors() -> None:
     assert captured.value.code == "program_run_already_active"
     assert captured.value.status_code == 409
     assert str(captured.value) == "one active Program run is already present"
+    assert captured.value.details == {"active_run": "program-cycle.1"}
+    assert captured.value.producer == "kernel"
 
 
 @pytest.mark.parametrize(

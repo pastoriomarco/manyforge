@@ -364,9 +364,11 @@ std::string OperationFailureHistoryMessage(const CanonicalValue &state) {
 }
 
 EventHistorianError::EventHistorianError(std::string code, std::string message)
-    : std::runtime_error(code + ": " + message), code_(std::move(code)) {}
+    : manyforge::core::TypedError(code, code + ": " + message) {}
 
-const std::string &EventHistorianError::code() const noexcept { return code_; }
+const std::string &EventHistorianError::code() const noexcept {
+  return manyforge::core::TypedError::code();
+}
 
 HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
                                   std::string severity,

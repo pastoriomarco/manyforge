@@ -2,9 +2,12 @@
 
 # Interrupts
 
-An interrupt stops a robot's motion when a condition becomes true, for
-example "a part was detected" or "the light curtain opened". The
-[Concepts](#concepts) section below explains the model: what a rule can read,
+Interrupt rules react when a condition becomes true, for example "a part was
+detected" or "the light curtain opened". Some reactions stop motion; a global
+`notify` rule only publishes its state on a normal condition trip. Its source
+readiness and ability to keep watching can still affect motion: setup failure
+or detected source/evaluation loss gates its scope and Stops moving robots.
+The [Concepts](#concepts) section below explains the model: what a rule can read,
 the two kinds of rules, and how fast they react. Sections 1 to 7 are the
 reference for writing conditions and rules.
 
@@ -64,21 +67,24 @@ and they are fully separate:
 | --- | --- | --- |
 | Where you author it | On a node in the Program: **Move until signal** (`motion.move_until_signal`) or **Probe search** (`motion.probe_search`) | In the Deployment, under `policies.interrupt_rules` |
 | When it is active | Only while that node's move runs | All the time, for every motion in its scope |
-| What it stops | That move | Every motion in its scope |
-| What it decides | The node's result (success or failure) | Nothing in the Program directly; it publishes its state in `interrupt_state.<rule_id>` |
+| Motion effect | Stops that move | `gate` and `full_stop` affect motion in scope; a normal `notify` trip has no motion effect |
+| What it decides | The node's result (success or failure) | No Program result; it publishes state in `interrupt_state.<rule_id>` |
 
-A global rule reacts in one of two ways (`on_trip`, section 4):
+A global rule reacts in one of three ways (`on_trip`, section 4):
 
 - `gate` (default): while the condition is true, new motion in the scope is
   not started, and a motion that is moving gets its Stop. When the condition
   clears, motion is allowed again with no acknowledgement (a motion it stopped
-  while moving can need Reset and an alarm acknowledgement; section 4). A motion
+  while moving fails its node; section 4). A motion
   node of a running Program that is held back this way does not fail: it
   **waits** ("Motion waits"), within its `execution_timeout_s`, and starts
   when the rule clears.
 - `full_stop`: a moving robot in the scope triggers a cell Full Stop, and the
   rule latches until the operator releases it in the GUI. The
   `idle_behaviour` setting exists only for this reaction.
+- `notify`: the rule publishes its state key for Program nodes to read. On a
+  normal condition trip it does not request a Stop, gate motion, or latch.
+  Source readiness and fault handling are described in section 7.
 
 ### How rules are evaluated
 
@@ -161,7 +167,12 @@ configured as interrupt rules and do not appear in `interrupt_state.*`:
   key, or detach the object. The system signal is published on every loss; see
   [Grasp lost as a Program event](#grasp-lost-as-a-program-event).
 - **Runtime collision monitor:** a collision it finds stops the motion
-  through the normal Stop path.
+  through the normal Stop path. The monitor also stops the motion when the
+  robot's measured position stops arriving or becomes too old (for example
+  after a robot controller fault). That Stop is reported as **Robot position
+  feedback lost** (`runtime_monitor_observation_lost`, alarm
+  `manyforge.motion.runtime_monitor_observation_lost`), not as a collision; it
+  is otherwise handled like a runtime collision Stop.
 - **Component stream faults:** when a required stream of a component stops
   reporting, the component is shown as faulted and motion is stopped and
   blocked.
@@ -181,7 +192,7 @@ The Attach object node's `on_grasp_lost` settings control the response:
 | Setting | Default | Effect on loss |
 | --- | --- | --- |
 | `raise_alarm` | `true` | Raise the `scene.carried_object_lost` alarm. When true, `stop_motion` must also be true. |
-| `stop_motion` | `true` | Request the existing Stop path for the carrier. |
+| `stop_motion` | `true` | Request the existing Stop path for the carrier. A carrier motion that Stop holds at its first stage fails its node (`carried_object_lost`) as an ordinary failure: the Program's Fallback can run; an escalated Stop keeps the operation held with the `manyforge.motion.execution_fault` alarm. |
 | `set_key` | `null` | Optional declared writable `bool` key. The Runner writes `true` once for this attachment's loss. |
 | `detach` | `true` | Detach the object at its observed pose. |
 
@@ -194,6 +205,15 @@ and keep `detach: true`. The loss also raises the system input signal
 read-only and declared by the Deployment automatically. It becomes `true` on
 loss and becomes `false` on the next attach by that gripper, a Program detach,
 or cell Reset. Detach-on-loss does not clear it.
+
+For an explicit Program-managed detach, set `detach: false` and a writable
+`set_key` on the attachment. A parallel Program branch can wait for that key
+and run a **Detach object** node for the carried part. The explicit detach
+updates the controller payload after the detach commits. The key event can
+arrive before a detach commits, and the parallel branch is scheduled by the
+Program; this pattern does not guarantee an immediate payload update or stop
+motion. Automatic grasp-loss detach also updates the controller payload after
+commit. See [TCPs](TCPS.md#attach-to-the-active-tcp).
 
 The Runner's key mirror is event-driven; it writes `true` for the loss and
 does not write `false`. Reset the key explicitly with a **Set value** node
@@ -212,13 +232,9 @@ value; it does not publish a grasp-loss event, change the read-only
 When `pick_retreat` is already moving, the global gate requests Stop. The
 example's Fallback is authored to reset `part_lost`, move to the safe pose
 outside the carry group, detach `graspable` (the manual write did not detach
-it) and skip the item. In this build, though, a moving gate Stop leaves the
-operation intervention-required and raises the
-`manyforge.motion.execution_fault` alarm: the Fallback resets `part_lost`, but
-its safe-pose move is refused (`participant_engine_busy`) and the Run fails.
-Clear the rule condition and inspect the fault; Reset retires the affected
-operation, and the execution-fault alarm requires acknowledgement before
-motion can proceed. Apply the usual readiness checks before the next Run. The
+it) and skip the item; the Run continues with the next cycle. The stopped
+carry raises no alarm and needs no Reset: it ends `stopped`, and its node fails
+with `interrupt_fault`. The
 same current-Run write is available through
 `POST /api/program/runs/{program_run_id}/blackboard-values`; include the live
 Run's `program_run_id`, `expected_owner_epoch`, and `expected_run_revision`,
@@ -238,7 +254,8 @@ evidence.
 
 In that node-level pattern, **Move until signal** reads the gripper's
 `carried_object_lost` resource role and uses `on_signal: failure`. That field
-chooses the node result; it does not name a recovery subtree. A **Fallback**
+chooses the node result; it does not name a recovery subtree. The node fails
+as an ordinary failure (no operator hold, no alarm), so the Fallback runs. A **Fallback**
 has the carry Sequence first and a second sequence guarded by **Check input**
 for that same signal to be `true`; it moves to the safe pose and skips the
 item. The system signal remains true until the next attach by that gripper, a
@@ -254,10 +271,8 @@ Safe-pose and recovery nodes remain outside the authored `carry` group, but a
 matching subject does not exempt their motions. While the key is true,
 the gate stops a matching move already running and refuses a new matching move.
 A Stop on an already-moving carry motion fails the node, so the Fallback checks
-that `part_lost` is still true and resets it to `false` to clear the gate. In
-this build its safe-pose move is then refused, as described in the Mock
-walkthrough above, so detach and skip are not reached. Because the key clears
-before the recovery motion, it stays false after that refusal. If the gate
+that `part_lost` is still true, resets it to `false` to clear the gate, moves
+to the safe pose, detaches and skips the item. If the gate
 refuses a motion before it starts, that motion stays RUNNING as **Motion
 waits** and the Fallback cannot run while the carry Sequence is waiting. It
 starts if the key clears before the node's `execution_timeout_s` and the rule's clear state is observed; otherwise the node
@@ -277,6 +292,29 @@ there is no current-Run blackboard to receive the key write; during a later Run,
 a loss on an attachment from an earlier Run can set its `set_key` if the current
 Program declares that key as a writable `bool`. The key means a loss happened
 during the current Run.
+
+### Choosing what a trip does
+
+| Outcome | How to author it |
+| --- | --- |
+| (a) Keep moving; only raise a signal or key for the tree or another rule to catch | `on_grasp_lost: {stop_motion: false, raise_alarm: false, set_key: <key>}`, or a Program-written key read by a global rule |
+| (b) Stop, then the node succeeds | Move until signal / Probe search with `on_signal: success` |
+| (c) Stop, then the node fails and the tree's Fallback runs at once | `on_signal: failure` (or a global `on_trip: gate`, or `on_grasp_lost: {stop_motion: true}`) with the node's default `recovery_policy` |
+| (d) Stop and hold for the operator | As (c), plus the node's `recovery_policy: {allow_intervention: true, max_retries: N}`: the Run holds with Retry from the stopped state (at most `N` times; `0` is unlimited), Continue (the node fails, then the Fallback runs) and Reset |
+| (e) Stop the whole cell | A global rule with `on_trip: full_stop`, or `on_trip: gate` and scope `everything`: a Full Stop the operator recovers |
+
+(b) to (d) hold only when the Stop held at its first stage. An escalated
+Stop, a lost source, a latched Stop fault, or an operator Stop joining it
+keeps the operation held for the operator (section 4). A Stop requested
+through the public Stop API is always an operator Stop. If the stopped
+robot's settlement cannot be confirmed (not in time, or its owner read
+fails), the node holds for the operator
+(`program_stop_settlement_unconfirmed`, "Stop not confirmed: acknowledge to
+continue") instead of failing, whatever its `recovery_policy`. Acknowledge
+continues the node with its normal Stop outcome, as if the cleanup had been
+confirmed: (b) succeeds, (c) fails into the Fallback, (d) holds with its own
+offers. The node rereads the operation once and closes it if it can;
+otherwise it stays retained until Reset. Reset also ends the hold.
 
 ### Interrupts are operational
 
@@ -384,10 +422,33 @@ What happens:
 - **The stop failed or cannot be proven, or the signal source was lost**: the
   node fails.
 
+In the Composer node editor, **When the signal trips** sets these fields in
+one Draft edit:
+
+- **Stop and succeed**: `on_signal: success`.
+- **Stop and fail (run the Fallback)**: `on_signal: failure`, with
+  intervention not allowed in the node's `recovery_policy`.
+- **Stop and ask the operator (Retry / Continue / Reset)**:
+  `on_signal: failure`, with `recovery_policy.allow_intervention: true`. The
+  retry limit shown with it is `recovery_policy.max_retries`.
+
+Values that match none of these show as **Custom**. On the **Attach object**
+node the same dropdown sets `on_grasp_lost`:
+
+- **Stop and raise the alarm (default)**: the default settings (alarm, Stop
+  and detach, no key).
+- **Keep moving, set a signal**: `stop_motion: false`, `raise_alarm: false`
+  and the chosen `set_key`; `detach` is kept.
+
+A key created from the key picker is written to `set_key` only. To stop the
+whole cell, use a global `full_stop` rule with scope `everything` (section 4).
+
 ## 4. Global rules (Deployment)
 
-A global rule watches its condition all the time and stops every motion in
-its scope:
+A global rule watches its condition all the time. Its `on_trip` reaction can
+gate motion, trip a Full Stop, or publish its state for the Program. A normal
+`notify` condition trip does not affect motion; source readiness and fault
+handling still follow section 7:
 
 ```yaml
 policies:
@@ -396,7 +457,7 @@ policies:
       condition: {compare: {operand: {signal: {controllable_component_id: station, signal_name: curtain_clear}}, op: "==", value: false}}
       scope: all_motion
       priority: 0
-      on_trip: gate                   # optional: gate | full_stop
+      on_trip: gate                   # optional: gate | full_stop | notify
       stop_entry_stage_id: software_hard   # optional
 ```
 
@@ -404,24 +465,27 @@ policies:
 | --- | --- | --- |
 | `rule_id` | Lower-case name, unique in the Deployment (letters, digits, `_`, `.`, `-`; at most 128 bytes). It also names the rule's state key `interrupt_state.<rule_id>` | required |
 | `condition` | The condition (section 2) | required |
-| `scope` | What it stops (below) | required |
+| `scope` | Which motions `gate`, `full_stop`, or notify's unavailable-source gate can affect (below); required for all modes | required |
 | `priority` | 0 to 100 | 0 |
-| `on_trip` | `gate` or `full_stop` (below) | `gate` |
+| `on_trip` | `gate`, `full_stop` or `notify` (below) | `gate` |
 | `idle_behaviour` | `latch` or `ignore`, only with `on_trip: full_stop` (below) | see below |
-| `stop_entry_stage_id` | The Stop stage to start from (section 5) | the robot's first stage |
+| `stop_entry_stage_id` | The Stop stage used by `gate` or `full_stop` (section 5); not allowed with `notify` | the robot's first stage for a motion reaction |
 
 A global rule has no `on_signal`, `on_no_signal` or
 `success_through_stage_id`. Unknown fields are refused.
 
 **Scope:**
 
-- `all_motion`: every arm, in a Program or moved by hand, with or without a
-  Run.
-- `{execution_groups: [left, right]}`: the robots of these execution groups
-  of the Applied Program (sorted, no duplicates). Not available when no
-  Program is applied.
-- `everything`: the existing Full Stop. All motion and all other commands
-  stop, including outputs and grippers.
+- For `gate` and `full_stop`, `all_motion` means every arm, in a Program or
+  moved by hand, with or without a Run.
+- For `gate` and `full_stop`, `{execution_groups: [left, right]}` means the
+  robots of these execution groups of the Applied Program (sorted, no
+  duplicates). Not available when no Program is applied.
+- For `gate` and `full_stop`, `everything` is the existing Full Stop: all
+  motion and all other commands stop, including outputs and grippers.
+- `notify` still requires a scope value. A normal condition trip does not
+  affect motion; the scope applies to the existing gate response if setup,
+  re-arm, source or evaluation becomes unavailable (section 7).
 
 **What a trip does (`on_trip`):**
 
@@ -438,21 +502,55 @@ A global rule has no `on_signal`, `on_no_signal` or
   on expiry the node fails with the gate refusal, as it would have at once.
   Halt pauses the wait and its time; Stop and Reset end it like any running
   node, and no motion starts by itself after them. A motion that
-  was already moving is stopped, not waited: its node fails. In this build
-  that Stop can leave the operation intervention-required and raise the
-  `manyforge.motion.execution_fault` alarm; in that case the next motion on
-  that robot is refused until Reset retires the operation, and motion needs
-  the alarm acknowledged.
+  was already moving is stopped, not waited: its node fails with
+  `interrupt_fault`, with no alarm, and the Program's own failure handling
+  runs (for example a Fallback that moves the robot). This holds when the
+  Stop held at its first stage and this gate alone requested it. If the Stop
+  escalated, latched a Stop fault or lost its source, or another rule or an
+  operator Stop joined it, the operation stays held with the
+  `manyforge.motion.execution_fault` alarm: the next motion on that robot is
+  refused until Reset retires the operation, and motion needs the alarm
+  acknowledged. A Robot Control jog the gate stops ends `stopped` and needs
+  no Reset.
 - `full_stop`: a motion in the scope that is moving trips a cell Full Stop:
   all motion and all other commands stop, also outside the scope. The rule
   latches; new motion in its scope is refused (`global_interrupt_latched`)
   until the operator clears the latch in the GUI with the cell recovery
-  action, once the condition is no longer true.
-- Its state key `interrupt_state.<rule_id>` changes to `tripped`, then
-  `latched`, and back to `clear` when released.
-- A lost source of the rule always latches it until the operator clears it,
-  also for `gate`.
+  action, once the condition is no longer true. Its state key becomes
+  `tripped`, then `latched`, and returns to `clear` when released.
+- `notify`: while the rule can watch its inputs, a normal condition trip only
+  publishes its state through the read-only `interrupt_state.<rule_id>` key.
+  It does not request a Stop, gate or refuse motion, or latch. Program nodes
+  can read the key with **Check value** or **Wait for value**. If setup or
+  re-arm fails, or a source loss/evaluation error is detected, the rule reports `unknown`, the
+  Program key is withdrawn, and the existing scoped gate and Stop response
+  applies until watching resumes (section 7). The Global rules display shows
+  the catalog reason and keeps the typed details under **Details**. This
+  depends on input liveness: a change-only source without an age deadline
+  cannot be detected as stale.
+- Rule state is published in `interrupt_state.<rule_id>` for Program nodes.
+- A lost source of a `gate` or `full_stop` rule latches it until the operator
+  clears it, also when nothing in its scope moves.
+- For `notify`, a detected source loss or evaluation error makes its status
+  `unknown` and withdraws the Program's current `interrupt_state.<rule_id>`
+  value, so a stale `clear` or `tripped` value is not read. The existing
+  scoped gate and Stop for moving robots applies, without a rule recovery
+  latch. The Global rules display shows the catalog text for the typed reason
+  and keeps its raw details under **Details**. A fresh, evaluable source
+  clears this unavailability automatically and republishes the key. A
+  change-only source without an age deadline cannot be detected as stale.
 - A Program Reset never clears a global rule's latch.
+
+For example, a Deployment rule can publish `interrupt_state.tray_full` with
+`on_trip: notify`. Put an ordinary work branch and a handler branch in a
+Program **Parallel** node (`success_policy: all`); start the handler branch
+with **Wait for value** on `interrupt_state.tray_full`, comparing it with
+`tripped`, then continue to an existing handler node such as **Set output**
+for an indicator. On the condition trip, the rule only publishes the
+read-only state key: the other branch keeps running, and the Program does not
+write a key for the rule. Rule state is copied to the Program periodically, so
+the handler may observe the trip later; a brief trip can clear before a copy
+sees it. This is not an immediate event or a motion stop.
 
 **Idle behaviour** (`full_stop` only), when the condition trips while
 nothing in the scope moves:
@@ -539,10 +637,19 @@ One per global rule.
 | `tripped` | The condition is true |
 | `latched` | The rule tripped and is still latched |
 
-- The key is always current: also between Runs, while a Run is held or
-  halted, and when no Run exists. Every change is kept in the history.
+If the Global rules panel shows a notify rule as "can't watch (motion
+blocked)", the rule gates its scope and the Program has no current value
+for its state key. It cannot read a stale `clear` or
+`tripped` value while the source or evaluation is unavailable. A fresh,
+evaluable reading restores the key.
+
+- When it has a value, the key is current also between Runs, while a Run is
+  held or halted, and when no Run exists. Every published change is kept in
+  the history.
 - It has no value until the rule's sources have reported for the first time.
-  After that it always follows the rule.
+  After that it follows the rule while its state is available. If a notify
+  source or evaluation becomes unavailable, the current value is withdrawn;
+  a fresh, evaluable reading restores it (above).
 - Reset does not change it. Only the operator (`full_stop`), or the
   condition clearing (`gate`), clears a latch.
 
@@ -591,20 +698,31 @@ A change-only source cannot be used in any interrupt condition: the editor
 marks it "liveness unproven" and Apply refuses it. Read it with an I/O wait,
 read or check node instead.
 
-**Startup wait.** Until every signal source a global rule reads has reported
-for the first time, motion in that rule's scope is refused with
-`global_interrupt_source_not_ready`, naming the rule; the Global rules panel
-shows the rule as "pending" until its current state is known. Sources report right after they
-are enabled, so this wait is normally short. It does not latch. User keys do
-not cause this wait.
+**Startup wait and watch capacity.** Until every signal source a global rule
+reads has reported for the first time, motion in its scope is refused with
+`global_interrupt_source_not_ready`, naming the rule; the existing gate path
+also Stops a moving robot. The Global rules panel shows the rule as
+"pending" until its current state is known. `notify` uses the same watch
+capacity as other global rules. If its source registration or arming fails,
+  its status is `unknown`, its Program state key has no current value, and the
+  failure carries a typed unavailable reason. The Global rules display shows
+  its catalog text and retains raw details under **Details**. The existing
+  scoped gate and Stop apply until setup succeeds. Sources report right after
+  they are enabled, so this wait is normally short. Startup wait does not
+  latch. User keys do not cause this wait.
 
 **Source loss.** If a signal source of a global rule is lost (or its readings
 stop arriving in time):
 
-- The rule latches, also when nothing in its scope moves.
-- Motion in scope that is running is stopped.
-- Only the operator can clear this latch, once the source reports again and
-  the condition is false. A `gate` rule does not release a loss latch by
-  itself.
+- For `gate` and `full_stop`, the rule latches, also when nothing in its scope
+  moves. Motion in scope that is running is stopped. Only the operator can
+  clear this latch, once the source reports again and the condition is false.
+  A `gate` rule does not release a loss latch by itself.
+- For `notify`, a source loss or evaluation error after setup makes the rule
+  state `unknown`, applies the existing scoped gate and Stops moving robots,
+  and creates no rule recovery latch. A fresh, evaluable reading clears the
+  unavailability automatically. This only applies to losses the source
+  liveness model can detect; a change-only source without an age deadline
+  cannot be detected as stale.
 
 For a node rule, losing its source fails the node.

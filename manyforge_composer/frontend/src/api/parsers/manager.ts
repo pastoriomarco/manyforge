@@ -951,6 +951,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
     'candidate_projection_revision', 'error', 'failure', 'last_progress',
     'ok', 'phase', 'prepared_activation', 'request_id',
     'request_owner_epoch', 'state', 'scene_initialization',
+    'failure_acknowledgement',
   ], 'managerApplyStatus');
   const apiVersion = stringAt(
     record.api_version,
@@ -1017,8 +1018,29 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
     : (() => {
       const failureRecord = objectAt(record.failure, 'managerApplyStatus.failure');
       exactKeysAt(failureRecord, [
-        'code', 'effect_disposition', 'message', 'phase',
+        'cause_code', 'cause_details', 'code', 'effect_boundary',
+        'effect_disposition', 'message', 'phase', 'producer',
       ], 'managerApplyStatus.failure');
+      const causeDetailsRecord = objectAt(
+        failureRecord.cause_details,
+        'managerApplyStatus.failure.cause_details',
+      );
+      const causeDetails: Record<string, string> = {};
+      for (const [key, item] of Object.entries(causeDetailsRecord)) {
+        if (typeof item !== 'string') {
+          return fail(`managerApplyStatus.failure.cause_details.${key}`, 'a string');
+        }
+        causeDetails[key] = item;
+      }
+      // `before_effect`: no configuration, runtime, component or Scene change;
+      // a claim, a fence and closed readiness may still exist.
+      const effectBoundary = stringAt(
+        failureRecord.effect_boundary,
+        'managerApplyStatus.failure.effect_boundary',
+      );
+      if (effectBoundary !== 'before_effect' && effectBoundary !== 'unknown') {
+        return fail('managerApplyStatus.failure.effect_boundary', 'before_effect or unknown');
+      }
       const failurePhase = managerApplyLifecyclePhaseAt(
         failureRecord.phase,
         'managerApplyStatus.failure.phase',
@@ -1046,6 +1068,18 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
         ),
         phase: failurePhase,
         effectDisposition: effectDisposition as ManagerApplyFailure['effectDisposition'],
+        causeCode: boundedText(
+          failureRecord.cause_code,
+          'managerApplyStatus.failure.cause_code',
+          128,
+        ),
+        causeDetails,
+        producer: boundedText(
+          failureRecord.producer,
+          'managerApplyStatus.failure.producer',
+          64,
+        ),
+        effectBoundary: effectBoundary as ManagerApplyFailure['effectBoundary'],
       };
     })();
   if ((state === 'succeeded') !== (candidate !== null)) {
@@ -1078,6 +1112,31 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
         expected,
       );
     }
+    if (failure.effectBoundary === 'before_effect'
+      && failure.effectDisposition !== 'known') {
+      return fail(
+        'managerApplyStatus.failure.effect_disposition',
+        'known when effect_boundary is before_effect',
+      );
+    }
+  }
+  const failureAcknowledgement = stringAt(
+    record.failure_acknowledgement,
+    'managerApplyStatus.failure_acknowledgement',
+  );
+  if (!['available', 'acknowledged', 'unavailable'].includes(failureAcknowledgement)) {
+    return fail(
+      'managerApplyStatus.failure_acknowledgement',
+      'available, acknowledged, or unavailable',
+    );
+  }
+  if (failureAcknowledgement !== 'unavailable'
+    && (state !== 'failed' || failure === null
+      || failure.effectBoundary !== 'before_effect')) {
+    return fail(
+      'managerApplyStatus.failure_acknowledgement',
+      'available or acknowledged only for a failed Apply with a retained before-effect failure',
+    );
   }
   return {
     apiVersion,
@@ -1129,6 +1188,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
       'managerApplyStatus.request_owner_epoch',
     ),
     state: state as ManagerApplyStatus['state'],
+    failureAcknowledgement: failureAcknowledgement as ManagerApplyStatus['failureAcknowledgement'],
   };
 }
 

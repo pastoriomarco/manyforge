@@ -37,7 +37,6 @@ public:
   VerifiedRouteConfigurationPublicationPort(
       const RetainedBundle &retained_bundle,
       const IVerifiedRetainedProductArtifactSource &artifact_source,
-      core::IResolvedStopBasePlanRepository &plan_repository,
       IRouteConfigurationKernelPublicationOwner &kernel_owner,
       std::vector<core::KinematicResourceSourceProjectionDTO>
           source_projections,
@@ -61,7 +60,6 @@ public:
 private:
   const RetainedBundle &retained_bundle_;
   const IVerifiedRetainedProductArtifactSource &artifact_source_;
-  core::IResolvedStopBasePlanRepository &plan_repository_;
   IRouteConfigurationKernelPublicationOwner &kernel_owner_;
   std::vector<core::KinematicResourceSourceProjectionDTO> source_projections_;
   std::function<std::int64_t()> now_ns_;

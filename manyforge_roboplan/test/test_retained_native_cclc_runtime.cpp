@@ -78,6 +78,8 @@ TEST(RetainedNativeCCLCRuntime, ExternalAdapterObservesProviderReadinessWithoutM
       "test_source_unavailable", "test source missing", {{"source", "selected-external-owner"}}};
   const auto port = RetainedExternallyManagedBrandLifecyclePort::Create(
       occurrence,
+      {occurrence.provider_manifest_id, occurrence.provider_manifest_revision,
+       occurrence.lifecycle_plan_catalog_digest, {}},
       [&](const core::ControlDomainId& domain, core::TimePoint now) {
         ++source_reads;
         EXPECT_EQ(domain, occurrence.control_domain_id);
@@ -85,7 +87,7 @@ TEST(RetainedNativeCCLCRuntime, ExternalAdapterObservesProviderReadinessWithoutM
         return source_available
             ? core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(snapshot)
             : core::Result<RetainedExternallyManagedDomainSnapshot>::Err(missing_source_error);
-      }, clock, 1000);
+      }, clock, 1000, 1000);
   ASSERT_TRUE(port.ok()) << port.error().message;
   const core::BrandLifecycleObservationQueryDTO query{
       core::LifecycleTransactionId("lifecycle.1"), core::LifecycleTransactionGeneration(1U),
@@ -131,13 +133,14 @@ TEST(RetainedNativeCCLCRuntime, ExternalAdapterObservesProviderReadinessWithoutM
       query.control_domain_revision, query.provider_instance_id,
       query.provider_manifest_id, query.provider_manifest_revision,
       query.provider_runtime_unit_id, query.provider_runtime_epoch,
-      core::LifecyclePrimitiveId("ros2_control.disable"),
+      core::LifecyclePrimitiveId("transition.disable"),
       core::LifecyclePrimitiveAttemptId("attempt.1"),
-      first.value().observation_generation, 10'000};
+      first.value().observation_generation, 10'000,
+      core::ComponentLifecycleStateDTO::kUndeclared};
   const auto reads_before_dispatch = source_reads;
-  const auto refused = port.value()->Dispatch(disable, std::stop_token{});
-  EXPECT_EQ(refused.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(refused.effect, core::LifecyclePrimitiveEffectDTO::kNone);
+  const auto refused = port.value()->Dispatch(disable, {}, std::stop_token{});
+  EXPECT_EQ(refused.outcome, core::LifecycleTransitionOutcomeDTO::kFailed);
+  EXPECT_TRUE(refused.substeps.empty());
   EXPECT_EQ(source_reads, reads_before_dispatch);
   const auto after_dispatch = port.value()->Observe(query);
   ASSERT_TRUE(after_dispatch.ok()) << after_dispatch.error().message;
@@ -624,28 +627,47 @@ TEST(RetainedNativeCCLCRuntime,
   EXPECT_FALSE(MakeVerifiedNoControllerRoutePublicationOwner(*populated).ok());
 }
 
+// V-B2: the port runs the Enable transition; the driver receives a
+// per-substep copy of the exact intent (the substep, the generation of the
+// observation its selection used, the remaining time) and still checks that
+// generation under its own lock at mutation.
 TEST(RetainedNativeCCLCRuntime,
      ProviderDriverReceivesExactIntentAndChecksGenerationAtMutation) {
+  using State = core::ComponentLifecycleStateDTO;
+  const core::LifecyclePredicateDTO prepared{{State::kPrepared}, {}};
+  const core::LifecyclePredicateDTO active{{State::kActive}, {}};
+  const auto catalog = core::MakeBrandLifecyclePlanCatalog(
+      core::ProviderManifestId("manyforge.provider.io_signals"),
+      core::ProviderManifestRevision(Sha('1')),
+      {{core::ComponentLifecycleIntentKindDTO::kEnable,
+        State::kActive,
+        std::nullopt,
+        active,
+        1'000'000'000LL,
+        {{core::LifecyclePrimitiveId("io.provider.enable"), prepared, active}}}});
+  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
   const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
       core::ControlDomainId("domain.io"),
       core::ControlDomainRevision("domain.io.revision"),
       core::ProviderInstanceId("driver.io"),
-      core::ProviderManifestId("manyforge.provider.io_signals"),
-      core::ProviderManifestRevision(Sha('1')),
+      catalog.value().provider_manifest_id,
+      catalog.value().provider_manifest_revision,
       core::RuntimeUnitId("host.io"),
       core::RuntimeEpoch("host.epoch"),
-      core::ContentDigest(Sha('2'))};
+      catalog.value().catalog_digest};
   const core::ControllableComponentId component("device.io");
   core::FakeClock clock;
   clock.set(100);
   std::mutex driver_mutex;
   std::uint64_t generation = 7U;
-  auto state = core::ComponentLifecycleStateDTO::kPrepared;
+  auto state = State::kPrepared;
+  // Another mutation of the driver between the observation and the send.
+  bool raced = false;
   std::optional<core::BrandLifecyclePrimitiveIntentDTO> actual_intent;
   unsigned calls = 0U;
   const auto port =
       RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
-          component, occurrence,
+          component, occurrence, catalog.value(),
           [&](const auto &, core::TimePoint) {
             std::lock_guard lock(driver_mutex);
             return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
@@ -654,33 +676,29 @@ TEST(RetainedNativeCCLCRuntime,
                  false,
                  {{core::LifecycleFactId("io.driver.enabled"),
                    {core::LifecycleFactValueKindDTO::kBoolean,
-                    state == core::ComponentLifecycleStateDTO::kActive,
-                    std::nullopt, std::nullopt}}},
+                    state == State::kActive, std::nullopt, std::nullopt}}},
                  std::nullopt});
           },
-          clock, 1'000,
+          clock, 1'000'000'000, 1'000'000,
           [&](const core::BrandLifecyclePrimitiveIntentDTO &intent,
               std::stop_token) {
             std::lock_guard lock(driver_mutex);
             ++calls;
             actual_intent = intent;
+            if (raced) ++generation;
             if (intent.expected_observation_generation != generation)
               return RetainedExternallyManagedPrimitiveOutcome{
-                  core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-                  core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                  RetainedRos2ControlSwitchOutcome::kNotSent,
                   core::ErrorDTO{"driver_generation_stale",
                                  "actual driver changed before mutation",
                                  {}}};
             ++generation;
-            state = core::ComponentLifecycleStateDTO::kActive;
+            state = State::kActive;
             return RetainedExternallyManagedPrimitiveOutcome{
-                core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
-                core::LifecyclePrimitiveEffectDTO::kObserved,
-                core::LifecyclePrimitiveKnownResultDTO::kSucceeded,
-                std::nullopt};
+                RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
           });
   ASSERT_TRUE(port.ok()) << port.error().message;
-  const core::BrandLifecyclePrimitiveIntentDTO intent{
+  core::BrandLifecyclePrimitiveIntentDTO intent{
       core::LifecycleTransactionId("actual.lifecycle"),
       core::LifecycleTransactionGeneration(3U),
       component,
@@ -691,30 +709,56 @@ TEST(RetainedNativeCCLCRuntime,
       occurrence.provider_manifest_revision,
       occurrence.provider_runtime_unit_id,
       occurrence.provider_runtime_epoch,
-      core::LifecyclePrimitiveId("io.provider.enable"),
+      core::LifecyclePrimitiveId("transition.enable"),
       core::LifecyclePrimitiveAttemptId("attempt.1"),
       7U,
-      500};
-  const auto sent = port.value()->Dispatch(intent, {});
-  EXPECT_EQ(sent.dispatch_state,
-            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+      1'000'000'000,
+      State::kActive};
+  const auto sent = port.value()->Dispatch(intent, {}, {});
+  EXPECT_EQ(sent.outcome, core::LifecycleTransitionOutcomeDTO::kSucceeded);
+  ASSERT_EQ(sent.substeps.size(), 1U);
+  EXPECT_EQ(sent.substeps.front().substep_id, core::LifecyclePrimitiveId("io.provider.enable"));
+  EXPECT_EQ(sent.substeps.front().outcome, core::LifecycleTransitionOutcomeDTO::kSucceeded);
   ASSERT_TRUE(actual_intent);
-  EXPECT_EQ(*actual_intent, intent);
+  EXPECT_GT(actual_intent->remaining_duration_ns, 0);
+  EXPECT_LE(actual_intent->remaining_duration_ns, intent.remaining_duration_ns);
+  auto expected = intent;
+  expected.lifecycle_primitive_id = core::LifecyclePrimitiveId("io.provider.enable");
+  expected.expected_observation_generation = 7U;
+  expected.remaining_duration_ns = actual_intent->remaining_duration_ns;
+  EXPECT_EQ(*actual_intent, expected);
   EXPECT_EQ(generation, 8U);
-  EXPECT_EQ(port.value()->Dispatch(intent, {}).dispatch_state,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(generation, 8U);
+  EXPECT_EQ(calls, 1U);
+
+  // Prepared again; the driver changes between the observation and the send.
+  {
+    std::lock_guard lock(driver_mutex);
+    state = State::kPrepared;
+    ++generation;
+    raced = true;
+  }
+  const auto stale = port.value()->Dispatch(intent, {}, {});
+  EXPECT_EQ(stale.outcome, core::LifecycleTransitionOutcomeDTO::kFailed);
+  ASSERT_TRUE(stale.error);
+  EXPECT_EQ(stale.error->code, "driver_generation_stale");
+  ASSERT_EQ(stale.substeps.size(), 1U);
+  EXPECT_EQ(stale.substeps.front().outcome, core::LifecycleTransitionOutcomeDTO::kFailed);
+  EXPECT_EQ(actual_intent->expected_observation_generation, 9U);
+  EXPECT_EQ(generation, 10U);
+  EXPECT_EQ(state, State::kPrepared);
   EXPECT_EQ(calls, 2U);
+
+  // Refused before any observation or send.
   auto foreign = intent;
   foreign.controllable_component_id =
       core::ControllableComponentId("foreign.component");
-  EXPECT_EQ(port.value()->Dispatch(foreign, {}).dispatch_state,
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(port.value()->Dispatch(foreign, {}, {}).outcome,
+            core::LifecycleTransitionOutcomeDTO::kFailed);
   std::stop_source cancellation;
   cancellation.request_stop();
-  EXPECT_EQ(
-      port.value()->Dispatch(intent, cancellation.get_token()).dispatch_state,
-      core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  const auto cancelled = port.value()->Dispatch(intent, {}, cancellation.get_token());
+  EXPECT_EQ(cancelled.outcome, core::LifecycleTransitionOutcomeDTO::kFailed);
+  EXPECT_TRUE(cancelled.substeps.empty());
   EXPECT_EQ(calls, 2U);
 }
 
@@ -968,6 +1012,9 @@ private:
 
 class PreparingBrandPort final : public core::IBrandLifecyclePort {
 public:
+  explicit PreparingBrandPort(core::BrandLifecyclePlanCatalogDTO catalog)
+      : admission_(std::move(catalog)) {}
+
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override {
     std::lock_guard lock(lifecycle_mutex_);
@@ -993,56 +1040,52 @@ public:
          {}});
   }
 
+  [[nodiscard]] const core::ILifecycleAdmission &Admission() const override {
+    return admission_;
+  }
+
+  /// One transition, its single substep (`prepare` or `enable`).
   [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
+           const core::LifecycleSubstepFeedbackSink &,
            std::stop_token cancellation) override {
     std::lock_guard lock(lifecycle_mutex_);
     const bool prepare = intent.lifecycle_primitive_id ==
-                         core::LifecyclePrimitiveId("prepare");
+                         core::LifecyclePrimitiveId("transition.prepare");
     const bool enable = intent.lifecycle_primitive_id ==
-                        core::LifecyclePrimitiveId("enable");
+                        core::LifecyclePrimitiveId("transition.enable");
+    core::BrandLifecyclePrimitiveResultDTO result{
+        intent.lifecycle_transaction_id,
+        intent.lifecycle_transaction_generation,
+        intent.controllable_component_id,
+        intent.control_domain_id,
+        intent.control_domain_revision,
+        intent.provider_instance_id,
+        intent.provider_manifest_id,
+        intent.provider_manifest_revision,
+        intent.provider_runtime_unit_id,
+        intent.provider_runtime_epoch,
+        intent.lifecycle_primitive_id,
+        intent.lifecycle_primitive_attempt_id,
+        intent.expected_observation_generation,
+        core::LifecycleTransitionOutcomeDTO::kFailed,
+        std::nullopt};
     if (cancellation.stop_requested() ||
         (!prepare && !enable) ||
         (prepare && state_.load() != core::ComponentLifecycleStateDTO::kDeclared) ||
         (enable && state_.load() != core::ComponentLifecycleStateDTO::kPrepared)) {
-      return {intent.lifecycle_transaction_id,
-              intent.lifecycle_transaction_generation,
-              intent.controllable_component_id,
-              intent.control_domain_id,
-              intent.control_domain_revision,
-              intent.provider_instance_id,
-              intent.provider_manifest_id,
-              intent.provider_manifest_revision,
-              intent.provider_runtime_unit_id,
-              intent.provider_runtime_epoch,
-              intent.lifecycle_primitive_id,
-              intent.lifecycle_primitive_attempt_id,
-              intent.expected_observation_generation,
-              core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-              core::LifecyclePrimitiveEffectDTO::kNone,
-              std::nullopt,
-              core::ErrorDTO{"prepare_cancelled", "prepare was cancelled", {}}};
+      result.outcome = core::LifecycleTransitionOutcomeDTO::kFailed;
+      result.error = core::ErrorDTO{"prepare_cancelled", "prepare was cancelled", {}};
+      return result;
     }
     state_.store(prepare ? core::ComponentLifecycleStateDTO::kPrepared
                          : core::ComponentLifecycleStateDTO::kActive);
     dispatch_count_.fetch_add(1U);
-    return {intent.lifecycle_transaction_id,
-            intent.lifecycle_transaction_generation,
-            intent.controllable_component_id,
-            intent.control_domain_id,
-            intent.control_domain_revision,
-            intent.provider_instance_id,
-            intent.provider_manifest_id,
-            intent.provider_manifest_revision,
-            intent.provider_runtime_unit_id,
-            intent.provider_runtime_epoch,
-            intent.lifecycle_primitive_id,
-            intent.lifecycle_primitive_attempt_id,
-            intent.expected_observation_generation,
-            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
-            core::LifecyclePrimitiveEffectDTO::kObserved,
-            core::LifecyclePrimitiveKnownResultDTO::kSucceeded,
-            std::nullopt};
+    result.outcome = core::LifecycleTransitionOutcomeDTO::kSucceeded;
+    result.substeps.push_back({core::LifecyclePrimitiveId(prepare ? "prepare" : "enable"),
+                               std::nullopt, core::LifecycleTransitionOutcomeDTO::kSucceeded,
+                               1'000, 1'000, std::nullopt});
+    return result;
   }
 
   [[nodiscard]] std::size_t dispatch_count() const noexcept {
@@ -1057,6 +1100,7 @@ public:
   }
 
 private:
+  core::CatalogLifecycleAdmission admission_;
   mutable std::mutex lifecycle_mutex_;
   std::atomic<std::uint64_t> next_sequence_{1U};
   std::atomic<std::size_t> dispatch_count_{0U};
@@ -2167,8 +2211,9 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
   const core::MotionParticipantIntentDTO motion{
       core::MoveId("move.native.readiness.1"),
       core::FrameRoleId("base"),
-      core::MotionEndpointReferenceDTO{value.target_role_id,
-                                       core::FrameRoleId("tcp")},
+      core::TcpSelectorDTO(core::TcpEntryDTO{value.controllable_component_id,
+                                             value.command_target_id,
+                                             core::FrameRoleId("tcp")}),
       core::TolerancesDTO{0.01, 0.001, 0.01},
       core::SpeedProfileDTO{},
       core::TimeoutsDTO{},
@@ -2745,7 +2790,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
                                      : std::vector{runtime.binding};
   const auto catalog = make_prepare_catalog(*runtime.control_binding);
   FixedCatalogSource catalogs(catalog);
-  auto brand_port = std::make_shared<PreparingBrandPort>();
+  auto brand_port = std::make_shared<PreparingBrandPort>(catalog);
 
   const auto manager_root = state.path() / "manager";
   const auto state_root = state.path() / "state";
@@ -2812,7 +2857,7 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
         throw std::logic_error(
             "maintained controller domain has no actual representative");
       const auto &path = *physical->value().control_path;
-      auto port = std::make_shared<PreparingBrandPort>();
+      auto port = std::make_shared<PreparingBrandPort>(catalog);
       domain_ports.emplace(desired.control_domain_id, port);
       brand_ports.push_back(
           {{desired.control_domain_id, desired.control_domain_revision,
@@ -3013,13 +3058,8 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
             route_status.value()
                 ->resulting_active_control_configuration
                 ->active_control_configuration_id);
-  EXPECT_TRUE(std::filesystem::exists(
-      plan_root / "resolved-stop-base-plans" / "sha256" /
-      (published.front()
-           .stop_readiness.value()
-           .resolved_stop_base_plan.resolved_stop_base_plan_id.value()
-           .substr(7U) +
-       ".json")));
+  // The resolved plan flows in memory only; nothing is persisted.
+  EXPECT_FALSE(std::filesystem::exists(plan_root / "resolved-stop-base-plans"));
 
   if (!captured_fixture) {
     // Route selection installed route and Stop readiness only: it never

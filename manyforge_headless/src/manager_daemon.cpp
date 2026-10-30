@@ -17,6 +17,7 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
+#include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
@@ -24,6 +25,7 @@
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -87,8 +89,26 @@ using content_identity::CanonicalValue;
 
 constexpr std::string_view kManagerCommandApiVersion =
     "manyforge.manager_command.v1";
+
+// Preserve the scene-runtime operation's existing refusal code while keeping
+// a typed lower-level cause and its producer for diagnosis.
+core::ErrorDTO SceneRuntimeFailureFromException(
+    std::string code, const std::exception &error,
+    std::map<std::string, std::string> details = {}) {
+  if (const auto *typed = dynamic_cast<const core::TypedError *>(&error)) {
+    details.emplace("cause_code", typed->code());
+    details.emplace("cause_producer", typed->producer().empty()
+        ? "component_manager" : typed->producer());
+    for (const auto &[key, value] : typed->details())
+      details.emplace("cause." + key, value);
+  }
+  return {std::move(code), error.what(), std::move(details)};
+}
 constexpr std::string_view kManagerCommandResponseApiVersion =
     "manyforge.manager_command_response.v1";
+// The owner named by a Manager response error unless a typed cause names
+// another producer (for example a forwarded Kernel refusal).
+constexpr std::string_view kManagerProducer = "component_manager";
 constexpr std::string_view kManagerSourceFileName = "manager-source.json";
 constexpr std::string_view kLogicalSceneSourceFileName =
     "logical-scene-source.json";
@@ -455,6 +475,7 @@ enum class CommandKind {
   kDeploymentCandidatePreview,
   kApply,
   kApplyStatus,
+  kApplyAcknowledge,
   kStopComponentProcess,
   kComponentProcessStopResult,
   kComponentProcessStopOffer,
@@ -489,6 +510,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kSceneTransactionStatus:
   case CommandKind::kApply:
   case CommandKind::kApplyStatus:
+  case CommandKind::kApplyAcknowledge:
   case CommandKind::kStopComponentProcess:
   case CommandKind::kComponentProcessStopResult:
   case CommandKind::kComponentProcessStopOffer:
@@ -1600,13 +1622,39 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         RequiredMember(root, "expected_runtime_identity"));
     return result;
   }
-  if (command == "apply_status") {
-    RequireExactObjectSize(root, 4U, "Apply status command");
-    ManagerCommand result{.kind = CommandKind::kApplyStatus};
-    result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
-    result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
-        RequiredMember(root, "apply_generation"), "apply_generation"));
-    return result;
+  if (command == "apply_status" || command == "apply_acknowledge") {
+    const bool acknowledging = command == "apply_acknowledge";
+    try {
+      RequireExactObjectSize(root, acknowledging ? 5U : 4U, "Apply status command");
+      ManagerCommand result{.kind = command == "apply_status"
+                                        ? CommandKind::kApplyStatus
+                                        : CommandKind::kApplyAcknowledge};
+      result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
+      result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
+          RequiredMember(root, "apply_generation"), "apply_generation"));
+      if (acknowledging) {
+        const auto &context = RequiredMember(root, "request_context");
+        const auto *correlation = context.find_object_member("correlation_id");
+        const auto *epoch = context.find_object_member("request_owner_epoch");
+        RequireExactObjectSize(context, 2U + (correlation ? 1U : 0U) + (epoch ? 1U : 0U),
+                               "Apply acknowledgement request context");
+        result.request_id = RequiredString(context, "request_id");
+        result.source_label = RequiredString(context, "source_label");
+        // Accepted for the standard wire context. Only ID/source are retained
+        // as audit labels; neither optional member grants authority here.
+        if (epoch) result.request_owner_epoch = RequiredString(context, "request_owner_epoch");
+        if (correlation) result.correlation_id = RequiredString(context, "correlation_id");
+      }
+      return result;
+    } catch (const std::exception &error) {
+      if (!acknowledging) throw;
+      auto cause = core::CauseOf(error, "invalid_request", kManagerProducer);
+      if (dynamic_cast<const core::TypedError *>(&error) == nullptr) {
+        cause.error.details["command"] = "invalid";
+      }
+      cause.error.details["effect"] = "none";
+      throw core::TypedError(cause.error, std::move(cause.producer));
+    }
   }
   Require(command == "apply", "command kind is unsupported");
   RequireExactObjectSize(root, 15U, "Apply command");
@@ -2040,13 +2088,30 @@ CanonicalValue ErrorValue(const core::ErrorDTO &error) {
   });
 }
 
+/// The error of a refused Manager response: the ErrorDTO plus its producer.
+CanonicalValue ResponseErrorValue(const core::ErrorDTO &error,
+                                  const std::string_view producer = kManagerProducer) {
+  Require(!error.code.empty(), "Manager response error has no code");
+  CanonicalValue::Object details;
+  details.reserve(error.details.size());
+  for (const auto &[key, value] : error.details) {
+    details.emplace_back(key, CanonicalValue(value));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"code", CanonicalValue(error.code)},
+      {"details", CanonicalValue(std::move(details))},
+      {"message", CanonicalValue(error.message)},
+      {"producer", CanonicalValue(std::string(producer))},
+  });
+}
+
 CanonicalValue SceneCandidatePreviewResponse(
     const core::Result<core::SceneCandidatePreviewDTO> &result) {
   if (!result.ok()) {
     return CanonicalValue(CanonicalValue::Object{
         {"api_version",
          CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-        {"error", ErrorValue(result.error())},
+        {"error", ResponseErrorValue(result.error())},
         {"ok", CanonicalValue(false)},
     });
   }
@@ -2056,7 +2121,7 @@ CanonicalValue SceneCandidatePreviewResponse(
         {"api_version",
          CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
         {"error",
-         ErrorValue(core::ErrorDTO{
+         ResponseErrorValue(core::ErrorDTO{
              "scene_candidate_preview_oversized",
              "scene candidate preview exceeds the bounded Manager transport",
              {}})},
@@ -2088,7 +2153,7 @@ CanonicalValue SceneCommitResponse(const ManagerCommand &command,
        result.committed_projection_revision.has_value()
            ? ProjectionRevision(*result.committed_projection_revision)
            : CanonicalValue(nullptr)},
-      {"error", result.error.has_value() ? ErrorValue(*result.error)
+      {"error", result.error.has_value() ? ResponseErrorValue(*result.error)
                                          : CanonicalValue(nullptr)},
       {"ok", CanonicalValue(result.success)},
       {"projection_status",
@@ -2108,78 +2173,56 @@ CanonicalValue SceneCommitResponse(const ManagerCommand &command,
   });
 }
 
-CanonicalValue ErrorResponse(const std::string_view code,
-                             const std::string_view message) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"error", CanonicalValue(CanonicalValue::Object{
-                    {"code", CanonicalValue(std::string(code))},
-                    {"message", CanonicalValue(std::string(message))},
-                })},
-      {"ok", CanonicalValue(false)},
-  });
-}
-
 CanonicalValue
 DetailedErrorResponse(const std::string_view code,
                       const std::string_view message,
-                      const std::map<std::string, std::string> &details) {
+                      const std::map<std::string, std::string> &details,
+                      const std::string_view producer = kManagerProducer) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"error", ErrorValue(core::ErrorDTO{std::string(code),
-                                          std::string(message), details})},
+      {"error", ResponseErrorValue(core::ErrorDTO{std::string(code),
+                                                  std::string(message), details},
+                                   producer)},
       {"ok", CanonicalValue(false)},
   });
 }
 
-CanonicalValue ApplyErrorResponse(const ManagerCommand &command,
-                                  const std::string_view code,
-                                  const std::string_view message) {
+CanonicalValue ErrorResponse(const std::string_view code,
+                             const std::string_view message) {
+  return DetailedErrorResponse(code, message, {});
+}
+
+/// The refusal for one caught failure: a typed cause keeps its code, details
+/// and producer; any other exception is `fallback_code` with its text.
+core::TypedCause ManagerCauseOf(const std::exception &error,
+                                const std::string_view fallback_code) {
+  if (const auto *program =
+          dynamic_cast<const deployment::ProgramContractError *>(&error);
+      program != nullptr && !program->code().empty()) {
+    const core::TypedError typed(program->code(), program->what());
+    return core::CauseOf(typed, fallback_code, kManagerProducer);
+  }
+  return core::CauseOf(error, fallback_code, kManagerProducer);
+}
+
+CanonicalValue CaughtErrorResponse(const std::exception &error,
+                                   const std::string_view fallback_code) {
+  const auto cause = ManagerCauseOf(error, fallback_code);
+  return DetailedErrorResponse(cause.error.code, cause.error.message,
+                               cause.error.details, cause.producer);
+}
+
+CanonicalValue ApplyDetailedErrorResponse(
+    const ManagerCommand &command, const core::ErrorDTO &error,
+    const std::string_view producer = kManagerProducer) {
   Require(command.request_id.has_value() &&
               command.request_owner_epoch.has_value(),
           "decoded Apply command lacks request identity");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"error", CanonicalValue(CanonicalValue::Object{
-                    {"code", CanonicalValue(std::string(code))},
-                    {"message", CanonicalValue(std::string(message))},
-                })},
-      {"ok", CanonicalValue(false)},
-      {"request_id", CanonicalValue(*command.request_id)},
-      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
-  });
-}
-
-CanonicalValue ApplyKnownNoEffectErrorResponse(
-    const ManagerCommand &command, const std::string_view code,
-    const std::string_view message) {
-  Require(command.request_id.has_value() &&
-              command.request_owner_epoch.has_value(),
-          "decoded Apply command lacks request identity");
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"error", ErrorValue(core::ErrorDTO{
-                    std::string(code), std::string(message),
-                    {{"effect", "none"}}})},
-      {"ok", CanonicalValue(false)},
-      {"request_id", CanonicalValue(*command.request_id)},
-      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
-  });
-}
-
-CanonicalValue ApplyDetailedErrorResponse(const ManagerCommand &command,
-                                          const core::ErrorDTO &error) {
-  Require(command.request_id.has_value() &&
-              command.request_owner_epoch.has_value(),
-          "decoded Apply command lacks request identity");
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"error", ErrorValue(error)},
+      {"error", ResponseErrorValue(error, producer)},
       {"ok", CanonicalValue(false)},
       {"request_id", CanonicalValue(*command.request_id)},
       {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
@@ -2187,10 +2230,18 @@ CanonicalValue ApplyDetailedErrorResponse(const ManagerCommand &command,
 }
 
 CanonicalValue ApplyKnownNoEffectDetailedErrorResponse(
-    const ManagerCommand &command, const core::ErrorDTO &error) {
+    const ManagerCommand &command, const core::ErrorDTO &error,
+    const std::string_view producer = kManagerProducer) {
   auto marked = error;
   marked.details["effect"] = "none";
-  return ApplyDetailedErrorResponse(command, marked);
+  return ApplyDetailedErrorResponse(command, marked, producer);
+}
+
+CanonicalValue ApplyKnownNoEffectErrorResponse(
+    const ManagerCommand &command, const std::string_view code,
+    const std::string_view message) {
+  return ApplyKnownNoEffectDetailedErrorResponse(
+      command, core::ErrorDTO{std::string(code), std::string(message), {}});
 }
 
 CanonicalValue ApplyUnavailableResponse(const ManagerCommand &command) {
@@ -2450,7 +2501,8 @@ CanonicalValue ApplyPreparedActivationValue(
 /// progress. A failure is reported once, with its first retained failure and
 /// effect certainty, and is never repaired, retried or rolled back.
 CanonicalValue ApplyStatusResponse(
-    const component_manager::PersistedManagerApplyStatus &status) {
+    const component_manager::PersistedManagerApplyStatus &status,
+    const component_manager::FailedApplyAcknowledgementState failure_acknowledgement) {
   const auto &intent = status.intent.intent;
   const auto progress =
       component_manager::DeriveManagerApplyProgress(status);
@@ -2466,14 +2518,24 @@ CanonicalValue ApplyStatusResponse(
   auto failure = CanonicalValue(nullptr);
   if (terminal != nullptr && terminal->failure.has_value()) {
     const auto &retained = *terminal->failure;
+    CanonicalValue::Object cause_details;
+    for (const auto &[key, value] : retained.cause_details) {
+      cause_details.emplace_back(key, CanonicalValue(value));
+    }
     failure = CanonicalValue(CanonicalValue::Object{
+        {"cause_code", CanonicalValue(retained.cause_code)},
+        {"cause_details", CanonicalValue(std::move(cause_details))},
         {"code", CanonicalValue(retained.failure_code)},
+        {"effect_boundary",
+         CanonicalValue(std::string(
+             component_manager::ToString(retained.effect_boundary)))},
         {"effect_disposition",
          CanonicalValue(std::string(
              component_manager::ToString(retained.effect_disposition)))},
         {"message", CanonicalValue(retained.failure_message)},
         {"phase", CanonicalValue(
                       std::string(component_manager::ToString(retained.phase)))},
+        {"producer", CanonicalValue(retained.producer)},
     });
   }
   return CanonicalValue(CanonicalValue::Object{
@@ -2487,6 +2549,8 @@ CanonicalValue ApplyStatusResponse(
                  : CanonicalValue(nullptr)},
       {"error", CanonicalValue(nullptr)},
       {"failure", std::move(failure)},
+      {"failure_acknowledgement",
+       CanonicalValue(std::string(component_manager::ToString(failure_acknowledgement)))},
       {"last_progress",
        CanonicalValue(CanonicalValue::Object{
            {"phase", phase},
@@ -2947,7 +3011,11 @@ public:
       carrier_reference_poses_.emplace(key, result);
       return Reply::Ok(std::move(result));
     } catch (const std::exception &error) {
-      return refused("scene_runtime_pose_reference_unresolved", error.what());
+      return Reply::Err(SceneRuntimeFailureFromException(
+          "scene_runtime_pose_reference_unresolved", error,
+          {{"reference_link", reference_link},
+           {"frame_role_id", carrier.frame_role_id.value()},
+           {"model_instance_id", carrier.model_instance_id.value()}}));
     }
   }
 
@@ -3203,6 +3271,8 @@ public:
                        std::string(kLogicalSceneSourceFileName)),
         scene_runtime_channel_(config_.projection_root,
                                std::string(kSceneRuntimeSourceFileName)),
+        viewer_pose_sessions_channel_(config_.projection_root,
+                                      "viewer-pose-sessions.json"),
         manager_owner_epoch_(RandomToken("manager-")),
         scene_runtime_owner_epoch_(RandomToken("scene-runtime-")),
         manager_owner_id_("component-manager." + admission_.cell_id().value()),
@@ -3521,19 +3591,21 @@ private:
   }
 
   [[nodiscard]] CanonicalValue ApplyErrorResponseFromJournalEvidence(
-      const ManagerCommand &command, const std::string_view code,
-      const std::string_view message) {
+      const ManagerCommand &command, const std::exception &error,
+      const std::string_view fallback_code) {
+    const auto cause = ManagerCauseOf(error, fallback_code);
     try {
       const auto accepted = stores_.apply_journal().ReadRequest(
           core::RequestOwnerEpoch(*command.request_owner_epoch),
           core::RequestId(*command.request_id));
       if (!accepted.has_value()) {
-        return ApplyKnownNoEffectErrorResponse(command, code, message);
+        return ApplyKnownNoEffectDetailedErrorResponse(command, cause.error,
+                                                       cause.producer);
       }
     } catch (...) {
       // A failed journal observation cannot prove whether acceptance happened.
     }
-    return ApplyErrorResponse(command, code, message);
+    return ApplyDetailedErrorResponse(command, cause.error, cause.producer);
   }
 
   // An owned replay copy may outlive a transport call. Never write its result
@@ -3572,12 +3644,6 @@ private:
       pose_provider_origins_.insert_or_assign(observation.key,
                                               *object.provider_evidence);
   }
-
-  struct OriginalConfiguredBringUpInput final {
-    component_manager::ManagerComponentBringUpInspectionRequestDTO request;
-    std::vector<core::ControllableComponentId> needed_components;
-    std::vector<component_manager::ManagerComponentProcessObservationDTO> configured_components;
-  };
 
   core::Result<CanonicalValue> ReadComponentProcessStopOffer(
       const core::ControllableComponentId &component) {
@@ -3683,233 +3749,6 @@ private:
         {"process_inventories", CanonicalValue(std::move(inventories))}}));
   }
 
-  CanonicalValue WithConfiguredBringUpImpact(
-      CanonicalValue impact, const deployment::RetainedBundle &candidate,
-      const component_manager::ManagerActiveRuntimePlanDTO &active,
-      std::vector<OriginalConfiguredBringUpInput> *original_inputs = nullptr) {
-    const auto &graph = candidate.value().cell_graph;
-    const bool ros_host = std::any_of(graph.runtime_units.begin(), graph.runtime_units.end(),
-        [](const auto &unit) {
-          return unit.runtime_profile_id.value() == deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId;
-        });
-    if (!ros_host) return impact;
-    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult> runtime;
-    {
-      std::lock_guard source_lock(manager_source_mutex_);
-      runtime = last_runtime_;
-    }
-    Require(runtime && runtime->plan.active_publication == active.active_publication,
-            "component bring-up preflight has no exact current runtime observation");
-    const auto current_scene = scene_owner_.CurrentProjectionRevision();
-    Require(current_scene.retained_bundle_id == active.active_publication.request.candidate_retained_bundle_id &&
-                current_scene.graph_revision == active.active_publication.request.candidate_graph_revision,
-            "component bring-up preflight Scene belongs to another current product");
-    const core::ProjectionRevisionDTO candidate_projection{
-        candidate.retained_bundle_id(), graph.graph_revision, current_scene.scene_revision};
-    std::set<core::ControllableComponentId> observed_components;
-    std::set<core::ControllableComponentId> needed_components;
-    CanonicalValue::Array observations;
-    for (const auto &unit : graph.runtime_units) {
-      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
-        continue;
-      const auto *owner = runtime->observations.observation(unit.runtime_unit_id.value());
-      Require(owner && owner->process_presence() == component_manager::ProcessPresenceState::kPresent &&
-                  !owner->runtime_epoch().empty(),
-              "component bring-up preflight requires its actual shared host process");
-      const component_manager::ManagerComponentBringUpInspectionRequestDTO request{
-          candidate_projection,
-          core::ContentDigest(content_identity::sha256_digest(candidate.canonical_bytes())),
-          candidate.canonical_bytes().size(), active.active_publication.request.candidate_projection_revision,
-          active.active_publication.publication_generation,
-          active.active_publication.durable_public_pointer_content_digest,
-          unit.runtime_unit_id, core::RuntimeEpoch(owner->runtime_epoch()), manager_runtime_epoch_};
-      const auto inspected = native_runtime_adapter_.InspectComponentBringUp(request);
-      if (!inspected.ok())
-        throw std::runtime_error("component bring-up preflight [" + inspected.error().code + "]: " + inspected.error().message);
-      Require(inspected.value().valid() && inspected.value().request == request,
-              "component bring-up preflight returned a foreign request");
-      OriginalConfiguredBringUpInput original{
-          request, {}, inspected.value().configured_components};
-      std::set<core::ControllableComponentId> expected;
-      for (const auto &component : graph.controllable_components)
-        if (std::find(component.runtime_unit_ids.begin(), component.runtime_unit_ids.end(), unit.runtime_unit_id) != component.runtime_unit_ids.end())
-          expected.insert(component.controllable_component_id);
-      CanonicalValue::Array rows;
-      for (const auto &component : inspected.value().configured_components) {
-        Require(expected.erase(component.controllable_component_id) == 1U &&
-                    observed_components.insert(component.controllable_component_id).second,
-                "component bring-up preflight membership differs from the verified candidate");
-        Require(component.process_presence != component_manager::ProcessPresenceState::kUnknown,
-                "component bring-up preflight cannot classify an unknown process owner");
-        bool needed = component.process_presence == component_manager::ProcessPresenceState::kAbsent;
-        if (component.process_owner_kind == component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
-          const auto predecessor = verified_package_.get_verified(
-              active.active_publication.request.candidate_retained_bundle_id);
-          Require(predecessor != nullptr,
-                  "component bring-up preflight has no verified immutable predecessor");
-          const component_manager::ManagerComponentProcessInventoryRequestDTO scope{
-              request.predecessor_projection_revision,
-              request.expected_predecessor_publication_generation,
-              request.expected_predecessor_public_pointer_digest,
-              request.runtime_unit_id, request.runtime_epoch, request.manager_runtime_epoch};
-          const component_manager::ManagerComponentProcessOccurrenceDTO local{
-              component.controllable_component_id, {}, 0,
-              component_manager::ProcessPresenceState::kAbsent,
-              core::ControllerLaunchCleanupState::kNotRequested, {},
-              component.installed_runtime_identity, component.process_owner_kind,
-              component.pneumatic_none_owner};
-          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(
-              *predecessor, scope, local);
-          Require(verified.ok(), verified.ok() ? std::string{} : verified.error().message);
-          // Source-verified installed identity, never authored mode or absent
-          // process alone, decides whether this candidate needs bring-up.
-          needed = component.installed_runtime_identity != deployment::derive_component_runtime_identity(
-              candidate, component.controllable_component_id);
-        }
-        if (needed) {
-          needed_components.insert(component.controllable_component_id);
-          original.needed_components.push_back(component.controllable_component_id);
-        }
-        rows.emplace_back(CanonicalValue::Object{
-            {"controllable_component_id", CanonicalValue(component.controllable_component_id.value())},
-            {"process_presence", CanonicalValue(std::string(component_manager::ToString(component.process_presence)))}});
-      }
-      Require(expected.empty(), "component bring-up preflight omitted configured candidate components");
-      if (original_inputs && !original.needed_components.empty())
-        original_inputs->push_back(std::move(original));
-      observations.emplace_back(CanonicalValue::Object{
-          {"runtime_unit_id", CanonicalValue(unit.runtime_unit_id.value())},
-          {"runtime_epoch", CanonicalValue(owner->runtime_epoch())},
-          {"manager_runtime_epoch", CanonicalValue(manager_runtime_epoch_.value())},
-          {"components", CanonicalValue(std::move(rows))}});
-    }
-    Require(observed_components.size() == graph.controllable_components.size(),
-            "component bring-up preflight has no complete actual process inventory");
-    Require(plan_source_.ReadCurrentPlan().active_publication == active.active_publication &&
-                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
-                                             current_scene),
-            "component bring-up preflight current publication or Scene changed");
-    CanonicalValue::Array needed;
-    for (const auto &component : needed_components) needed.emplace_back(component.value());
-    auto object = std::get<CanonicalValue::Object>(impact.storage());
-    object.emplace_back("bring_up_components", CanonicalValue(std::move(needed)));
-    object.emplace_back("bring_up_required", CanonicalValue(!needed_components.empty()));
-    object.emplace_back("bring_up_process_observations", CanonicalValue(std::move(observations)));
-    return CanonicalValue(std::move(object));
-  }
-
-  component_manager::ManagerApplyBringUpPlanDTO BuildOriginalBringUpPlan(
-      const std::vector<OriginalConfiguredBringUpInput> &inputs,
-      const component_manager::ManagerApplyIntentDTO &intent,
-      const deployment::RetainedBundle &predecessor,
-      const deployment::RetainedBundle &candidate,
-      const component_manager::ManagerActiveRuntimePlanDTO &active,
-      const core::RequestAttributionDTO &attribution) {
-    const auto &head = active.active_publication;
-    const auto &graph = candidate.value().cell_graph;
-    Require(!inputs.empty() &&
-                intent.expected_admission_generation.has_value() &&
-                !intent.parent_authoring_claim &&
-                predecessor.retained_bundle_id() ==
-                    head.request.candidate_retained_bundle_id &&
-                intent.expected_active_projection_revision.retained_bundle_id ==
-                    head.request.candidate_retained_bundle_id &&
-                intent.expected_active_projection_revision.graph_revision ==
-                    head.request.candidate_graph_revision &&
-                plan_source_.ReadCurrentPlan().active_publication == head,
-            "original bring-up plan lost its exact predecessor publication");
-    const core::ProjectionRevisionDTO target{
-        candidate.retained_bundle_id(), graph.graph_revision,
-        intent.expected_active_projection_revision.scene_revision};
-    const core::ContentDigest digest(
-        content_identity::sha256_digest(candidate.canonical_bytes()));
-    std::vector<component_manager::ManagerApplyBringUpChildRequestDTO> children;
-    for (const auto &input : inputs) {
-      // The preflight and the Apply each recorded the Scene revision of their
-      // own moment; only the Deployment and Scene identity must agree.
-      Require(core::SameProjectionIdentity(input.request.candidate_projection_revision, target) &&
-                  input.request.candidate_retained_bundle_digest == digest &&
-                  input.request.candidate_retained_bundle_bytes ==
-                      candidate.canonical_bytes().size() &&
-                  input.request.predecessor_projection_revision ==
-                      head.request.candidate_projection_revision &&
-                  input.request.expected_predecessor_publication_generation ==
-                      head.publication_generation &&
-                  input.request.expected_predecessor_public_pointer_digest ==
-                      head.durable_public_pointer_content_digest,
-              "original bring-up input differs from captured Apply products");
-      for (const auto &component_id : input.needed_components) {
-        auto request = input.request;
-        request.planning_component_id = component_id;
-        const auto inspected =
-            native_runtime_adapter_.InspectComponentBringUp(request);
-        if (!inspected.ok())
-          throw std::runtime_error("original component planning [" +
-                                   inspected.error().code + "]: " +
-                                   inspected.error().message);
-        Require(inspected.value().valid() &&
-                    inspected.value().request == request &&
-                    inspected.value().configured_components == input.configured_components &&
-                    inspected.value().planning_facts &&
-                    inspected.value().planning_facts->component_id == component_id,
-                "original component planning returned foreign owner facts");
-        const auto &facts = *inspected.value().planning_facts;
-        const auto row = std::find_if(
-            inspected.value().configured_components.begin(),
-            inspected.value().configured_components.end(), [&](const auto &value) {
-              return value.controllable_component_id == component_id;
-            });
-        Require(row != inspected.value().configured_components.end() &&
-                    row->process_presence ==
-                        component_manager::ProcessPresenceState::kAbsent,
-                "acknowledged component bring-up inventory changed");
-        const auto &selection = facts.generation_selection;
-        const auto expected_generation = selection.predecessor_generation
-            ? *selection.predecessor_generation
-            : selection.owner_qualified_predecessor
-                  ? selection.owner_qualified_predecessor->generation
-                  : core::ComponentLifecycleGeneration(0U);
-        core::ComponentLifecycleIntentDTO child_intent{
-            {core::RequestId(RandomToken("apply-child.")), facts.owner_epoch,
-             intent.request_context.source_label,
-             intent.request_context.correlation_id},
-            component_id, facts.next_intent,
-            intent.expected_active_projection_revision.graph_revision,
-            expected_generation, facts.candidate_expected_domains, std::nullopt,
-            attribution, *intent.expected_admission_generation, std::nullopt,
-            selection};
-        children.push_back({std::move(child_intent), target, digest,
-                            candidate.canonical_bytes().size(), request.runtime_unit_id,
-                            request.runtime_epoch, request.manager_runtime_epoch});
-      }
-    }
-    std::sort(children.begin(), children.end(), [](const auto &left, const auto &right) {
-      return left.intent.controllable_component_id <
-             right.intent.controllable_component_id;
-    });
-    const component_manager::ManagerApplyPrivateMaterializationDTO materialization{
-        target.scene_revision.content_hash, intent.apply_id, intent.apply_generation,
-        target, digest, candidate.canonical_bytes().size()};
-    const core::ActiveBundlePublicationRequestDTO publication{
-        core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation},
-        target, target.retained_bundle_id, target.graph_revision,
-        head.publication_generation,
-        component_manager::ComputeManagerApplyPrivateMaterializationDigest(materialization)};
-    component_manager::ManagerApplyBringUpPlanDTO plan{
-        intent.apply_id, intent.apply_generation,
-        component_manager::ComputeManagerApplyIntentDigest(intent), {},
-        std::move(children), publication, head.durable_public_pointer_content_digest};
-    for (const auto &component : graph.controllable_components)
-      plan.configured_components.push_back(component.controllable_component_id);
-    std::sort(plan.configured_components.begin(), plan.configured_components.end());
-    Require(plan.valid() &&
-                plan_source_.ReadCurrentPlan().active_publication == head &&
-                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
-                                             intent.expected_active_projection_revision),
-            "original bring-up plan lost its exact current owner inputs");
-    return plan;
-  }
-
   PublicationGenerations PublishActiveRuntime(
       component_manager::ManagerActiveRuntimeConvergenceResult runtime) {
     const bool kernel_apply_available = HasConvergedKernelApplyOwner(runtime);
@@ -3996,6 +3835,7 @@ private:
         scene_runtime_owner_.EstablishOpenRuntime(
             desired_scene_runtime, publication_generation,
             "durable_finalized_active_projection");
+        TryPublishViewerPoseSessionsLocked();
       } else {
         const auto changed = scene_runtime_owner_.AdoptFinalizedOpenRuntime(
             desired_scene_runtime, publication_generation,
@@ -4003,6 +3843,7 @@ private:
         if (changed) {
           pose_observer_sessions_.clear();
           pose_observation_replays_.clear();
+          TryPublishViewerPoseSessionsLocked();
         }
       }
     }
@@ -4855,6 +4696,36 @@ private:
     }
   }
 
+  void TryPublishViewerPoseSessionsLocked() noexcept {
+    try {
+      const auto state = SceneRuntimeStateValue(scene_runtime_owner_.Snapshot());
+      const auto *identity = state.find_object_member("runtime_identity");
+      Require(identity != nullptr, "scene-runtime identity is missing");
+      CanonicalValue::Array sessions;
+      for (const auto &[source_id, session] : pose_observer_sessions_) {
+        sessions.emplace_back(CanonicalValue::Object{
+            {"source_id", CanonicalValue(source_id)},
+            {"source_epoch", CanonicalValue(session.source_epoch)},
+            {"source_epoch_order", Unsigned(session.source_epoch_order,
+                                             "source_epoch_order")},
+        });
+      }
+      static_cast<void>(viewer_pose_sessions_channel_.Publish(
+          "scene_runtime", scene_runtime_owner_id_, scene_runtime_owner_epoch_,
+          static_cast<std::int64_t>(ElapsedNs()),
+          CanonicalValue(CanonicalValue::Object{
+              {"runtime_identity", *identity},
+              {"sessions", CanonicalValue(std::move(sessions))},
+          })));
+    } catch (const std::exception &error) {
+      std::cerr << "Manager viewer pose session publication failed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager viewer pose session publication failed with an "
+                   "unknown error\n";
+    }
+  }
+
   std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
     const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
     auto payload = BuildSceneRuntimeSourcePayload(
@@ -5216,12 +5087,29 @@ private:
   }
 
   // Requests the normal operational Stop of the carrier's motion through the
-  // Kernel's Stop control socket, as the public Stop route does. A carrier
-  // with no running motion is a no-effect Stop.
+  // Kernel's Stop control socket, as the public Stop route does. C-P4 (G1):
+  // it names the holder and every component it is mounted on, from the
+  // active bundle's cell graph, so a loss during an arm move stops the arm.
+  // A component with no running motion is a no-effect Stop.
   std::optional<core::ErrorDTO>
   RequestCarrierStop(const SceneRuntimeCarriedObjectLoss &loss) {
     constexpr std::string_view source = "manager.carried_object_lost";
     try {
+      std::shared_ptr<const deployment::RetainedBundle> bundle;
+      {
+        std::lock_guard source_lock(manager_source_mutex_);
+        bundle = last_active_bundle_;
+      }
+      Require(bundle != nullptr,
+              "carried-object-lost Stop has no active bundle");
+      CanonicalValue::Array components;
+      for (const auto &component : SceneRuntimeCarrierStopComponents(
+               bundle->value().cell_graph, loss.controllable_component_id))
+        components.push_back(CanonicalValue(CanonicalValue::Object{
+            {"controllable_component_id", CanonicalValue(component.value())},
+            {"expected_component_lifecycle_generation", CanonicalValue(1.0)},
+            {"expected_graph_revision",
+             CanonicalValue(loss.graph_revision.value())}}));
       const auto response = ExchangeLocalPacket(
           config_.execution_run_root / "execution-control.sock",
           CanonicalValue(CanonicalValue::Object{
@@ -5234,16 +5122,7 @@ private:
               {"command", CanonicalValue("stop")},
               {"request",
                CanonicalValue(CanonicalValue::Object{
-                   {"components",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"controllable_component_id",
-                             CanonicalValue(
-                                 loss.controllable_component_id.value())},
-                            {"expected_component_lifecycle_generation",
-                             CanonicalValue(1.0)},
-                            {"expected_graph_revision",
-                             CanonicalValue(loss.graph_revision.value())}})})},
+                   {"components", CanonicalValue(std::move(components))},
                    {"reason", CanonicalValue(std::string(
                                   core::kCarriedObjectLostReason))},
                    {"request_context",
@@ -5442,8 +5321,7 @@ private:
           core::RetainedBundleId(runtime_identity.retained_bundle_id));
     } catch (const std::exception &error) {
       return core::Result<SceneRuntimePoseApplicationResult>::Err(
-          core::ErrorDTO{
-              "scene_runtime_pose_bundle_unavailable", error.what(), {}});
+          SceneRuntimeFailureFromException("scene_runtime_pose_bundle_unavailable", error));
     }
     if (bundle == nullptr ||
         bundle->retained_bundle_id().value() !=
@@ -5571,7 +5449,8 @@ private:
       bundle = verified_package_.get_verified(
           core::RetainedBundleId(runtime_identity.retained_bundle_id));
     } catch (const std::exception &error) {
-      return failure("scene_runtime_pose_bundle_unavailable", error.what());
+      return core::Result<BeforePlanningLatchResult>::Err(
+          SceneRuntimeFailureFromException("scene_runtime_pose_bundle_unavailable", error));
     }
     if (bundle == nullptr ||
         bundle->retained_bundle_id().value() !=
@@ -5588,7 +5467,8 @@ private:
     try {
       configured_sources = ConfiguredPoseSources(*bundle);
     } catch (const std::exception &error) {
-      return failure("scene_runtime_pose_bundle_unavailable", error.what());
+      return core::Result<BeforePlanningLatchResult>::Err(
+          SceneRuntimeFailureFromException("scene_runtime_pose_bundle_unavailable", error));
     }
     struct LatchCandidate final {
       PoseObservationReplay *replay{};
@@ -5617,7 +5497,8 @@ private:
           object = scene_owner_.GetObjectState(
               core::SceneResourceId(binding.object_id));
         } catch (const std::exception &error) {
-          return failure("scene_runtime_pose_scene_unavailable", error.what());
+          return core::Result<BeforePlanningLatchResult>::Err(
+              SceneRuntimeFailureFromException("scene_runtime_pose_scene_unavailable", error));
         }
         if (!object.exists ||
             (object.attached && latch_policy == "before_planning"))
@@ -5888,7 +5769,16 @@ private:
       return false;
     }
     try {
-      const auto command = DecodeCommand(*packet);
+      // A command that does not decode is one request-validation refusal.
+      const auto command = [&] {
+        try {
+          return DecodeCommand(*packet);
+        } catch (const core::TypedError &) {
+          throw;
+        } catch (const std::exception &error) {
+          throw core::RequestInvalid("command", "invalid", error.what());
+        }
+      }();
       if (RequiresCurrentPackageGeneration(command.kind)) {
         try {
           RequireCurrentPackageGeneration();
@@ -6077,7 +5967,7 @@ private:
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
-              ErrorResponse("deployment_candidate_rejected", error.what()));
+              CaughtErrorResponse(error, "deployment_candidate_rejected"));
         }
         return false;
       }
@@ -6237,7 +6127,6 @@ private:
               existing.has_value()
                   ? existing->intent.candidate_retained_bundle_id
                   : candidate_receipt.candidate_retained_bundle_id;
-          // Q106: configuration Apply never creates/advances lifecycle children.
           const auto result = named_apply_.AcceptOrReplay(
               {
                   core::PublicRequestContextDTO{
@@ -6271,8 +6160,7 @@ private:
         } catch (const component_manager::ManagerNamedApplyBusyError &error) {
           TrySendResponse(
               client.get(),
-              ApplyErrorResponseFromJournalEvidence(command, "apply_busy",
-                                                    error.what()));
+              ApplyErrorResponseFromJournalEvidence(command, error, "apply_busy"));
         } catch (const ManagerPackageGenerationRestartRequired &error) {
           PublishPackageRestartRequired();
           // Publishing the package-generation fault is itself externally
@@ -6282,24 +6170,47 @@ private:
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
-              ApplyErrorResponseFromJournalEvidence(
-                  command, "apply_rejected", error.what()));
+              ApplyErrorResponseFromJournalEvidence(command, error,
+                                                    "apply_rejected"));
         }
         return false;
       }
-      case CommandKind::kApplyStatus: {
+      case CommandKind::kApplyStatus:
+      case CommandKind::kApplyAcknowledge: {
         Require(command.apply_id.has_value() &&
                     command.apply_generation.has_value(),
                 "decoded Apply status command lacks its durable identity");
-        const auto status = stores_.apply_journal().ReadStatus(
-            *command.apply_id, *command.apply_generation);
+        const auto status = [&] {
+          try {
+            return stores_.apply_journal().ReadStatus(
+                *command.apply_id, *command.apply_generation);
+          } catch (const std::exception &error) {
+            if (command.kind != CommandKind::kApplyAcknowledge) throw;
+            auto cause = core::CauseOf(error, "manager_command_rejected", kManagerProducer);
+            cause.error.details["effect"] = "none";
+            throw core::TypedError(cause.error, std::move(cause.producer));
+          }
+        }();
         if (!status.has_value()) {
           TrySendResponse(client.get(),
-                          ErrorResponse("apply_status_not_found",
-                                        "Manager Apply identity is unknown"));
+                          DetailedErrorResponse(
+                              "apply_status_not_found", "Manager Apply identity is unknown",
+                              command.kind == CommandKind::kApplyAcknowledge
+                                  ? std::map<std::string, std::string>{{"effect", "none"}}
+                                  : std::map<std::string, std::string>{}));
           return false;
         }
-        TrySendResponse(client.get(), ApplyStatusResponse(*status));
+        if (command.kind == CommandKind::kApplyAcknowledge) {
+          Require(command.request_id.has_value() && command.source_label.has_value(),
+                  "decoded Apply acknowledgement lacks its request context");
+          named_apply_.AcknowledgeFailedApply(*command.apply_id,
+                                              *command.apply_generation,
+                                              core::RequestId(*command.request_id),
+                                              *command.source_label);
+        }
+        TrySendResponse(client.get(), ApplyStatusResponse(
+            *status, named_apply_.FailedApplyAcknowledgementStatus(
+                         *command.apply_id, *command.apply_generation)));
         return false;
       }
       case CommandKind::kSceneCommit: {
@@ -6497,6 +6408,7 @@ private:
             PoseObserverSession{*snapshot.runtime_identity,
                                 *command.pose_source_epoch, source_epoch_order,
                                 command.pose_observer_bindings});
+        TryPublishViewerPoseSessionsLocked();
         source_lock.unlock();
         TrySendResponse(client.get(),
                         SceneRuntimeObserverOpenResponse(
@@ -6771,7 +6683,7 @@ private:
                                             error.error().details));
     } catch (const std::exception &error) {
       TrySendResponse(client.get(),
-                      ErrorResponse("manager_command_rejected", error.what()));
+                      CaughtErrorResponse(error, "manager_command_rejected"));
     } catch (...) {
       TrySendResponse(client.get(),
                       ErrorResponse("manager_command_rejected",
@@ -6821,6 +6733,7 @@ private:
   AtomicSourceSnapshotChannel manager_channel_;
   AtomicSourceSnapshotChannel scene_channel_;
   AtomicSourceSnapshotChannel scene_runtime_channel_;
+  AtomicSourceSnapshotChannel viewer_pose_sessions_channel_;
   std::string manager_owner_epoch_;
   std::string scene_runtime_owner_epoch_;
   std::string manager_owner_id_;

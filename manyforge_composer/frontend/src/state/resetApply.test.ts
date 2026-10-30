@@ -40,6 +40,7 @@ const idle = {
   ...held, state: 'idle_after_reset' as const, cycleGeneration: 8, programRunId: null,
   causalCorrelationId: 'reset-apply.1',
 };
+const ownerRejoinedIdle = Object.assign({}, idle, { programRunnerOwnerEpoch: 'runner.epoch.2' });
 
 function facts(patch: Partial<ResetApplyFacts> = {}): ResetApplyFacts {
   return {
@@ -83,7 +84,7 @@ describe('Apply after Reset sequence', () => {
     });
   });
 
-  it('refuses an Idle reached by another request, a failed Reset and an owner restart', () => {
+  it('refuses an Idle reached by another request or a failed Reset', () => {
     expect(nextResetApplyStep(awaiting, facts({
       cycle: { ...idle, causalCorrelationId: 'someone-else' },
     }))).toMatchObject({ phase: { kind: 'failed', stage: 'reset', unknown: false } });
@@ -91,8 +92,8 @@ describe('Apply after Reset sequence', () => {
       cycle: { ...idle, state: 'recovery_required', cycleGeneration: 7, failure: { message: 'stop fault latched' } },
     }))).toMatchObject({ phase: { kind: 'failed', stage: 'reset', message: expect.stringContaining('stop fault latched') } });
     expect(nextResetApplyStep(awaiting, facts({
-      cycle: { ...idle, programRunnerOwnerEpoch: 'runner.epoch.2' },
-    }))).toMatchObject({ phase: { kind: 'failed', stage: 'reset', unknown: true } });
+      cycle: ownerRejoinedIdle,
+    }))).toEqual({ kind: 'phase', phase: { kind: 'applying', reset, idle: { cycleGeneration: 8 }, sent: false } });
   });
 
   it('reconciles a Reset whose reply was lost only from its correlated settlement', () => {
@@ -140,7 +141,6 @@ describe('Apply after Reset sequence', () => {
     };
     // Waiting for admission does not skip the identity check.
     for (const cycle of [
-      { ...idle, programRunnerOwnerEpoch: 'runner.epoch.2' },
       { ...idle, cycleGeneration: 9 },
       { ...idle, causalCorrelationId: 'someone-else' },
       { ...idle, state: 'running' as const, programRunId: 'run.2' },
@@ -152,8 +152,9 @@ describe('Apply after Reset sequence', () => {
         expect(step).not.toEqual({ kind: 'send_apply' });
       }
     }
-    expect(nextResetApplyStep(applying, facts({ cycle: { ...idle, programRunnerOwnerEpoch: 'runner.epoch.2' } })))
-      .toMatchObject({ phase: { message: expect.stringContaining('runner restarted after Reset settled') } });
+    expect(nextResetApplyStep(applying, facts({
+      cycle: ownerRejoinedIdle, applyAvailable: true,
+    }))).toEqual({ kind: 'send_apply' });
     expect(nextResetApplyStep(applying, facts({ cycle: { ...idle, cycleGeneration: 9 } })))
       .toMatchObject({ phase: { message: expect.stringContaining('cycle changed after Reset reached Idle') } });
     // An absent observation proves nothing: wait, never send.
@@ -213,7 +214,10 @@ describe('Apply after Reset sequence', () => {
     expect(nextResetApplyStep(awaitingApply, facts({
       activation: {
         ...apply, state: 'unknown_effect',
-        failure: { code: 'manager_lost', message: 'reply lost', phase: 'accepted', effectDisposition: 'unknown' },
+        failure: {
+          code: 'manager_lost', message: 'reply lost', phase: 'accepted', effectDisposition: 'unknown',
+          causeCode: 'manager_lost', causeDetails: {}, producer: 'component_manager', effectBoundary: 'unknown',
+        },
       },
     }))).toMatchObject({ phase: { kind: 'failed', stage: 'apply', unknown: true, apply } });
   });

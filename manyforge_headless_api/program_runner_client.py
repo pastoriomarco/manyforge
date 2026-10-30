@@ -25,11 +25,13 @@ class ProgramRunnerClientError(RuntimeError):
         status_code: int | None = None,
         *,
         details: Mapping[str, Any] | None = None,
+        producer: str = "program_runner",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.details = deepcopy(dict(details or {}))
+        self.producer = producer
 
 
 _PERSISTENT_VALUE_ACTION_SUFFIXES = {"set": "", "reset": "/reset", "clear": "/clear"}
@@ -191,6 +193,7 @@ class ProgramRunnerHttpClient:
         code = detail.get("code") if isinstance(detail, Mapping) else None
         message = detail.get("message") if isinstance(detail, Mapping) else None
         details = detail.get("details") if isinstance(detail, Mapping) else None
+        producer = detail.get("producer") if isinstance(detail, Mapping) else None
         return ProgramRunnerClientError(
             code if isinstance(code, str) and code else "program_runner_http_error",
             (
@@ -200,6 +203,11 @@ class ProgramRunnerHttpClient:
             ),
             status_code,
             details=details if isinstance(details, Mapping) else None,
+            producer=(
+                producer
+                if isinstance(producer, str) and producer
+                else "program_runner"
+            ),
         )
 
     def _request(

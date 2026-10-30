@@ -129,6 +129,17 @@ planning scene. Enable **Collision geometry** to show the collision shapes used
 by trajectory validation. These overlays are viewer-only; they do not modify
 object poses or collision validation.
 
+With an outside measured robot source (the pose observer's measured robot),
+the ghost uses that source for the robot's joints, mapped to the arm through
+the component index. Other robots and tools use their own joint or position
+streams. A static fixture or any other element without a stream gets no
+ghost. If data needed to place an element has not arrived yet, that element is
+hidden rather than drawn at a neutral pose as if measured; unrelated elements
+continue to render. The Scene panel shows one line per component, for example
+"Parts of lite_gripper are hidden in the measured overlay until their joint
+state arrives." With no live robot position at all it shows "Measured robot
+overlay requires execution."
+
 ## Troubleshooting
 
 Scene-specific cases below. For cross-cutting failures (collision rejection,

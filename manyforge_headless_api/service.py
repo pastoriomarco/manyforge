@@ -27,10 +27,12 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ActivationPreparationRequest,
+    CallerAttributionRequest,
     CanonicalEmptyActivationPreparationRequest,
     HistorianReconcileRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
+    ManagerApplyAcknowledgementContext,
     MockIoInputRequest,
     ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
@@ -275,6 +277,66 @@ def _build_skills():
     )
 
 
+@lru_cache(maxsize=1)
+def _palette_environment():
+    return build_node_environment()
+
+
+def _palette_missing_capability(entry: Any, offers: set[str]) -> str | None:
+    """Evaluate unconditional requirements and each parameter's alternatives."""
+    conditional: dict[str, dict[object, list[str]]] = {}
+    for requirement in entry.required_capabilities:
+        if requirement.when_parameter is None:
+            if requirement.capability_id not in offers:
+                return requirement.capability_id
+        else:
+            conditional.setdefault(requirement.when_parameter, {}).setdefault(
+                requirement.when_equals, []
+            ).append(requirement.capability_id)
+    for alternatives in conditional.values():
+        if not any(
+            all(capability in offers for capability in required)
+            for required in alternatives.values()
+        ):
+            return next(
+                capability
+                for required in alternatives.values()
+                for capability in required
+                if capability not in offers
+            )
+    return None
+
+
+def _palette_model_configured(applied: Mapping[str, Any]) -> bool:
+    assistant = applied.get("assistant_projection")
+    if not isinstance(assistant, Mapping):
+        return False
+    models = assistant.get("ai_models")
+    endpoints = assistant.get("model_endpoint_aliases")
+    if not isinstance(models, list) or not isinstance(endpoints, list):
+        return False
+    components = {
+        row["controllable_component_id"]
+        for row in models
+        if isinstance(row, Mapping)
+        and isinstance(row.get("controllable_component_id"), str)
+    }
+    return any(
+        isinstance(row, Mapping)
+        and row.get("external_resource_alias") in components
+        for row in endpoints
+    )
+
+
+def _strip_palette_offers(projection: dict[str, Any]) -> Any:
+    offers = projection.pop("capability_offers", None)
+    availability = projection.get("availability")
+    if isinstance(availability, dict):
+        for row in availability.get("implementations", []):
+            row["reasons"] = []
+    return offers
+
+
 @dataclass(frozen=True, slots=True)
 class TrustedAttribution:
     principal_id: str | None = None
@@ -311,6 +373,12 @@ class HeadlessService:
         self._apply_scene_attempted: tuple[str, int, str] | None = None
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
+        # Item 38: set when this service ran the Kernel's Force close step
+        # (armed Full Stop, Close retirement). It lives for that attempt only:
+        # the next preparation of any kind consumes it, success or failure, and
+        # the attempt's step `end` (SX-616) or a new arm clears it. Callers
+        # cannot set it.
+        self._force_close_in_progress = False
         # Each Apply Headless forwards is followed to its committed outcome,
         # which wakes the Program runner (see apply_follower).
         self.apply_follower: CommittedApplyFollower | None = (
@@ -341,7 +409,10 @@ class HeadlessService:
 
     @staticmethod
     def _admission_error(error: CellAdmissionError) -> HeadlessApiError:
-        return HeadlessApiError(error.code, str(error))
+        return HeadlessApiError(
+            error.code, str(error), details=error.details,
+            producer=error.producer or "headless_api",
+        )
 
     def authoring_admission(self) -> dict[str, Any]:
         try:
@@ -666,6 +737,49 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self._execution().recover_stop_fault(request)
 
+    def scenario_force_close_arm(self, stop_generation: int) -> dict[str, Any]:
+        """Item 37: the Kernel confirms the operator's Full Stop for Force close."""
+
+        self._force_close_in_progress = False
+        return self._execution().force_close(step="arm", stop_generation=stop_generation)
+
+    def scenario_force_close_operations(
+        self, context: CallerAttributionRequest
+    ) -> dict[str, Any]:
+        """Item 37: the Kernel step, then one History row of what stays unknown."""
+
+        response = self._execution().force_close(step="close_operations")
+        if response.get("ok") is not True:
+            return response
+        self._force_close_in_progress = True
+        result = response["result"]
+        record = {
+            "schema_version": "manyforge.scenario_force_close.v1",
+            "reason_code": "cell_force_closed_by_operator",
+            "request_id": context.request_id,
+            "source_label": context.source_label,
+            "stop_generation": result["stop_generation"],
+            "operations": result["operations"],
+            "released_orphan_resources": result["released_orphan_resources"],
+            # FIX1: the cell-wide motion block of an unresolved closure ended.
+            "motion_block_cleared": result.get("motion_block_cleared") is True,
+        }
+        try:
+            history = self.core.record_scenario_force_close(record)
+        except HeadlessApiError as error:
+            # The Kernel step already happened; a lost History row is logged.
+            logging.getLogger(__name__).warning(
+                "Force close History row was not recorded: %s", error.code
+            )
+            history = {"event_id": None, "recorded": False}
+        return {**response, "history": history}
+
+    def scenario_force_close_end(self) -> dict[str, Any]:
+        """SX-616: the caller's Force close sequence ended; its exception ends."""
+
+        self._force_close_in_progress = False
+        return {"ok": True, "command": "force_close", "result": {"step": "end", "operations": []}}
+
     def execution_set_runtime_scale_control(
         self,
         request: RuntimeScaleControlRequest,
@@ -909,6 +1023,16 @@ class HeadlessService:
                 "node_environment_projection_invalid",
                 "native core returned an unsupported node environment projection",
             )
+        offers = _strip_palette_offers(projection)
+        if (
+            not isinstance(offers, list)
+            or any(not isinstance(value, str) for value in offers)
+            or offers != sorted(set(offers))
+        ):
+            raise HeadlessApiError(
+                "node_environment_projection_invalid",
+                "native core returned invalid Deployment capability offers",
+            )
         if self.program_runner is None:
             return projection
         try:
@@ -1087,10 +1211,53 @@ class HeadlessService:
                     "program_runner_response_invalid",
                     "Program node availability disagrees with the active registry",
                 )
-            projected_rows.append({field: runner_row[field] for field in core_row})
+            projected_rows.append(
+                {field: runner_row[field] for field in core_row if field != "reasons"}
+            )
+        environment = _palette_environment()
+        if environment.environment_digest != projection["environment_digest"]:
+            raise HeadlessApiError(
+                "program_node_availability_stale",
+                "Installed palette catalog does not match the active environment",
+            )
+        catalog = environment.catalog
+        offer_set = set(offers)
+        required_nodes = set(runner_availability["required_node_ids"])
+        model_configured = _palette_model_configured(applied)
+        palette_reasons: set[str] = set()
+        for row in projected_rows:
+            entry = catalog.get(row["node_id"])
+            missing = _palette_missing_capability(entry, offer_set)
+            reasons = []
+            if missing is not None:
+                reasons.append({
+                    "code": "capability_not_offered",
+                    "message": f"No component offers {missing}",
+                    "details": {"capability": missing},
+                })
+            if (
+                entry.execution.owner_api == "assistant.model_request"
+                and not model_configured
+            ):
+                reasons.append({
+                    "code": "model_not_configured",
+                    "message": "No model is configured",
+                    "details": {},
+                })
+            row["reasons"] = reasons
+            if reasons:
+                row["binding_available"] = False
+                row["execution_available"] = False
+                row["reason_codes"] = sorted(
+                    set(row["reason_codes"]) | {reason["code"] for reason in reasons}
+                )
+                if row["node_id"] in required_nodes:
+                    palette_reasons.update(reason["code"] for reason in reasons)
         projection["availability"] = {
             "binding_context": "applied",
-            "execution_available": runner_availability.get("execution_available"),
+            "execution_available": (
+                runner_availability.get("execution_available") and not palette_reasons
+            ),
             "implementations": projected_rows,
             "manager_runtime_converged": core_availability.get(
                 "manager_runtime_converged"
@@ -1098,7 +1265,9 @@ class HeadlessService:
             "portable_authoring_available": runner_availability.get(
                 "portable_authoring_available"
             ),
-            "reason_codes": runner_availability.get("reason_codes"),
+            "reason_codes": sorted(
+                set(runner_availability.get("reason_codes", [])) | palette_reasons
+            ),
             "restoration_gates": sorted(
                 {
                     gate
@@ -1115,7 +1284,7 @@ class HeadlessService:
         source = projection.get("source")
         if projection.get(
             "schema_version"
-        ) != "manyforge.source_model_projection.v2" or not isinstance(source, dict):
+        ) != "manyforge.source_model_projection.v3" or not isinstance(source, dict):
             raise HeadlessApiError(
                 "source_model_projection_invalid",
                 "native core returned an unsupported source model projection",
@@ -1133,12 +1302,13 @@ class HeadlessService:
             or context["node_environment"].get("schema_version")
             != "manyforge.node_environment_projection.v2"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v2"
+            != "manyforge.source_model_projection.v3"
         ):
             raise HeadlessApiError(
                 "source_model_context_invalid",
                 "native core returned an unsupported source-model context",
             )
+        _strip_palette_offers(context["node_environment"])
         return context
 
     def assistant_mode_context(self, mode_id: str) -> dict[str, Any]:
@@ -1162,12 +1332,13 @@ class HeadlessService:
             or context["node_environment"].get("schema_version")
             != "manyforge.node_environment_projection.v2"
             or context["source_model"].get("schema_version")
-            != "manyforge.source_model_projection.v2"
+            != "manyforge.source_model_projection.v3"
         ):
             raise HeadlessApiError(
                 "assistant_mode_context_invalid",
                 "native core returned an unsupported assistant-mode context",
             )
+        _strip_palette_offers(context["node_environment"])
         return context
 
     def program_applied(self) -> dict[str, Any]:
@@ -1370,6 +1541,7 @@ class HeadlessService:
             error.code,
             str(error),
             details=error.details,
+            producer=error.producer,
         )
 
     @staticmethod
@@ -2593,6 +2765,38 @@ class HeadlessService:
             )
         return offer.get("recovery_unavailable_reason") == "stop_fault_recovery_closing"
 
+    def _require_no_carried_objects(self) -> None:
+        """Close refuses while a part is attached: the caller detaches first.
+
+        The canonical-empty Apply preserves the Scene, so an attachment would
+        outlive its carrier and could no longer be detached.
+        """
+
+        _runtime, section = self._source_section("logical_scene")
+        snapshot = section["payload"].get("snapshot")
+        attachments = (
+            snapshot.get("carried_object_attachments")
+            if isinstance(snapshot, Mapping) else None
+        )
+        if not attachments:
+            return
+        raise HeadlessApiError(
+            "scenario_close_attachment_present",
+            "Detach every carried object before Close",
+            details={"carried_objects": [
+                {
+                    key: row.get(key)
+                    for key in (
+                        "scene_resource_id",
+                        "controllable_component_id",
+                        "command_target_id",
+                    )
+                }
+                for row in attachments
+                if isinstance(row, Mapping)
+            ]},
+        )
+
     def prepare_activation(
         self, request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest
     ) -> dict[str, Any]:
@@ -2602,14 +2806,18 @@ class HeadlessService:
                 "Activation preparation is not configured",
             )
         canonical_empty = isinstance(request, CanonicalEmptyActivationPreparationRequest)
+        # Item 38: one preparation consumes the Force close exception, whatever
+        # its outcome (SX-616).
+        force_close_bypass = canonical_empty and self._force_close_in_progress
+        self._force_close_in_progress = False
 
         def admitted() -> bool:
             try:
                 admission = self._cell_admission().get()
             except CellAdmissionError as error:
                 raise self._admission_error(error) from error
-            if admission.get("admission_generation") != request.expected_admission_generation:
-                return False
+            # The request's admission generation is evidence only: preparation
+            # follows the current admission facts.
             if admission.get("authoring_allowed") is True:
                 return True
             # D6 (SX-366/370): while Scenario Close runs, authoring stays
@@ -2620,10 +2828,14 @@ class HeadlessService:
 
         if not admitted():
             raise HeadlessApiError(
-                "stale_generation",
+                "authoring_not_ready",
                 "Activation preparation requires the current idle admission",
             )
         if canonical_empty:
+            # Item 38 (b): during Force close a part whose detach was refused
+            # (the robot's process is gone) may stay attached.
+            if not force_close_bypass:
+                self._require_no_carried_objects()
             selection = self.manager.canonical_empty_selection()
             origin = request.origin.model_dump(mode="json")
             selected_origin = {
@@ -2676,6 +2888,16 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self.manager.observe_apply(apply_id, apply_generation)
 
+    def manager_apply_acknowledge(
+        self,
+        apply_id: str,
+        apply_generation: int,
+        request_context: ManagerApplyAcknowledgementContext,
+    ) -> dict[str, Any]:
+        return self.manager.acknowledge_apply(
+            apply_id, apply_generation, request_context
+        )
+
     def scene_commit(
         self,
         request: SceneTransactionRequest,
@@ -2711,10 +2933,11 @@ class HeadlessService:
                 "invalid_request",
                 "runtime scene mutation cannot carry Program Reset authorization",
             )
-        return self.manager.commit_scene_transaction(
+        response = self.manager.commit_scene_transaction(
             request,
             trusted_principal_id=attribution.principal_id,
         )
+        return response
 
     def scene_transaction_status(
         self, request: SceneTransactionRequest

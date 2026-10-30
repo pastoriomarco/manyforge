@@ -90,6 +90,7 @@
         }
       ],
       "command_target_id": "arm",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "base",
@@ -97,9 +98,16 @@
           "model_role_id": "arm_model"
         },
         {
+          "asset_frame_role_id": "flange",
+          "frame_role_id": "flange",
+          "model_role_id": "arm_model",
+          "tcp": true
+        },
+        {
           "asset_frame_role_id": "tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -124,7 +132,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur5_roboplan.fixed_scale.component",
-  "component_type_revision": "sha256:2c6a3ed8a3792542d9169e26bd116c01a8852ec7967a774b4a79d3509cc7ff94",
+  "component_type_revision": "sha256:a64848ad8416228732053d3b9fdb25607a4d42f302487e369a9654463cadd10a",
   "model_mounts": [],
   "model_roles": [
     {

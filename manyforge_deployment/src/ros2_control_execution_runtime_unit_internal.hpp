@@ -44,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274";
+        "fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -87,9 +87,11 @@ inline constexpr std::size_t
     kMaxRos2ControlExecutionLaunchDescriptorBytes = 4U * 1024U;
 
 /// Q85: reject collisions on the exclusive topics of the known Isaac profiles.
-/// Both authored compilation and retained activation use this one check.
+/// Both authored compilation and retained activation use this one check. Only
+/// an arm (a component with a motion target limit) owns those topics.
 void require_no_exclusive_ros_controller_topic_collision(
-    const CanonicalValue::Array &controller_profiles);
+    const CanonicalValue::Array &controller_profiles,
+    const CanonicalValue::Array &motion_target_limits);
 
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_document();
 [[nodiscard]] std::string ros2_control_execution_runtime_profile_revision();
@@ -109,12 +111,6 @@ void require_no_exclusive_ros_controller_topic_collision(
 decode_ros2_control_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &rows);
 
-/// D11: one controller profile row's optional `tool_payload`, exactly
-/// `{mass_kg >= 0, center_of_mass_m: [x, y, z]}` with finite values.
-/// Throws RetainedBundleError otherwise.
-[[nodiscard]] ros2_control_execution_runtime_contract::Configuration::ToolPayload
-decode_ros2_control_tool_payload(const core::JsonValueDTO &value);
-
 /// CP9: the strict `component_streams` rows of one ROS unit configuration,
 /// sorted by (component, stream). Exactly `measured_joints` for every
 /// controller-profile component plus `gripper_feedback` for every gripper-row
@@ -124,6 +120,16 @@ decode_ros2_control_tool_payload(const core::JsonValueDTO &value);
     ros2_control_execution_runtime_contract::Configuration::ComponentStream>
 decode_ros2_control_execution_component_streams(
     const core::JsonObjectDTO &configuration);
+
+/// A controller profile row's optional `stop_lead_in_anchor` (`commanded` or
+/// `measured`); absent stays absent (the lane default, commanded). Any other
+/// value is refused.
+[[nodiscard]] std::optional<core::StopLeadInAnchor>
+decode_ros2_control_stop_lead_in_anchor(const std::optional<std::string> &value);
+
+/// M6b: a controller profile row's optional `controller_tcp_offset_sync`
+/// (absent: on); a value that is not a boolean is refused.
+[[nodiscard]] bool decode_ros2_control_tcp_offset_sync(const core::JsonValueDTO *value);
 
 /// DX817: one source classifier for the already-qualified selected graph.
 /// Absence preserves the historical physical/default Stop contract. A returned

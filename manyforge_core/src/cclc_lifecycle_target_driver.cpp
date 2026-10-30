@@ -1,6 +1,7 @@
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -139,6 +140,9 @@ struct DomainObservation final {
   /// motion.
   bool moved_externally{};
   bool in_motion{};
+  /// M6 ADAPTERM: the fresh observation reports ManyForge's own re-arm in
+  /// progress (`device.rearm_in_progress`).
+  bool rearm_in_progress{};
 };
 
 [[nodiscard]] bool BooleanFactIs(const BrandLifecycleObservationDTO& observation,
@@ -225,6 +229,9 @@ struct DomainObservation final {
     result.in_motion = BooleanFactIs(observed.value(), kDeviceInMotionFactId, true);
     if (!external_move_tolerated()) domain_cause = LifecycleBlockingCauseClassDTO::kExternalControl;
   }
+  result.rearm_in_progress =
+      BooleanFactIs(observed.value(), kDeviceRearmInProgressFactId, true) &&
+      !lifecycle_cause_requires_intervention(domain_cause);
   result.reported = domain_cause;
   if (recovered_cause && domain_cause == *recovered_cause) {
     // The operator's Recover already covers this cause: an adapter that keeps
@@ -349,13 +356,11 @@ RequestId LifecycleTargetRequestId(const ControllableComponentId& component,
 CoordinatorLifecycleTargetDriverPorts::CoordinatorLifecycleTargetDriverPorts(
     ComponentLifecycleCoordinator& coordinator,
     const ICCLCCurrentComponentSnapshotSource& snapshot_source,
-    const ICCLCLifecyclePlanCatalogSource& catalog_source,
     const ICCLCBrandLifecyclePortResolver& port_resolver,
     IKernelCellAdmissionPort& kernel_cell_admission_port,
     std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components) noexcept
     : coordinator_(coordinator),
       snapshot_source_(&snapshot_source),
-      catalog_source_(&catalog_source),
       port_resolver_(&port_resolver),
       kernel_cell_admission_port_(kernel_cell_admission_port),
       unsettled_components_(std::move(unsettled_components)) {}
@@ -378,8 +383,8 @@ Result<void> CoordinatorLifecycleTargetDriverPorts::WithPinnedProduct(
   if (!acquired.ok()) return Result<void>::Err(acquired.error());
   const auto& context = acquired.value().context();
   CoordinatorLifecycleTargetDriverPorts bound(
-      coordinator_, context.current_snapshot_source, context.lifecycle_plan_catalog_source,
-      context.lifecycle_port_resolver, kernel_cell_admission_port_, unsettled_components_);
+      coordinator_, context.current_snapshot_source, context.lifecycle_port_resolver,
+      kernel_cell_admission_port_, unsettled_components_);
   bound.product_pin_ = &acquired.value();
   pass(bound);
   return Result<void>::Ok();
@@ -426,20 +431,28 @@ CoordinatorLifecycleTargetDriverPorts::ReadCurrentComponent(
   return snapshot;
 }
 
-Result<BrandLifecyclePlanCatalogDTO> CoordinatorLifecycleTargetDriverPorts::LoadLifecyclePlanCatalog(
+Result<std::shared_ptr<const ILifecycleAdmission>>
+CoordinatorLifecycleTargetDriverPorts::Admission(
     const ResolvedLifecycleProviderOccurrenceDTO& occurrence) {
-  if (catalog_source_ == nullptr) {
-    auto result = Result<BrandLifecyclePlanCatalogDTO>::Err(
-        driver_error("cclc_product_read_unavailable", "the product read did not run",
-                     "product_read_unavailable"));
-    const auto pinned = WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
-      result = ports.LoadLifecyclePlanCatalog(occurrence);
-    });
-    return pinned.ok() ? result : Result<BrandLifecyclePlanCatalogDTO>::Err(pinned.error());
+  using Reply = Result<std::shared_ptr<const ILifecycleAdmission>>;
+  if (port_resolver_ == nullptr) {
+    auto result = Reply::Err(driver_error("cclc_product_read_unavailable",
+                                          "the product read did not run",
+                                          "product_read_unavailable"));
+    const auto pinned = WithPinnedProduct(
+        [&](ICCLCLifecycleTargetDriverPorts& ports) { result = ports.Admission(occurrence); });
+    return pinned.ok() ? result : Reply::Err(pinned.error());
   }
-  return catalog_source_->LoadExactLifecyclePlanCatalog(occurrence.provider_manifest_id,
-                                                        occurrence.provider_manifest_revision,
-                                                        occurrence.lifecycle_plan_catalog_digest);
+  auto port = port_resolver_->ResolveExactLifecyclePort(occurrence);
+  if (!port.ok()) return Reply::Err(port.error());
+  if (!port.value()) {
+    return Reply::Err(driver_error("lifecycle_target_port_missing",
+                                   "the resolver returned no lifecycle port",
+                                   "brand_port_missing"));
+  }
+  // Aliasing: the admission query keeps its adapter alive.
+  return Reply::Ok(std::shared_ptr<const ILifecycleAdmission>(port.value(),
+                                                              &port.value()->Admission()));
 }
 
 Result<BrandLifecycleObservationDTO> CoordinatorLifecycleTargetDriverPorts::Observe(
@@ -972,11 +985,16 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
   // admission (no Program cycle, claim or Stop fault), read at this decision
   // boundary, unless lifecycle work of this component holds the cell's claim
   // (its own re-arm): then the episode's decision stands. With no decision,
-  // conservative: the `external_control` incident. The re-arm itself is an
-  // operator Recover at the next motion command, fenced on the then current
-  // admission generation.
+  // conservative: the `external_control` incident. M6 ADAPTERM: an episode
+  // decided ordinary (idle cell) stays so until the move latch ends: the next
+  // admitted ManyForge motion holds the cell while its vendor adapter
+  // re-engages the robot, which ends the latch. Recover cell still re-arms it
+  // explicitly. A new move after the latch ended is decided again.
   const auto component = target.controllable_component_id;
   const std::function<bool()> external_move_tolerated = [&]() {
+    if (state.external_move_decision.has_value() &&
+        state.external_move_decision->authoring_allowed)
+      return true;
     if (state.in_flight || state.pending_intent || ports.ComponentLifecycleSettling(component)) {
       return state.external_move_decision.has_value() &&
              state.external_move_decision->authoring_allowed;
@@ -1000,8 +1018,13 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
     }
     conditions.push_back({occurrence.control_domain_id, std::move(observed)});
   }
-  if (std::none_of(conditions.begin(), conditions.end(),
-                   [](const DomainCondition& condition) { return condition.observed.moved_externally; })) {
+  // Item 32: only a fresh report showing the latch ended ends the episode; a
+  // stale or unavailable observation neither ends nor creates it.
+  if (std::all_of(conditions.begin(), conditions.end(),
+                  [](const DomainCondition& condition) {
+                    return condition.observed.observation.has_value() &&
+                           !condition.observed.moved_externally;
+                  })) {
     state.external_move_decision.reset();
   }
   return conditions;
@@ -1258,7 +1281,9 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
     }
     // m5.5: the vendor switched the controllers off for an external move on
     // an idle cell; the driver re-arms it, so this is waiting, not a loss.
-    if (observed.moved_externally && !lifecycle_cause_requires_intervention(observed.cause)) {
+    // M6 ADAPTERM: so is ManyForge's own re-arm in progress.
+    if ((observed.moved_externally || observed.rearm_in_progress) &&
+        !lifecycle_cause_requires_intervention(observed.cause)) {
       moved_externally = true;
       requested_controller_absence = true;
       continue;
@@ -1599,31 +1624,21 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(ICCLCLifecycleTargetDriverPorts& 
   }
   const auto& value = *status.value();
   if (!value.terminal_result) {
-    const bool uncertain = value.reconciliation_required ||
-                           value.phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
-                           value.phase == ComponentLifecycleTransactionPhaseDTO::kReconciling;
-    Publish(state,
-            uncertain ? LifecycleProgressPhaseDTO::kOutcomeUncertain
-                      : LifecycleProgressPhaseDTO::kTransitionInProgress,
-            in_flight.intent, known_cause,
+    Publish(state, LifecycleProgressPhaseDTO::kTransitionInProgress, in_flight.intent, known_cause,
             target && in_flight.expected_target.controllable_component_id == target->controllable_component_id &&
                 in_flight.expected_target.target_generation == target->target_generation
-                ? (uncertain ? std::optional<std::string>("reconciling_from_fresh_observation")
-                             : std::nullopt)
+                ? std::nullopt
                 : std::optional<std::string>("superseded_step_settling"),
             now_ns);
     return true;
   }
-  // CCLC has recorded a known outcome (after reconciliation when needed).
+  // CCLC has recorded the outcome: succeeded, or failed / connection lost,
+  // which both count as a failed step.
   const bool current = target && in_flight.expected_target.controllable_component_id == target->controllable_component_id &&
                 in_flight.expected_target.target_generation == target->target_generation;
   const bool succeeded = *value.terminal_result == ComponentLifecycleTerminalResultDTO::kSucceeded;
-  const bool recover_settled = in_flight.intent == ComponentLifecycleIntentKindDTO::kRecover;
   state.in_flight.reset();
   if (!current) return false;
-  // One driver Recover per operator Recover for an observed cause (see
-  // EvaluateComponent), whatever its outcome.
-  if (recover_settled) state.recover_settled_generation = state.recovery_generation;
   if (succeeded) {
     ++state.step;
     state.attempt = 1U;
@@ -1740,6 +1755,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   const auto& actual_target = facts.value().target;
   const bool retired = !actual_target || actual_target->target_generation != state.target_generation;
   state.recovery_generation = facts.value().recovery_generation;
+  state.recover_attempt_generation = facts.value().recover_attempt_generation;
   // CP9: pushed stream health, read once per pass (no observation pull).
   state.streams = config_.stream_health ? config_.stream_health->Verdict(component)
                                         : ComponentStreamVerdictDTO{};
@@ -1844,6 +1860,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     state = ComponentState{};
     state.target_generation = actual_target->target_generation;
     state.recovery_generation = facts.value().recovery_generation;
+    state.recover_attempt_generation = facts.value().recover_attempt_generation;
   }
   auto target = *actual_target;
   state.requested_state = target.requested_state;
@@ -1925,7 +1942,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   // A fresh intervention from the exact current occurrence is catastrophic
   // in every lifecycle state (129). Availability still needs the durable
   // reached marker. Reuse this one observation pass for plan eligibility too;
-  // a missing plan catalog cannot hide an explicitly reported intervention.
+  // a missing admission query cannot hide an explicitly reported intervention.
   const auto conditions =
       ObserveAllDomains(ports, target, state, current, retained, !settling);
   // A Declared component whose every domain is already at a Disabled target
@@ -1941,16 +1958,16 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     bool all_at_target = true;
     for (std::size_t index = 0U; all_at_target && index < conditions.size(); ++index) {
       const auto& observation = conditions[index].observed.observation;
-      const auto catalog = observation
-          ? ports.LoadLifecyclePlanCatalog(current.provider_occurrences[index])
-          : Result<BrandLifecyclePlanCatalogDTO>::Err(ErrorDTO{"observation_not_fresh", "", {}});
-      const auto decision = catalog.ok()
-          ? EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kDisable,
-                                        ComponentLifecycleStateDTO::kDisabled, catalog.value(),
-                                        *observation)
-          : Result<LifecycleDomainPlanDecision>::Err(catalog.error());
-      all_at_target = decision.ok() &&
-                      decision.value().kind == LifecycleDomainPlanDecisionKind::kAlreadySatisfied;
+      const auto admission = observation
+          ? ports.Admission(current.provider_occurrences[index])
+          : Result<std::shared_ptr<const ILifecycleAdmission>>::Err(
+                ErrorDTO{"observation_not_fresh", "", {}});
+      const auto answer = admission.ok()
+          ? admission.value()->Evaluate(ComponentLifecycleIntentKindDTO::kDisable,
+                                        ComponentLifecycleStateDTO::kDisabled, *observation)
+          : Result<LifecycleAdmissionDTO>::Err(admission.error());
+      all_at_target = answer.ok() &&
+                      answer.value().postcondition == LifecyclePostconditionResultDTO::kSatisfied;
     }
     if (all_at_target) next.reset();
   }
@@ -1958,7 +1975,9 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   // domain that still reports the recovered cause, degraded or faulted, needs
   // them whatever CCLC's achieved state is (a vendor error present before the
   // component was ever armed leaves it Declared). Only with `recovered_cause`
-  // (set by the operator's Recover alone), and once per operator Recover.
+  // (set by the operator's Recover alone), and once per recovery generation:
+  // the journal records the generation each accepted Recover ran under, the
+  // operator's ordinary Recover included (M6, item 35).
   const bool recover_observed_cause =
       following && target.recovered_cause &&
       (achieved == ComponentLifecycleStateDTO::kDeclared ||
@@ -1980,10 +1999,12 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
                                      : LifecycleBlockingCauseClassDTO::kNone)) {
     return true;
   }
-  if (recover_observed_cause && state.recover_settled_generation == state.recovery_generation) {
-    // This driver's Recover already ran under this operator Recover and the
-    // cause persists (for example an emergency stop still engaged): nothing
-    // is resubmitted until the operator acts again.
+  if (recover_observed_cause && !settling &&
+      state.recover_attempt_generation == state.recovery_generation) {
+    // A Recover (this driver's, or the operator's ordinary one) already ran
+    // under this recovery generation and the cause persists (for example an
+    // emergency stop still engaged): nothing is resubmitted until the
+    // operator acts again. While a transaction settles, it is waited on.
     Publish(state, LifecycleProgressPhaseDTO::kBlocked, next, *target.recovered_cause,
             "recovered_cause_persists:" + std::string(to_string(*target.recovered_cause)) +
                 (state.failure_reason ? ":" + *state.failure_reason : std::string()),
@@ -1995,8 +2016,10 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     state.failure_reason.reset();
     // m5.5: moved from the robot's own interface on an idle cell: a
     // non-blocking warning at the target (like a lost joint stream). The
-    // next ManyForge motion command re-arms it first (operator Recover; this
-    // driver then re-drives Prepare and Enable); nothing is submitted here.
+    // next admitted ManyForge motion re-engages it through its vendor
+    // adapter (M6 ADAPTERM); Recover cell re-arms it explicitly (operator
+    // Recover; this driver then re-drives Prepare and Enable). Nothing is
+    // submitted here.
     const auto moved = std::find_if(conditions.begin(), conditions.end(),
                                     [](const DomainCondition& condition) {
       return condition.observed.moved_externally &&
@@ -2007,6 +2030,16 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
               LifecycleBlockingCauseClassDTO::kAvailability,
               std::string(moved->observed.in_motion ? "moved_externally:in_motion"
                                                     : "moved_externally:rearm_at_next_motion"),
+              now_ns);
+      return true;
+    }
+    // M6 ADAPTERM: ManyForge's own re-arm in progress: a waiting condition at
+    // the target until the reactivated controller is bound.
+    if (std::any_of(conditions.begin(), conditions.end(), [](const DomainCondition& condition) {
+          return condition.observed.rearm_in_progress;
+        })) {
+      Publish(state, LifecycleProgressPhaseDTO::kSatisfied, std::nullopt,
+              LifecycleBlockingCauseClassDTO::kAvailability, std::string("rearm_in_progress"),
               now_ns);
       return true;
     }
@@ -2072,7 +2105,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   }
 
   // One fresh observation per provider occurrence, read only.
-  std::vector<BrandLifecyclePlanCatalogDTO> catalogs;
+  std::vector<std::shared_ptr<const ILifecycleAdmission>> admissions;
   std::vector<std::optional<BrandLifecycleObservationDTO>> observations;
   AttemptBasis basis{{}, 0U, current.snapshot_digest.value()};
   auto cause = LifecycleBlockingCauseClassDTO::kNone;
@@ -2080,14 +2113,14 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   std::optional<std::string> unavailable_reason;
   for (std::size_t index = 0U; index < current.provider_occurrences.size(); ++index) {
     const auto& occurrence = current.provider_occurrences[index];
-    auto catalog = ports.LoadLifecyclePlanCatalog(occurrence);
-    if (!catalog.ok()) {
+    auto admission = ports.Admission(occurrence);
+    if (!admission.ok()) {
       Publish(state, LifecycleProgressPhaseDTO::kBlocked, *next,
               LifecycleBlockingCauseClassDTO::kConfiguration,
-              ReasonOf("lifecycle_catalog_unavailable", catalog.error()), now_ns);
+              ReasonOf("lifecycle_catalog_unavailable", admission.error()), now_ns);
       return true;
     }
-    catalogs.push_back(std::move(catalog.value()));
+    admissions.push_back(std::move(admission.value()));
     const auto& observed = conditions[index].observed;
     basis.observation_generations.push_back(observed.generation);
     if (!observed.observation) {
@@ -2137,15 +2170,21 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     return true;
   }
 
-  // Eligibility of the next intent's own plan on the fresh observations.
+  // Eligibility of the next intent on the fresh observations, answered by
+  // each provider's admission query.
   auto requested_state = RequestedStateOf(*next);
   if (*next == ComponentLifecycleIntentKindDTO::kRecover) {
-    std::vector<LifecycleRecoverSelectionInput> inputs;
-    for (std::size_t index = 0U; index < catalogs.size(); ++index) {
-      inputs.push_back({current.provider_occurrences[index], catalogs[index],
-                        *observations[index]});
+    std::vector<std::array<LifecyclePostconditionResultDTO, 3>> targets;
+    for (std::size_t index = 0U; index < admissions.size(); ++index) {
+      const auto answers = admissions[index]->RecoverTargets(*observations[index]);
+      if (!answers.ok()) {
+        Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites, *next, cause,
+                ReasonOf("prerequisites_unmet", answers.error()), now_ns);
+        return true;
+      }
+      targets.push_back(answers.value());
     }
-    const auto selected = SelectCommonRecoverTarget(inputs);
+    const auto selected = SelectCommonRecoverTarget(targets);
     if (!selected.ok()) {
       Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites, *next, cause,
               ReasonOf("prerequisites_unmet", selected.error()), now_ns);
@@ -2153,12 +2192,14 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     }
     requested_state = selected.value();
   }
-  for (std::size_t index = 0U; index < catalogs.size(); ++index) {
-    const auto decision =
-        EvaluateLifecycleDomainPlan(*next, requested_state, catalogs[index], *observations[index]);
-    if (!decision.ok()) {
+  for (std::size_t index = 0U; index < admissions.size(); ++index) {
+    const auto answer =
+        admissions[index]->Evaluate(*next, requested_state, *observations[index]);
+    if (!answer.ok() || answer.value().not_ready) {
       Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites, *next, cause,
-              ReasonOf("prerequisites_unmet", decision.error()), now_ns);
+              ReasonOf("prerequisites_unmet",
+                       answer.ok() ? *answer.value().not_ready : answer.error()),
+              now_ns);
       return true;
     }
   }
@@ -2302,6 +2343,9 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
     }
   }
   view.target = target.value();
+  const auto retired = store_.ActiveTargetRetiredByIncident(component);
+  if (!retired.ok()) return Result<ComponentLifecycleTargetViewDTO>::Err(retired.error());
+  view.active_target_retired_by_incident = retired.value();
   if (config_.stream_health) view.stream_health = config_.stream_health->Read(component);
   {
     std::lock_guard lock(state_mutex_);
@@ -2423,6 +2467,53 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
     result = recover();
   });
   return pinned.ok() ? result : Result<Value>::Err(pinned.error());
+}
+
+Result<void> CCLCLifecycleTargetDriver::RefuseWhileAcknowledgementPending(
+    const ControllableComponentId& component) {
+  const auto refuse = [&](std::string message, std::string reason,
+                          std::optional<std::string> incident_id) {
+    auto error = driver_error("cclc_incident_open", std::move(message), std::move(reason));
+    error.details["effect"] = "not_started";
+    if (incident_id) error.details["incident_id"] = std::move(*incident_id);
+    return Result<void>::Err(std::move(error));
+  };
+  // Read only: nothing is acknowledged, cleared or woken here.
+  if (config_.stream_health) {
+    const auto verdict = config_.stream_health->Verdict(component);
+    const auto rows = config_.stream_health->Read(component);
+    if (verdict.fault_event ||
+        std::any_of(rows.begin(), rows.end(),
+                    [](const StreamHealthDTO& row) { return row.acknowledgement_required; })) {
+      return refuse("a stream condition of the component awaits the operator's Recover",
+                    "stream_acknowledgement_pending", std::nullopt);
+    }
+  }
+  const auto facts = store_.LoadLifecycleTargetFacts(component);
+  if (!facts.ok()) return Result<void>::Err(facts.error());
+  if (facts.value().open_incident) {
+    return refuse("a component incident is open; the operator's Recover acknowledges it",
+                  "incident_open", facts.value().open_incident->incident.incident_id);
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> CCLCLifecycleTargetDriver::RefuseIfAnotherIncidentOpen(
+    const ControllableComponentId& component, const std::string& expected_incident_id) {
+  // Read only, before the Recover's stream acknowledgement and journal write.
+  const auto facts = store_.LoadLifecycleTargetFacts(component);
+  if (!facts.ok()) return Result<void>::Err(facts.error());
+  const auto& open = facts.value().open_incident;
+  // Item 26: nothing open (the expected one was closed meanwhile) is an
+  // ordinary Recover.
+  if (!open || open->incident.incident_id == expected_incident_id) return Result<void>::Ok();
+  auto error = driver_error("cclc_incident_changed",
+                            "the component's open incident is not the one this Recover expects",
+                            "incident_changed");
+  error.details["effect"] = "not_started";
+  error.details["expected_incident_id"] = expected_incident_id;
+  error.details["incident_id"] = open->incident.incident_id;
+  return Result<void>::Err(std::move(error));
 }
 
 Result<std::vector<ComponentIncidentEventDTO>> CCLCLifecycleTargetDriver::LoadIncidentEvents(

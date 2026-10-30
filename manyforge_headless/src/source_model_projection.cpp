@@ -489,6 +489,29 @@ CanonicalValue TargetValue(const deployment::VerifiedRetainedModelMap& model_map
 
 }  // namespace
 
+CanonicalValue SourceModelComponents(const core::CellGraphDTO& graph) {
+  std::map<std::string, CanonicalValue> mounted_on;
+  for (const auto& component : graph.controllable_components) {
+    mounted_on.emplace(component.controllable_component_id.value(), CanonicalValue(nullptr));
+  }
+  for (const auto& edge : graph.component_attachments) {
+    mounted_on.at(edge.child.controllable_component_id.value()) =
+        CanonicalValue(CanonicalValue::Object{
+            {"component_id", CanonicalValue(edge.parent.controllable_component_id.value())},
+            {"interface_id", CanonicalValue(edge.parent.attachment_interface_id.value())},
+        });
+  }
+  CanonicalValue::Array rows;
+  rows.reserve(mounted_on.size());
+  for (auto& [component_id, parent] : mounted_on) {
+    rows.emplace_back(CanonicalValue::Object{
+        {"component_id", CanonicalValue(component_id)},
+        {"mounted_on", std::move(parent)},
+    });
+  }
+  return CanonicalValue(std::move(rows));
+}
+
 ActiveSourceModelProjection::ActiveSourceModelProjection(
     std::filesystem::path package_root,
     std::optional<std::filesystem::path> activation_root)
@@ -534,6 +557,7 @@ CanonicalValue ActiveSourceModelProjection::Project(
 
   CanonicalValue result(CanonicalValue::Object{
       {"cell_id", CanonicalValue(bundle.cell_graph.cell_id.value())},
+      {"components", SourceModelComponents(bundle.cell_graph)},
       {"graph_revision", CanonicalValue(bundle.cell_graph.graph_revision.value())},
       {"model_map_contract", std::move(map_contract)},
       {"model_map_product_id", std::move(map_product_id)},

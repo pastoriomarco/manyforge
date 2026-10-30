@@ -14,6 +14,8 @@ from manyforge_headless_api.models import (
     CapabilityCommandParticipantRequest,
     ManagerApplyPreparedActivation,
     ManagerApplyRequest,
+    ManagerApplyAcknowledgementContext,
+    ManagerApplyAcknowledgementRequest,
     ManagerApplyStatus,
     ManagerDeploymentCandidatePreviewRequest,
     MAX_APPLY_FAILURE_MESSAGE_BYTES,
@@ -227,7 +229,8 @@ def _planning_motion(
         "move_id": move_id,
         "base_frame_role_id": "frame-role:base",
         "tcp_endpoint": {
-            "target_role_id": "arm", "frame_role_id": "frame-role:tcp"
+            "kind": "entry", "entry": {"component_id": "robot", "target_id": "arm",
+                                       "frame_role_id": "frame-role:tcp"}
         },
         "tolerances": {
             "joint_position_tol_rad": 0.01,
@@ -587,13 +590,14 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         PlaceSequencePlanningRequest.model_validate(place)
 
 
-@pytest.mark.parametrize("owner", ["arm", "tool"])
-def test_motion_tcp_endpoint_is_the_only_wire_form_and_round_trips(owner: str) -> None:
+@pytest.mark.parametrize("selector", [
+    {"kind": "current"},
+    {"kind": "default_of_role", "role": "tool"},
+    {"kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}},
+])
+def test_motion_tcp_endpoint_is_the_only_wire_form_and_round_trips(selector) -> None:
     payload = _planning_motion("tcp", {"kind": "pose_goal", "goal": _planning_pose()})
-    payload["tcp_endpoint"] = {
-        "target_role_id": owner,
-        "frame_role_id": "fingertip",
-    }
+    payload["tcp_endpoint"] = selector
     operation = _planning_operation("endpoint", payload)
     parsed = OperationIntentRequest.model_validate(operation)
     wire = parsed.model_dump(mode="json")
@@ -613,6 +617,10 @@ def test_motion_tcp_endpoint_is_the_only_wire_form_and_round_trips(owner: str) -
         {"tcp_frame_role_id": ""},
         {"tcp_endpoint": None},
         {"tcp_endpoint": {}},
+        {"tcp_endpoint": {"kind": "current", "role": "tool"}},
+        {"tcp_endpoint": {"kind": "default_of_role", "role": ""}},
+        {"tcp_endpoint": {"kind": "entry", "entry": {"component_id": "robot", "target_id": "arm"}}},
+        {"tcp_endpoint": {"kind": "entry", "entry": {"component_id": "robot", "target_id": "arm", "frame_role_id": "tcp", "extra": 1}}},
         {"tcp_endpoint": {"target_role_id": "tool"}},
         {"tcp_endpoint": {"target_role_id": "", "frame_role_id": "tcp"}},
         {"tcp_endpoint": {"target_role_id": "tool", "frame_role_id": ""}},
@@ -640,14 +648,25 @@ def test_motion_tcp_endpoint_rejects_missing_null_legacy_and_open_shapes(
         MotionParticipantRequest.model_validate({**payload, **selectors})
 
 
-@pytest.mark.parametrize("crossed_field", ["target_role_id", "frame_role_id"])
+def test_set_tcp_payload_round_trips_and_rejects_legacy_shape() -> None:
+    selector = {"kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}}
+    operation = _planning_operation("set-tcp", {"kind": "set_tcp", "tcp": selector})
+    parsed = OperationIntentRequest.model_validate(operation)
+    assert parsed.model_dump(mode="json")["participants"][0]["payload"] == {
+        "kind": "set_tcp", "tcp": selector,
+    }
+    operation["participants"][0]["payload"]["tcp"] = {"target_role_id": "arm", "frame_role_id": "tcp"}
+    with pytest.raises(ValidationError):
+        OperationIntentRequest.model_validate(operation)
+
+
+@pytest.mark.parametrize("crossed_field", ["component_id", "target_id", "frame_role_id"])
 def test_pick_motion_phases_compare_the_exact_qualified_tcp(crossed_field: str) -> None:
     request = _pick_request()
     for phase in ("approach_operation", "descend_operation", "retreat_operation"):
         payload = request[phase]["participants"][0]["payload"]
         payload["tcp_endpoint"] = {
-            "target_role_id": "tool",
-            "frame_role_id": "fingertip",
+            "kind": "entry", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "fingertip"},
         }
     parsed = PickSequencePlanningRequest.model_validate(request)
     assert parsed.carrier_frame_role_id == "frame-role:tcp"
@@ -655,9 +674,7 @@ def test_pick_motion_phases_compare_the_exact_qualified_tcp(crossed_field: str) 
     assert PickSequencePlanningRequest.model_validate_json(
         parsed.model_dump_json()
     ).model_dump(mode="json") == wire
-    request["retreat_operation"]["participants"][0]["payload"]["tcp_endpoint"][
-        crossed_field
-    ] = "other"
+    request["retreat_operation"]["participants"][0]["payload"]["tcp_endpoint"]["entry"][crossed_field] = "other"
     with pytest.raises(ValidationError, match="share one target and frame set"):
         PickSequencePlanningRequest.model_validate(request)
 
@@ -772,6 +789,19 @@ def test_absolute_goal_frame_is_one_named_frame_and_absent_means_base(frame) -> 
         MotionParticipantRequest.model_validate(
             {**request, "goal_frame_reference": {"type": "pose", "pose": _planning_pose()}}
         )
+
+
+def test_motion_clearance_is_optional_and_bounded() -> None:
+    request = _planning_motion("clear", {"kind": "pose_goal", "goal": _planning_pose()})
+    assert "clearance_m" not in MotionParticipantRequest.model_validate(request).model_dump(
+        mode="json"
+    )
+    for value in (0.0, 0.0005, 0.05):
+        parsed = MotionParticipantRequest.model_validate({**request, "clearance_m": value})
+        assert parsed.model_dump(mode="json")["clearance_m"] == value
+    for value in (-0.001, 0.0501, float("nan")):
+        with pytest.raises(ValidationError):
+            MotionParticipantRequest.model_validate({**request, "clearance_m": value})
 
 
 def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
@@ -1065,6 +1095,7 @@ def _status_body() -> dict[str, object]:
             "record_digest": "sha256:" + "f" * 64,
         },
         "state": "pending",
+        "failure_acknowledgement": "unavailable",
         "candidate_projection_revision": None,
     }
 
@@ -1089,7 +1120,47 @@ def _retained_failure(
         "message": "replacement initialization failed after teardown",
         "phase": phase,
         "effect_disposition": disposition,
+        "cause_code": "runtime_initialization_failed",
+        "cause_details": {},
+        "producer": "component_manager",
+        "effect_boundary": "unknown",
     }
+
+
+def test_apply_status_failure_carries_the_typed_cause() -> None:
+    failure = {
+        **_retained_failure(phase="accepted"),
+        "code": "apply_admission_failed",
+        "cause_code": "stale_generation",
+        "cause_details": {"reason": "expected_generation_stale"},
+        "producer": "kernel",
+        "effect_boundary": "before_effect",
+    }
+    body = {
+        **_status_body(),
+        "phase": "accepted",
+        "last_progress": {"phase": "accepted", "record_digest": "sha256:" + "f" * 64},
+        "state": "failed",
+        "failure": failure,
+    }
+    status = ManagerApplyStatus.model_validate(body)
+    assert status.failure is not None
+    assert status.failure.cause_code == "stale_generation"
+    assert status.failure.cause_details == {"reason": "expected_generation_stale"}
+    assert status.failure.producer == "kernel"
+    assert status.failure.effect_boundary == "before_effect"
+    for bad in (
+        {"cause_code": ""},
+        {"producer": ""},
+        {"cause_details": {"": "empty key"}},
+        {"cause_details": {f"key{index}": "v" for index in range(17)}},
+        {"effect_boundary": "after_effect"},
+    ):
+        with pytest.raises(ValidationError):
+            ManagerApplyStatus.model_validate({**body, "failure": {**failure, **bad}})
+    without_cause = {key: value for key, value in failure.items() if key != "cause_code"}
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate({**body, "failure": without_cause})
 
 
 @pytest.mark.parametrize(
@@ -1267,6 +1338,104 @@ def test_apply_status_is_one_closed_bounded_lifecycle() -> None:
         ManagerApplyStatus.model_validate(
             {**_status_body(), "apply_generation": 0}
         )
+
+
+def test_apply_status_requires_strict_failure_acknowledgement_state() -> None:
+    body = _status_body()
+    assert ManagerApplyStatus.model_validate(body).failure_acknowledgement == "unavailable"
+    for bad in (None, 0, 1, "false", "unknown"):
+        with pytest.raises(ValidationError):
+            ManagerApplyStatus.model_validate(
+                {**body, "failure_acknowledgement": bad}
+            )
+    missing = dict(body)
+    del missing["failure_acknowledgement"]
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate(missing)
+
+    before_effect_failure = {
+        **_retained_failure(phase="runtime_converged"),
+        "effect_boundary": "before_effect",
+    }
+    eligible = {
+        **body,
+        "phase": "runtime_converged",
+        "last_progress": {
+            "phase": "runtime_converged",
+            "record_digest": "sha256:" + "f" * 64,
+        },
+        "state": "failed",
+        "failure": before_effect_failure,
+        "failure_acknowledgement": "available",
+    }
+    assert ManagerApplyStatus.model_validate(eligible).failure_acknowledgement == "available"
+    assert ManagerApplyStatus.model_validate({
+        **eligible,
+        "failure_acknowledgement": "acknowledged",
+    }).failure_acknowledgement == "acknowledged"
+
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate({
+            **body,
+            "failure_acknowledgement": "available",
+        })
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate({
+            **eligible,
+            "failure_acknowledgement": "available",
+            "failure": _retained_failure(phase="runtime_converged"),
+        })
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate({
+            **eligible,
+            "failure_acknowledgement": "acknowledged",
+            "failure": _retained_failure(phase="runtime_converged"),
+        })
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate({
+            **eligible,
+            "state": "unknown_effect",
+            "failure_acknowledgement": "acknowledged",
+            "failure": _retained_failure(
+                phase="runtime_converged", disposition="unknown"
+            ),
+        })
+
+
+def test_apply_acknowledgement_context_is_bounded_and_allows_missing_epoch() -> None:
+    request = ManagerApplyAcknowledgementRequest.model_validate({
+        "request_context": {
+            "request_id": "composer-ack.request.1",
+            "source_label": "manyforge_composer",
+        }
+    })
+    assert request.request_context.model_dump(mode="json", exclude_none=True) == {
+        "request_id": "composer-ack.request.1",
+        "source_label": "manyforge_composer",
+    }
+    with_epoch = ManagerApplyAcknowledgementContext.model_validate({
+        "request_id": "composer-ack.request.2",
+        "source_label": "manyforge_composer",
+        "request_owner_epoch": "operator-command.epoch.2",
+        "correlation_id": "correlation.2",
+    })
+    assert with_epoch.request_owner_epoch == "operator-command.epoch.2"
+    for context in (
+        {"request_id": "", "source_label": "manyforge_composer"},
+        {"request_id": "request.1", "source_label": ""},
+        {
+            "request_id": "request.1",
+            "source_label": "manyforge_composer",
+            "request_owner_epoch": "e\u0301",
+        },
+        {
+            "request_id": "request.1",
+            "source_label": "manyforge_composer",
+            "unexpected": True,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            ManagerApplyAcknowledgementContext.model_validate(context)
 
 
 def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
@@ -1660,6 +1829,25 @@ def test_attach_grasp_lost_bound_is_optional_positive_and_absent_on_the_wire() -
         {"translation_m": 0.03, "rotation_rad": 0.26, "extra": 1},
     ):
         body["operation"] = {**body["operation"], "grasp_lost_bound": invalid}
+        with pytest.raises(ValidationError):
+            SceneTransactionRequest.model_validate(body)
+
+
+def test_scene_object_mass_is_optional_positive_and_absent_on_the_wire() -> None:
+    from manyforge_headless_api.manager import _transaction_body
+
+    body = _scene_transaction()
+    plain = SceneTransactionRequest.model_validate(body)
+    assert plain.operation.mass_kg is None
+    assert "mass_kg" not in _transaction_body(plain)["operation"]
+
+    for kind in ("add_object", "upsert_object"):
+        body["operation"] = {**body["operation"], "kind": kind, "mass_kg": 2.5}
+        heavy = SceneTransactionRequest.model_validate(body)
+        assert _transaction_body(heavy)["operation"]["mass_kg"] == 2.5
+
+    for invalid in (0.0, -1.0, float("inf"), float("nan"), "2.5"):
+        body["operation"] = {**body["operation"], "mass_kg": invalid}
         with pytest.raises(ValidationError):
             SceneTransactionRequest.model_validate(body)
 

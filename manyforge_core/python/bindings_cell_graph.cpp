@@ -368,21 +368,45 @@ void register_cell_graph_bindings(py::module_& module) {
           "__ne__", [](const RuntimeUnitDTO& lhs, const RuntimeUnitDTO& rhs) { return lhs != rhs; },
           py::is_operator());
 
+  py::class_<ModelCustomTcpDTO>(module, "ModelCustomTcpDTO", py::is_final())
+      .def(py::init([](FrameRoleId frame_role_id, std::string parent_link_name,
+                       PlacementPoseDTO pose_in_parent_link) {
+             return ModelCustomTcpDTO{std::move(frame_role_id), std::move(parent_link_name),
+                                      std::move(pose_in_parent_link)};
+           }),
+           py::arg("frame_role_id"), py::arg("parent_link_name"),
+           py::arg("pose_in_parent_link"))
+      .def_readonly("frame_role_id", &ModelCustomTcpDTO::frame_role_id)
+      .def_readonly("parent_link_name", &ModelCustomTcpDTO::parent_link_name)
+      .def_readonly("pose_in_parent_link", &ModelCustomTcpDTO::pose_in_parent_link)
+      .def(
+          "__eq__",
+          [](const ModelCustomTcpDTO& lhs, const ModelCustomTcpDTO& rhs) { return lhs == rhs; },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ModelCustomTcpDTO& lhs, const ModelCustomTcpDTO& rhs) { return lhs != rhs; },
+          py::is_operator());
+
   py::class_<ModelInstanceDTO>(module, "ModelInstanceDTO", py::is_final())
       .def(py::init([](ModelInstanceId model_instance_id, ModelAssetId model_asset_id,
                        ModelRevision model_revision,
-                       std::optional<PlacementPoseDTO> root_pose_in_cell) {
+                       std::optional<PlacementPoseDTO> root_pose_in_cell,
+                       std::vector<ModelCustomTcpDTO> custom_tcps) {
              return ModelInstanceDTO{
                  std::move(model_instance_id), std::move(model_asset_id),
                  std::move(model_revision), std::move(root_pose_in_cell),
+                 std::move(custom_tcps),
              };
            }),
            py::arg("model_instance_id"), py::arg("model_asset_id"), py::arg("model_revision"),
-           py::arg("root_pose_in_cell") = std::nullopt)
+           py::arg("root_pose_in_cell") = std::nullopt,
+           py::arg("custom_tcps") = std::vector<ModelCustomTcpDTO>{})
       .def_readonly("model_instance_id", &ModelInstanceDTO::model_instance_id)
       .def_readonly("model_asset_id", &ModelInstanceDTO::model_asset_id)
       .def_readonly("model_revision", &ModelInstanceDTO::model_revision)
       .def_readonly("root_pose_in_cell", &ModelInstanceDTO::root_pose_in_cell)
+      .def_readonly("custom_tcps", &ModelInstanceDTO::custom_tcps)
       .def(
           "__eq__",
           [](const ModelInstanceDTO& lhs, const ModelInstanceDTO& rhs) { return lhs == rhs; },
@@ -392,22 +416,46 @@ void register_cell_graph_bindings(py::module_& module) {
           [](const ModelInstanceDTO& lhs, const ModelInstanceDTO& rhs) { return lhs != rhs; },
           py::is_operator());
 
+  py::class_<ComponentDefaultTcpDTO>(module, "ComponentDefaultTcpDTO", py::is_final())
+      .def(py::init([](CommandTargetId command_target_id, FrameRoleId frame_role_id) {
+             return ComponentDefaultTcpDTO{std::move(command_target_id),
+                                           std::move(frame_role_id)};
+           }),
+           py::arg("command_target_id"), py::arg("frame_role_id"))
+      .def_readonly("command_target_id", &ComponentDefaultTcpDTO::command_target_id)
+      .def_readonly("frame_role_id", &ComponentDefaultTcpDTO::frame_role_id)
+      .def(
+          "__eq__",
+          [](const ComponentDefaultTcpDTO& lhs, const ComponentDefaultTcpDTO& rhs) {
+            return lhs == rhs;
+          },
+          py::is_operator())
+      .def(
+          "__ne__",
+          [](const ComponentDefaultTcpDTO& lhs, const ComponentDefaultTcpDTO& rhs) {
+            return lhs != rhs;
+          },
+          py::is_operator());
+
   py::class_<ControllableComponentDTO>(module, "ControllableComponentDTO", py::is_final())
       .def(py::init([](ControllableComponentId controllable_component_id,
                        ComponentTypeId component_type_id,
                        ComponentTypeRevision component_type_revision,
                        std::vector<ModelRoleBindingDTO> model_role_bindings,
                        std::vector<RuntimeUnitId> runtime_unit_ids,
-                       std::optional<PlacementPoseDTO> root_pose_in_cell) {
+                       std::optional<PlacementPoseDTO> root_pose_in_cell,
+                       std::optional<ComponentDefaultTcpDTO> default_tcp) {
              return ControllableComponentDTO{
                  std::move(controllable_component_id), std::move(component_type_id),
                  std::move(component_type_revision), std::move(model_role_bindings),
                  std::move(runtime_unit_ids), std::move(root_pose_in_cell),
+                 std::move(default_tcp),
              };
            }),
            py::arg("controllable_component_id"), py::arg("component_type_id"),
            py::arg("component_type_revision"), py::arg("model_role_bindings"),
-           py::arg("runtime_unit_ids"), py::arg("root_pose_in_cell") = std::nullopt)
+           py::arg("runtime_unit_ids"), py::arg("root_pose_in_cell") = std::nullopt,
+           py::arg("default_tcp") = std::nullopt)
       .def_readonly("controllable_component_id",
                     &ControllableComponentDTO::controllable_component_id)
       .def_readonly("component_type_id", &ControllableComponentDTO::component_type_id)
@@ -415,6 +463,7 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("model_role_bindings", &ControllableComponentDTO::model_role_bindings)
       .def_readonly("runtime_unit_ids", &ControllableComponentDTO::runtime_unit_ids)
       .def_readonly("root_pose_in_cell", &ControllableComponentDTO::root_pose_in_cell)
+      .def_readonly("default_tcp", &ControllableComponentDTO::default_tcp)
       .def(
           "__eq__",
           [](const ControllableComponentDTO& lhs, const ControllableComponentDTO& rhs) {
@@ -618,18 +667,20 @@ void register_cell_graph_bindings(py::module_& module) {
       .def(py::init([](ComponentAttachmentId component_attachment_id,
                        ComponentAttachmentRevision component_attachment_revision,
                        ComponentAttachmentEndpointDTO parent, ComponentAttachmentEndpointDTO child,
-                       PlacementPoseDTO child_interface_pose_in_parent_interface) {
+                       PlacementPoseDTO child_interface_pose_in_parent_interface,
+                       bool primary) {
              return ComponentAttachmentEdgeDTO{
                  std::move(component_attachment_id),
                  std::move(component_attachment_revision),
                  std::move(parent),
                  std::move(child),
                  std::move(child_interface_pose_in_parent_interface),
+                 primary,
              };
            }),
            py::arg("component_attachment_id"), py::arg("component_attachment_revision"),
            py::arg("parent"), py::arg("child"),
-           py::arg("child_interface_pose_in_parent_interface"))
+           py::arg("child_interface_pose_in_parent_interface"), py::arg("primary") = false)
       .def_readonly("component_attachment_id", &ComponentAttachmentEdgeDTO::component_attachment_id)
       .def_readonly("component_attachment_revision",
                     &ComponentAttachmentEdgeDTO::component_attachment_revision)
@@ -637,6 +688,7 @@ void register_cell_graph_bindings(py::module_& module) {
       .def_readonly("child", &ComponentAttachmentEdgeDTO::child)
       .def_readonly("child_interface_pose_in_parent_interface",
                     &ComponentAttachmentEdgeDTO::child_interface_pose_in_parent_interface)
+      .def_readonly("primary", &ComponentAttachmentEdgeDTO::primary)
       .def(
           "__eq__",
           [](const ComponentAttachmentEdgeDTO& lhs, const ComponentAttachmentEdgeDTO& rhs) {

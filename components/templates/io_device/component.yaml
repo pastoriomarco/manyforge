@@ -1,0 +1,24 @@
+# Component descriptor of one I/O device: its signals. Guide:
+# docs/authoring/ADDING_A_COMPONENT.md. Edit, then run
+#   scripts/manyforge component check <this folder>
+# Provider profiles: inputs geometric_contact, mock, ros2_control_gpio,
+# ros_bool, ur_io_states, xarm_digital; outputs mock_output,
+# ros2_control_gpio, ros_set_bool, ur_set_io, xarm_digital.
+api_version: manyforge.component_package.v1
+kind: io_device
+id: __ID__
+version: 1.0.0
+title: <TODO what the device is>
+license: Apache-2.0
+signals:
+  - signal_name: output_1
+    direction: output
+    value_type: bool
+    provider: {profile: mock_output, channel: output_1}
+  - signal_name: input_1
+    direction: input
+    value_type: bool
+    provider: {profile: mock, initial_value: false}
+    freshness: {mode: provider_validity}
+    transition_capability: sampled_only
+    update_mode: change_only

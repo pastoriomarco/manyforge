@@ -125,3 +125,95 @@ describe('viewer object panel', () => {
     await act(() => { root.unmount(); });
   });
 });
+
+describe('object mass field', () => {
+  const withMetadata = (metadata?: Record<string, unknown>) => ({
+    ...program,
+    scene: [{ ...program.scene![0], ...(metadata === undefined ? {} : { metadata }) }],
+  } as unknown as ProgramAuthoringDocument);
+
+  async function editMass(document: ProgramAuthoringDocument, text: string) {
+    const { host, created } = stubDom();
+    const mutate = vi.fn(async () => null);
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => {
+      root.render(
+        <ProgramSceneEditor
+          program={document}
+          draftRevision={3}
+          busy={false}
+          busyReason={null}
+          mutate={mutate}
+          liveObjects={[]}
+          selectedResourceId="part"
+          onSelectResource={() => undefined}
+        />,
+      );
+    });
+    const mounted = (predicate: (props: ReactProps) => boolean) => {
+      const element = created.find((candidate) => {
+        const props = reactProps(candidate);
+        return props !== undefined && predicate(props);
+      });
+      return element === undefined ? undefined : reactProps(element)!;
+    };
+    const field = mounted((props) => props['aria-label'] === 'Draft object mass (kg)')!;
+    await act(() => {
+      field.onChange!({ currentTarget: { value: text } });
+    });
+    await act(() => {
+      mounted((props) => props['data-testid'] === 'program-scene-editor')!
+        .onBlurCapture!({ target: { tagName: 'INPUT' } });
+    });
+    const alert = mounted((props) => props.role === 'alert')?.children;
+    await act(() => { root.unmount(); });
+    return { mutate, alert };
+  }
+
+  it('writes metadata.mass_kg as one Draft edit and keeps the other metadata', async () => {
+    const { mutate, alert } = await editMass(withMetadata({ note: 'fixture' }), '2.5');
+
+    expect(alert).toBeUndefined();
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate).toHaveBeenCalledWith('scene_draft_update_object', {
+      scene_resource: expect.objectContaining({
+        scene_resource_id: 'part',
+        metadata: { note: 'fixture', mass_kg: 2.5 },
+        pose: expect.objectContaining({ position_m: [0.4, 0.1, 0.2] }),
+      }),
+    });
+    expect(sceneCommit).not.toHaveBeenCalled();
+  });
+
+  it('removes the key when the field is emptied (0 kg), and the metadata when nothing is left', async () => {
+    const kept = await editMass(withMetadata({ note: 'fixture', mass_kg: 2 }), '');
+    expect(kept.mutate).toHaveBeenCalledExactlyOnceWith('scene_draft_update_object', {
+      scene_resource: expect.objectContaining({ metadata: { note: 'fixture' } }),
+    });
+
+    const emptied = await editMass(withMetadata({ mass_kg: 2 }), '');
+    expect(emptied.mutate).toHaveBeenCalledTimes(1);
+    const [, payload] = (emptied.mutate.mock.calls[0] as unknown) as [string, { scene_resource: object }];
+    expect(payload.scene_resource).not.toHaveProperty('metadata');
+  });
+
+  it('commits an explicit 0 as no key, and refuses a negative or over-bound mass without a Draft edit', async () => {
+    // One representation of "no mass": 0 removes the key, like an empty field.
+    const zero = await editMass(withMetadata({ note: 'fixture', mass_kg: 2 }), '0');
+    expect(zero.mutate).toHaveBeenCalledExactlyOnceWith('scene_draft_update_object', {
+      scene_resource: expect.objectContaining({ metadata: { note: 'fixture' } }),
+    });
+    const zeroOnly = await editMass(withMetadata({ mass_kg: 2 }), '0');
+    const [, payload] = (zeroOnly.mutate.mock.calls[0] as unknown) as [string, { scene_resource: object }];
+    expect(payload.scene_resource).not.toHaveProperty('metadata');
+    // 0 on a massless object is no change: no Draft edit.
+    expect((await editMass(withMetadata(), '0')).mutate).not.toHaveBeenCalled();
+
+    for (const text of ['-1', '1000.5']) {
+      const { mutate, alert } = await editMass(withMetadata(), text);
+      expect(mutate).not.toHaveBeenCalled();
+      expect(alert).toBe('Mass must be between 0 and 1000 kg.');
+    }
+  });
+});

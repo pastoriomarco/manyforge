@@ -301,6 +301,23 @@ describe('authoringWorkspace', () => {
     })]);
   });
 
+  it('keeps a Controlled Stop row with its own cause beside an open latch (ERRUI, SX-643)', () => {
+    // No overview reason is the latch or the incident itself, so a missing
+    // stop binding stays its own item; the latch has its own Recover cell item.
+    const state = headlessState(5);
+    state.componentOverview = {
+      components: [{
+        id: 'stop_capability', label: 'Controlled Stop', required: true, status: 'offline',
+        detail: 'controlled-Stop contract or current owner state is unavailable',
+        reasonCode: 'controlled_stop_capability_unavailable',
+      }],
+    } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
+      id: 'component.health.stop_capability', severity: 'error', title: 'Controlled Stop unavailable',
+      message: 'controlled-Stop contract or current owner state is unavailable',
+    })]);
+  });
+
   it('does not report an available alarm owner with active alarms as unavailable', () => {
     const state = headlessState(5);
     const alarms = {

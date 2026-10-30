@@ -5,9 +5,9 @@ import type { JsonValue } from '../types/api';
  * (manyforge.value_schema.runtime.ros2_control_execution.v1, schema82
  * interface-freeze01, and runtime.io_provider_execution.v1 for an I/O device
  * component). Boolean inputs (Mock / ROS Bool / UR io_states / ros2_control
- * GPIO) and outputs (ROS SetBool / Mock / UR set_io / ros2_control GPIO) are
- * authored here. Any other row (e.g. the R7-deferred xArm controller input) is
- * kept verbatim.
+ * GPIO / geometric contact / xArm digital) and outputs (ROS SetBool / Mock /
+ * UR set_io / ros2_control GPIO) are authored here. Any other row (e.g. the
+ * R7-deferred xArm controller input) is kept verbatim.
  */
 
 export type IoSourceProfile = 'mock' | 'ros_bool' | 'ur_io_states' | 'ros2_control_gpio' | 'geometric_contact' | 'xarm_digital';
@@ -111,13 +111,10 @@ export interface IoSignalInputDraft {
   /** ros2_control GPIO group and interface name (exact, no trim). */
   group: string;
   interfaceName: string;
-  /** Geometric contact: an existing motion endpoint, independent of this I/O row. */
-  endpointComponentId: string;
-  endpointTargetId: string;
-  endpointFrameRoleId: string;
+  /** Geometric contact / xArm digital: selected robot component id. */
+  robotComponentId: string;
   /** Geometric contact: an existing logical Scene resource. */
   targetSceneResourceId: string;
-  robotComponentId: string;
   bank: 'tool' | 'controller';
   /** Periodic sample-age freshness bound, in ms. */
   maximumAgeMs: string;
@@ -177,7 +174,7 @@ const PROVIDER_KEYS: Record<IoSourceProfile, string[]> = {
   ur_io_states: ['profile', 'ingress_depth', 'topic', 'pin'],
   ros2_control_gpio: ['profile', 'ingress_depth', 'topic', 'group', 'interface_name'],
   geometric_contact: [
-    'profile', 'ingress_depth', 'endpoint', 'target_scene_resource_id',
+    'profile', 'ingress_depth', 'robot_component_id', 'target_scene_resource_id',
   ],
   xarm_digital: ['profile', 'ingress_depth', 'robot_component_id', 'bank', 'pin'],
 };
@@ -221,7 +218,6 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     row.signal_name, row.source_id];
   if (ids.some((value) => typeof value !== 'string')) return null;
   const liveness = profile === 'ros_bool' ? rosBoolLiveness(provider) : null;
-  const geometricEndpoint = profile === 'geometric_contact' ? object(provider.endpoint) : null;
   const echo = profile === 'mock' && provider.echo !== undefined ? object(provider.echo) : null;
   if (profile === 'mock' && provider.echo !== undefined && (echo === null
     || !exactKeys(echo, ['output_signal_name', 'delay_ms'])
@@ -242,15 +238,11 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     || (profile === 'ur_io_states' && safeInteger(provider.pin) === null)
     || (profile === 'xarm_digital' && (typeof provider.robot_component_id !== 'string'
       || (provider.bank !== 'tool' && provider.bank !== 'controller') || safeInteger(provider.pin) === null))
+    || (profile === 'geometric_contact' && typeof provider.robot_component_id !== 'string')
     || (profile === 'ros2_control_gpio'
       && (typeof provider.group !== 'string' || typeof provider.interface_name !== 'string'))
     || (profile === 'geometric_contact' && (
-      geometricEndpoint === null
-      || !exactKeys(geometricEndpoint, ['controllable_component_id', 'command_target_id', 'frame_role_id'])
-      || typeof geometricEndpoint.controllable_component_id !== 'string'
-      || typeof geometricEndpoint.command_target_id !== 'string'
-      || typeof geometricEndpoint.frame_role_id !== 'string'
-      || typeof provider.target_scene_resource_id !== 'string'
+      typeof provider.target_scene_resource_id !== 'string'
     ))
   ) return null;
   const depth = provider.ingress_depth;
@@ -273,12 +265,6 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     pin: safeInteger(provider.pin)?.toString() ?? '0',
     group: typeof provider.group === 'string' ? provider.group : '',
     interfaceName: typeof provider.interface_name === 'string' ? provider.interface_name : '',
-    endpointComponentId: typeof geometricEndpoint?.controllable_component_id === 'string'
-      ? geometricEndpoint.controllable_component_id : '',
-    endpointTargetId: typeof geometricEndpoint?.command_target_id === 'string'
-      ? geometricEndpoint.command_target_id : '',
-    endpointFrameRoleId: typeof geometricEndpoint?.frame_role_id === 'string'
-      ? geometricEndpoint.frame_role_id : '',
     targetSceneResourceId: typeof provider.target_scene_resource_id === 'string'
       ? provider.target_scene_resource_id : '',
     robotComponentId: typeof provider.robot_component_id === 'string' ? provider.robot_component_id : '',
@@ -412,11 +398,8 @@ export function newIoSignalInput(componentId = ''): IoSignalInputDraft {
     pin: '0',
     group: '',
     interfaceName: '',
-    endpointComponentId: '',
-    endpointTargetId: '',
-    endpointFrameRoleId: '',
-    targetSceneResourceId: '',
     robotComponentId: '',
+    targetSceneResourceId: '',
     bank: 'tool',
     maximumAgeMs: '',
     ingressDepth: String(IO_DEFAULT_INGRESS_DEPTH),
@@ -519,10 +502,8 @@ export function validateIoSignalInput(draft: IoSignalInputDraft, index = 0): str
       ? `${label}: the Mock echo delay must be a whole number of milliseconds from 0 to 9007199254.` : null;
   }
   if (draft.profile === 'geometric_contact') {
-    if (!PORTABLE_ID.test(draft.endpointComponentId)
-      || !PORTABLE_ID.test(draft.endpointTargetId)
-      || !PORTABLE_ID.test(draft.endpointFrameRoleId)) {
-      return `${label}: select a motion endpoint.`;
+    if (!PORTABLE_ID.test(draft.robotComponentId)) {
+      return `${label}: select a robot.`;
     }
     if (!PORTABLE_ID.test(draft.targetSceneResourceId)) {
       return `${label}: enter a target Scene resource id.`;
@@ -596,7 +577,7 @@ function sourceFacts(row: Extract<IoSignalRow, { kind: 'input' | 'output' }>): s
   const { draft } = row;
   if (draft.profile === 'geometric_contact') {
     return JSON.stringify(['input', draft.profile, integerText(draft.ingressDepth),
-      draft.endpointComponentId, draft.endpointTargetId, draft.endpointFrameRoleId,
+      draft.robotComponentId,
       draft.targetSceneResourceId, inputLivenessMode(draft)]);
   }
   if (draft.profile === 'xarm_digital') {
@@ -715,11 +696,7 @@ export function ioSignalInputValue(draft: IoSignalInputDraft): Record<string, Js
       provider: {
         profile: draft.profile,
         ...optional('ingress_depth', depth, IO_DEFAULT_INGRESS_DEPTH),
-        endpoint: {
-          controllable_component_id: draft.endpointComponentId,
-          command_target_id: draft.endpointTargetId,
-          frame_role_id: draft.endpointFrameRoleId,
-        },
+        robot_component_id: draft.robotComponentId,
         target_scene_resource_id: draft.targetSceneResourceId,
       },
     };
@@ -848,7 +825,7 @@ export function ioInputSourceText(draft: IoSignalInputDraft): string {
     case 'ur_io_states': return `ROS topic ${draft.topic}, pin ${draft.pin}`;
     case 'ros2_control_gpio': return `ROS topic ${draft.topic}, GPIO ${draft.group}/${draft.interfaceName}`;
     case 'xarm_digital': return `xArm ${draft.robotComponentId} ${draft.bank} digital input pin ${draft.pin}`;
-    case 'geometric_contact': return `geometric contact with ${draft.targetSceneResourceId}`;
+    case 'geometric_contact': return `geometric contact for ${draft.robotComponentId} with ${draft.targetSceneResourceId}`;
     case 'mock': return 'Mock input';
   }
 }
@@ -868,8 +845,9 @@ export function ioSourceKey(componentId: string, targetId: string, resourceRoleI
 
 export const IO_DEVICE_PROFILE_ID = 'io_device_v0';
 export const IO_PROVIDER_RUNTIME_KIND = 'io_provider';
-/** Contract 60: per-device lifecycle command time limit, prefilled 30 s. */
-export const IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S = 30;
+/** Contract 60: per-device lifecycle command time limit, prefilled with the
+ * default component lifecycle budget (10 s, as every component). */
+export const IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S = 10;
 /** The existing lifecycle transaction maximum (kMaxLifecycleTransactionTimeoutNs). */
 export const IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S = 3600;
 const COMPONENT_ID = /^[a-z][a-z0-9._-]{0,127}$/;
@@ -977,7 +955,7 @@ export interface IoDeviceDraft {
   signal: Extract<IoSignalRow, { kind: 'input' | 'output' }>;
 }
 
-/** A new form: the first free `io_device_N`, 30 s, one Mock input on target `io`. */
+/** A new form: the first free `io_device_N`, 10 s, one Mock input on target `io`. */
 export function newIoDeviceDraft(existingComponentIds: readonly string[]): IoDeviceDraft {
   let number = 1;
   while (existingComponentIds.includes(`io_device_${number}`)) number += 1;

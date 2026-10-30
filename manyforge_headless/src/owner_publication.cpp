@@ -687,7 +687,7 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
         }
       },
       value.placement);
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object object{
       {"collision_shapes", CanonicalValue(std::move(shapes))},
       {"placement", placement},
       {"provider_evidence", value.provider_evidence.has_value()
@@ -695,7 +695,12 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
                                 : CanonicalValue(nullptr)},
       {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
       {"support_contacts", CanonicalValue(std::move(support_contacts))},
-  });
+  };
+  // Absent at zero, like the logical scene codec.
+  if (value.mass_kg > 0.0) {
+    object.emplace_back("mass_kg", CanonicalValue(value.mass_kg));
+  }
+  return CanonicalValue(std::move(object));
 }
 
 CanonicalValue SceneSnapshot(const core::LogicalSceneSnapshotDTO &value) {

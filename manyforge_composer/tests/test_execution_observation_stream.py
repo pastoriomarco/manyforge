@@ -234,7 +234,7 @@ def test_failed_source_invalidates_every_subscriber_and_never_replays_cache() ->
             source.take_payload(first)
             source.grant_credit(slow, None)
             # Slow browser has not taken its cached frame yet.
-            source.grant_credit(first, ("execution-owner.1", "joint-source.1", 1))
+            source.grant_credit(first, first.outstanding)
             await _next_cursor(client)
             client.responses.put({"ok": False, "error": {"code": "source_lost"}})
             await asyncio.wait_for(first.wake.wait(), 1.0)
@@ -330,6 +330,18 @@ class _Upstream:
         raise RuntimeError("cancelled")
 
 
+class _QuietPoseUpstream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def next(self, cursor, cancelled):
+        cancelled.wait()
+        raise RuntimeError("cancelled")
+
+
 class _Client:
     def __init__(self) -> None:
         self.connections = 0
@@ -338,6 +350,9 @@ class _Client:
 
     def open_execution_observation_stream(self) -> _Upstream:
         return _Upstream(self)
+
+    def open_viewer_pose_stream(self) -> _QuietPoseUpstream:
+        return _QuietPoseUpstream()
 
 
 async def _next_cursor(client: _Client) -> dict[str, Any] | None:
@@ -353,7 +368,7 @@ def test_websocket_closes_failed_source_and_reconnect_captures_current_only():
             SimpleNamespace(execution_observation_source=source), SecurityConfig()
         )
     )
-    credit = {"schema_version": stream.OBSERVATION_CREDIT_SCHEMA, "last_applied": None}
+    credit = {"schema_version": stream.OBSERVATION_CREDIT_SCHEMA, "last_applied": None, "pose_rate_hz": 60}
     try:
         with TestClient(app) as client:
             with client.websocket_connect("/ws/scene/viewer") as socket:
@@ -371,6 +386,7 @@ def test_websocket_closes_failed_source_and_reconnect_captures_current_only():
                                 "owner_epoch",
                                 "source_epoch",
                                 "source_sequence",
+                                "delivery_sequence",
                             )
                         },
                     }
@@ -426,7 +442,7 @@ def test_source_is_change_driven_credited_and_independent_per_browser() -> None:
         await asyncio.sleep(0)
         assert client.cursors.empty()
 
-        source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 1))
+        source.grant_credit(subscription, subscription.outstanding)
         assert await _next_cursor(client) == {
             "owner_epoch": "execution-owner.1",
             "source_epoch": "joint-source.1",
@@ -445,7 +461,7 @@ def test_source_is_change_driven_credited_and_independent_per_browser() -> None:
         assert json.loads(source.take_payload(second) or "null")["source_sequence"] == 2
         source.grant_credit(
             subscription,
-            ("execution-owner.1", "joint-source.1", 2),
+            subscription.outstanding,
         )
         assert (await _next_cursor(client))["source_sequence"] == 2  # type: ignore[index]
         client.responses.put(_status(sequence=3, position=0.3))
@@ -488,7 +504,7 @@ def test_source_coalesces_visual_heartbeats_but_retains_the_latest_cursor() -> N
 
         source.grant_credit(
             fast,
-            ("execution-owner.1", "joint-source.1", 1),
+            fast.outstanding,
         )
         assert (await _next_cursor(client)) == {
             "owner_epoch": "execution-owner.1",
@@ -523,6 +539,45 @@ def test_source_coalesces_visual_heartbeats_but_retains_the_latest_cursor() -> N
     asyncio.run(exercise())
 
 
+def test_source_keeps_credit_after_duplicate_identity_coalescing() -> None:
+    async def exercise() -> None:
+        client = _Client()
+        source = stream.ExecutionObservationSource(client)  # type: ignore[arg-type]
+        subscription = source.subscribe()
+        try:
+            source.grant_credit(subscription, None)
+            assert await _next_cursor(client) is None
+            client.responses.put(_status(sequence=1, position=0.1))
+            await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+            source.take_payload(subscription)
+
+            source.grant_credit(subscription, subscription.outstanding)
+            expected_cursor = {
+                "owner_epoch": "execution-owner.1",
+                "source_epoch": "joint-source.1",
+                "source_sequence": 1,
+            }
+            assert await _next_cursor(client) == expected_cursor
+            client.responses.put(_status(sequence=1, position=0.1))
+
+            # An exact duplicate does not render, but the existing credit must
+            # keep the owner cursor read alive for the next visual change.
+            assert await _next_cursor(client) == expected_cursor
+            assert source.status()["fanout"]["coalesced_frames_total"] == 1
+            assert not subscription.wake.is_set()
+
+            client.responses.put(_status(sequence=2, position=0.2))
+            await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+            latest = json.loads(source.take_payload(subscription) or "null")
+            assert latest["source_sequence"] == 2
+            assert latest["targets"][0]["positions_si"] == [0.2, -0.2]
+        finally:
+            source.unsubscribe(subscription)
+            source.close()
+
+    asyncio.run(exercise())
+
+
 def test_source_reports_idle_wait_separately_from_processing(monkeypatch) -> None:
     async def exercise() -> None:
         now = 0.0
@@ -544,7 +599,7 @@ def test_source_reports_idle_wait_separately_from_processing(monkeypatch) -> Non
             client.responses.put(_status(sequence=1))
             await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
             source.take_payload(subscription)
-            source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 1))
+            source.grant_credit(subscription, subscription.outstanding)
             await _next_cursor(client)  # Processing and metric publication completed.
             status = source.status()
             assert status["schema_version"] == "manyforge.execution_observation_stream_status.v3"
@@ -558,7 +613,7 @@ def test_source_reports_idle_wait_separately_from_processing(monkeypatch) -> Non
             client.responses.put(_status(sequence=2, position=0.2))
             await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
             source.take_payload(subscription)
-            source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 2))
+            source.grant_credit(subscription, subscription.outstanding)
             await _next_cursor(client)
             metrics = source.status()["source"]
             assert metrics["last_source_wait_duration_us"] == 10_000
@@ -616,7 +671,7 @@ def test_static_visible_credit_over_24_hours_creates_no_periodic_source_work() -
         client.responses.put(_status(sequence=1, position=0.1))
         await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
         source.take_payload(subscription)
-        applied = ("execution-owner.1", "joint-source.1", 1)
+        applied = subscription.outstanding
         source.grant_credit(subscription, applied)
         assert await _next_cursor(client) == {
             "owner_epoch": "execution-owner.1",
@@ -663,7 +718,7 @@ def test_source_bounds_clients_and_rejects_stale_acknowledgements() -> None:
         with pytest.raises(ValueError, match="stale"):
             source.grant_credit(
                 first,
-                ("execution-owner.1", "joint-source.1", 99),
+                ("execution-owner.1", "joint-source.1", 99, 99),
             )
 
         for subscription in subscriptions:
@@ -686,7 +741,7 @@ def test_source_rejects_changed_state_at_the_same_source_sequence() -> None:
         assert first["targets"][0]["positions_si"] == [1.0, -1.0]
         source.grant_credit(
             subscription,
-            ("execution-owner.1", "joint-source.1", 7),
+            subscription.outstanding,
         )
         await _next_cursor(client)
         client.responses.put(_status(sequence=7, position=2.0))
@@ -715,7 +770,7 @@ def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence() -> None:
         source.take_payload(subscription)
         source.grant_credit(
             subscription,
-            ("execution-owner.1", "joint-source.1", 50),
+            subscription.outstanding,
         )
         await _next_cursor(client)
         restarted = _status(sequence=1, position=0.2)

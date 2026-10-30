@@ -627,11 +627,20 @@ describe('global rule status section', () => {
   it('shows each rule state beside the signals', () => {
     const html = view([
       { ruleId: 'door', state: 'latched', keys: [] },
+      { ruleId: 'unknown_rule', state: 'unknown', keys: [], unavailableReason: {
+        code: 'motion_interrupt_arm_failed', message: 'Notify rule cannot watch its signals',
+        details: { reason: 'io_rule_source_unavailable', source: 'door' },
+      } },
       { ruleId: 'light', state: 'pending', keys: [] },
       { ruleId: 'part', state: 'waiting_for_program', keys: ['part_ready'] },
     ]);
     expect(html).toContain('data-global-rule="door" data-global-rule-state="latched"');
+    expect(html).toContain('data-global-rule="unknown_rule" data-global-rule-state="unknown"');
     expect(html).toContain('latched (see its recovery notice)');
+    expect(html).toContain("can&#x27;t watch (motion blocked)");
+    expect(html).toContain("Interrupt rule unknown_rule can&#x27;t watch its signals: Interrupt rule source unavailable");
+    expect(html).toContain('<summary>Details</summary>');
+    expect(html).toContain('io_rule_source_unavailable');
     expect(html).toContain('pending (no current state yet)');
     expect(html).toContain('waiting for a Program that declares part_ready');
     expect(html).toContain('The running cell has no bound I/O signals.');
@@ -650,6 +659,19 @@ describe('global rule status section', () => {
     expect(retained).toContain('data-global-rule-current="false"');
     expect(retained).toContain('last known: clear (not current)');
     expect(retained).toContain('showing the last known rule states');
+  });
+
+  it('shows unknown instead of retaining a prior clear state', () => {
+    const html = view([{
+      ruleId: 'door', state: 'unknown', keys: [], unavailableReason: {
+        code: 'motion_interrupt_arm_failed', message: 'Notify rule cannot watch its signals',
+        details: { reason: 'io_rule_source_unavailable' },
+      },
+    }]);
+    expect(html).toContain('data-global-rule="door" data-global-rule-state="unknown"');
+    expect(html).toContain("can&#x27;t watch (motion blocked)");
+    expect(html).toContain("Interrupt rule door can&#x27;t watch its signals: Interrupt rule source unavailable");
+    expect(html).not.toContain('last known: clear');
   });
 
   it('says unknown, and hides the section with no rules or no control source', () => {

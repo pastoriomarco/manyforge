@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <manyforge_core/stop_timing.hpp>
+#include <manyforge_core/types/timeouts.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -29,6 +30,21 @@ TEST(StopTimingTest, ControlledStopDeadlineIsMainsDecelerationPlusCompletionTole
   profile.deceleration_time_s.reset();
   EXPECT_EQ(controlled_stop_deadline_ns(profile),
             static_cast<Duration>(kDefaultDecelerationTimeS * 1e9) + 500'000'000);
+}
+
+TEST(StopTimingTest, SentStopTrajectoryUsesTheNormalMotionNoReportBound) {
+  // Maintainer M6: a normal motion's watchdog, max(10 s, minimum,
+  // 1.5 x duration + 2 s), is also a sent Stop trajectory's no-report bound.
+  EXPECT_DOUBLE_EQ(trajectory_execution_budget_s(1.0), 10.0);
+  EXPECT_DOUBLE_EQ(trajectory_execution_budget_s(1.0, 12.0), 12.0);
+  EXPECT_DOUBLE_EQ(trajectory_execution_budget_s(8.0), 14.0);
+  EXPECT_EQ(stop_trajectory_no_report_ns(1.1), 10'000'000'000);
+  EXPECT_EQ(stop_trajectory_no_report_ns(8.0), 14'000'000'000);
+  EXPECT_EQ(stop_trajectory_no_report_ns(-1.0), 10'000'000'000);
+  // The Kernel's stage watchdog: the deadline (latest send) + that bound for a
+  // trajectory as long as the deadline, never before the provider's bound.
+  EXPECT_EQ(controlled_stage_watchdog_ns(1'500'000'000), 11'500'000'000);
+  EXPECT_EQ(controlled_stage_watchdog_ns(8'000'000'000), 22'000'000'000);
 }
 
 TEST(StopTimingTest, ExplicitMaxStopTimeIsTheRobotsOwnControlledDeadline) {

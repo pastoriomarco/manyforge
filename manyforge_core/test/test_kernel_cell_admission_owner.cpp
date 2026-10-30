@@ -274,9 +274,73 @@ TEST(KernelCellAdmissionOwner,
   journal.fail_generation = false;
   ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
   EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(fresh).ok());  // pre-clear generation
-  fresh.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+  // `fresh` still names the pre-clear generation: only the generation moved,
+  // so the cleared fault admits it.
+  EXPECT_NE(fresh.expected_admission_generation,
+            owner.GetAuthoringAdmission().admission_generation);
   EXPECT_TRUE(owner.AcquireCellAdmissionClaim(fresh).ok());
+}
+
+// A4: the expected admission generation is claim evidence only. A Disable
+// moves the generation; a caller that still names the pre-Disable generation
+// is admitted on the current facts, which alone can refuse.
+TEST(KernelCellAdmissionOwner, OldGenerationAfterDisableIsAcceptedOnCurrentFacts) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  bool fault = false;
+  auto owner = Owner(clock, journal, 16U, {}, [&] { return fault; });
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
+  const auto observed = owner.GetAuthoringAdmission().admission_generation;
+  const auto disable = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, observed, "disable"));
+  ASSERT_TRUE(disable.ok());
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(disable.value())).ok());
+  // Manager publishes the reduced required set after the Disable.
+  auto disabled = Ready();
+  disabled.required_component_total = 1U;
+  disabled.required_component_current_compatible_ready_converged = 1U;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(disabled).value().authoring_allowed);
+  ASSERT_GT(owner.GetAuthoringAdmission().admission_generation.value(), observed.value());
+
+  // Preview (authoring), Apply, Execute (manual) and Run, each still naming
+  // the pre-Disable generation.
+  const std::vector<std::pair<CellAdmissionClaimKindDTO, std::string>> requests{
+      {CellAdmissionClaimKindDTO::kAuthoringMutation, "preview"},
+      {CellAdmissionClaimKindDTO::kManagerApply, "apply"},
+      {CellAdmissionClaimKindDTO::kManualOperation, "execute"},
+      {CellAdmissionClaimKindDTO::kProgramCycle, "run"}};
+  for (const auto& [kind, request] : requests) {
+    auto intent = Intent(kind, observed, request);
+    if (kind == CellAdmissionClaimKindDTO::kManagerApply)
+      intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+    const auto accepted = owner.AcquireCellAdmissionClaim(intent);
+    ASSERT_TRUE(accepted.ok()) << request << ": " << accepted.error().message;
+    EXPECT_EQ(accepted.value().intent.expected_admission_generation, observed);
+    EXPECT_GT(accepted.value().acquired_admission_generation.value(), observed.value());
+    // Exact replay still returns the recorded claim.
+    EXPECT_EQ(owner.AcquireCellAdmissionClaim(intent).value(), accepted.value());
+    if (kind == CellAdmissionClaimKindDTO::kAuthoringMutation) {
+      // A held claim is a real admission fact: a second caller is refused
+      // whatever generation it names.
+      for (const auto generation : {observed, owner.GetAuthoringAdmission().admission_generation}) {
+        const auto busy = owner.AcquireCellAdmissionClaim(
+            Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation, "preview.busy"));
+        ASSERT_FALSE(busy.ok());
+        EXPECT_EQ(busy.error().code, "authoring_not_ready");
+      }
+    }
+    ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(accepted.value())).ok());
+  }
+
+  // A latched Stop fault still refuses, with an old or the current generation.
+  fault = true;
+  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
+  for (const auto generation : {observed, owner.GetAuthoringAdmission().admission_generation}) {
+    const auto refused = owner.AcquireCellAdmissionClaim(
+        Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation, "run.faulted"));
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "active_stop_fault_requires_recovery");
+  }
 }
 
 KernelCellAdmissionOwner ScopedOwner(FixedClock& clock, AdmissionJournal& journal,
@@ -957,6 +1021,19 @@ TEST(KernelCellAdmissionOwner, ProgramNodeDependencyRefusalReportsCurrentReadine
   EXPECT_NE(refused.error().message.find("unsettled_effect_count=4"), std::string::npos);
   EXPECT_EQ(journal.sequence.load(), sequence_before);
   EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+
+  // S1: a child naming the older, pre-Run generation is refused by the same
+  // current fact; the generation it names never decides.
+  const auto old_generation = parent_intent.expected_admission_generation;
+  EXPECT_LT(old_generation.value(), owner.GetAuthoringAdmission().admission_generation.value());
+  auto old_child = Intent(CellAdmissionClaimKindDTO::kAuthoredScene, old_generation,
+                          "scene.child.old");
+  old_child.program_node_evidence = child.program_node_evidence;
+  const auto old_refused = owner.AcquireCellAdmissionClaim(old_child);
+  ASSERT_FALSE(old_refused.ok());
+  EXPECT_EQ(old_refused.error().code, "authoring_not_ready");
+  EXPECT_EQ(old_refused.error().details.at("reason"), "program_node_dependencies_not_current");
+  EXPECT_EQ(journal.sequence.load(), sequence_before);
 }
 
 TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {
@@ -1491,9 +1568,12 @@ TEST(KernelCellAdmissionOwner, PreparedResetJournalProofCannotSurviveAdmissionGe
   ASSERT_TRUE(proof.ok());
   ASSERT_TRUE(owner.SetRouteRecoveryPending(true).ok());
   ASSERT_TRUE(owner.SetRouteRecoveryPending(false).ok());
+  // The Kernel's own prepared proof is fenced on its generation; the intent's
+  // expected generation is not compared.
   const auto acquired = owner.AcquirePreparedProgramResetClaim(intent, proof.value());
   ASSERT_FALSE(acquired.ok());
-  EXPECT_EQ(acquired.error().code, "stale_generation");
+  EXPECT_EQ(acquired.error().code, "authoring_not_ready");
+  EXPECT_EQ(acquired.error().details.at("reason"), "program_reset_not_current");
 }
 
 TEST(KernelCellAdmissionOwner, ResettingReconciledParentAlsoRejectsFreshChildren) {
@@ -2193,9 +2273,10 @@ TEST(KernelCellAdmissionOwner, CapacityAndForeignOrStaleReleaseFailClosed) {
       owner.AcquireCellAdmissionClaim(Intent(CellAdmissionClaimKindDTO::kAuthoringMutation,
                                              owner.GetAuthoringAdmission().admission_generation));
   ASSERT_TRUE(claim.ok());
+  // An old generation alone is no refusal; the full ledger is.
   auto stale_intent = Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, AdmissionGeneration(1U),
                              "request.stale");
-  EXPECT_EQ(owner.AcquireCellAdmissionClaim(stale_intent).error().code, "stale_generation");
+  EXPECT_EQ(owner.AcquireCellAdmissionClaim(stale_intent).error().code, "request_ledger_full");
   EXPECT_EQ(owner
                 .AcquireCellAdmissionClaim(Intent(
                     CellAdmissionClaimKindDTO::kAuthoringMutation,

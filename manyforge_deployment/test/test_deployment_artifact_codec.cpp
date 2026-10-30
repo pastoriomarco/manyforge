@@ -819,6 +819,90 @@ TEST(DeploymentArtifactCodec, PneumaticIoResolvesTypedSignalsAndRejectsInvalidMa
                RetainedBundleError);
 }
 
+TEST(DeploymentArtifactCodec, GraspConfirmationIsOptInAndNeedsItsEvidenceSource) {
+  const auto rows_of = [](std::string_view kind) {
+    const auto fixture =
+        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture({}, kind);
+    return std::get<core::JsonValueDTO::Array>(
+        fixture.qualified.deployment().graph().graph().runtime_units.front()
+            .configuration.at("gripper_target_configurations").value);
+  };
+  const auto with = [](core::JsonValueDTO::Array rows, core::JsonObjectDTO grasp) {
+    std::get<core::JsonObjectDTO>(rows.front().value)
+        .emplace("grasp_confirmation", core::JsonValueDTO{std::move(grasp)});
+    return rows;
+  };
+  const auto window = [](double low, double high) {
+    return core::JsonValueDTO{core::JsonObjectDTO{
+        {"min_position", core::JsonValueDTO{low}}, {"max_position", core::JsonValueDTO{high}}}};
+  };
+  const auto decode = [](const core::JsonValueDTO::Array &rows) {
+    return detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+  };
+
+  // Default: absent, so today's unconfirmed Close is unchanged.
+  for (const std::string_view kind : {"pneumatic", "position_commanded"})
+    EXPECT_FALSE(decode(rows_of(kind)).front().grasp_confirmation.has_value());
+
+  // Position: the stall window is the evidence source.
+  const auto position = rows_of("position_commanded");
+  const auto required = decode(with(position, {
+      {"policy", core::JsonValueDTO{std::string("required")}},
+      {"stall_window", window(0.001, 0.02)}}));
+  ASSERT_TRUE(required.front().grasp_confirmation.has_value());
+  EXPECT_TRUE(required.front().grasp_confirmation->required);
+  ASSERT_TRUE(required.front().grasp_confirmation->stall_window.has_value());
+  EXPECT_DOUBLE_EQ(required.front().grasp_confirmation->stall_window->min_position, 0.001);
+  EXPECT_DOUBLE_EQ(required.front().grasp_confirmation->stall_window->max_position, 0.02);
+  const auto not_required = decode(with(position, {
+      {"policy", core::JsonValueDTO{std::string("not_required")}}}));
+  EXPECT_FALSE(not_required.front().grasp_confirmation->required);
+  EXPECT_THROW((void)decode(with(position, {{"policy", core::JsonValueDTO{std::string("required")}}})),
+               RetainedBundleError);
+  EXPECT_THROW((void)decode(with(position, {{"policy", core::JsonValueDTO{std::string("required")}},
+                                            {"stall_window", window(0.02, 0.001)}})),
+               RetainedBundleError);
+  EXPECT_THROW((void)decode(with(position, {{"policy", core::JsonValueDTO{std::string("always")}}})),
+               RetainedBundleError);
+  EXPECT_THROW((void)decode(with(position, {{"policy", core::JsonValueDTO{std::string("required")}},
+                                            {"stall_window", window(0.0, 0.01)},
+                                            {"extra", core::JsonValueDTO{true}}})),
+               RetainedBundleError);
+
+  // Pneumatic: the mapped workpiece_grasped input is the evidence source.
+  auto pneumatic = rows_of("pneumatic");
+  const auto required_pneumatic = core::JsonObjectDTO{
+      {"policy", core::JsonValueDTO{std::string("required")}}};
+  EXPECT_THROW((void)decode(with(pneumatic, required_pneumatic)), RetainedBundleError);
+  const auto signal = [](std::string name) {
+    return core::JsonValueDTO{core::JsonObjectDTO{
+        {"controllable_component_id", core::JsonValueDTO{std::string("valve_io")}},
+        {"signal_name", core::JsonValueDTO{std::move(name)}}}};
+  };
+  const auto io = [&](bool with_input) {
+    core::JsonObjectDTO result{
+        {"outputs", core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{core::JsonObjectDTO{
+            {"signal", signal("valve")}, {"open_value", core::JsonValueDTO{false}},
+            {"close_value", core::JsonValueDTO{true}}}}}}}};
+    if (with_input)
+      result.emplace("inputs", core::JsonValueDTO{core::JsonObjectDTO{
+          {"workpiece_grasped", core::JsonValueDTO{core::JsonObjectDTO{
+              {"signal", signal("workpiece")}}}}}});
+    return core::JsonValueDTO{std::move(result)};
+  };
+  auto unmapped = pneumatic;
+  std::get<core::JsonObjectDTO>(unmapped.front().value).emplace("pneumatic_io", io(false));
+  EXPECT_THROW((void)decode(with(unmapped, required_pneumatic)), RetainedBundleError);
+  std::get<core::JsonObjectDTO>(pneumatic.front().value).emplace("pneumatic_io", io(true));
+  const auto mapped = decode(with(pneumatic, required_pneumatic));
+  ASSERT_TRUE(mapped.front().grasp_confirmation.has_value());
+  EXPECT_TRUE(mapped.front().grasp_confirmation->required);
+  EXPECT_FALSE(mapped.front().grasp_confirmation->stall_window.has_value());
+  EXPECT_THROW((void)decode(with(pneumatic, {{"policy", core::JsonValueDTO{std::string("required")}},
+                                             {"stall_window", window(0.0, 0.01)}})),
+               RetainedBundleError);
+}
+
 // The authored ROS runtime configuration with its `component_streams` member
 // replaced, or removed when no rows are given.
 CanonicalValue authored_component_streams(const CanonicalValue &value,
@@ -942,6 +1026,29 @@ TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
   auto missing_measured = real;
   missing_measured.erase("component_streams");
   EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(missing_measured),
+               RetainedBundleError);
+}
+
+TEST(DeploymentArtifactCodec, ControllerProfileStopLeadInAnchorDecodesBothValues) {
+  EXPECT_EQ(detail::decode_ros2_control_stop_lead_in_anchor(std::nullopt), std::nullopt);
+  EXPECT_EQ(detail::decode_ros2_control_stop_lead_in_anchor(std::string("commanded")),
+            std::optional<core::StopLeadInAnchor>(core::StopLeadInAnchor::kCommanded));
+  EXPECT_EQ(detail::decode_ros2_control_stop_lead_in_anchor(std::string("measured")),
+            std::optional<core::StopLeadInAnchor>(core::StopLeadInAnchor::kMeasured));
+  EXPECT_THROW(static_cast<void>(detail::decode_ros2_control_stop_lead_in_anchor(
+                   std::string("feedback"))),
+               RetainedBundleError);
+}
+
+TEST(DeploymentArtifactCodec, ControllerProfileTcpOffsetSyncIsOnUnlessFalse) {
+  // M6b: absent is on (TCP updates are sent to the robot's controller).
+  EXPECT_TRUE(detail::decode_ros2_control_tcp_offset_sync(nullptr));
+  const core::JsonValueDTO on{true};
+  const core::JsonValueDTO off{false};
+  EXPECT_TRUE(detail::decode_ros2_control_tcp_offset_sync(&on));
+  EXPECT_FALSE(detail::decode_ros2_control_tcp_offset_sync(&off));
+  const core::JsonValueDTO text{std::string("false")};
+  EXPECT_THROW(static_cast<void>(detail::decode_ros2_control_tcp_offset_sync(&text)),
                RetainedBundleError);
 }
 

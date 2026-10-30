@@ -7,6 +7,9 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_core/component_lifecycle_budget.hpp>
+#include <map>
 
 namespace {
 using namespace manyforge::core;
@@ -69,7 +72,8 @@ CellGraphDTO with_xarm_robot(CellGraphDTO graph) {
   graph.runtime_units.front().configuration["controller_profiles"] = JsonValueDTO{
       Array{JsonValueDTO{Object{
           {"controllable_component_id", JsonValueDTO{std::string("robot.arm")}},
-          {"real_profile", JsonValueDTO{std::string("lite6_real")}}}}}};
+          {"real_profile", JsonValueDTO{std::string("lite6_real")}},
+          {"adapter_family", JsonValueDTO{std::string("xarm")}}}}}};
   return graph;
 }
 
@@ -103,6 +107,16 @@ TEST(IoSignalCatalogTest, XArmBankRequiresOneSourceAndDriverExposedPins) {
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
       with_xarm_robot(io_graph({JsonValueDTO{second}}))).ok());
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{first}})).ok());
+  // V-B4: the xArm bank needs a robot of the `xarm` adapter family; the
+  // real profile alone does not imply it.
+  EXPECT_TRUE(ResolveRetainedIoSignalCatalog(
+      with_xarm_robot(io_graph({JsonValueDTO{first}}))).ok());
+  auto other_family = with_xarm_robot(io_graph({JsonValueDTO{first}}));
+  auto &rows = std::get<Array>(
+      other_family.runtime_units.front().configuration["controller_profiles"].value);
+  std::get<Object>(rows.front().value)["adapter_family"] =
+      JsonValueDTO{std::string("other_family")};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(other_family).ok());
 }
 
 ControlBindingDTO capability_binding(std::string component, std::string target,
@@ -193,6 +207,42 @@ TEST(IoSignalCatalogTest, CompiledCatalogDeclaresOneLostSignalPerGripperTarget) 
   ASSERT_FALSE(reserved_conflict.ok());
   EXPECT_EQ(reserved_conflict.error().details.at("reason"),
             "io_system_signal_conflict");
+}
+
+// Per-component time budget: a composition counts each component's authored
+// budget, else the one default component budget (10 s) that every plan uses,
+// for every kind and lane. CCLC reads only authored budgets.
+TEST(IoSignalCatalogTest, CompositionBudgetsDefaultToTheOneComponentBudget) {
+  namespace contract = manyforge::deployment::ros2_control_execution_runtime_contract;
+  auto graph = io_graph();
+  const auto component = [](std::string id) {
+    return ControllableComponentDTO{ControllableComponentId(std::move(id)),
+                                    ComponentTypeId("robot"),
+                                    ComponentTypeRevision("revision.robot"),
+                                    {}, {RuntimeUnitId("host.io")}, {}};
+  };
+  for (const auto *id : {"robot.real", "robot.mock", "tool.free"})
+    graph.controllable_components.push_back(component(id));
+  graph.control_bindings = {
+      capability_binding("robot.real", "arm", "execution.trajectory.execute"),
+      capability_binding("robot.mock", "arm", "execution.trajectory.execute")};
+  const std::map<std::string, std::int64_t, std::less<>> defaults{
+      {"device.io", 10'000'000'000LL}, {"robot.mock", 10'000'000'000LL},
+      {"robot.real", 10'000'000'000LL}, {"tool.free", 10'000'000'000LL}};
+  EXPECT_EQ(kDefaultLifecycleBudgetNs, 10'000'000'000LL);
+  EXPECT_TRUE(contract::component_lifecycle_budgets_ns(graph).empty());
+  EXPECT_EQ(contract::component_composition_budgets_ns(graph), defaults);
+
+  graph.runtime_units.front().configuration["lifecycle_command_timeouts"] =
+      JsonValueDTO{Array{JsonValueDTO{Object{
+          {"controllable_component_id", JsonValueDTO{std::string("robot.mock")}},
+          {"lifecycle_command_timeout_s", JsonValueDTO{120.0}}}}}};
+  auto authored = defaults;
+  authored["robot.mock"] = 120'000'000'000LL;
+  EXPECT_EQ(contract::component_lifecycle_budgets_ns(graph),
+            (std::map<std::string, std::int64_t, std::less<>>{
+                {"robot.mock", 120'000'000'000LL}}));
+  EXPECT_EQ(contract::component_composition_budgets_ns(graph), authored);
 }
 
 TEST(IoSignalCatalogTest, MockEchoRequiresDeclaredSameDeviceMockOutput) {
@@ -756,7 +806,7 @@ TEST(IoSignalCatalogTest,
   ASSERT_TRUE(defaults.ok());
   ASSERT_EQ(defaults.value().size(), 1U);
   EXPECT_EQ(defaults.value().front().lifecycle_command_timeout_ns,
-            30000000000LL);
+            10000000000LL);
   const auto frozen = graph.runtime_units.front().configuration;
   ASSERT_TRUE(
       manyforge::deployment::MaterializeRetainedIoProviderDevices(graph).ok());
@@ -846,7 +896,7 @@ TEST(IoSignalCatalogTest,
   const auto device =
       manyforge::deployment::ResolveRetainedIoProviderDevices(graph);
   ASSERT_TRUE(device.ok());
-  EXPECT_EQ(device.value().front().lifecycle_command_timeout_ns, 30000000000LL);
+  EXPECT_EQ(device.value().front().lifecycle_command_timeout_ns, 10000000000LL);
   auto bad = device_row(1.0);
   bad["controllable_component_id"] = JsonValueDTO{std::string("not_owned")};
   graph.runtime_units.front().configuration["io_provider_devices"] =
@@ -867,7 +917,7 @@ TEST(IoSignalCatalogTest,
   ASSERT_EQ(devices.value().size(), 1U);
   EXPECT_EQ(devices.value().front().output_source_ack_timeout_ns, 500000000);
   EXPECT_EQ(devices.value().front().lifecycle_command_timeout_ns,
-            30000000000LL);
+            10000000000LL);
   const auto frozen = mixed.runtime_units.front().configuration;
   ASSERT_TRUE(MaterializeRetainedIoProviderDevices(mixed).ok());
   EXPECT_EQ(mixed.runtime_units.front().configuration, frozen);
@@ -974,12 +1024,7 @@ Object geometric_contact_input(std::string name = "contact",
   provider(row) = {
       {"profile", JsonValueDTO{std::string("geometric_contact")}},
       {"ingress_depth", JsonValueDTO{4.0}},
-      {"endpoint",
-       JsonValueDTO{Object{
-           {"controllable_component_id",
-            JsonValueDTO{std::string("robot.arm")}},
-           {"command_target_id", JsonValueDTO{std::string("arm")}},
-           {"frame_role_id", JsonValueDTO{std::string("tool")}}}}},
+      {"robot_component_id", JsonValueDTO{std::string("robot.arm")}},
       {"target_scene_resource_id",
        JsonValueDTO{std::string("fixture.target")}}};
   return row;
@@ -999,12 +1044,8 @@ TEST(IoSignalCatalogTest,
     EXPECT_EQ(signal.descriptor.freshness.mode,
               IoFreshnessMode::kSampleAge);
     EXPECT_EQ(signal.descriptor.freshness.maximum_age_ns, 125);
-    ASSERT_TRUE(signal.provider.endpoint);
-    EXPECT_EQ(signal.provider.endpoint->controllable_component_id,
+    EXPECT_EQ(signal.provider.robot_component_id,
               ControllableComponentId("robot.arm"));
-    EXPECT_EQ(signal.provider.endpoint->command_target_id,
-              CommandTargetId("arm"));
-    EXPECT_EQ(signal.provider.endpoint->frame_role_id, FrameRoleId("tool"));
     EXPECT_EQ(signal.provider.target_scene_resource_id,
               SceneResourceId("fixture.target"));
   }
@@ -1038,7 +1079,7 @@ TEST(IoSignalCatalogTest,
   }
 
   auto malformed = geometric_contact_input();
-  provider(malformed).erase("endpoint");
+  provider(malformed).erase("robot_component_id");
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
                    io_graph({JsonValueDTO{malformed}}))
                    .ok());
@@ -1049,8 +1090,16 @@ TEST(IoSignalCatalogTest,
                    io_graph({JsonValueDTO{malformed}}))
                    .ok());
   malformed = geometric_contact_input();
-  auto &endpoint = std::get<Object>(provider(malformed).at("endpoint").value);
-  endpoint["unrecognized"] = JsonValueDTO{true};
+  provider(malformed)["endpoint"] = JsonValueDTO{Object{
+      {"controllable_component_id", JsonValueDTO{std::string("robot.arm")}},
+      {"command_target_id", JsonValueDTO{std::string("arm")}},
+      {"frame_role_id", JsonValueDTO{std::string("tool")}}}};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{malformed}}))
+                   .ok());
+
+  // The former fixed-endpoint profile is refused even without a new field.
+  provider(malformed).erase("robot_component_id");
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
                    io_graph({JsonValueDTO{malformed}}))
                    .ok());
@@ -1064,10 +1113,8 @@ TEST(IoSignalCatalogTest,
   }
 
   auto endpoint_conflict = geometric_contact_input("contact_copy");
-  auto &conflicting_endpoint =
-      std::get<Object>(provider(endpoint_conflict).at("endpoint").value);
-  conflicting_endpoint["frame_role_id"] =
-      JsonValueDTO{std::string("other_tool")};
+  provider(endpoint_conflict)["robot_component_id"] =
+      JsonValueDTO{std::string("other_robot")};
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
                    io_graph({JsonValueDTO{geometric_contact_input()},
                              JsonValueDTO{endpoint_conflict}}))
@@ -1308,8 +1355,7 @@ TEST(IoSignalCatalogTest,
      "transition_capability":"sampled_only",
      "freshness":{"mode":"sample_age","maximum_age_ns":125},
      "provider":{"profile":"geometric_contact","ingress_depth":4,
-       "endpoint":{"controllable_component_id":"robot.arm",
-                   "command_target_id":"arm","frame_role_id":"tool"},
+       "robot_component_id":"robot.arm",
        "target_scene_resource_id":"fixture.target"}}
   ])")
                            .root();
@@ -1349,10 +1395,9 @@ TEST(IoSignalCatalogTest,
       *rows[geometric_index].find_object_member("provider");
   EXPECT_EQ(geometric_provider.find_object_member("profile")->as_string(),
             "geometric_contact");
-  EXPECT_EQ(geometric_provider.find_object_member("endpoint")
-                ->find_object_member("frame_role_id")
+  EXPECT_EQ(geometric_provider.find_object_member("robot_component_id")
                 ->as_string(),
-            "tool");
+            "robot.arm");
   auto invalid_signals = signals.as_array();
   auto invalid = invalid_signals.front().as_object();
   for (auto &[key, field] : invalid) {

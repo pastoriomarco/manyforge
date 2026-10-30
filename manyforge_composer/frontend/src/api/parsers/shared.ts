@@ -179,13 +179,6 @@ export function monotonicNanosecondsAt(value: unknown, path: string): Nanosecond
   return parseNanoseconds(value, path);
 }
 
-export function nullableMonotonicNanosecondsAt(
-  value: unknown,
-  path: string,
-): Nanoseconds | null {
-  return value === null ? null : monotonicNanosecondsAt(value, path);
-}
-
 export function boundedArrayAt(
   value: unknown,
   path: string,

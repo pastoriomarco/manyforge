@@ -780,6 +780,203 @@ TEST(RetainedObservedStateChannelTest,
 }
 
 TEST(RetainedObservedStateChannelTest,
+     DisplayInputIsMarkedUntilTheNextAddressedSampleReplacesIt) {
+  // M6: display input moves only the display; on a channel that does not
+  // follow display input, the next addressed publication takes the render
+  // coordinates back.
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::array initial{0.0}, velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(initial, velocity, 100, 100).applied());
+  ASSERT_TRUE(channel.current_bound_render_state().ok());
+  EXPECT_FALSE(channel.current_bound_render_state().value().display_only);
+  const auto owner_before = channel.current_state(100);
+  ASSERT_TRUE(owner_before.ok());
+
+  const std::array moved{0.012};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, moved).ok());
+  auto display = channel.current_bound_render_state();
+  ASSERT_TRUE(display.ok());
+  EXPECT_TRUE(display.value().display_only);
+  EXPECT_EQ(display.value().positions_si, std::vector<double>{0.012});
+  EXPECT_EQ(channel.current_state(100).value(), owner_before.value());
+
+  // The same coordinates from an addressed sample are still a visible change.
+  const auto generation = channel.render_change_generation();
+  ASSERT_TRUE(channel.publish_state(moved, velocity, 101, 101).applied());
+  display = channel.current_bound_render_state();
+  ASSERT_TRUE(display.ok());
+  EXPECT_FALSE(display.value().display_only);
+  EXPECT_GT(channel.render_change_generation(), generation);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     AFollowingChannelKeepsTheDisplayInputOverAddressedSamples) {
+  // M6 (approval list 2, item 23): a Real arm's display always follows its
+  // vendor joint topic. Addressed samples render until the first display
+  // input; afterwards they update only the authoritative state.
+  const auto binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.predicted", 0, 1U});
+  channel.follow_display_input();
+  const auto names = channel.query_context().joint_names;
+  const std::array initial{0.0}, velocity{0.0};
+  ASSERT_TRUE(channel.publish_state(initial, velocity, 100, 100).applied());
+  auto render = channel.current_bound_render_state();
+  ASSERT_TRUE(render.ok());
+  EXPECT_FALSE(render.value().display_only);
+
+  const std::array vendor{0.012};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, vendor).ok());
+  const auto generation = channel.render_change_generation();
+  const std::array addressed{0.02};
+  ASSERT_TRUE(channel.publish_state(addressed, velocity, 101, 101).applied());
+  render = channel.current_bound_render_state();
+  ASSERT_TRUE(render.ok());
+  EXPECT_TRUE(render.value().display_only);
+  EXPECT_EQ(render.value().positions_si, std::vector<double>{0.012});
+  EXPECT_EQ(channel.render_change_generation(), generation);
+  // Planning and readiness read the addressed sample.
+  const auto owner = channel.current_state(101);
+  ASSERT_TRUE(owner.ok());
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearPositionDTO>(owner.value().positions.front()).value_m, 0.02);
+
+  const std::array next{0.015};
+  ASSERT_TRUE(channel.update_render_positions(binding, names, next).ok());
+  render = channel.current_bound_render_state();
+  ASSERT_TRUE(render.ok());
+  EXPECT_EQ(render.value().positions_si, std::vector<double>{0.015});
+}
+
+TEST(RetainedObservedStateChannelTest,
+     ALivePreviewStartsFromTheDisplayInputOnlyWhileTheStreamLeads) {
+  // M6 (approval list 2, item 34): poses follow the live controller stream.
+  // A jog/Move-to preview starts from the display input (a Real arm's latest
+  // valid vendor joint sample) while the arm counts as moved or re-arming,
+  // or while the broadcaster's addressed state is stale. Otherwise, and on a
+  // channel without display input, it starts from the addressed state.
+  auto value = make_binding(CoordinateKind::kAngular, "arm.target").value();
+  value.model_groups.clear();
+  for (auto& resource : value.resources) resource.source_joint_name.reset();
+  value.control_path->state_authority_class = StateAuthorityClass::kMeasured;
+  const auto sealed = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(sealed.ok());
+  RetainedObservedStateChannel channel(
+      sealed.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kJointState,
+                                         "joint_state", 100, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::vector<double> broadcaster{0.1, 0.2}, vendor{0.4, 0.5}, zero{0.0, 0.0};
+  ASSERT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kJointState,
+      names, broadcaster, zero, 1000, 1000).complete);
+
+  // Not display-led (Mock, Isaac, a vendor without a joint topic): never.
+  ASSERT_TRUE(channel.update_render_positions(sealed.value(), names, vendor).ok());
+  channel.set_display_input_leads(true);
+  EXPECT_FALSE(channel.live_preview_start(1050).has_value());
+  EXPECT_FALSE(channel.live_preview_start(2000).has_value());
+
+  channel.follow_display_input();
+  ASSERT_TRUE(channel.update_render_positions(sealed.value(), names, vendor).ok());
+  // A normal preview: fresh broadcaster, arm not moved. Unchanged.
+  channel.set_display_input_leads(false);
+  EXPECT_FALSE(channel.live_preview_start(1050).has_value());
+  // Moved or re-arming: the vendor pose, even while the broadcaster is fresh.
+  channel.set_display_input_leads(true);
+  auto live = channel.live_preview_start(1050);
+  ASSERT_TRUE(live.has_value());
+  EXPECT_EQ(live->compiled_joint_names, names);
+  EXPECT_EQ(live->positions_si, vendor);
+  EXPECT_EQ(live->binding.value(), sealed.value().value());
+  // Broadcaster stale (past the 100 ns budget), not moved: the vendor pose.
+  channel.set_display_input_leads(false);
+  live = channel.live_preview_start(1200);
+  ASSERT_TRUE(live.has_value());
+  EXPECT_EQ(live->positions_si, vendor);
+  // A fresh broadcaster sample ends it.
+  ASSERT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kJointState,
+      names, broadcaster, zero, 1300, 1300).complete);
+  EXPECT_FALSE(channel.live_preview_start(1310).has_value());
+  // Planning, readiness and arrival read the addressed state throughout.
+  const auto owner = channel.current_state(1310);
+  ASSERT_TRUE(owner.ok());
+  EXPECT_DOUBLE_EQ(std::get<AngularPositionDTO>(owner.value().positions[0]).value_rad, 0.1);
+}
+
+TEST(RetainedObservedStateChannelTest,
+     PresentationReadsFollowTheDisplayInputWhileTheStreamLeads) {
+  // M6 (approval list 2, items 23/34): the host's control-state and
+  // observation reads serve the live display pose under the preview rule,
+  // instead of failing on a stale broadcaster. Otherwise they are exactly
+  // current_bound_state; current_state (planning) never changes.
+  auto value = make_binding(CoordinateKind::kAngular, "arm.target").value();
+  value.model_groups.clear();
+  for (auto& resource : value.resources) resource.source_joint_name.reset();
+  value.control_path->state_authority_class = StateAuthorityClass::kMeasured;
+  const auto sealed = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(sealed.ok());
+  RetainedObservedStateChannel channel(
+      sealed.value(), nullptr,
+      RetainedObservedStateChannelConfig{ObservedStateSourceKind::kJointState,
+                                         "joint_state", 100, 1U});
+  const auto names = channel.query_context().joint_names;
+  const std::vector<double> broadcaster{0.1, 0.2}, vendor{0.4, 0.5}, moving{0.3, 0.3};
+  ASSERT_TRUE(channel.publish_adapter_state(ObservedRobotStateSourceKind::kJointState,
+      names, broadcaster, moving, 1000, 1000).complete);
+  const auto position = [](const ObservedStateSnapshotDTO& state, std::size_t index) {
+    return std::get<AngularPositionDTO>(state.positions[index]).value_rad;
+  };
+
+  // Not display-led: exactly current_bound_state, which fails when stale.
+  ASSERT_TRUE(channel.update_render_positions(sealed.value(), names, vendor).ok());
+  channel.set_display_input_leads(true);
+  auto read = channel.current_live_bound_state(1050);
+  ASSERT_TRUE(read.ok());
+  EXPECT_DOUBLE_EQ(position(read.value().state, 0), 0.1);
+  EXPECT_FALSE(channel.current_live_bound_state(1200).ok());
+
+  channel.follow_display_input();
+  ASSERT_TRUE(channel.update_render_positions(sealed.value(), names, vendor).ok());
+  // Fresh broadcaster, not moved: the addressed state, unchanged.
+  channel.set_display_input_leads(false);
+  read = channel.current_live_bound_state(1050);
+  ASSERT_TRUE(read.ok());
+  EXPECT_DOUBLE_EQ(position(read.value().state, 0), 0.1);
+  EXPECT_TRUE(read.value().state.velocities.has_value());
+  // Stale broadcaster: the live vendor pose, with the addressed identity.
+  ASSERT_FALSE(channel.current_bound_state(1200).ok());
+  read = channel.current_live_bound_state(1200);
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_EQ(read.value().binding.value(), sealed.value().value());
+  EXPECT_EQ(read.value().state.joint_names, names);
+  EXPECT_DOUBLE_EQ(position(read.value().state, 0), 0.4);
+  EXPECT_DOUBLE_EQ(position(read.value().state, 1), 0.5);
+  EXPECT_TRUE(read.value().state.complete);
+  EXPECT_FALSE(read.value().state.velocities.has_value());
+  EXPECT_EQ(read.value().state.control_binding_id,
+            channel.query_context().control_binding_id);
+  // Moved or re-arming with a fresh broadcaster: the live vendor pose too.
+  channel.set_display_input_leads(true);
+  read = channel.current_live_bound_state(1050);
+  ASSERT_TRUE(read.ok());
+  EXPECT_DOUBLE_EQ(position(read.value().state, 0), 0.4);
+  // Planning, readiness and arrival never read it.
+  const auto owner = channel.current_state(1050);
+  ASSERT_TRUE(owner.ok());
+  EXPECT_DOUBLE_EQ(position(owner.value(), 0), 0.1);
+  EXPECT_FALSE(channel.current_state(1200).ok());
+}
+
+TEST(RetainedObservedStateChannelTest,
      RenderWritesRejectForeignBindingNamesAndNonfiniteValues) {
   const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target",
                                     true, "route.native");

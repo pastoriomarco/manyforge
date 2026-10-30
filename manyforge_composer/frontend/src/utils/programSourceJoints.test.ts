@@ -114,12 +114,13 @@ const applied: AppliedProgramSelection = {
 };
 
 const sourceModel: SourceModelProjection = {
-  schema_version: 'manyforge.source_model_projection.v2',
+  schema_version: 'manyforge.source_model_projection.v3',
   cell_id: 'cell',
   retained_bundle_id: 'sha256:bundle',
   graph_revision: 'sha256:graph',
   model_map_contract: null,
   model_map_product_id: null,
+  components: [{ component_id: 'lite6', mounted_on: null }],
   occurrences: [],
   targets: [{
     target_id: 'lite6_arm',

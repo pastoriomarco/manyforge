@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import { failureContextText } from '../state/structuredError';
+import { commandRefusalCause } from '../state/commandRefusal';
 import type {
   AppliedProgramSelection,
   AppliedProgramStatus,
@@ -17,6 +18,7 @@ import type {
   ProgramCycleStatus,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
+  StructuredError,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
@@ -185,6 +187,7 @@ interface ProgramRuntimeState {
   failureNoticeKey?: string | null;
   /** The failed run whose notice was dismissed or superseded by a command. */
   dismissedFailureKey?: string | null;
+  errorRefusal: StructuredError | null;
 }
 
 /** Commands that start or resume Program progression or motion. */
@@ -206,6 +209,7 @@ const INITIAL_STATE: ProgramRuntimeState = {
   selectionPending: [],
   controlPending: null,
   error: null,
+  errorRefusal: null,
 };
 
 function currentScenarioKey(value: CurrentScenarioResponse | null): string {
@@ -223,6 +227,54 @@ function currentScenarioKey(value: CurrentScenarioResponse | null): string {
         scenario.programRevision,
         scenario.programBindingId,
       ].join(':')}`;
+}
+
+/** GUI-owned Execute facts. An absent projection is unknown, not a change. */
+export type ExecuteIdentityValue = string | number | boolean | undefined;
+export type ExecuteIdentity = readonly ExecuteIdentityValue[];
+
+export function executeIdentity(
+  enabled: boolean,
+  applied: AppliedProgramSelection | null,
+  currentScenario: CurrentScenarioResponse | null,
+  snapshot: ComposerHeadlessState | null,
+  workspace: ProgramWorkspaceResponse | null,
+  deploymentPending: boolean,
+): ExecuteIdentity {
+  const scenario = currentScenario?.currentScenario;
+  const scenarioIdentity: ExecuteIdentityValue[] = scenario == null
+    ? [applied?.recordDigest, undefined, undefined]
+    : [applied?.recordDigest, scenario.scenarioId, scenario.sourceDocumentDigest];
+  const draftIdentity: ExecuteIdentityValue[] = workspace === null
+    ? [undefined, undefined, undefined, undefined]
+    : [workspace.draft.draftId, workspace.draft.draftRevision,
+      workspace.draft.programRevision ?? 'no-program-revision', workspace.draft.programLoaded];
+  const cycleIdentity: ExecuteIdentityValue[] = snapshot === null
+    ? [undefined, undefined, undefined]
+    : [snapshot.programCycle.programRunId ?? 'no-program-run',
+      snapshot.programCycle.cycleGeneration, snapshot.programCycle.state];
+  const deploymentDraftIdentity: ExecuteIdentityValue[] = snapshot === null
+    ? [undefined, undefined]
+    : [snapshot.authoringWorkspace.deploymentDraftId, snapshot.authoringWorkspace.deploymentDraftRevision];
+  return [
+    enabled,
+    ...scenarioIdentity,
+    ...draftIdentity,
+    ...cycleIdentity,
+    ...deploymentDraftIdentity,
+    snapshot === null ? undefined : JSON.stringify(snapshot.authoringWorkspaceContainment),
+    deploymentPending,
+  ];
+}
+
+export function bindExecuteIdentity(
+  bound: ExecuteIdentity,
+  current: ExecuteIdentity,
+): ExecuteIdentity | null {
+  if (bound.length !== current.length) return null;
+  if (bound.some((value, index) => value !== undefined
+    && current[index] !== undefined && value !== current[index])) return null;
+  return bound.map((value, index) => value ?? current[index]);
 }
 
 /** The exact Applied Program selection a view shows ('none' when absent). */
@@ -408,7 +460,7 @@ export interface ProgramResetIdentity {
 
 /** The exact cycle a caller confirmed Reset for; any other is refused unsent. */
 export type ProgramResetExpectation = Pick<
-  ProgramResetIdentity, 'programRunId' | 'programRunnerOwnerEpoch' | 'cycleGeneration'
+  ProgramResetIdentity, 'programRunId' | 'cycleGeneration'
 >;
 
 /** Optional explicit restoration effects; omitted selectors preserve known state. */
@@ -929,6 +981,7 @@ export function useProgramRuntime(
       : {
         ...current,
         error: null,
+        errorRefusal: null,
         failureNoticeKey: null,
         dismissedFailureKey: programFailureNoticeKey(current.run)
           ?? current.dismissedFailureKey,
@@ -960,6 +1013,7 @@ export function useProgramRuntime(
       error: null,
       // A Program command (Reset, Run, ...) supersedes the failed-run notice.
       failureNoticeKey: null,
+      errorRefusal: null,
       dismissedFailureKey: programFailureNoticeKey(current.run)
         ?? current.dismissedFailureKey,
     }));
@@ -967,7 +1021,7 @@ export function useProgramRuntime(
 
   const beginControlCommand = useCallback((pending: string) => {
     setState((current) => ({
-      ...current, controlPending: pending, error: null, failureNoticeKey: null,
+      ...current, controlPending: pending, error: null, errorRefusal: null, failureNoticeKey: null,
     }));
   }, []);
 
@@ -1012,6 +1066,7 @@ export function useProgramRuntime(
           `Request ${requestId}. Backend state remains authoritative.`,
         ].join(' '),
         failureNoticeKey: null,
+        errorRefusal: commandRefusalCause(reason),
       };
     });
   }, []);
@@ -1057,7 +1112,7 @@ export function useProgramRuntime(
   /**
    * Send one Reset for the cycle the caller names and report what is known.
    *
-   * `expected` is the exact run, runner owner and cycle generation the caller
+   * `expected` is the exact run and cycle generation the caller
    * confirmed: when the current observation differs, nothing is sent. A
    * definite refusal (not sent, or refused by the owner) is distinct from a
    * submitted Reset whose reply was lost: that one may have been received, so
@@ -1075,7 +1130,6 @@ export function useProgramRuntime(
     if (expected !== undefined && (
       cycle === null
       || cycle.programRunId !== expected.programRunId
-      || cycle.programRunnerOwnerEpoch !== expected.programRunnerOwnerEpoch
       || cycle.cycleGeneration !== expected.cycleGeneration
     )) {
       return {
@@ -1091,7 +1145,7 @@ export function useProgramRuntime(
         ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
         : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.';
       if (mounted.current) {
-        setState((current) => ({ ...current, error: message, failureNoticeKey: null }));
+        setState((current) => ({ ...current, error: message, errorRefusal: null, failureNoticeKey: null }));
       }
       await refresh();
       return { status: 'refused', message };
@@ -1794,25 +1848,21 @@ export function useProgramRuntime(
   const [activationPending, setActivationPending] = useState(false);
   const [activationWaiting, setActivationWaiting] = useState(false);
   const executeFlow = useRef<{
-    key: string; observation: ActivationSequenceObservation | null;
+    identity: ExecuteIdentity; applied: AppliedProgramSelection | null;
+    observation: ActivationSequenceObservation | null;
     phase: 'reading' | 'offered' | 'activating' | 'waiting'; abort: AbortController;
   } | null>(null);
-  // Admission generations may advance while lifecycle work settles. Both Drafts,
-  // the Applied selection, receiver and exact idle Runner cycle must stay bound.
-  const executeKey = JSON.stringify([
-    enabled, appliedKey(state.applied), state.currentScenario?.currentScenario,
-    snapshot?.runtime?.activeConfiguration, snapshot?.runtime?.sections.manager.sourceOwnerEpoch,
-    snapshot?.executionControlStatus?.ownerEpoch,
-    snapshot?.receiverEpoch, snapshot?.authoringWorkspace, snapshot?.authoringWorkspaceContainment,
-    workspace?.draft.draftId, workspace?.draft.draftRevision, workspace?.draft.programRevision,
-    workspace?.draft.programLoaded,
-    snapshot?.programCycle.programRunnerOwnerEpoch, snapshot?.programCycle.cycleGeneration,
-    snapshot?.programCycle.programRunId, snapshot?.programCycle.cycleClaimGeneration,
-    snapshot?.programCycle.state, deploymentPending,
-  ]);
+  // Only GUI-owned Scenario, Draft and Runner-cycle facts are bound. Missing
+  // projections stay unknown until a later read supplies a value.
+  const currentExecuteIdentity = executeIdentity(
+    enabled, state.applied, state.currentScenario, snapshot, workspace, deploymentPending,
+  );
+  const executeIdentityKey = JSON.stringify(currentExecuteIdentity);
   const executeAllowed = commandAllowed('program_run');
-  const latestExecute = useRef({ key: executeKey, cclc, ordinaryRun, allowed: executeAllowed, applied: state.applied });
-  latestExecute.current = { key: executeKey, cclc, ordinaryRun, allowed: executeAllowed, applied: state.applied };
+  const latestExecute = useRef({ identity: currentExecuteIdentity, cclc, ordinaryRun,
+    allowed: executeAllowed, applied: state.applied });
+  latestExecute.current = { identity: currentExecuteIdentity, cclc, ordinaryRun,
+    allowed: executeAllowed, applied: state.applied };
   const finishExecuteFlow = useCallback((message?: string) => {
     const flow = executeFlow.current;
     executeFlow.current = null;
@@ -1822,7 +1872,7 @@ export function useProgramRuntime(
     setActivationPending(false);
     setActivationWaiting(false);
     if (message !== undefined) {
-      setState((current) => ({ ...current, error: message, failureNoticeKey: null }));
+      setState((current) => ({ ...current, error: message, errorRefusal: null, failureNoticeKey: null }));
     }
   }, []);
   const cancelActivationExecute = useCallback(() => finishExecuteFlow(), [finishExecuteFlow]);
@@ -1835,29 +1885,39 @@ export function useProgramRuntime(
   useEffect(() => {
     const flow = executeFlow.current;
     if (flow === null) return;
-    if (flow.key !== executeKey) {
-      finishExecuteFlow('Execute stopped: the Scenario, Draft, owner or Runner cycle changed.');
+    const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
+    if (bound === null) {
+      finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
       return;
     }
+    flow.identity = bound;
     if (flow.phase === 'waiting' && latestExecute.current.allowed) {
       // Consume before dispatch. This uses the latest ordinary builder and a new
       // request identity; a refusal is displayed once with no recursive offer.
       finishExecuteFlow();
       void latestExecute.current.ordinaryRun();
     }
-  }, [executeKey, executeAllowed, activationWaiting, finishExecuteFlow]);
+  }, [executeIdentityKey, executeAllowed, activationWaiting, finishExecuteFlow]);
   const run = useCallback(async () => {
     if (executeFlow.current !== null) return;
     if (cclc === undefined) { await ordinaryRun(); return; }
     if (!latestExecute.current.allowed) return;
-    const flow = { key: latestExecute.current.key, observation: null as ActivationSequenceObservation | null,
+    const flow = { identity: latestExecute.current.identity,
+      applied: latestExecute.current.applied,
+      observation: null as ActivationSequenceObservation | null,
       phase: 'reading' as 'reading' | 'offered' | 'activating' | 'waiting', abort: new AbortController() };
     executeFlow.current = flow;
     setActivationPending(true);
     try {
-      const observation = await cclc.readActivationSequence(flow.abort.signal);
-      if (executeFlow.current !== flow || latestExecute.current.key !== flow.key) return;
-      const applied = latestExecute.current.applied;
+      const observation = await cclc.readActivationSequence(flow.abort.signal, 'execute');
+      if (executeFlow.current !== flow) return;
+      const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
+      if (bound === null) {
+        finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
+        return;
+      }
+      flow.identity = bound;
+      const applied = flow.applied;
       if (applied === null || observation.components.some((component) => (
         component.retainedBundleId !== applied.retainedBundleId || component.graphRevision !== applied.graphRevision
       ))) throw new Error('Execute stopped: components do not match the Applied Program configuration.');
@@ -1877,16 +1937,27 @@ export function useProgramRuntime(
   const confirmActivationExecute = useCallback(async () => {
     const flow = executeFlow.current;
     if (flow === null || flow.phase !== 'offered' || flow.observation === null) return;
-    if (flow.key !== latestExecute.current.key || latestExecute.current.cclc === undefined) {
-      finishExecuteFlow('Execute stopped: the Scenario, Draft, owner or Runner cycle changed.');
+    const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
+    if (latestExecute.current.cclc === undefined || bound === null) {
+      finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
       return;
     }
+    flow.identity = bound;
     const controller = latestExecute.current.cclc;
     flow.phase = 'activating';
     setActivationPending(true);
     try {
-      const succeeded = await controller.activateSequence(flow.observation.identity);
-      if (executeFlow.current !== flow || latestExecute.current.key !== flow.key) return;
+      const succeeded = await controller.activateSequence(
+        flow.observation.identity,
+        flow.observation.activationOrder,
+      );
+      if (executeFlow.current !== flow) return;
+      const settledIdentity = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
+      if (settledIdentity === null) {
+        finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
+        return;
+      }
+      flow.identity = settledIdentity;
       if (!succeeded) {
         finishExecuteFlow('Activation stopped; Execute was not sent. See component lifecycle details.');
         return;

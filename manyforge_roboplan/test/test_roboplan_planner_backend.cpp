@@ -416,6 +416,53 @@ TEST(RoboPlanPlannerBackendTest,
       std::invalid_argument);
 }
 
+// lite6_pick_and_place (merge 6 tool split): the planner inventory also holds
+// the frames of the tool mounted on the robot, with the tool's own component
+// and model identity. Construction failed here and the native runtime exited.
+// B7: each frame has one, owner-stamped spelling; the moving arm's spelling of
+// the tool's frame is outside the inventory and refused before transport.
+TEST(RoboPlanPlannerBackendTest, AcceptsTheFramesOfAToolMountedOnTheMotionComponent) {
+  auto binding = candidate_binding();
+  const ResolvedFrameDTO tool_tcp = ResolvedComponentModelFrameDTO{
+      ControllableComponentId("lite_gripper"), ModelInstanceId("lite_gripper_model"),
+      FrameRoleId("tcp"), "lite_gripper_link_tcp", ModelRevision("tool-model-revision")};
+  binding.permitted_frames.push_back(tool_tcp);
+  auto owned = std::make_unique<RecordingCandidateClient>(binding);
+  auto *client = owned.get();
+  std::unique_ptr<RoboPlanPlannerBackend> backend;
+  ASSERT_NO_THROW(backend = std::make_unique<RoboPlanPlannerBackend>(
+                      testing::make_test_projection_binding(), binding,
+                      std::move(owned)));
+
+  auto request = testing::make_test_plan_request(
+      "move:tool-tcp", ResolvedMotionSpecDTO{joint_goal(binding)});
+  request.tcp_frame = tool_tcp;
+  ASSERT_TRUE(backend->plan(request).trajectory);
+  ASSERT_TRUE(client->last_request);
+  EXPECT_EQ(client->last_request->tcp_frame, tool_tcp);
+  EXPECT_EQ(client->compute_calls, 1);
+
+  auto arm_spelled = request;
+  std::get<ResolvedComponentModelFrameDTO>(arm_spelled.tcp_frame)
+      .controllable_component_id = binding.controllable_component_id;
+  const auto refused = backend->plan(arm_spelled);
+  EXPECT_FALSE(refused.trajectory);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->details.at("reason"),
+            "native_planner_participant_binding_mismatch");
+  EXPECT_EQ(client->compute_calls, 1);
+
+  // A frame on the motion model itself still carries the motion model revision.
+  auto stale = candidate_binding();
+  stale.permitted_frames.push_back(ResolvedComponentModelFrameDTO{
+      stale.controllable_component_id, stale.model_instance_id, FrameRoleId("flange"),
+      "flange", ModelRevision("another-revision")});
+  EXPECT_THROW(
+      (void)RoboPlanPlannerBackend(testing::make_test_projection_binding(), stale,
+                                   std::make_unique<RecordingCandidateClient>(stale)),
+      std::invalid_argument);
+}
+
 TEST(RoboPlanPlannerBackendTest,
      ContactSelectionIsOperationScopedAndOrdinaryPlanAndIkClearIt) {
   BackendFixture fixture;
@@ -473,6 +520,52 @@ TEST(RoboPlanPlannerBackendTest,
   EXPECT_FALSE(fixture.client->projection_history.back().contact_policy_id);
   EXPECT_EQ(fixture.client->compute_calls, 4);
   EXPECT_EQ(fixture.client->ik_calls, 1);
+}
+
+TEST(RoboPlanPlannerBackendTest, PlanForwardsTheKernelClearanceMarginsAndIkClearsThem) {
+  BackendFixture fixture;
+  fixture.client->require_projection = true;
+  auto policy = std::make_shared<CollisionPolicySnapshot>();
+  policy->policy_id = "clearance-policy-snapshot";
+  policy->revision = CollisionPolicyRevision{
+      1U, "sha256:"
+          "0000000000000000000000000000000000000000000000000000000000000000"};
+  const auto world =
+      CollisionWorldSnapshotBuilder()
+          .set_publisher_id("backend-clearance-test")
+          .set_revision_id(1U)
+          .set_policy_overlay_content_hash(policy->revision.content_hash)
+          .build_shared();
+  ASSERT_TRUE(world.ok()) << world.error().message;
+  auto margins = std::make_shared<CollisionClearanceMargins>();
+  margins->margin_m = 0.003;
+  margins->pairs = {{CollisionPairId{"component/arm/model/arm_model/body/link1/collision/0",
+                                     "scene/wall/shape/0"},
+                     0.003}};
+  auto input = testing::make_test_plan_request(
+      "move:clearance", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
+  input.retained_collision_world = world.value();
+  input.retained_collision_policy = policy;
+  input.retained_clearance_margins = margins;
+  ASSERT_TRUE(fixture.backend->plan(input).trajectory);
+  ASSERT_FALSE(fixture.client->projection_history.empty());
+  EXPECT_EQ(fixture.client->projection_history.back().clearance_margins, margins);
+
+  const auto resolved = testing::make_test_execution_binding();
+  IkRequestDTO ik{resolved.controllable_component_id,
+                  resolved.command_target_id,
+                  resolved.model_bindings,
+                  resolved.resources,
+                  Pose3DTO{{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}},
+                  resolved.base_frame,
+                  resolved.tcp_frame,
+                  testing::make_test_controlled_state(resolved, {0.0, 0.0}),
+                  input.projection_binding,
+                  0.1};
+  ik.retained_collision_world = input.retained_collision_world;
+  ik.retained_collision_policy = input.retained_collision_policy;
+  ASSERT_TRUE(fixture.backend->solve_ik(ik).ok);
+  EXPECT_FALSE(fixture.client->projection_history.back().clearance_margins);
 }
 
 }  // namespace

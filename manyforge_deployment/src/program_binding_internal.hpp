@@ -1,7 +1,10 @@
 #pragma once
 
+#include <manyforge_core/types/component_type.hpp>
+#include <manyforge_deployment/component_type_codec.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 
+#include <algorithm>
 #include <memory>
 #include <string_view>
 
@@ -21,5 +24,16 @@ class ProgramBindingConstructionAuthority final {
   [[nodiscard]] static std::shared_ptr<const ProgramBinding> reload_intrinsic(
       std::string_view canonical_bytes);
 };
+
+/// The declared frame role a target frame role binds as; null when the type
+/// does not declare it (a custom TCP).
+[[nodiscard]] inline const core::ComponentTypeFrameRoleDTO*
+declared_target_frame_role(const core::ComponentTypeCommandTargetDTO& target,
+                           const core::FrameRoleId& role) {
+  const auto found = std::find_if(
+      target.frame_roles.begin(), target.frame_roles.end(),
+      [&](const auto& value) { return value.frame_role_id == role; });
+  return found == target.frame_roles.end() ? nullptr : &*found;
+}
 
 }  // namespace manyforge::deployment::detail

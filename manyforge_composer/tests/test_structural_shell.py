@@ -53,7 +53,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 49
+    assert len(payload["entries"]) == 50  # motion.set_tcp
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
     assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
@@ -92,7 +92,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 49
+    assert len(environment_payload["executableRegistry"]) == 50
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:
@@ -990,3 +990,57 @@ def test_scenario_folder_browser_is_bounded(
     )
 
     assert response.status_code == 413
+
+
+def test_typed_refusals_name_their_producer_and_share_the_validation_shape() -> None:
+    from fastapi import HTTPException
+    from pydantic import BaseModel
+
+    app = create_app(
+        ComposerState(),
+        security=SecurityConfig(
+            allowed_fs_roots=["/workspace"],
+            cors_origins=["http://localhost:3000"],
+        ),
+    )
+
+    def own_refusal() -> None:
+        raise HTTPException(status_code=409, detail={"code": "test_refused", "message": "no"})
+
+    def forwarded_refusal() -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "stale_generation", "message": "moved", "producer": "kernel"},
+        )
+
+    def plain_refusal() -> None:
+        raise HTTPException(status_code=404, detail="Not here")
+
+    class Body(BaseModel):
+        name: str
+
+    def validated(body: Body) -> dict[str, str]:
+        return {"name": body.name}
+
+    for path, endpoint, methods in (
+        ("/api/test/own", own_refusal, ["GET"]),
+        ("/api/test/forwarded", forwarded_refusal, ["GET"]),
+        ("/api/test/plain", plain_refusal, ["GET"]),
+        ("/api/test/validated", validated, ["POST"]),
+    ):
+        app.add_api_route(path, endpoint, methods=methods)
+        # Ahead of the unavailable catch-all.
+        app.router.routes.insert(0, app.router.routes.pop())
+    client = TestClient(app)
+
+    assert client.get("/api/test/own").json()["detail"] == {
+        "code": "test_refused", "message": "no", "producer": "composer",
+    }
+    assert client.get("/api/test/forwarded").json()["detail"]["producer"] == "kernel"
+    assert client.get("/api/test/plain").json() == {"detail": "Not here"}
+    refused = client.post("/api/test/validated", json={})
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert detail["code"] == "invalid_request"
+    assert detail["details"] == {"body.name": "missing"}
+    assert detail["producer"] == "composer"

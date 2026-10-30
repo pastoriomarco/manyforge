@@ -26,6 +26,9 @@ struct CollisionWorldPolicySnapshotBundle {
 
   CollisionWorldSnapshotPtr world;
   std::optional<CollisionPolicySnapshot> policy;
+  /// Operation-local clearance margins installed by the Kernel at admission
+  /// from `world`, `policy` and the request. Publishers leave it null.
+  std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
 };
 
 /// One immutable, coherent publication consumed by runtime-safety ticks.

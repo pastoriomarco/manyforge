@@ -45,6 +45,7 @@ export const HARDWARE_ACTING_NODE_IDS: ReadonlySet<string> = new Set([
   'motion.move_to_pose',
   'motion.move_until_signal',
   'motion.probe_search',
+  'motion.set_tcp',
 ]);
 
 export function isHardwareActingNode(nodeId: string): boolean {
@@ -95,7 +96,10 @@ export function executionGroupScopes(
       scope.hardwareNodeIds.push(node.instance_id);
       if (targetRole === null) continue;
       scope.targetRoleIds.add(targetRole);
-      if (node.node_id.startsWith('motion.')) scope.motionTargetRoleIds.add(targetRole);
+      // Set TCP changes controller state but does not move the robot.
+      if (node.node_id.startsWith('motion.') && node.node_id !== 'motion.set_tcp') {
+        scope.motionTargetRoleIds.add(targetRole);
+      }
     }
     for (const child of node.children) pending.push({ node: child, inherited: groups });
   }

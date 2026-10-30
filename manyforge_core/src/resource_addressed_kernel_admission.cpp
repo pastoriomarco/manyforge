@@ -1,4 +1,5 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include "admission_timing_internal.hpp"
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/types/program_io_condition.hpp>
@@ -138,6 +139,7 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireComponent
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_admission_claim(
     const CellAdmissionClaimIntentDTO& intent, const bool close_disable) {
+  detail::AdmissionTiming timing(false, intent.request_id.value());
   if (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
       intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
     return reject<CellAdmissionClaimDTO>(
@@ -169,9 +171,13 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
   const bool physical_mutation = intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle ||
                                  intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset;
   if (physical_mutation) {
+    const auto wait_start = detail::AdmissionTiming::Clock::now();
     submit_lock.lock();
+    timing.record->submission_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   }
+  const auto admission_wait_start = detail::AdmissionTiming::Clock::now();
   std::unique_lock admission_lock(*admission_mutex_);
+  timing.record->admission_wait += detail::AdmissionTiming::Clock::now() - admission_wait_start;
   if (physical_mutation) {
     std::lock_guard state_lock(state_mutex_);
     // Every blocking condition and the identities it concerns, so a caller
@@ -224,7 +230,9 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_adm
       : close_disable ? cell_admission_owner_->AcquireCloseDisableLifecycleClaim(intent)
                       : cell_admission_owner_->AcquireCellAdmissionClaim(intent);
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
+    const auto refresh_start = detail::AdmissionTiming::Clock::now();
     refresh_execution_claims();
+    timing.record->refresh += detail::AdmissionTiming::Clock::now() - refresh_start;
   }
   admission_lock.unlock();
   return acquired;
@@ -1166,10 +1174,15 @@ ResourceAddressedExecutionKernel::AcquireSelectedComponentBringUpClaim(
 }
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
+  detail::AdmissionTiming timing(true, release.request_id.value());
+  const auto wait_start = detail::AdmissionTiming::Clock::now();
   std::unique_lock admission_lock(*admission_mutex_);
+  timing.record->admission_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto released = cell_admission_owner_->ReleaseCellAdmissionClaim(release);
   if (released.ok()) {
+    const auto refresh_start = detail::AdmissionTiming::Clock::now();
     refresh_execution_claims();
+    timing.record->refresh += detail::AdmissionTiming::Clock::now() - refresh_start;
   }
   admission_lock.unlock();
   return released;
@@ -1374,8 +1387,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_manual_operation_admiss
       // The existing exact operation-control gate wins a concurrent Stop or
       // terminal transition. Reconsider only these races on the owner wake.
       if (reason != retired.error().details.end() &&
-          (reason->second == "operation_revision_stale" ||
-           reason->second == "operation_not_resident" ||
+          (reason->second == "operation_not_resident" ||
            reason->second == "operation_control_state_invalid" ||
            reason->second == "operation_control_busy" ||
            reason->second == "operation_effect_in_flight" ||

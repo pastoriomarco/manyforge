@@ -11,6 +11,13 @@ namespace manyforge::roboplan_backend::host_detail {
 namespace {
 using Value = content_identity::CanonicalValue;
 
+TEST(ToolPayloadCommandCodec, RemovedBridgeCommandIsRejected) {
+  const auto command = content_identity::canonical_json(Value(Value::Object{
+      {"api_version", Value(std::string(kCommandApiVersion))},
+      {"command", Value("apply_tool_payload")}}));
+  EXPECT_THROW(DecodeCommand(command), std::exception);
+}
+
 Value Row(std::string name, std::string type, Value value) {
   return Value(Value::Object{{"name", Value(std::move(name))},
                              {"value_type", Value(std::move(type))},
@@ -471,14 +478,15 @@ TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControl
 }
 }  // namespace
 
+// Active TCP (M7, T-MQ17): the motion's TCP is the three-form selector; the
+// pre-M7 `{target_role_id, frame_role_id}` endpoint is refused.
 TEST(MotionEndpointCommandCodecTest,
-     DecodesOnlyTheRequiredPortableTcpEndpoint) {
+     DecodesOnlyTheRequiredTcpSelector) {
   const auto payload = Value(Value::Object{
       {"kind", Value("motion")},
       {"move_id", Value("move.endpoint")},
       {"base_frame_role_id", Value("base")},
-      {"tcp_endpoint", Value(Value::Object{{"target_role_id", Value("arm")},
-                                           {"frame_role_id", Value("tcp")}})},
+      {"tcp_endpoint", Value(Value::Object{{"kind", Value("current")}})},
       {"tolerances",
        Value(Value::Object{{"joint_position_tol_rad", Value(0.01)},
                            {"translation_tol_m", Value(0.001)},
@@ -527,19 +535,33 @@ TEST(MotionEndpointCommandCodecTest,
         core::RequestAttributionDTO{});
   };
   const auto own = decode(payload);
-  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(
-                own.participants.front().payload)
-                .tcp_endpoint.target_role_id,
-            core::TargetRoleId("arm"));
+  EXPECT_TRUE(std::holds_alternative<core::CurrentTcpDTO>(
+      std::get<core::MotionParticipantIntentDTO>(own.participants.front().payload)
+          .tcp_endpoint));
   auto fields = payload.as_object();
-  const Value endpoint(Value::Object{{"target_role_id", Value("tool")},
-                                     {"frame_role_id", Value("tip")}});
+  const Value entry(Value::Object{{"component_id", Value("gripper")},
+                                  {"target_id", Value("tool")},
+                                  {"frame_role_id", Value("tip")}});
+  const Value endpoint(Value::Object{{"kind", Value("entry")}, {"entry", entry}});
   const auto qualified =
       decode(Replace(Value(fields), "tcp_endpoint", endpoint));
   const auto &motion = std::get<core::MotionParticipantIntentDTO>(
       qualified.participants.front().payload);
-  EXPECT_EQ(motion.tcp_endpoint.target_role_id, core::TargetRoleId("tool"));
-  EXPECT_EQ(motion.tcp_endpoint.frame_role_id, core::FrameRoleId("tip"));
+  EXPECT_EQ(motion.tcp_endpoint,
+            core::TcpSelectorDTO(core::TcpEntryDTO{core::ControllableComponentId("gripper"),
+                                                   core::CommandTargetId("tool"),
+                                                   core::FrameRoleId("tip")}));
+  const auto form2 = decode(Replace(
+      Value(fields), "tcp_endpoint",
+      Value(Value::Object{{"kind", Value("default_of_role")}, {"role", Value("tool")}})));
+  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(form2.participants.front().payload)
+                .tcp_endpoint,
+            core::TcpSelectorDTO(core::DefaultTcpOfRoleDTO{core::TargetRoleId("tool")}));
+  // The pre-M7 endpoint shape is refused.
+  EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
+                              Value(Value::Object{{"target_role_id", Value("arm")},
+                                                  {"frame_role_id", Value("tcp")}}))),
+               std::exception);
   // Contact is explicit even for a joint destination. Spatial references
   // remain invalid; resolving this policy/object pair remains Core-owned.
   const Value runtime_object(Value::Object{
@@ -579,11 +601,56 @@ TEST(MotionEndpointCommandCodecTest,
                               Replace(endpoint, "extra", Value(true)))),
                std::exception);
   EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
-                              Replace(endpoint, "frame_role_id", Value("")))),
+                              Replace(endpoint, "entry",
+                                      Replace(entry, "frame_role_id", Value(""))))),
                std::exception);
   std::erase_if(fields,
                 [](const auto &row) { return row.first == "tcp_endpoint"; });
   EXPECT_THROW(decode(Value(fields)), std::exception);
+}
+
+// Active TCP (M7, T-MQ15): the Set TCP payload carries a selector only.
+TEST(MotionEndpointCommandCodecTest, DecodesTheSetTcpPayload) {
+  const auto decode = [](Value payload) {
+    return DecodeOperation(
+        Value(Value::Object{
+            {"request_context",
+             Value(Value::Object{{"request_id", Value("request.set_tcp")},
+                                 {"request_owner_epoch", Value("owner")},
+                                 {"source_label", Value("test")},
+                                 {"correlation_id", Value(nullptr)}})},
+            {"program_id", Value("program")},
+            {"program_revision", Value("revision")},
+            {"program_binding_id", Value("binding")},
+            {"program_run_id", Value("run")},
+            {"expected_graph_revision", Value("graph")},
+            {"expected_retained_bundle_id", Value("bundle")},
+            {"expected_scene_revision", Value(nullptr)},
+            {"coordination_policy", Value("independent")},
+            {"participants", Value(Value::Array{Value(Value::Object{
+                                 {"component_role_id", Value("robot")},
+                                 {"target_role_id", Value("arm")},
+                                 {"required_capability_id",
+                                  Value("execution.trajectory.execute")},
+                                 {"action_span", Value(nullptr)},
+                                 {"payload", std::move(payload)}})})}}),
+        core::RequestAttributionDTO{});
+  };
+  const Value entry(Value::Object{{"component_id", Value("gripper")},
+                                  {"target_id", Value("tool")},
+                                  {"frame_role_id", Value("tip")}});
+  const auto decoded = decode(Value(Value::Object{
+      {"kind", Value("set_tcp")},
+      {"tcp", Value(Value::Object{{"kind", Value("entry")}, {"entry", entry}})}}));
+  const auto &set = std::get<core::SetTcpParticipantIntentDTO>(
+      decoded.participants.front().payload);
+  EXPECT_TRUE(std::holds_alternative<core::TcpEntryDTO>(set.tcp));
+  EXPECT_THROW(decode(Value(Value::Object{{"kind", Value("set_tcp")}})), std::exception);
+  EXPECT_THROW(decode(Value(Value::Object{
+                   {"kind", Value("set_tcp")},
+                   {"tcp", Value(Value::Object{{"kind", Value("current")}})},
+                   {"extra", Value(true)}})),
+               std::exception);
 }
 
 TEST(MockIoInputCommandCodecTest,
@@ -741,6 +808,26 @@ TEST(OperationRecoveryCommandCodecTest,
   ASSERT_NE(details, nullptr);
   EXPECT_EQ(*details->find_object_member("reason"),
             Value("action_not_allowed"));
+}
+
+TEST(ActiveTcpCommandCodecTest, OrderedReadRoutesOnlyExplicitTrueToSubmissionLane) {
+  const auto decode = [](Value::Object extra) {
+    Value::Object root{{"api_version", Value(std::string(kCommandApiVersion))},
+                       {"command", Value("read_active_tcp")}};
+    root.insert(root.end(), extra.begin(), extra.end());
+    return DecodeCommand(content_identity::canonical_json(Value(std::move(root))));
+  };
+  const auto ordinary = decode({});
+  EXPECT_EQ(ordinary.kind, CommandKind::kReadActiveTcp);
+  EXPECT_FALSE(IsSubmissionOrdered(ordinary.kind));
+  const auto explicitly_false = decode({{"ordered", Value(false)}});
+  EXPECT_EQ(explicitly_false.kind, CommandKind::kReadActiveTcp);
+  EXPECT_FALSE(IsSubmissionOrdered(explicitly_false.kind));
+  const auto ordered = decode({{"ordered", Value(true)}});
+  EXPECT_EQ(ordered.kind, CommandKind::kReadActiveTcpOrdered);
+  EXPECT_TRUE(IsSubmissionOrdered(ordered.kind));
+  EXPECT_THROW((void)decode({{"ordered", Value("true")}}), std::exception);
+  EXPECT_THROW((void)decode({{"ordered", Value(true)}, {"extra", Value(true)}}), std::exception);
 }
 
 }  // namespace manyforge::roboplan_backend::host_detail

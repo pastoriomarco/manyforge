@@ -11,20 +11,21 @@
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
 
-/// Exact already-compiled endpoint and current observation/query owners used
-/// by one Deployment-selected geometric-contact source. The endpoint owns its
-/// contact-body list; this adapter never accepts another body selector list.
+/// Live Active TCP contact-body selection and current observation/query owners
+/// used by one Deployment-selected geometric-contact source.
 struct GeometricContactInputBinding final {
   core::InterruptSourceId source_id;
   core::IoSourceIncarnation incarnation;
   std::vector<core::IoSignalDescriptorDTO> signals;
-  core::RuntimeMotionEndpointBindingDTO endpoint;
+  std::function<core::Result<std::vector<core::CollisionBodyId>>()>
+      read_contact_bodies;
   core::SceneResourceId target_scene_resource_id;
   /// Current reported coordinate authorities needed by the selected endpoint.
   /// Integrated model-backed grippers have their own publication and are
@@ -36,6 +37,12 @@ struct GeometricContactInputBinding final {
   std::shared_ptr<core::IScheduler> scheduler;
   core::Duration sample_period_ns{};
   core::Duration query_timeout_ns{};
+  /// Classification in the prepared snapshot for this robot's motion group.
+  std::function<std::optional<bool>(const core::CollisionWorldSnapshot &,
+                                    const core::CollisionBodyId &)>
+      body_static_wrt_group;
+  /// A model coordinate has no position authority, e.g. a pneumatic tool.
+  bool model_coordinate_unavailable{};
 };
 
 struct GeometricContactInputBaseline final {

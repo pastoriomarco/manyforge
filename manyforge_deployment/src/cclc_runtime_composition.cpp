@@ -1,6 +1,7 @@
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <set>
 
 #include <fcntl.h>
@@ -106,14 +107,9 @@ public:
           core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
               const core::ControlDomainId &)>
           current_configuration_source,
-      std::unique_ptr<core::FilesystemResolvedStopBasePlanRepository>
-          &repository,
-      const CCLCRuntimeCompositionConfig &config,
       core::ICCLCKernelRouteConfigurationFencePort &route_fence,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
       core::IClock &clock, core::ICCLCComponentCommandReadinessPort *readiness,
-      core::FilesystemResolvedStopBasePlanRepository *existing_repository =
-          nullptr,
       std::shared_ptr<const void> installed_lifetime = {},
       std::shared_ptr<const core::ConfiguredRobotMeasuredStateInventory> measured_inventory = {},
       CCLCReadinessSourceCapture capture_readiness_sources = {})
@@ -122,9 +118,6 @@ public:
         active_publication_reader(publication_reader),
         expected_publication(std::move(publication)),
         port_registry(std::move(brand_ports), std::move(controller_ports)),
-        plan_repository(existing_repository != nullptr
-                            ? *existing_repository
-                            : InitializePlanRepository(repository, config)),
         lifecycle_snapshot_source(
             *retained_bundle, publication_reader, expected_publication,
             journal, catalog_source, std::move(providers),
@@ -138,7 +131,7 @@ public:
                               std::move(controllers),
                               std::move(current_configuration_source)),
         route_publication_port(*retained_bundle, artifact_source,
-                               plan_repository, kernel_publication_owner,
+                               kernel_publication_owner,
                                std::move(source_projections),
                                [&clock] { return clock.now(); }),
         services{lifecycle_snapshot_source,
@@ -151,7 +144,10 @@ public:
                  ProductIdentity(*retained_bundle, expected_publication),
                  &route_snapshot_source,
                  std::move(measured_inventory),
-                 std::move(capture_readiness_sources)} {}
+                 std::move(capture_readiness_sources),
+                 ros2_control_execution_runtime_contract::
+                     component_lifecycle_budgets_ns(
+                         retained_bundle->value().cell_graph)} {}
 
   // First member: all borrowed installed product sources/ports are destroyed
   // before this single owning lifetime pin is released.
@@ -160,7 +156,6 @@ public:
   const core::IActiveBundlePublicationReader &active_publication_reader;
   const core::ActiveBundlePublicationReceiptDTO expected_publication;
   core::FixedCCLCPortRegistry port_registry;
-  core::FilesystemResolvedStopBasePlanRepository &plan_repository;
   VerifiedComponentLifecycleCurrentSnapshotSource lifecycle_snapshot_source;
   VerifiedRouteSelectionCurrentSnapshotSource route_snapshot_source;
   VerifiedRouteConfigurationPublicationPort route_publication_port;
@@ -177,21 +172,6 @@ private:
           component.controllable_component_id);
     return identity;
   }
-
-  static core::FilesystemResolvedStopBasePlanRepository &
-  InitializePlanRepository(
-      std::unique_ptr<core::FilesystemResolvedStopBasePlanRepository>
-          &repository,
-      const CCLCRuntimeCompositionConfig &config) {
-    // Preserve construction order: exact registry validation precedes any
-    // repository filesystem work; the stable facade still owns the repository.
-    repository =
-        std::make_unique<core::FilesystemResolvedStopBasePlanRepository>(
-            config.run_root, config.maximum_resolved_stop_plan_count,
-            config.maximum_resolved_stop_plan_bytes,
-            config.maximum_single_resolved_stop_plan_bytes);
-    return *repository;
-  }
 };
 
 bool CCLCRuntimeCompositionConfig::locally_valid() const noexcept {
@@ -206,13 +186,6 @@ bool CCLCRuntimeCompositionConfig::locally_valid() const noexcept {
          terminal_result_bytes_capacity > 0U &&
          terminal_result_bytes_capacity <=
              core::kMaximumCCLCTerminalResultBytes &&
-         maximum_resolved_stop_plan_count > 0U &&
-         maximum_resolved_stop_plan_bytes > 0U &&
-         maximum_single_resolved_stop_plan_bytes > 0U &&
-         maximum_single_resolved_stop_plan_bytes <=
-             core::kMaximumResolvedStopBasePlanEncodedBytes &&
-         maximum_single_resolved_stop_plan_bytes <=
-             maximum_resolved_stop_plan_bytes &&
          lifecycle_target_driver.locally_valid();
 }
 
@@ -396,10 +369,9 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
           lifecycle_catalog_source, std::move(lifecycle_provider_occurrences),
           std::move(controller_sources), std::move(brand_ports),
           std::move(controller_ports), std::move(source_projections),
-          std::move(kernel_current_configuration_source), plan_repository_,
-          config_, kernel_route_fence_port, kernel_publication_owner, clock,
-          component_command_readiness_port, nullptr,
-          std::shared_ptr<const void>{},
+          std::move(kernel_current_configuration_source),
+          kernel_route_fence_port, kernel_publication_owner, clock,
+          component_command_readiness_port, std::shared_ptr<const void>{},
           std::move(measured_state_inventory),
           std::move(capture_readiness_sources))),
       coordinator_(
@@ -470,9 +442,9 @@ CCLCRuntimeComposition::PrepareProductContext(CCLCProductContextInputs inputs) {
         std::move(inputs.controller_sources), std::move(inputs.brand_ports),
         std::move(inputs.controller_ports),
         std::move(inputs.source_projections),
-        std::move(inputs.current_configuration_source), plan_repository_,
-        config_, kernel_route_fence_port_, inputs.kernel_publication_owner,
-        clock_, inputs.readiness_port, plan_repository_.get(),
+        std::move(inputs.current_configuration_source),
+        kernel_route_fence_port_, inputs.kernel_publication_owner,
+        clock_, inputs.readiness_port,
         std::move(inputs.installed_product_lifetime),
         std::move(inputs.measured_state_inventory),
         std::move(inputs.capture_readiness_sources));

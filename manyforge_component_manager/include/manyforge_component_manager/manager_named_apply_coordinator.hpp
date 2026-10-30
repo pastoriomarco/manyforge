@@ -71,6 +71,9 @@ struct ManagerNamedApplyRequestDTO final {
 
 enum class ManagerApplySettlementAttempt { kInitial, kOrdinaryHeartbeat };
 
+enum class FailedApplyAcknowledgementState { kAvailable, kAcknowledged, kUnavailable };
+[[nodiscard]] const char *ToString(FailedApplyAcknowledgementState state) noexcept;
+
 enum class ManagerNamedApplyResultState {
   kPending,
   kSucceeded,
@@ -175,6 +178,19 @@ public:
   /// process's captured original claim and inputs. Recovery never reconstructs
   /// live delegation from retained observations.
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
+
+  /// Advisory availability of acknowledgement for a failed, before-effect
+  /// Apply. The release path must check the current owner facts again.
+  [[nodiscard]] FailedApplyAcknowledgementState FailedApplyAcknowledgementStatus(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation);
+
+  /// Release only this acknowledged, proven-before-effect Apply's held fence
+  /// and claim. The original terminal failure is retained.
+  void AcknowledgeFailedApply(const manyforge::core::ApplyId &apply_id,
+                              manyforge::core::ApplyGeneration apply_generation,
+                              const manyforge::core::RequestId &request_id,
+                              const std::string &source_label);
 
   /// Nonblocking metadata read by the ordinary heartbeat. An earlier beat
   /// cannot schedule a later Apply's settlement; this is only a scheduling tag.

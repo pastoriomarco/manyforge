@@ -21,18 +21,22 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <map>
 #include <memory>
@@ -44,6 +48,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -465,6 +470,119 @@ ReceivePacket(const int fd, const std::chrono::milliseconds timeout) {
   }
   bytes.resize(static_cast<std::size_t>(count));
   return bytes;
+}
+
+[[nodiscard]] std::pair<std::string_view, std::string_view> AdmissionIdentity(
+    const detail::KernelCellAdmissionRpcPacket &packet) noexcept {
+  if (const auto *intent = std::get_if<manyforge::core::CellAdmissionClaimIntentDTO>(&packet.request))
+    return {"request_id", intent->request_id.value()};
+  if (const auto *release = std::get_if<manyforge::core::CellAdmissionClaimReleaseDTO>(&packet.request))
+    return {"request_id", release->request_id.value()};
+  if (const auto *query = std::get_if<manyforge::core::CellAdmissionRecoveryReceiptQueryDTO>(&packet.request))
+    return {"request_id", query->intent.request_id.value()};
+  if (const auto *reset = std::get_if<manyforge::core::ProgramResetSceneAuthorizationDTO>(&packet.request)) {
+    if (reset->reset_claim.has_value())
+      return {"request_id", reset->reset_claim->request_id.value()};
+    return {"program_run_id", reset->program_run_id.value()};
+  }
+  return {"none", {}};
+}
+
+template <typename Request>
+[[nodiscard]] std::pair<std::string_view, std::string_view>
+FenceIdentity(const Request &request) noexcept {
+  using namespace manyforge::core;
+  if constexpr (std::is_same_v<Request, ApplyConfigurationFenceIntentDTO>)
+    return {"apply_id", request.owner_transaction.apply_id.value()};
+  else if constexpr (std::is_same_v<Request, ApplyFenceAcquireAttemptQueryDTO>)
+    return {"apply_id", request.persisted_intent.owner_transaction.apply_id.value()};
+  else if constexpr (std::is_same_v<Request, ApplyFenceRehydrateDTO>)
+    return {"apply_id", request.apply_id.value()};
+  else if constexpr (std::is_same_v<Request, ConfigurationFenceStatusQueryDTO>)
+    return {"apply_id", request.owner_transaction.apply_id.value()};
+  else if constexpr (std::is_same_v<Request, ConfigurationFenceReleaseDTO>)
+    return {"apply_id", request.reconciliation_evidence.owner_transaction.apply_id.value()};
+  else if constexpr (std::is_same_v<Request, SelectedBringUpConfigurationFenceIntentDTO>)
+    return {"lifecycle_transaction_id", request.lifecycle_transaction_id.value()};
+  else if constexpr (std::is_same_v<Request, SelectedBringUpFenceAcquireAttemptQueryDTO>)
+    return {"lifecycle_transaction_id", request.persisted_intent.lifecycle_transaction_id.value()};
+  else if constexpr (std::is_same_v<Request, SelectedBringUpConfigurationFenceStatusQueryDTO>)
+    return {"lifecycle_transaction_id", request.owner_transaction.lifecycle_transaction_id.value()};
+  else if constexpr (std::is_same_v<Request, SelectedBringUpConfigurationFenceReleaseDTO>)
+    return {"lifecycle_transaction_id", request.reconciliation_evidence.owner_transaction.lifecycle_transaction_id.value()};
+  else if constexpr (std::is_same_v<Request, SelectedBringUpFenceReleaseAttemptQueryDTO>)
+    return {"lifecycle_transaction_id", request.persisted_request.reconciliation_evidence.owner_transaction.lifecycle_transaction_id.value()};
+  else
+    return {"none", {}};
+}
+
+// Rate limit ordinary slow records independently per command; timeouts bypass it.
+[[nodiscard]] bool AllowSlowKernelLog(const std::string_view command,
+                                      const std::chrono::steady_clock::time_point now) noexcept {
+  static constexpr std::array<std::string_view, 21> kinds{
+      "cell_admission_get", "cell_admission_update_readiness",
+      "cell_admission_publish_liveness", "cell_admission_acquire",
+      "cell_admission_release", "cell_admission_reconcile",
+      "cell_admission_recovery_receipt", "cell_admission_validate_program_reset_scene",
+      "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
+      "fence_rehydrate", "fence_query_status", "fence_release",
+      "fence_selected_acquire", "fence_selected_reconcile_attempt",
+      "fence_selected_query_status", "fence_selected_release",
+      "fence_selected_reconcile_release", "status", "composition_finalize"};
+  static std::array<std::atomic<std::int64_t>, kinds.size() + 1U> last{};
+  const auto found = std::find(kinds.begin(), kinds.end(), command);
+  const auto index = static_cast<std::size_t>(found - kinds.begin());
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+  auto previous = last[index].load(std::memory_order_relaxed);
+  while (previous == 0 || ns - previous >= 1000000000LL) {
+    if (last[index].compare_exchange_weak(previous, ns, std::memory_order_relaxed))
+      return true;
+  }
+  return false;
+}
+
+// These protocols do not have a universal per-request ID.
+[[nodiscard]] std::optional<std::string> TimedKernelExchange(
+    const int fd, const std::string_view bytes,
+    const std::chrono::milliseconds timeout, const std::string_view command,
+    const pid_t pid, const std::string_view id_type = "none",
+    const std::string_view identity = {}) {
+  auto start = std::chrono::steady_clock::now();
+  auto report = [&](const bool timed_out, const char *phase) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = now - start;
+    if (timed_out || (elapsed > std::chrono::milliseconds(200) &&
+                      AllowSlowKernelLog(command, now))) {
+      const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+      char id[129]{};
+      const auto length = std::min(identity.size(), sizeof(id) - 1U);
+      for (std::size_t i = 0; i < length; ++i) {
+        const auto c = static_cast<unsigned char>(identity[i]);
+        id[i] = c >= 33U && c <= 126U && c != '=' ? static_cast<char>(c) : '_';
+      }
+      const auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(start.time_since_epoch()).count();
+      const auto end_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+      std::fprintf(stderr, "kernel rpc timing: command=%.*s pid=%ld id_type=%.*s id=%s phase=%s start_us=%lld end_us=%lld elapsed_us=%lld timeout=%d\n",
+                   static_cast<int>(command.size()), command.data(),
+                   static_cast<long>(pid), static_cast<int>(id_type.size()), id_type.data(),
+                   length ? id : "none", phase, static_cast<long long>(start_us),
+                   static_cast<long long>(end_us), static_cast<long long>(us), timed_out ? 1 : 0);
+    }
+  };
+  try {
+    SendPacket(fd, bytes, timeout);
+  } catch (const RetainedNativeRuntimeUnitAdapterError &error) {
+    report(std::string_view(error.what()) == "native runtime control write timed out", "send");
+    throw;
+  }
+  try {
+    auto packet = ReceivePacket(fd, timeout);
+    report(!packet.has_value(), "reply");
+    return packet;
+  } catch (...) {
+    report(false, "reply");
+    throw;
+  }
 }
 
 [[nodiscard]] std::string ReceiveReadyPacket(const int fd) {
@@ -1326,10 +1444,18 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   [[nodiscard]] Response ExchangeKernelFence(Child &child,
                                              const Request &request) {
     RequireSettledInspection(child);
-    const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(
-        detail::KernelApplyFenceRpcRequest(request));
-    SendPacket(child.channel.get(), encoded, kStatusTimeout);
-    const auto packet = ReceivePacket(child.channel.get(), kStatusTimeout);
+    const detail::KernelApplyFenceRpcRequest kind(request);
+    const auto encoded = detail::EncodeKernelApplyFenceRpcRequest(kind);
+    static constexpr std::array<std::string_view, 11> names{
+        "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
+        "fence_rehydrate", "fence_query_status", "fence_release",
+        "fence_selected_acquire", "fence_selected_reconcile_attempt",
+        "fence_selected_query_status", "fence_selected_release",
+        "fence_selected_reconcile_release"};
+    static_assert(names.size() == std::variant_size_v<detail::KernelApplyFenceRpcRequest>);
+    const auto [id_type, id] = FenceIdentity(request);
+    const auto packet = TimedKernelExchange(child.channel.get(), encoded,
+        kStatusTimeout, names[kind.index()], child.pid, id_type, id);
     if (!packet.has_value()) {
       child.channel.Reset();
       StopChildNoThrow(child);
@@ -1371,9 +1497,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       return manyforge::core::Result<Response>::Err(
           {"component_bring_up_inspection_pending", "shared runtime channel has an unresolved inspection response", {}});
     const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
-    SendPacket(found->second.channel.get(), encoded, kStatusTimeout);
-    const auto packet =
-        ReceivePacket(found->second.channel.get(), kStatusTimeout);
+    const auto [id_type, id] = AdmissionIdentity(request);
+    const auto packet = TimedKernelExchange(found->second.channel.get(), encoded,
+        kStatusTimeout, request.command, found->second.pid, id_type, id);
     if (!packet.has_value()) {
       found->second.channel.Reset();
       StopChildNoThrow(found->second);
@@ -1582,6 +1708,16 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (!request.valid()) {
       Fail("selected runtime-composition request is invalid");
     }
+    // Each installed component's lifecycle time budget, from the candidate
+    // the request composes.
+    const auto candidate = bundle_source.get_verified(
+        request.candidate_projection_revision.retained_bundle_id);
+    if (candidate == nullptr) {
+      Fail("retained native adapter could not reload the candidate bundle");
+    }
+    const auto budgets_ns =
+        manyforge::deployment::ros2_control_execution_runtime_contract::
+            component_composition_budgets_ns(candidate->value().cell_graph);
     std::lock_guard lock(mutex);
     const auto found = children.find(request.runtime_unit_id.value());
     if (found == children.end()) {
@@ -1606,10 +1742,28 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // CCLC recovery before it can service the ordinary command channel.  This
     // is cold composition work, not a steady-state status exchange: the child
     // installs every added or replaced component inside this one exchange, so
-    // the budget grows with their number.
-    const auto timeout = detail::SelectedRuntimeCompositionTimeout(request.component_delta);
-    SendPacket(found->second.channel.get(), encoded, timeout);
-    const auto packet = ReceivePacket(found->second.channel.get(), timeout);
+    // it waits for the sum of their lifecycle time budgets.
+    const auto timeout =
+        detail::SelectedRuntimeCompositionTimeout(request.component_delta, budgets_ns);
+    // F-5 timing: compare with the child's install line (received_unix_ms).
+    std::cerr << "native composition request: send apply=" << request.apply_id.value()
+              << " phase="
+              << (request.phase == ManagerSelectedRuntimeCompositionPhase::kPrepare
+                      ? "prepare"
+                      : "finalize")
+              << " unix_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count()
+              << " timeout_ms=" << timeout.count() << '\n';
+    std::optional<std::string> packet;
+    if (request.phase == ManagerSelectedRuntimeCompositionPhase::kFinalize) {
+      packet = TimedKernelExchange(found->second.channel.get(), encoded, timeout,
+          "composition_finalize", found->second.pid, "apply_id", request.apply_id.value());
+    } else {
+      SendPacket(found->second.channel.get(), encoded, timeout);
+      packet = ReceivePacket(found->second.channel.get(), timeout);
+    }
     if (!packet.has_value()) {
       found->second.channel.Reset();
       StopChildNoThrow(found->second);
@@ -1620,6 +1774,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (const auto *failure =
             std::get_if<detail::SelectedRuntimeCompositionRpcFailure>(
                 &response)) {
+      // A clean composition refusal keeps its typed code and cause.
+      if (failure->error.code == kScenarioCompositionRefusedCode)
+        throw manyforge::core::TypedError(
+            failure->error, std::string(kExecutionHostProducer));
       Fail("managed runtime-composition request failed [" +
            failure->error.code + "]: " + failure->error.message);
     }
@@ -1908,9 +2066,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     auto &endpoint = liveness_endpoints.begin()->second;
     const auto encoded = detail::EncodeKernelCellAdmissionRpcRequest(request);
-    SendPacket(endpoint.channel.get(), encoded, kManagerLivenessTimeout);
-    const auto packet =
-        ReceivePacket(endpoint.channel.get(), kManagerLivenessTimeout);
+    const auto [id_type, id] = AdmissionIdentity(request);
+    const auto packet = TimedKernelExchange(endpoint.channel.get(), encoded,
+        kManagerLivenessTimeout, request.command, endpoint.pid, id_type, id);
     if (!packet.has_value()) {
       Fail("managed Kernel liveness/readiness response timed out");
     }
@@ -2384,8 +2542,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     // failure of the whole runtime.
     std::optional<std::string> packet;
     try {
-      SendPacket(found->second.channel.get(), "status", kStatusTimeout);
-      packet = ReceivePacket(found->second.channel.get(), kStatusTimeout);
+      packet = TimedKernelExchange(found->second.channel.get(), "status",
+          kStatusTimeout, "status", found->second.pid);
     } catch (const RetainedNativeRuntimeUnitAdapterError &error) {
       std::cerr << "native runtime child private channel failed: pid="
                 << found->second.pid << ": " << error.what() << '\n';

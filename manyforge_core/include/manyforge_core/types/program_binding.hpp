@@ -5,6 +5,7 @@
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 
 #include <cstddef>
 #include <optional>
@@ -52,6 +53,18 @@ struct ProgramFrameRoleBindingDTO final {
 
   friend bool operator==(const ProgramFrameRoleBindingDTO&,
                          const ProgramFrameRoleBindingDTO&) = default;
+};
+
+/// One selectable TCP known to a moving robot. `entry` names its owner while
+/// `frame` carries the exact retained frame and the owner's contact bodies.
+struct ProgramRobotTcpBindingDTO final {
+  TcpEntryDTO entry;
+  ProgramFrameRoleBindingDTO frame;
+  bool end_effector{};
+  bool component_default{};
+
+  friend bool operator==(const ProgramRobotTcpBindingDTO&,
+                         const ProgramRobotTcpBindingDTO&) = default;
 };
 
 struct ProgramResourceRoleBindingDTO final {
@@ -163,6 +176,12 @@ struct ProgramTargetRoleBindingDTO final {
   std::vector<ProgramSignalRoleBindingDTO> signal_role_bindings{};
   // Omitted for all targets without an authored pneumatic I/O mapping.
   std::optional<ProgramPneumaticIoBindingDTO> pneumatic_io{};
+  // Present for a trajectory-execution target, including an empty list;
+  // omitted for other targets. Rows cover this robot's own TCPs and every
+  // tool component's TCPs in the Deployment.
+  std::optional<std::vector<ProgramRobotTcpBindingDTO>> robot_tcps{};
+  // The bound component role's explicit or declared default TCP, if any.
+  std::optional<TcpEntryDTO> default_tcp{};
 
   friend bool operator==(const ProgramTargetRoleBindingDTO&,
                          const ProgramTargetRoleBindingDTO&) = default;

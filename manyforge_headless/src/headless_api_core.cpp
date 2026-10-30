@@ -24,6 +24,7 @@
 #include <manyforge_core/types/carried_object_lost.hpp>
 #include <manyforge_core/types/io_rule_state.hpp>
 #include <manyforge_core/types/component_incident.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
@@ -56,6 +57,9 @@ constexpr std::string_view kAssistantModeIndexIdentityDomain =
     "manyforge-assistant-mode-index-semantic";
 constexpr std::string_view kHistorianOwnerHealthCode =
     "historian_delivery_unavailable";
+constexpr std::string_view kRuntimeCollisionAlarm = "manyforge.motion.runtime_collision";
+constexpr std::string_view kRuntimeMonitorObservationLostAlarm =
+    "manyforge.motion.runtime_monitor_observation_lost";
 constexpr std::string_view kAlarmResourceRegistryHealthCode =
     "operator_alarm_resource_registry_unavailable";
 
@@ -427,10 +431,17 @@ void ValidateInterruptRuleStateProjection(const CanonicalValue &payload,
             code, "rule-state counter is not a canonical positive uint64 string");
     return result;
   };
-  closed(payload, {"owner_epoch", "catalog_generation",
-                   "active_publication_generation", "retained_bundle_id",
-                   "graph_revision", "rule_id", "state",
-                   "triggering_acquisition"});
+  const auto state = RequiredString(payload, "state");
+  if (state == "unknown")
+    closed(payload, {"owner_epoch", "catalog_generation",
+                     "active_publication_generation", "retained_bundle_id",
+                     "graph_revision", "rule_id", "state",
+                     "triggering_acquisition", "unavailable_reason"});
+  else
+    closed(payload, {"owner_epoch", "catalog_generation",
+                     "active_publication_generation", "retained_bundle_id",
+                     "graph_revision", "rule_id", "state",
+                     "triggering_acquisition"});
   const core::IoRuleStateContextDTO context{
       core::RequestOwnerEpoch(RequiredString(payload, "owner_epoch")),
       counter(payload, "catalog_generation"),
@@ -438,16 +449,30 @@ void ValidateInterruptRuleStateProjection(const CanonicalValue &payload,
           RequiredCounter(payload, "active_publication_generation", 1U)),
       core::RetainedBundleId(RequiredString(payload, "retained_bundle_id")),
       core::GraphRevision(RequiredString(payload, "graph_revision"))};
-  const auto state = RequiredString(payload, "state");
   Require(context.owner_epoch.value() == source_owner_epoch &&
-              (state == "clear" || state == "tripped" || state == "latched"),
+              (state == "clear" || state == "tripped" || state == "latched" || state == "unknown"),
           code, "rule-state projection differs from its actual owner or state");
   const auto kind = state == "clear" ? core::IoGlobalRuleState::kClear
                   : state == "tripped" ? core::IoGlobalRuleState::kTripped
-                                       : core::IoGlobalRuleState::kLatched;
+                  : state == "latched" ? core::IoGlobalRuleState::kLatched
+                                       : core::IoGlobalRuleState::kUnknown;
   core::IoRuleStateDTO rule{
       core::InterruptPolicyId(RequiredString(payload, "rule_id")), kind,
       std::nullopt};
+  if (state == "unknown") {
+    const auto &reason = RequiredMember(payload, "unavailable_reason");
+    closed(reason, {"code", "message", "details"});
+    const auto &message = RequiredMember(reason, "message");
+    Require(message.is_string(), code, "unavailable reason message must be text");
+    core::ErrorDTO error{RequiredString(reason, "code"), message.as_string(), {}};
+    const auto &details = RequiredMember(reason, "details");
+    Require(details.is_object(), code, "unavailable reason details must be an object");
+    for (const auto &[key, value] : details.as_object()) {
+      Require(value.is_string(), code, "unavailable reason detail must be text");
+      error.details.emplace(key, value.as_string());
+    }
+    rule.unavailable_reason = std::move(error);
+  }
   const auto &acquired = RequiredMember(payload, "triggering_acquisition");
   if (!acquired.is_null()) {
     closed(acquired, {"source_id", "source_epoch", "source_sequence",
@@ -473,6 +498,9 @@ OperationHistoryEventType(const std::string_view record_kind,
                           const CanonicalValue &payload) {
   if (record_kind == "interrupt_rule_state_changed") {
     return "interrupt_rule_state_changed";
+  }
+  if (record_kind == "active_tcp_changed") {
+    return "active_tcp_changed";
   }
   if (record_kind == "operation_accepted") {
     return "operation_accepted";
@@ -2192,6 +2220,36 @@ CanonicalValue HeadlessApiCore::HistorianHealth() {
   return AsyncHistorianHealthValue(historian_.Health());
 }
 
+CanonicalValue HeadlessApiCore::RecordScenarioForceClose(CanonicalValue record) {
+  // Headless builds this record from the Kernel's own Force close result;
+  // only its envelope is checked here.
+  Require(record.is_object() &&
+              RequiredString(record, "schema_version") ==
+                  "manyforge.scenario_force_close.v1" &&
+              RequiredString(record, "reason_code") == "cell_force_closed_by_operator",
+          "scenario_force_close_record_invalid", "Force close History record is invalid");
+  auto payload = record.as_object();
+  payload.emplace_back("clock_owner", CanonicalValue("headless:" + config_.owner_epoch));
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  auto event = MakeHistorianEvent("manyforge.headless", "scenario_force_closed", "WARN",
+                                  clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
+                                  CanonicalValue(std::move(payload)));
+  const auto event_id = event.event_id;
+  const bool recorded = historian_.TryEnqueue(std::move(event));
+  if (!recorded) {
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian queue rejected a Force close record");
+  }
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", CanonicalValue(event_id)},
+      {"recorded", CanonicalValue(recorded)},
+      {"schema_version", CanonicalValue("manyforge.scenario_force_close_record.v1")},
+  });
+}
+
 CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
   const std::string code = "program_diagnostic_invalid";
   const std::set<std::string> fields{"schema_version",
@@ -2783,8 +2841,11 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   const bool stop_terminal_projection =
       record_kind == "stop_terminal_projected";
   const bool stop_fault_clear_projection = record_kind == "stop_fault_cleared";
+  // Active TCP (M7, A2a-2): one History event per confirmed change (robot,
+  // old -> new entry, source, offset sent), carried in the journal payload.
+  const bool active_tcp_projection = record_kind == "active_tcp_changed";
   const bool rule_state_projection =
-      record_kind == "interrupt_rule_state_changed";
+      record_kind == "interrupt_rule_state_changed" || active_tcp_projection;
   const bool stop_scoped_projection = stop_acceptance_projection ||
                                       stop_terminal_projection ||
                                       stop_fault_clear_projection;
@@ -2811,6 +2872,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
                                                    "stop_fault_cleared",
                                                    "runtime_scale_accepted",
                                                    "interrupt_rule_state_changed",
+                                                   "active_tcp_changed",
                                                    "operation_prepared",
                                                    "state_observed",
                                                    "host_replaced"};
@@ -2827,7 +2889,16 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
   ParsedOperationFacts operation_facts;
   std::optional<std::uint64_t> stop_terminal_duration_ns;
   std::optional<std::string> stop_terminal_result;
-  if (rule_state_projection) {
+  if (active_tcp_projection) {
+    Require(!request_id && !effect_pending &&
+                RequiredString(journal_payload, "api_version") ==
+                    "manyforge.active_tcp_change.v1" &&
+                RequiredString(journal_payload, "owner_epoch") ==
+                    source_owner_epoch &&
+                !RequiredString(journal_payload, "component_id").empty(),
+            "headless_operation_event_invalid",
+            "Active TCP change does not match its durable envelope");
+  } else if (rule_state_projection) {
     Require(!request_id && !effect_pending,
             "headless_operation_event_invalid",
             "rule-state projection cannot name a request or pending effect");
@@ -3197,7 +3268,7 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
     active_operation_faults_.erase(operation);
   }
   retired.clear();
-  for (const auto &[operation, subject] : active_runtime_collisions_) {
+  for (const auto &[operation, condition] : active_runtime_collisions_) {
     if (observed_runtime_collisions_.contains(operation)) {
       continue;
     }
@@ -3206,8 +3277,8 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
             "operation alarm adapter sequence is exhausted");
     ++operation_adapter_.source_sequence;
     AlarmConditionUpdate update{
-        "manyforge.motion.runtime_collision",
-        subject,
+        condition.definition_id,
+        condition.subject,
         false,
         operation_adapter_.source_id,
         operation_adapter_.source_epoch,
@@ -4553,7 +4624,12 @@ void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
   const auto &affected = RequiredMember(journal_payload, "affected_state");
   const auto &operations = RequiredArray(affected, "operations");
   auto resources = StringArray(affected, "resources");
-  Require(reason.has_value() && *reason == "runtime_collision_fault" &&
+  // The runtime monitor's Stop is a collision, or lost measured robot state.
+  const bool observation_lost =
+      reason.has_value() &&
+      *reason == manyforge::core::error_codes::kRuntimeMonitorObservationLost;
+  Require(reason.has_value() &&
+              (*reason == "runtime_collision_fault" || observation_lost) &&
               correlation.has_value() && operations.size() == 1U &&
               !resources.empty(),
           "headless_operation_event_invalid",
@@ -4601,7 +4677,8 @@ void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
     evidence_refs.emplace_back(raw_event_id);
   }
   AlarmConditionUpdate update{
-      "manyforge.motion.runtime_collision",
+      std::string(observation_lost ? kRuntimeMonitorObservationLostAlarm
+                                   : kRuntimeCollisionAlarm),
       AlarmSubject{"operation", operation_id, resources},
       true,
       operation_adapter_.source_id,
@@ -4656,8 +4733,8 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
               "operation alarm adapter sequence is exhausted");
       ++operation_adapter_.source_sequence;
       AlarmConditionUpdate update{
-          "manyforge.motion.runtime_collision",
-          collision->second,
+          collision->second.definition_id,
+          collision->second.subject,
           false,
           operation_adapter_.source_id,
           operation_adapter_.source_epoch,
@@ -4693,8 +4770,9 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
       active_runtime_collisions_.erase(collision);
       observed_runtime_collisions_.erase(operation_id);
     } else {
-      ForgetRefusedOperationConditionLocked(
-          "manyforge.motion.runtime_collision", operation_id);
+      ForgetRefusedOperationConditionLocked(kRuntimeCollisionAlarm, operation_id);
+      ForgetRefusedOperationConditionLocked(kRuntimeMonitorObservationLostAlarm,
+                                            operation_id);
     }
   }
   // Runtime collision is a separate native condition, including for Program work.
@@ -4708,7 +4786,9 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
                              ? details->find_object_member("reason")
                              : nullptr;
     if (reason != nullptr && reason->is_string() &&
-        reason->as_string() == "runtime_collision_fault") {
+        (reason->as_string() == "runtime_collision_fault" ||
+         reason->as_string() ==
+             manyforge::core::error_codes::kRuntimeMonitorObservationLost)) {
       runtime_collision_outcome = true;
     }
   }
@@ -5101,14 +5181,16 @@ std::string RefusedConditionKey(const std::string_view definition_id,
 
 void HeadlessApiCore::TrackAdmittedOperationConditionLocked(
     const OperationConditionKind kind, const std::string &tracking_id,
-    const AlarmSubject &subject) {
+    const AlarmConditionUpdate &update) {
+  const auto &subject = update.subject;
   switch (kind) {
   case OperationConditionKind::kExecutionFault:
     active_operation_faults_.insert_or_assign(tracking_id, subject);
     observed_operation_faults_.insert(tracking_id);
     break;
   case OperationConditionKind::kRuntimeCollision:
-    active_runtime_collisions_.insert_or_assign(tracking_id, subject);
+    active_runtime_collisions_.insert_or_assign(
+        tracking_id, RuntimeMonitorStopCondition{update.definition_id, subject});
     observed_runtime_collisions_.insert(tracking_id);
     break;
   case OperationConditionKind::kProgramFailure:
@@ -5143,7 +5225,7 @@ void HeadlessApiCore::ReconsiderRefusedOperationConditionsLocked() {
       const auto mutation = alarm_owner_.Submit(entry.update);
       static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
       TrackAdmittedOperationConditionLocked(entry.kind, entry.tracking_id,
-                                            entry.update.subject);
+                                            entry.update);
     } catch (const OperatorAlarmError &) {
       refused_operation_conditions_.insert_or_assign(key, std::move(entry));
     }
@@ -5234,7 +5316,7 @@ std::optional<AlarmMutation> HeadlessApiCore::SubmitOperationConditionLocked(
       SynchronizeAlarmScopeConditionLocked();
     }
     if (update.active) {
-      TrackAdmittedOperationConditionLocked(kind, tracking_id, update.subject);
+      TrackAdmittedOperationConditionLocked(kind, tracking_id, update);
     }
     return mutation;
   } catch (const OperatorAlarmError &error) {

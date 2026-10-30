@@ -195,6 +195,19 @@ describe('generated Program Binding transport parser', () => {
     expect(parsed.target_role_bindings[0].capability_bindings).toBeInstanceOf(Array);
   });
 
+  it('preserves absent and empty robot TCP inventories and rejects null', () => {
+    const document = fixture();
+    const target = rows(document.target_role_bindings)[0];
+    delete target.robot_tcps;
+    expect(parseProgramBindingTransport(document, 'binding')).toBe(document);
+    expect(Object.hasOwn(target, 'robot_tcps')).toBe(false);
+    target.robot_tcps = [];
+    expect(parseProgramBindingTransport(document, 'binding')).toBe(document);
+    expect(target.robot_tcps).toEqual([]);
+    target.robot_tcps = null;
+    expect(() => parseProgramBindingTransport(document, 'binding')).toThrow();
+  });
+
   it('does not infer native retained-bundle context', () => {
     const document = fixture();
     document.retained_bundle_id = `sha256:${'f'.repeat(64)}`;

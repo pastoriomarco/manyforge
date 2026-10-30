@@ -37,6 +37,7 @@ from manyforge_headless_api.control_state import HeadlessControlStateSource
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
+    ManagerApplyAcknowledgementContext,
     ProgramCycleResetRequest,
     ProgramFullStopResetRequest,
     SceneResourcePoseQuery,
@@ -46,6 +47,17 @@ from manyforge_headless_api.models import (
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
 from manyforge_headless_api.service import HeadlessService, TrustedAttribution
+
+
+def test_cell_admission_error_keeps_owner_details_and_producer() -> None:
+    owner_error = CellAdmissionError(
+        "stale_generation", "claim changed", {"reason": "expected_generation_stale"},
+        producer="kernel",
+    )
+    forwarded = HeadlessService._admission_error(owner_error)
+    assert forwarded.code == "stale_generation"
+    assert forwarded.details == {"reason": "expected_generation_stale"}
+    assert forwarded.producer == "kernel"
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -282,6 +294,7 @@ def test_execution_projection_refusal_preserves_http_class_and_owner_details(
             "code": code,
             "message": message,
             "details": details,
+            "producer": "kernel",
             "request_id": "empty-runtime-check",
         }
     else:
@@ -559,6 +572,7 @@ class FakeCore:
 
     def node_environment_projection(self) -> dict[str, Any]:
         return {
+            "capability_offers": [],
             "schema_version": "manyforge.node_environment_projection.v2",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
@@ -579,9 +593,10 @@ class FakeCore:
 
     def source_model_projection(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.source_model_projection.v2",
+            "schema_version": "manyforge.source_model_projection.v3",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
+            "components": [],
             "occurrences": [],
             "targets": [],
             "source": {
@@ -804,6 +819,8 @@ class FakeManager:
         self.scene_requests: list[tuple[SceneTransactionRequest, str | None]] = []
         self.scene_pose_requests: list[SceneResourcePoseQuery] = []
         self.apply_observations: list[tuple[str, int]] = []
+        self.apply_acknowledgements: list[tuple[str, int]] = []
+        self.apply_acknowledgement_contexts: list[ManagerApplyAcknowledgementContext] = []
 
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         self.requests.append(request)
@@ -852,7 +869,35 @@ class FakeManager:
             "request_id": "request.1",
             "request_owner_epoch": "client.epoch.1",
             "state": "pending",
+            "failure_acknowledgement": "unavailable",
         }
+
+    def acknowledge_apply(
+        self,
+        apply_id: str,
+        apply_generation: int,
+        request_context: ManagerApplyAcknowledgementContext,
+    ) -> dict[str, Any]:
+        self.apply_acknowledgements.append((apply_id, apply_generation))
+        self.apply_acknowledgement_contexts.append(request_context)
+        status = self.observe_apply(apply_id, apply_generation)
+        status.update(
+            {
+                "state": "failed",
+                "failure_acknowledgement": "acknowledged",
+                "failure": {
+                    "cause_code": "manager_apply_preflight_refused",
+                    "cause_details": {},
+                    "code": "manager_apply_preflight_refused",
+                    "effect_boundary": "before_effect",
+                    "effect_disposition": "known",
+                    "message": "Apply was refused before effect.",
+                    "phase": "accepted",
+                    "producer": "component_manager",
+                },
+            }
+        )
+        return status
 
     def commit_scene_transaction(
         self,
@@ -1365,6 +1410,11 @@ def _node_availability_fixture(
         core["reason_codes"] = ["program_binding_unselected"]
         core_implementations.append(core)
     core_projection = {
+        "capability_offers": sorted({
+            requirement.capability_id
+            for entry in environment.catalog.entries
+            for requirement in entry.required_capabilities
+        }),
         "schema_version": "manyforge.node_environment_projection.v2",
         "retained_bundle_id": applied["retained_bundle_id"],
         "graph_revision": applied["graph_revision"],
@@ -1613,7 +1663,7 @@ class FakeActivationPreparer:
         }
 
 
-def test_activation_preparation_requires_current_idle_generation() -> None:
+def test_activation_preparation_accepts_any_generation_while_idle() -> None:
     core = FakeCore()
     manager = FakeManager()
     preparer = FakeActivationPreparer()
@@ -1655,10 +1705,11 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
         }
     ]
 
-    body["expected_admission_generation"] = _ADMISSION_GENERATION + 1
-    rejected = client.post("/api/activation-preparations", json=body)
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "stale_generation"
+    # The request's generation is evidence only: a different one is prepared.
+    body["expected_admission_generation"] = _ADMISSION_GENERATION - 1
+    prepared = client.post("/api/activation-preparations", json=body)
+    assert prepared.status_code == 200, prepared.text
+    assert len(preparer.calls) == 2
 
 
 def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
@@ -1828,7 +1879,7 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
             "manyforge.node_environment_projection.v2"
         )
         assert context["source_model"]["schema_version"] == (
-            "manyforge.source_model_projection.v2"
+            "manyforge.source_model_projection.v3"
         )
         urdf = client.get("/api/viewer-model/urdf")
         assert urdf.status_code == 200
@@ -2013,6 +2064,126 @@ def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
     ]
 
 
+def _palette_projection(applied: dict[str, Any], offers: list[str] | None = None) -> dict[str, Any]:
+    core = FakeCore()
+    core.applied_program = copy.deepcopy(applied)
+    core_projection, runner_projection = _node_availability_fixture(applied)
+    if offers is not None:
+        core_projection["capability_offers"] = sorted(offers)
+    core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
+    return _service(core, FakeManager(), program_runner=_NodeAvailabilityRunner(runner_projection)).node_environment()
+
+
+def _palette_row(projection: dict[str, Any], node_id: str) -> dict[str, Any]:
+    return next(row for row in projection["availability"]["implementations"]
+                if row["node_id"] == node_id)
+
+
+def test_palette_model_api_uses_applied_endpoint_and_model_configuration() -> None:
+    applied = _applied_projection(_program_document())
+    absent = _palette_projection(applied)
+    row = _palette_row(absent, "assistant.query_model")
+    assert row["authoring_available"] is True
+    assert row["binding_available"] is False
+    assert row["reasons"] == [{"code": "model_not_configured",
+                                "message": "No model is configured",
+                                "details": {}}]
+    for node_id in ("assistant.build_scene_selection", "assistant.validate_scene_selection"):
+        row = _palette_row(absent, node_id)
+        assert row["authoring_available"] is True
+        assert row["binding_available"] is True
+        assert row["execution_available"] is True
+        assert row["reasons"] == []
+    applied["assistant_mode"] = "optional"
+    applied["assistant_projection"] = {
+        "model_endpoint_aliases": [{"external_resource_alias": "model.1"}],
+        "ai_models": [{"controllable_component_id": "model.1"}],
+    }
+    configured = _palette_projection(applied)
+    row = _palette_row(configured, "assistant.query_model")
+    assert row["binding_available"] is True
+    assert row["execution_available"] is True
+    assert row["reasons"] == []
+    applied["assistant_projection"]["ai_models"][0]["controllable_component_id"] = "other"
+    assert _palette_row(_palette_projection(applied), "assistant.query_model")["binding_available"] is False
+
+
+def test_palette_gripper_and_multiple_capability_requirements() -> None:
+    applied = _applied_projection(_program_document())
+    all_offers = _node_availability_fixture(applied)[0]["capability_offers"]
+    no_gripper = [offer for offer in all_offers if not offer.startswith("tool.gripper.")]
+    row = _palette_row(_palette_projection(applied, no_gripper), "gripper.command_position")
+    assert row["authoring_available"] is True
+    assert row["binding_available"] is False
+    assert row["execution_available"] is False
+    assert row["reasons"] == [{"code": "capability_not_offered",
+                                "message": "No component offers tool.gripper.command",
+                                "details": {"capability": "tool.gripper.command"}}]
+    assert _palette_row(_palette_projection(applied, all_offers), "gripper.command_position")["binding_available"] is True
+    missing_scene = [offer for offer in all_offers if offer != "scene.shape.sphere"]
+    row = _palette_row(_palette_projection(applied, missing_scene), "scene.add_object")
+    assert row["reasons"][0]["details"] == {"capability": "scene.shape.sphere"}
+
+
+def test_palette_conditional_requirements_allow_one_complete_alternative() -> None:
+    applied = _applied_projection(_program_document())
+    all_offers = _node_availability_fixture(applied)[0]["capability_offers"]
+    one_profile = [offer for offer in all_offers if offer not in {
+        "planning.profile.balanced", "planning.profile.quality_bounded"}]
+    row = _palette_row(_palette_projection(applied, one_profile), "motion.move_to_joint_target")
+    assert row["binding_available"] is True
+    none = [offer for offer in one_profile if offer != "planning.profile.first_feasible"]
+    row = _palette_row(_palette_projection(applied, none), "motion.move_to_joint_target")
+    assert row["binding_available"] is False
+    assert row["reasons"][0]["details"] == {"capability": "planning.profile.first_feasible"}
+
+
+def test_palette_without_selected_binding_keeps_unselected_reason() -> None:
+    applied = _applied_projection(_program_document())
+    core_projection, runner_projection = _node_availability_fixture(applied)
+    core = FakeCore()
+    core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
+    runner = _NodeAvailabilityRunner(runner_projection)
+    result = _service(core, FakeManager(), program_runner=runner).node_environment()
+    row = _palette_row(result, "assistant.query_model")
+    assert row["reason_codes"] == ["program_binding_unselected"]
+    assert row["reasons"] == []
+    assert runner.calls == []
+    assert "capability_offers" not in result
+
+
+def test_palette_keeps_owner_failure_and_joins_required_node_reason() -> None:
+    applied = _applied_projection(_program_document())
+    core = FakeCore()
+    core.applied_program = copy.deepcopy(applied)
+    core_projection, runner_projection = _node_availability_fixture(applied)
+    node = next(row for row in runner_projection["availability"]["implementations"]
+                if row["node_id"] == "gripper.command_position")
+    node["owner_health_available"] = False
+    node["execution_available"] = False
+    node["reason_codes"] = ["program_runtime_owner_unavailable"]
+    core_projection["capability_offers"] = [
+        offer for offer in core_projection["capability_offers"]
+        if offer != "tool.gripper.command"
+    ]
+    availability = runner_projection["availability"]
+    availability["required_node_ids"] = ["gripper.command_position"]
+    availability["execution_available"] = False
+    availability["reason_codes"] = ["program_runtime_owner_unavailable"]
+    source = runner_projection["source"]
+    source["content_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps({
+        "availability": availability,
+        **{key: value for key, value in source.items() if key != "content_digest"},
+    })).hexdigest()
+    core.node_environment_projection = lambda: copy.deepcopy(core_projection)  # type: ignore[method-assign]
+    result = _service(core, FakeManager(), program_runner=_NodeAvailabilityRunner(runner_projection)).node_environment()
+    row = _palette_row(result, "gripper.command_position")
+    assert row["owner_health_available"] is False
+    assert row["reason_codes"] == ["capability_not_offered", "program_runtime_owner_unavailable"]
+    assert result["availability"]["execution_available"] is False
+    assert result["availability"]["reason_codes"] == ["capability_not_offered", "program_runtime_owner_unavailable"]
+
+
 def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
     core = FakeCore()
     applied = _applied_projection(_program_document())
@@ -2170,6 +2341,7 @@ def test_program_started_then_failed_preserves_owner_status_and_details(
         "code": code,
         "message": "Owner outcome",
         "details": details,
+        "producer": "program_runner",
         "request_id": response.headers["X-Request-ID"],
     }
 
@@ -2836,6 +3008,32 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
         "program_binding_id": "sha256:" + "9" * 64,
     }
     assert manager.apply_observations == [("apply/7", 7)]
+
+
+def test_apply_acknowledgement_is_a_post_for_the_exact_durable_identity() -> None:
+    client, _core, manager = _client()
+    with client:
+        response = client.post(
+            "/api/manager/apply/acknowledge",
+            params={"apply_id": "apply/7", "apply_generation": 7},
+            json={"request_context": {
+                "request_id": "composer-ack.request.7",
+                "source_label": "manyforge_composer",
+            }},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "failed"
+    assert body["failure_acknowledgement"] == "acknowledged"
+    assert body["failure"]["message"] == "Apply was refused before effect."
+    assert manager.apply_acknowledgements == [("apply/7", 7)]
+    assert manager.apply_acknowledgement_contexts[0].model_dump(
+        mode="json", exclude_none=True
+    ) == {
+        "request_id": "composer-ack.request.7",
+        "source_label": "manyforge_composer",
+    }
 
 
 class _CommittingManager(FakeManager):
@@ -3934,7 +4132,7 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
                     "kind": "motion",
                     "move_id": "robot-control-joint-preview",
                     "base_frame_role_id": "base",
-                    "tcp_endpoint": {"target_role_id": "command_target", "frame_role_id": "tcp"},
+                    "tcp_endpoint": {"kind": "current"},
                     "tolerances": {
                         "joint_position_tol_rad": 0.001,
                         "translation_tol_m": 0.001,
@@ -4576,6 +4774,7 @@ class _PersistentValuesRunner:
                 "persistent_key_run_conflict",
                 "Program run program-cycle.1 refused the edit",
                 409,
+                producer="kernel",
             )
         return {"action": action}
 
@@ -4616,6 +4815,7 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
     )
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "persistent_key_run_conflict"
+    assert refused.json()["detail"]["producer"] == "kernel"
     # A relative or non-normalized project folder is refused before the runner.
     for path in ("projects/cell-pick.scenario", "/projects/./cell-pick.scenario"):
         assert client.post(
@@ -4762,6 +4962,35 @@ def test_sealed_preparation_uses_fresh_selection_and_has_no_apply_effect() -> No
     assert worker.calls == [_empty_preparation_selection()]
     assert manager.selection_reads == 2
     assert worker.released == []
+
+
+def test_sealed_preparation_refuses_close_while_a_part_is_attached() -> None:
+    class _CarryingCore(FakeCore):
+        def runtime_snapshot(self) -> dict[str, Any]:
+            snapshot = super().runtime_snapshot()
+            snapshot["sections"]["logical_scene"]["payload"]["snapshot"] = {
+                "carried_object_attachments": [{
+                    "carried_object_attachment_id": "attachment.1",
+                    "scene_resource_id": "graspable",
+                    "controllable_component_id": "lite6_robot",
+                    "command_target_id": "gripper",
+                }],
+            }
+            return snapshot
+
+    manager = _EmptyPreparationManager()
+    worker = _EmptyPreparationWorker()
+    client = TestClient(create_app(service=_service(_CarryingCore(), manager, activation_preparer=worker)))
+    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "scenario_close_attachment_present"
+    assert detail["details"] == {"carried_objects": [{
+        "scene_resource_id": "graspable",
+        "controllable_component_id": "lite6_robot",
+        "command_target_id": "gripper",
+    }]}
+    assert worker.calls == [] and worker.released == []
 
 
 @pytest.mark.parametrize("field", ["request_owner_epoch", "cell_id", "deployment_artifact_id",
@@ -4954,3 +5183,39 @@ def test_stop_fault_recovery_route_dispatches_the_global_io_rule_variant() -> No
     assert dumped["selector"] == recovery["selector"]
     assert dumped["reason"] is None
     assert dumped["request_context"]["request_id"] == "request.rule-recovery.1"
+
+
+def test_request_validation_refusal_maps_each_field_path_to_its_code() -> None:
+    client, _core, manager = _client()
+    response = client.post(
+        "/api/manager/apply", headers={"X-Request-ID": "validation-1"}, json={}
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid_request"
+    assert detail["producer"] == "headless_api"
+    assert detail["request_id"] == "validation-1"
+    assert detail["details"]
+    assert all(path.startswith("body") for path in detail["details"])
+    assert all(isinstance(code, str) and code for code in detail["details"].values())
+    assert next(iter(detail["details"])) in detail["message"]
+    assert manager.requests == []
+
+
+def test_uncaught_failure_answers_with_the_typed_carrier() -> None:
+    app = create_app(service=_service(FakeCore(), FakeManager()))
+
+    def boom() -> None:
+        raise RuntimeError("owner exploded")
+
+    app.add_api_route("/api/test/boom", boom, methods=["GET"])
+    response = TestClient(app, raise_server_exceptions=False).get("/api/test/boom")
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert isinstance(detail.pop("request_id"), str)
+    assert detail == {
+        "code": "headless_api_internal_failure",
+        "details": {},
+        "message": "owner exploded",
+        "producer": "headless_api",
+    }

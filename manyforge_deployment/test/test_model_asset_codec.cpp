@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/model_asset.hpp>
@@ -24,7 +25,7 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kModelAssetSchemaRevision =
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kOneDigest =
@@ -83,6 +84,8 @@ struct AssetSpec final {
   std::vector<CollisionSpec> collision_bodies{
       {"arm_collision", {"tool0", "base_link"}},
   };
+  // TOOLCTX: the asset's own payload; absent emits no field.
+  std::optional<core::ModelAssetPayloadDTO> payload{};
 };
 
 [[nodiscard]] CanonicalValue string_array(
@@ -174,7 +177,7 @@ struct AssetSpec final {
     });
   }
 
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object root{
       {"api_version",
        CanonicalValue(std::string(core::kModelAssetApiVersion))},
       {"model_asset_id", CanonicalValue(spec.asset_id)},
@@ -186,7 +189,20 @@ struct AssetSpec final {
       {"resource_role_bindings", CanonicalValue(std::move(resources))},
       {"collision_body_role_bindings",
        CanonicalValue(std::move(collision_bodies))},
-  });
+  };
+  if (spec.payload.has_value()) {
+    CanonicalValue::Array center;
+    for (const double value : spec.payload->center_of_mass_m) {
+      center.emplace_back(value);
+    }
+    root.emplace_back("payload", CanonicalValue(CanonicalValue::Object{
+                                     {"mass_kg",
+                                      CanonicalValue(spec.payload->mass_kg)},
+                                     {"center_of_mass_m",
+                                      CanonicalValue(std::move(center))},
+                                 }));
+  }
+  return CanonicalValue(std::move(root));
 }
 
 [[nodiscard]] std::string model_asset_document(const AssetSpec& spec) {
@@ -554,6 +570,71 @@ TEST(ModelAssetCodec, RejectsOpenShapeNullAndStaleSemanticIdentity) {
   EXPECT_THROW(resolve_and_qualify_model_asset(
                    stale_reference, store_key, stale),
                ModelAssetCodecError);
+}
+
+// TOOLCTX: a model's own payload is optional; an asset without one keeps
+// its exact bytes (no field), one with it decodes and round-trips.
+TEST(ModelAssetCodec, PayloadIsOptionalAndRoundTrips) {
+  const auto plain_document = model_asset_document(AssetSpec{});
+  EXPECT_EQ(plain_document.find("\"payload\""), std::string::npos);
+  const auto plain = qualify(AssetSpec{});
+  EXPECT_FALSE(plain.value().payload.has_value());
+  EXPECT_EQ(canonical_json(plain.normalized_root()), plain_document);
+
+  AssetSpec tool;
+  tool.payload = core::ModelAssetPayloadDTO{0.6, {0.0, -0.01, 0.05}};
+  const auto document = model_asset_document(tool);
+  EXPECT_NE(document.find("\"payload\""), std::string::npos);
+  const auto qualified = qualify(tool);
+  EXPECT_EQ(qualified.value().payload, tool.payload);
+  EXPECT_EQ(canonical_json(qualified.normalized_root()), document);
+  EXPECT_NE(revision_from_document(document),
+            revision_from_document(plain_document));
+
+  AssetSpec bounds;
+  bounds.payload = core::ModelAssetPayloadDTO{100.0, {-2.0, 2.0, 0.0}};
+  EXPECT_EQ(qualify(bounds).value().payload, bounds.payload);
+  bounds.payload = core::ModelAssetPayloadDTO{0.0, {0.0, 0.0, 0.0}};
+  EXPECT_EQ(qualify(bounds).value().payload, bounds.payload);
+}
+
+TEST(ModelAssetCodec, RefusesAPayloadOutsideTheControllerBounds) {
+  const std::vector<core::ModelAssetPayloadDTO> invalid{
+      {-0.001, {0.0, 0.0, 0.0}}, {100.5, {0.0, 0.0, 0.0}},
+      {1.0, {2.01, 0.0, 0.0}},   {1.0, {0.0, -2.5, 0.0}},
+      {1.0, {0.0, 0.0, 3.0}},
+  };
+  for (const auto& payload : invalid) {
+    AssetSpec spec;
+    spec.payload = payload;
+    const auto document = model_asset_document(spec);
+    const core::ContentAddressedStoreKey store_key{"sha256/payload-invalid"};
+    try {
+      (void)resolve_and_qualify_model_asset(
+          reference_for(spec.asset_id, document, store_key), store_key,
+          document);
+      ADD_FAILURE() << "payload accepted: " << payload.mass_kg;
+    } catch (const ModelAssetCodecError& error) {
+      EXPECT_TRUE(std::string_view(error.what())
+                      .starts_with("model_asset_payload_invalid:"))
+          << error.what();
+    }
+  }
+
+  // Shape is closed: three centre values, numbers only, no extra fields.
+  AssetSpec spec;
+  spec.payload = core::ModelAssetPayloadDTO{1.0, {0.0, 0.0, 0.1}};
+  const auto valid = model_asset_document(spec);
+  expect_closed_schema_rejection(
+      spec.asset_id, valid,
+      replace_once(valid, "\"center_of_mass_m\":[0,0,0.1]",
+                   "\"center_of_mass_m\":[0,0.1]"));
+  expect_closed_schema_rejection(
+      spec.asset_id, valid,
+      replace_once(valid, "\"mass_kg\":1", "\"mass_kg\":\"1\""));
+  expect_closed_schema_rejection(
+      spec.asset_id, valid,
+      replace_once(valid, "\"mass_kg\":1", "\"mass_kg\":1,\"inertia\":[]"));
 }
 
 TEST(ModelAssetCodec, EnforcesTheCompleteTypedReferentBoundary) {

@@ -99,6 +99,10 @@ describe('Composer shell continuity', () => {
     expect(markup).toContain('aria-label="Workbench sections"');
     expect(markup).toContain('>Program</button>');
     expect(markup).toContain('>Scene</button>');
+    // Components sits with Program, Scene and Deployment, before Deployment.
+    expect(markup).toContain('data-workspace="components"');
+    expect(markup.indexOf('data-workspace="scene"')).toBeLessThan(markup.indexOf('data-workspace="components"'));
+    expect(markup.indexOf('data-workspace="components"')).toBeLessThan(markup.indexOf('data-workspace="deployment"'));
     expect(markup).toContain('data-workspace="deployment"');
     expect(markup).toContain('data-backend-connected="false"');
     expect(markup).toContain('Live status feed unavailable');
@@ -245,6 +249,43 @@ describe('Composer shell continuity', () => {
     expect(appSource).not.toContain('clientErrors={clientErrors}');
   });
 
+  it('opens global rules on Deployment Cell settings, where the rules section mounts and reveals itself', () => {
+    const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    const editorSource = readFileSync(new URL('./components/DeploymentFocusedEditor.tsx', import.meta.url), 'utf8');
+    const handler = appSource.slice(
+      appSource.indexOf('useEffect(() => onOpenGlobalRulesRequest('),
+      appSource.indexOf('[openDeploymentTab, programInvalidEdit]);'),
+    );
+    expect(handler).toContain("else openDeploymentTab('cell');");
+    // Refused, like the Deployment button, while a Program field edit is invalid.
+    expect(handler).toContain('if (programInvalidEdit) takeOpenGlobalRulesRequest();');
+    expect(handler).not.toContain("setActiveWorkspace('deployment')");
+    // The rules mount only on Cell settings and take the pending request when they mount.
+    expect(editorSource).toMatch(/\{intent && cell && \(\s*<GlobalInterruptRulesSection/);
+    expect(editorSource).toMatch(/if \(!takeOpenGlobalRulesRequest\(\) \|\| section\.current === null\) return;\s*section\.current\.open = true;/);
+  });
+
+  it('classifies robot-control errors by type and hides a failed Apply notice only when nothing is held', () => {
+    const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    // Item 19 extended: no message-text classification of what reaches the warning row.
+    expect(appSource).toContain('robotControl.state.errorLocal ? null : robotControl.state.error');
+    expect(appSource).not.toMatch(/state\.error\.startsWith\(/);
+    // Item 21: hidden only on positive evidence (pre-fence refusal, or no failed Apply).
+    const notices = appSource.slice(
+      appSource.indexOf('const activationNotices = useMemo'),
+      appSource.indexOf('const activationCompleted = useBriefNotice'),
+    );
+    expect(notices).toContain('if (dismissedActivationNotice === id) return [];');
+    expect(notices).toContain('outcomeUnknown: applyAcknowledgementOutcomeUnknown,');
+    expect(notices).toContain('dismiss: () => setDismissedActivationNotice(id),');
+    const handler = appSource.slice(
+      appSource.indexOf('const acknowledgeFailedApply = useCallback'),
+      appSource.indexOf('const acknowledgingApply ='),
+    );
+    expect(handler).toContain('await activation.acknowledgeFailure();');
+    expect(handler).toMatch(/if \(result\.noFailedApply\) \{\s*setDismissedActivationNotice\(`activation\.\$\{acknowledgementKey\}`\);/);
+  });
+
   it('keeps document, deployment, status, and artifact workflows in their owned locations', () => {
     const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
     const controlsSource = readFileSync(
@@ -258,6 +299,12 @@ describe('Composer shell continuity', () => {
     expect(appSource).not.toContain('<ProgramDocumentControls');
     expect(appSource).not.toContain('<DeploymentDocumentControls');
     expect(appSource).toContain('<DeploymentCompositionPanel');
+    expect(appSource).toContain('<ComponentsWorkspace');
+    // One component catalog for both; Components edits the Deployment Draft, so its header is Deployment's.
+    expect(appSource.match(/useComponentCatalog\(/g)).toHaveLength(1);
+    expect(appSource).toContain("activeWorkspace === 'deployment' || activeWorkspace === 'components'");
+    // Robot Control stays in the viewer: a Components page only opens it.
+    expect(appSource).toContain("requestOpenSettings('robot')");
     expect(appSource).toContain('viewerModelRefreshKey(headlessSnapshot)');
     expect(appSource).toMatch(
       /refreshViewerModelsOnManagerChange\([\s\S]*?retrySourceModel,\s*retryManifest,/,

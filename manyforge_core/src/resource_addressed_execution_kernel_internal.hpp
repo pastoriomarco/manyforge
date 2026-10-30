@@ -19,6 +19,7 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
+#include <manyforge_core/stop_timing.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
 #include "stop_terminal_reducer_internal.hpp"
@@ -26,6 +27,7 @@
 
 #include "component_lifecycle_journal_codec_internal.hpp"
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -366,10 +368,14 @@ derive_route_readiness_projection(
          left.default_fault_stop_profile == right.default_fault_stop_profile &&
          left.deployment_maximum_tcp_linear_speed_mps ==
              right.deployment_maximum_tcp_linear_speed_mps &&
+         left.speed_check_flange_frame == right.speed_check_flange_frame &&
          left.intrinsic_direct_control == right.intrinsic_direct_control &&
          left.direct_control_joint_limits == right.direct_control_joint_limits &&
          left.motion_takeover_preparation_budget_s == right.motion_takeover_preparation_budget_s &&
-         left.motion_takeover_planning_budget_s == right.motion_takeover_planning_budget_s;
+         left.motion_takeover_planning_budget_s == right.motion_takeover_planning_budget_s &&
+         left.motion_endpoint_owner == right.motion_endpoint_owner &&
+         left.set_tcp.has_value() == right.set_tcp.has_value() &&
+         (!left.set_tcp || left.set_tcp->holds_robot == right.set_tcp->holds_robot);
 }
 
 [[nodiscard]] inline bool registration_controller_equal_after_product_reseal(
@@ -402,6 +408,7 @@ derive_route_readiness_projection(
       left.default_fault_stop_profile != right.default_fault_stop_profile ||
       left.deployment_maximum_tcp_linear_speed_mps !=
           right.deployment_maximum_tcp_linear_speed_mps ||
+      left.speed_check_flange_frame != right.speed_check_flange_frame ||
       left.intrinsic_direct_control != right.intrinsic_direct_control ||
       left.direct_control_joint_limits != right.direct_control_joint_limits ||
       left.motion_takeover_preparation_budget_s != right.motion_takeover_preparation_budget_s ||
@@ -698,11 +705,11 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
           object->scene_resource_id, std::move(body_ids), policy->envelope}});
 }
 
-[[nodiscard]] inline ResolvedFrameDTO resolved_component_frame(const RuntimeParticipantBindingDTO& binding,
+// B7: a frame's component is always its owner, never the moving arm.
+[[nodiscard]] inline ResolvedFrameDTO resolved_component_frame(const ControllableComponentId& owner,
                                                         const ProgramFrameRoleBindingDTO& frame) {
-  return ResolvedComponentModelFrameDTO{binding.controllable_component_id, frame.model_instance_id,
-                                        frame.frame_role_id, frame.compiled_frame_name,
-                                        frame.model_revision};
+  return ResolvedComponentModelFrameDTO{owner, frame.model_instance_id, frame.frame_role_id,
+                                        frame.compiled_frame_name, frame.model_revision};
 }
 
 [[nodiscard]] inline Result<ExecuteRequestDTO> build_motion_request(
@@ -721,8 +728,9 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   const auto* base = find_frame(binding, motion.base_frame_role_id);
   const auto* tcp =
       binding.motion_endpoint &&
-              motion.tcp_endpoint.target_role_id == binding.motion_endpoint->target_role_id &&
-              motion.tcp_endpoint.frame_role_id == binding.motion_endpoint->frame.frame_role_id
+              tcp_selector_admits(
+                  motion.tcp_endpoint, *binding.motion_endpoint,
+                  registration.motion_endpoint_owner.value_or(binding.controllable_component_id))
           ? &binding.motion_endpoint->frame
           : nullptr;
   if (base == nullptr || tcp == nullptr) {
@@ -833,8 +841,11 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       control.provider_runtime_epoch,
       std::move(runtime_units),
       std::move(bound_resources),
-      resolved_component_frame(binding, *base),
-      resolved_component_frame(binding, *tcp),
+      // The base is the motion component's own frame; the TCP entry belongs to
+      // the motion component or a tool mounted on it.
+      resolved_component_frame(binding.controllable_component_id, *base),
+      resolved_component_frame(
+          registration.motion_endpoint_owner.value_or(binding.controllable_component_id), *tcp),
       {},
       {},
       control.runtime_scale_qualification,
@@ -843,6 +854,12 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       binding.target_role_id,
       binding.frame_bindings,
       binding.collision_body_bindings};
+
+  // The one admitted limit holds at every point of this set (planner retime
+  // and post-plan validation); the flange comes from the robot, never the
+  // Program.
+  exact_binding.speed_check_frames = speed_check_frames(
+      exact_binding.tcp_frame, registration.speed_check_flange_frame);
 
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();
@@ -884,6 +901,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   request.action_span = participant.action_span;
   request.contact_policy_id =
       motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
+  request.clearance_m = motion.clearance_m;
   request.runtime_object_bindings = motion.runtime_object_bindings;
   auto contact_grasp = resolve_contact_grasp_binding(motion, binding);
   if (!contact_grasp.ok()) {
@@ -1131,13 +1149,17 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
         "prepared motion is missing accepted-trajectory diagnostics",
         "prepared_motion_diagnostics_missing", ErrorCode::kInvariantViolation);
   }
+  std::vector<std::string> speed_check_frame_role_ids;
+  for (const auto& frame : motion->plan_request.speed_check_frames)
+    speed_check_frame_role_ids.push_back(frame_role_id(frame));
   return Result<PreparedMotionDiagnosticsDTO>::Ok(PreparedMotionDiagnosticsDTO{
       participant.participant_id, participant.prepared_contract_digest, motion->move_id,
       motion->trajectory.joint_names,
       *motion->validation_evidence.noncollision_result.trajectory_metrics,
       motion->requested_tcp_linear_speed_mps,
       motion->deployment_maximum_tcp_linear_speed_mps,
-      *motion->plan_request.speed_profile.max_tcp_linear_speed_mps});
+      *motion->plan_request.speed_profile.max_tcp_linear_speed_mps,
+      std::move(speed_check_frame_role_ids)});
 }
 
 [[nodiscard]] inline Result<PreparedOperationParticipantDTO> build_prepared_io_output_participant(
@@ -1632,6 +1654,29 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
       !details.contains("runtime_query_failure_reason");
 }
 
+/// The runtime monitor stopped motion because the measured robot state it
+/// checks was missing, stale or incomplete, not because of contact.
+[[nodiscard]] inline bool runtime_monitor_observation_lost(
+    const std::map<std::string, std::string>& details) {
+  const auto contact = details.find("in_collision");
+  const auto reason = details.find("reason");
+  return (contact == details.end() || contact->second != "true") && reason != details.end() &&
+         (reason->second == "stale_observed_robot_state" ||
+          reason->second == "observed_state_unavailable" ||
+          reason->second == "observed_state_incomplete");
+}
+
+/// The Kernel's own containment Stop for a runtime monitor fact: a collision
+/// or lost measured robot state.
+[[nodiscard]] inline bool runtime_monitor_containment_stop(const StopIntentDTO* stop) {
+  if (stop == nullptr || stop->request_context.source_label != "kernel.runtime_collision" ||
+      !stop->reason.has_value()) {
+    return false;
+  }
+  return *stop->reason == "runtime_collision_fault" ||
+         *stop->reason == error_codes::kRuntimeMonitorObservationLost;
+}
+
 [[nodiscard]] inline std::optional<std::int64_t> motion_takeover_budget_ns(
     const std::optional<double> seconds) noexcept {
   if (!seconds || !std::isfinite(*seconds) || *seconds <= 0.0) return std::nullopt;
@@ -1868,6 +1913,11 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   // Run/Resume and motion-producing recovery; they never gate a manual
   // operation, whether or not a manual cell-admission claim still names it.
   bool manual{};
+  // The current Stop (`state.active_stop_id`) was requested by the Program's
+  // own configuration (`is_program_requested_stop`) and no other requester
+  // joined it. Its settled first-stage outcome is the Program's ordinary
+  // failure, not an operator hold (spec 260 §2.8.4).
+  bool program_requested_stop{};
   bool retry_run_ended{false};
   mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
   mutable std::uint64_t recovery_assessment_revision{};
@@ -1887,6 +1937,13 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
         state.active_stop_generation == settled_stop->generation)
       return settled_stop->result;
     return std::nullopt;
+  }
+
+  /// The Program's ordinary failure from its own Stop: that Stop alone,
+  /// settled at its first stage, left the operation Stopped (spec 260 §2.8.4).
+  [[nodiscard]] bool ordinary_program_stop() const noexcept {
+    return program_requested_stop && state.state == OperationStateKind::kStopped &&
+           terminal_stop_result() == StopCertificateResultDTO::kSucceededNominal;
   }
 
   [[nodiscard]] bool cancelled_pneumatic_preparation_shape() const noexcept {
@@ -2195,6 +2252,23 @@ inline constexpr std::string_view kZeroSpeedHoldStopReason = "zero_speed_hold_ti
 
 enum class InternalStopKind : std::uint8_t { kNone, kReset, kZeroSpeedHold };
 
+/// A Stop the Program's own configuration requested, by authoritative
+/// provenance, never by a caller's labels: a node or global interrupt rule's
+/// trip (the Kernel's own rule selection, not a lost source), or the
+/// Manager's carried-object-lost response (internal owner transport; the
+/// public Stop route always stamps its own transport). Every other Stop,
+/// including any public Stop whatever its context says, is an operator Stop.
+[[nodiscard]] inline bool is_program_requested_stop(const StopIntentDTO* intent,
+                                                    bool kernel_rule_selection) noexcept {
+  if (intent == nullptr || !intent->reason.has_value()) return false;
+  const auto& reason = *intent->reason;
+  if (kernel_rule_selection)
+    return reason == "interrupt_fault" || reason == "motion_interrupt_signal_trip";
+  return intent->attribution.transport == RequestTransportDTO::kInternal &&
+         intent->request_context.source_label == "manager.carried_object_lost" &&
+         reason == "carried_object_lost";
+}
+
 /// Internal Stops with their own Stop choice: Reset while busy runs the
 /// deployment's operator Stop profile and issues the lane's hard stop only
 /// on its timeout or when no profile is configured (Q27, as `main`
@@ -2473,8 +2547,12 @@ struct ResourceAddressedExecutionKernel::GlobalInterruptStopParticipant final {
 };
 
 struct ResourceAddressedExecutionKernel::GlobalInterruptStopSelection final {
-  IoRuleRegistrationDTO registration;
-  IoRuleEvidenceDTO evidence;
+  // A normal rule response has actual watch evidence. A notify rule that
+  // cannot watch instead carries its actual setup/input error, never a token.
+  InterruptPolicyId policy_id;
+  std::optional<IoRuleRegistrationDTO> registration;
+  std::optional<IoRuleEvidenceDTO> evidence;
+  std::optional<ErrorDTO> watch_error;
   bool everything;
   int priority;
   std::vector<GlobalInterruptStopParticipant> participants;
@@ -2649,15 +2727,21 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return budget;
 }
 
-/// The Kernel's own watchdog for one stage: only a controlled stage's own
-/// deadline (as `main`'s controlled-Stop deadline watchdog). The Kernel arms
-/// no watchdog of its own for a hard stage (Q57) or a gripper cancel (Q58).
+/// The Kernel's own watchdog for one stage: only a controlled stage's, from
+/// the Stop request its controlled deadline plus a normal motion's no-report
+/// bound for a Stop trajectory as long as that deadline (maintainer M6: a
+/// dispatched Stop trajectory finishes like a normal motion,
+/// `controlled_stage_watchdog_ns`). The Kernel arms no watchdog of its own for
+/// a hard stage (Q57) or a gripper cancel (Q58).
 [[nodiscard]] inline std::optional<std::int64_t> stage_watchdog_deadline(
     const RemainingStopBudgetDTO& budget, const std::int64_t now) noexcept {
   if (!budget.remaining_controlled_deadline_ns.has_value()) {
     return std::nullopt;
   }
-  const auto deadline = checked_deadline(now, *budget.remaining_controlled_deadline_ns);
+  const auto deadline = checked_deadline(
+      now, controlled_stage_watchdog_ns(*budget.remaining_controlled_deadline_ns +
+                                        budget.elapsed_since_stop_ns) -
+               budget.elapsed_since_stop_ns);
   return deadline < 0 ? std::nullopt : std::optional(deadline);
 }
 
@@ -3087,6 +3171,9 @@ struct ResourceAddressedExecutionKernel::GlobalIoRuleRuntime final {
   std::optional<IoRuleEvidenceDTO> latched_evidence{};
   std::optional<IoRuleEvidenceDTO> last_source_loss{};
   bool source_loss_latch{};
+  // A notify arm failure must reach scoped containment before a retry can
+  // open the gate over a moving operation.
+  bool notify_failure_needs_containment{};
 };
 
 struct ResourceAddressedExecutionKernel::StagedGlobalIoRuleCatalog final {
@@ -3326,6 +3413,11 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
     // the latch is a fact about its robots and is kept (never cleared here).
     std::lock_guard state_lock(owner_.state_mutex_);
     owner_.refresh_stop_fault_latch_locked();
+    // Item 37: after the operator's confirmed Full Stop, Force close retires
+    // the targets while operations are still resident; its own Kernel step
+    // then moves them into history. A newer Stop or a newly admitted
+    // operation ends the arm.
+    if (owner_.force_close_stop_generation_.has_value()) return Result<void>::Ok();
     for (const auto& [id, operation] : owner_.active_operations_) {
       if (operation->containment_effect_uncertain())
         return Result<void>::Err(ErrorDTO{"cell_close_containment_uncertain", "Close cannot infer rest from an uncertain terminal", {{"operation_id", id.value()}}});

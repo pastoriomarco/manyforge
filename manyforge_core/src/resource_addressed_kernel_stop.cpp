@@ -1048,6 +1048,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   } post_reserve_guard;
   const auto* ordinary = std::get_if<StopIntentDTO>(&projected_intent);
   const auto* full = std::get_if<FullStopIntentDTO>(&projected_intent);
+  // Only the Kernel's own rule responses pass a rule selection; a public Stop
+  // never does.
+  const bool kernel_rule_selection = global_selection != nullptr || !interrupt_selections.empty();
   const auto* program_run_targets =
       ordinary == nullptr ? nullptr
                           : std::get_if<std::vector<StopProgramRunTargetDTO>>(&ordinary->selector);
@@ -1089,10 +1092,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     }
   }
   const auto& context = ordinary != nullptr ? ordinary->request_context : full->request_context;
-  const bool runtime_collision_containment =
-      ordinary != nullptr &&
-      ordinary->reason == std::optional<std::string>{"runtime_collision_fault"} &&
-      ordinary->request_context.source_label == "kernel.runtime_collision";
+  const bool runtime_collision_containment = runtime_monitor_containment_stop(ordinary);
   const auto& attribution = ordinary != nullptr ? ordinary->attribution : full->attribution;
   if (!attribution.locally_valid()) {
     return reject<StopAcceptedDTO>("Stop ingress attribution is invalid",
@@ -1994,6 +1994,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       }
       if (global_selection)
         transaction.global_interrupt_winners.push_back(*global_selection);
+      // Another requester joined: the outcome is no longer only the
+      // Program's own Stop, so it keeps the operator Stop's hold.
+      if (!is_program_requested_stop(ordinary, kernel_rule_selection))
+        for (const auto& joined_id : stop_operation_snapshot_ids(transaction))
+          if (auto* joined = find_active_operation_locked(joined_id))
+            joined->program_requested_stop = false;
       // A containment that joins a resident Stop still latches its outcome.
       if (required_fault_latch.has_value() && !transaction.certificate.has_value()) {
         latch_stop_fault_locked(transaction, *required_fault_latch);
@@ -2299,6 +2305,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         operation->state.state = OperationStateKind::kStopping;
         operation->state.active_stop_id = StopId(std::string(outcome.stop_id()));
         operation->state.active_stop_generation = outcome.stop_generation;
+        operation->program_requested_stop = is_program_requested_stop(ordinary, kernel_rule_selection);
         operation->state.updated_at_ns = accepted_at_ns;
         for (auto& participant_state : operation->state.participants) {
           if (participant_selected(affected.operation_id, participant_state.participant_id)) {
@@ -2422,6 +2429,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       // stage completion.
       next_stop_id_ = proposed_number + 1U;
       cell_stop_generation_ = std::max(cell_stop_generation_, outcome.stop_generation);
+      // Item 37: a newer Stop ends the operator's Force close arm.
+      if (force_close_stop_generation_ && *force_close_stop_generation_ != cell_stop_generation_)
+        force_close_stop_generation_.reset();
     }
 
     if (outcome.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
@@ -2682,7 +2692,8 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
         (*record)->surveillance_projection_token.reset();
       }
       if ((*record)->surveillance_state == nullptr) {
-        motion_admission_closed_ = true;
+        // M6b: Recover cleared the latch on current rest while this
+        // checkpoint was being written; surveillance ended with the clear.
         return;
       }
       auto checkpoint_status = StopDurableProjectionStatusDTO{
@@ -3670,13 +3681,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         takeover_source_wakeup = transaction.operations.front();
       const auto now = clock_.now();
       const auto* ordinary_stop = std::get_if<StopIntentDTO>(&transaction.projected_intent);
-      const bool runtime_collision_containment =
-          ordinary_stop != nullptr &&
-          ordinary_stop->reason == std::optional<std::string>{"runtime_collision_fault"} &&
-          ordinary_stop->request_context.source_label == "kernel.runtime_collision";
+      const bool runtime_collision_containment = runtime_monitor_containment_stop(ordinary_stop);
       // The Manager stopped a motion whose carried object was lost: a settled
-      // participant ends Failed with that typed cause, so the Program node
-      // fails through its normal failure handling.
+      // participant ends Stopped with that typed cause, so the Program node
+      // fails through its normal failure handling. Commit relabels it Failed
+      // unless the Stop settled at its first stage (finalize_io_rule_stop_locked).
       const bool carried_object_lost_stop =
           ordinary_stop != nullptr &&
           ordinary_stop->reason == std::optional<std::string>{"carried_object_lost"} &&
@@ -4330,8 +4339,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         participant_state->state =
             item.participant_failure_preserved ? OperationStateKind::kFailed :
             participant_settled && !runtime_collision_participant
-                ? (io_source_failed || carried_object_lost_stop ? OperationStateKind::kFailed
-                                                                : OperationStateKind::kStopped)
+                ? (io_source_failed ? OperationStateKind::kFailed : OperationStateKind::kStopped)
                 : OperationStateKind::kInterventionRequired;
         if (item.stop_path_collision.has_value()) {
           // The collision on the Stop path is the participant's cause.
@@ -4650,7 +4658,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const bool ordinary_stopped = !value.terminal_fact &&
             recovery.execution_state == ExecutionState::kStopped &&
             recovery.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
-            recovery.status == RecoveryAssessmentStatus::kRetryReady && recovery.retry_admissible;
+            ((recovery.status == RecoveryAssessmentStatus::kRetryReady &&
+              recovery.retry_admissible) ||
+             stopped_awaiting_terminal_cleanup(recovery));
         const bool exact = value.execution_id == request.execution_id &&
                            value.aggregate_stop_certificate == request.aggregate_stop_certificate &&
                            value.operation_id == stage.operation_id &&

@@ -81,7 +81,7 @@ TEST_F(IoProviderDomainTest,
   EXPECT_EQ(provider->provider_runtime_unit_id,
             c::RuntimeUnitId("io.execution"));
   EXPECT_EQ(provider->signal_names, std::vector<std::string>{"ready"});
-  EXPECT_EQ(provider->lifecycle_command_timeout_ns, 30'000'000'000LL);
+  EXPECT_EQ(provider->lifecycle_command_timeout_ns, 10'000'000'000LL);
   EXPECT_EQ(domain.control_coordinator_endpoint_role,
             c::EndpointRoleId("ros2_control_execution_status"));
   const auto catalog =

@@ -32,10 +32,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.8.0"
+EXPECTED_CONTENT_VERSION = "2.9.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:5ffd4dac211459905977367414bfb7684842045ee4b32c5cb3da5f513a03d134"
+    "sha256:cb77330e3362a78d9ac74177a486a3a60a8c2e20c42105b6bac8dd7f9474791c"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")

@@ -2,6 +2,7 @@
 
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <optional>
@@ -310,6 +311,28 @@ TEST(RuntimeParticipantBindingTest,
             (std::vector<CoordinateKind>{CoordinateKind::kLinear}));
 }
 
+TEST(RuntimeParticipantBindingTest, AcceptsFramelessGripperAndStillValidatesPresentFrames) {
+  auto value = gripper_binding();
+  value.frame_bindings.clear();
+  auto frameless = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(frameless.ok()) << frameless.error().message;
+  EXPECT_TRUE(frameless.value().value().frame_bindings.empty());
+  EXPECT_EQ(frameless.value().value().command_target_id, CommandTargetId("gripper"));
+  EXPECT_EQ(frameless.value().value().resources.front().resource_role_id, ResourceRoleId("fingers"));
+
+  value.frame_bindings = valid_binding().frame_bindings;
+  value.frame_bindings.push_back(value.frame_bindings.front());
+  auto duplicate = verify_runtime_participant_binding(value);
+  ASSERT_FALSE(duplicate.ok());
+  EXPECT_EQ(duplicate.error().details.at("reason"), "runtime_frame_binding_invalid");
+
+  value.frame_bindings.pop_back();
+  value.frame_bindings.front().compiled_frame_name.clear();
+  auto incomplete = verify_runtime_participant_binding(value);
+  ASSERT_FALSE(incomplete.ok());
+  EXPECT_EQ(incomplete.error().details.at("reason"), "runtime_frame_binding_invalid");
+}
+
 TEST(RuntimeParticipantBindingTest, RejectsDuplicateResourceIdentity) {
   auto value = valid_binding();
   value.resources.back().resource_id = value.resources.front().resource_id;
@@ -396,6 +419,57 @@ TEST(RuntimeParticipantBindingTest,
   ASSERT_TRUE(crossed_epoch.ok()) << crossed_epoch.error().message;
   EXPECT_FALSE(runtime_participant_binding_physically_contains(
       physical.value(), crossed_epoch.value()));
+}
+
+// ur5_pick_and_place: the UR5 `flange` and `tcp` roles compile to one link.
+// A Program naming `base` and `tcp` is still exactly contained (the run was
+// refused with runtime_program_binding_crosses_physical_owner).
+TEST(RuntimeParticipantBindingTest, PhysicalContainmentKeepsRolesThatShareOneFrame) {
+  auto value = valid_binding();
+  const auto frame = [&](const char *role, const char *compiled) {
+    return ProgramFrameRoleBindingDTO{FrameRoleId(role), ModelInstanceId("robot.model"),
+                                      ModelRevision("model-revision"), compiled};
+  };
+  value.frame_bindings = {frame("base", "mf2_base"), frame("flange", "mf2_tool0"),
+                          frame("tcp", "mf2_tool0")};
+  auto physical = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(physical.ok()) << physical.error().message;
+  value.frame_bindings = {frame("base", "mf2_base"), frame("tcp", "mf2_tool0")};
+  auto selected = verify_runtime_participant_binding(std::move(value));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  EXPECT_TRUE(runtime_participant_binding_physically_contains(physical.value(), selected.value()));
+
+  auto foreign = selected.value().value();
+  foreign.frame_bindings.back().frame_role_id = FrameRoleId("camera");
+  auto crossed = verify_runtime_participant_binding(std::move(foreign));
+  ASSERT_TRUE(crossed.ok()) << crossed.error().message;
+  EXPECT_FALSE(runtime_participant_binding_physically_contains(physical.value(), crossed.value()));
+}
+
+// M7 U3: the one Program frame identity used by the LOADFIX5/10/11 sites.
+// Role, model, revision and compiled name all count; contact bodies do not.
+TEST(SameProgramFrameTest, ComparesRoleModelRevisionAndCompiledNameOnly) {
+  const ProgramFrameRoleBindingDTO tcp{FrameRoleId("tcp"), ModelInstanceId("robot.model"),
+                                       ModelRevision("model-revision"), "mf2_tool0", {}};
+  EXPECT_TRUE(same_program_frame(tcp, tcp));
+  auto with_contacts = tcp;
+  with_contacts.contact_body_role_ids = {CollisionBodyRoleId("fingers")};
+  EXPECT_TRUE(same_program_frame(tcp, with_contacts));
+  EXPECT_TRUE(same_program_frame(with_contacts, tcp));
+
+  // A UR5's `flange` and `tcp` share one compiled frame and stay distinct.
+  auto flange = tcp;
+  flange.frame_role_id = FrameRoleId("flange");
+  EXPECT_FALSE(same_program_frame(tcp, flange));
+  auto other_model = tcp;
+  other_model.model_instance_id = ModelInstanceId("gripper.model");
+  EXPECT_FALSE(same_program_frame(tcp, other_model));
+  auto other_revision = tcp;
+  other_revision.model_revision = ModelRevision("other-revision");
+  EXPECT_FALSE(same_program_frame(tcp, other_revision));
+  auto other_name = tcp;
+  other_name.compiled_frame_name = "mf2_link6";
+  EXPECT_FALSE(same_program_frame(tcp, other_name));
 }
 
 TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhysicalProjection) {
@@ -516,6 +590,46 @@ TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAss
     EXPECT_FALSE(verify_runtime_participant_binding(std::move(wrong)).ok());
   }
   // Endpoints without contact bodies remain valid for ordinary motion.
+  value.motion_endpoint->frame.contact_body_role_ids.clear();
+  value.motion_endpoint->contact_body_bindings.clear();
+  EXPECT_TRUE(verify_runtime_participant_binding(value).ok());
+}
+
+// TCP-D: a robot motion endpoint may sit on a tool mounted on the robot (its
+// own model instance); the contact bodies keep the tool's component identity.
+// The resolver proves the mount against the cell graph.
+TEST(RuntimeParticipantBindingTest, MotionEndpointMayUseAMountedToolModel) {
+  auto value = valid_binding();
+  const auto body_id = [](std::string component) {
+    return make_component_collision_body_id(ControllableComponentId(component),
+                                            ModelInstanceId("lite_gripper.model"),
+                                            CollisionBodyRoleId("gripper_fingers"), 0U);
+  };
+  value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
+      TargetRoleId("tool"),
+      CommandTargetId("gripper"),
+      {FrameRoleId("tcp"),
+       ModelInstanceId("lite_gripper.model"),
+       ModelRevision("tool-model-revision"),
+       "mf2_lite_gripper_link_tcp",
+       {CollisionBodyRoleId("gripper_fingers")}},
+      {{ComponentRoleId("tool"),
+        TargetRoleId("tool"),
+        ControllableComponentId("lite_gripper"),
+        CommandTargetId("gripper"),
+        std::nullopt,
+        CollisionBodyRoleId("gripper_fingers"),
+        ModelInstanceId("lite_gripper.model"),
+        ModelRevision("tool-model-revision"),
+        {body_id("lite_gripper")}}}};
+  const auto accepted = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  // Body ids keyed by the motion component instead of the body owner fail.
+  value.motion_endpoint->contact_body_bindings.front().collision_body_ids.front() =
+      body_id("robot.1");
+  EXPECT_FALSE(verify_runtime_participant_binding(value).ok());
+  // D1's default robot `tcp` on the tool carries no contact bodies.
+  value.motion_endpoint->target_role_id = TargetRoleId("arm");
   value.motion_endpoint->frame.contact_body_role_ids.clear();
   value.motion_endpoint->contact_body_bindings.clear();
   EXPECT_TRUE(verify_runtime_participant_binding(value).ok());

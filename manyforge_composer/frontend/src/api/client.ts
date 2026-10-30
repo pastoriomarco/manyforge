@@ -1,9 +1,10 @@
 import { normalizePublicRequestContext, parseComponentProcessStopResult, parseComponentProcessStopOffer } from './processStopParsers';
 import type { ManualValveIntent } from '../state/pneumaticManual';
-import { parseCanonicalEmptySelection, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
+import { parseCanonicalEmptySelection, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
   parseLifecycleTargetRetirementResult, parseLifecycleTargetRetirementLookup } from './scenarioCloseParsers';
-import type { CanonicalEmptySelection, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
-  LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult, LifecycleTargetRetirementScope } from '../types/scenarioClose';
+import type { CanonicalEmptySelection, ForceCloseRequest, ForceCloseResult, LifecycleOwnerSettlementResult,
+  LifecycleTargetRetirementIntent, LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult,
+  LifecycleTargetRetirementScope } from '../types/scenarioClose';
 import type { ComponentProcessStopRequest, ComponentProcessStopResult } from '../types/cclc';
 import {
   parseAuthoringSubmissionOutcome,
@@ -99,6 +100,7 @@ import type {
   LocalWorkspaceFenceRequest,
   DraftMutationResponse,
   DeploymentControlledStopUpdate,
+  TcpSpeedCheck,
   DeploymentCandidateOperationResponse,
   DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
@@ -106,6 +108,7 @@ import type {
   HealthResponse,
   JsonValue,
   ManagerApplyStatus,
+  ManagerApplyAcknowledgementContext,
   NodeEnvironmentResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -152,6 +155,8 @@ import type {
   ProgramRunAdmittedSpeeds,
 } from '../types/robotControl';
 import type { DeploymentActivationScope } from '../state/activationScope';
+import type { ComponentCatalog } from '../types/componentCatalog';
+import { parseComponentCatalog } from './componentCatalogParser';
 import type {
   AssistantModeIndex,
   AssistantProviderStatus,
@@ -407,6 +412,16 @@ export function authoringRefusalMessage(error: unknown): string | null {
   return `Not applied: ${message}. Nothing was changed.`;
 }
 
+/**
+ * The typed cause the activation preparer named for a refused preparation
+ * (`details.cause_code`, a catalog code), or null.
+ */
+export function preparationCauseCode(error: unknown): string | null {
+  if (!(error instanceof ApiError) || apiErrorCode(error) !== 'activation_preparation_failed') return null;
+  const cause = error.structuredError?.details?.cause_code;
+  return typeof cause === 'string' && cause !== '' ? cause : null;
+}
+
 // The document was written to the named path but not read back or adopted as
 // Saved (for example a newer workspace revision): a definite outcome, so the
 // client shows it, refreshes and adopts the current identity, never retries.
@@ -556,6 +571,9 @@ async function requestJsonResponse<T>(
   try {
     payload = await response.json();
   } catch {
+    // Night change 10: a body read cut by the caller's abort is that abort,
+    // not a malformed reply.
+    signal?.throwIfAborted();
     if (!response.ok) {
       throw new ApiError(
         response.statusText || `HTTP ${response.status}`,
@@ -1085,6 +1103,22 @@ export const api = {
         parseDeploymentWorkspaceResponse,
         signal,
       ),
+    /** Components Add component can compose into the Draft (read-only). */
+    componentCatalog: (signal?: AbortSignal): Promise<ComponentCatalog> =>
+      requestJson('/api/deployment/component-catalog', parseComponentCatalog, signal),
+    /**
+     * Compile the Draft and read Manager's convergence diff against Applied.
+     * Effect-free: nothing is claimed, applied or installed.
+     */
+    previewDraft: (
+      fence: LocalWorkspaceFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
+      '/api/deployment/draft/preview',
+      parseDeploymentCandidateOperationResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
+    ),
     openDraft: (
       fence: LocalWorkspaceFenceRequest,
       path: string,
@@ -1114,6 +1148,21 @@ export const api = {
         body: JSON.stringify({ ...fence, path, operation, value }),
       },
     ),
+    /** Append component rows and their attachment rows in one Draft edit (Add component). */
+    addComponents: (
+      fence: LocalWorkspaceFenceRequest,
+      components: Array<Record<string, JsonValue>>,
+      attachments: Array<Record<string, JsonValue>>,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/draft/components',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, components, attachments }),
+      },
+    ),
     updateControlledStop: (
       fence: LocalWorkspaceFenceRequest,
       update: DeploymentControlledStopUpdate,
@@ -1132,6 +1181,7 @@ export const api = {
       controllableComponentId: string,
       commandTargetId: string,
       maximumTcpLinearSpeedMps: number,
+      tcpSpeedCheck?: TcpSpeedCheck,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/draft/motion-target-limit',
@@ -1144,6 +1194,7 @@ export const api = {
           controllable_component_id: controllableComponentId,
           command_target_id: commandTargetId,
           maximum_tcp_linear_speed_mps: maximumTcpLinearSpeedMps,
+          tcp_speed_check: tcpSpeedCheck,
         }),
       },
     ),
@@ -1338,6 +1389,37 @@ export const api = {
         signal,
       );
     },
+    acknowledgeApply: (
+      applyId: string,
+      applyGeneration: number,
+      requestContext: ManagerApplyAcknowledgementContext,
+      signal?: AbortSignal,
+    ): Promise<ManagerApplyStatus> => {
+      const params = new URLSearchParams({
+        apply_id: applyId,
+        apply_generation: String(applyGeneration),
+      });
+      return requestJson(
+        `/api/manager/apply/acknowledge?${params.toString()}`,
+        (value) => {
+          const status = parseManagerApplyStatus(value);
+          if (
+            status.applyId !== applyId
+            || status.applyGeneration !== applyGeneration
+          ) {
+            throw new Error(
+              'Manager Apply acknowledgement identity does not match the request',
+            );
+          }
+          return status;
+        },
+        signal,
+        {
+          method: 'POST',
+          body: JSON.stringify({ request_context: requestContext }),
+        },
+      );
+    },
   },
   files: {
     browse: (
@@ -1515,9 +1597,18 @@ export const api = {
     /**
      * Recover cell: one Headless composite. It acknowledges open component
      * incidents, waits briefly for the cell latch, and clears it with the
-     * owners' current identities. The browser sends only its request ID.
+     * owners' current identities. The browser sends its request ID and,
+     * when it showed them, the open incident IDs (M6, item 36): an incident
+     * not shown refuses the press `cclc_incident_changed`. `replayOnly`
+     * (an automatic resend after an HTTP timeout) never starts a press: an
+     * ID Headless no longer holds answers an unknown outcome.
      */
-    cellRecover: (requestId: string, signal?: AbortSignal): Promise<CellRecoverResult> =>
+    cellRecover: (
+      requestId: string,
+      expectedIncidentIds?: readonly string[] | null,
+      signal?: AbortSignal,
+      replayOnly = false,
+    ): Promise<CellRecoverResult> =>
       requestJson(
         '/api/execution/cell-recover',
         (value) => parseCellRecoverResult(value, requestId),
@@ -1530,8 +1621,42 @@ export const api = {
               source_label: 'composer_ui',
               correlation_id: null,
             },
+            ...(expectedIncidentIds == null
+              ? {} : { expected_incident_ids: [...expectedIncidentIds] }),
+            ...(replayOnly ? { replay_only: true } : {}),
           }),
         },
+      ),
+    /**
+     * SX-679: abort the running Recover cell press. Headless starts no later
+     * step; the step in flight settles and the press answers
+     * `cell_recover_aborted`. With none running it throws
+     * `cell_recover_not_running`.
+     */
+    cellRecoverAbort: (requestId: string, signal?: AbortSignal): Promise<void> =>
+      requestJson(
+        '/api/execution/cell-recover/abort',
+        () => undefined,
+        signal,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            request_context: { request_id: requestId, source_label: 'composer_ui', correlation_id: null },
+          }),
+        },
+      ),
+    /**
+     * Item 37: one step of an operator Force close. `stop` sends the cell Full
+     * Stop and returns only once the Kernel confirms it; `close_operations`
+     * moves the resident operations into history and records the History row.
+     * A refusal throws with its typed code. One send per step, never replayed.
+     */
+    forceClose: (request: ForceCloseRequest, signal?: AbortSignal): Promise<ForceCloseResult> =>
+      requestJson(
+        '/api/execution/force-close',
+        (value) => parseForceCloseResult(value, request.step),
+        signal,
+        { method: 'POST', body: JSON.stringify(request) },
       ),
     /** Latched global rules' recovery offers from the same stop-fault read (SX-2206). */
     globalRuleRecoveryOffers: (signal?: AbortSignal): Promise<GlobalRuleRecoveryOffer[]> =>
@@ -1595,7 +1720,7 @@ export const api = {
       );
     },
     manualAvailability: (
-      intent: DirectControlOperationIntent,
+      intent: DirectControlOperationIntent | import('../types/robotControl').DirectControlSetTcpIntent,
       signal?: AbortSignal,
     ): Promise<ManualControlAvailability> => requestJson(
       '/api/execution/manual-handover',

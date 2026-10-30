@@ -6,7 +6,7 @@
     },
     {
       "component_role_id": "tool",
-      "controllable_component_id": "isaac_ur10e_collision_robot"
+      "controllable_component_id": "robotiq_2f_140"
     }
   ],
   "target_roles": [

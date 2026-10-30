@@ -26,6 +26,7 @@ import {
 } from './useCCLC';
 import type {
   CCLCComponentSnapshot,
+  CCLCLifecycleIntent,
   CCLCRequestContext,
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
@@ -242,8 +243,11 @@ describe('explicit ordinary activation', () => {
     )).rejects.toThrow('requires reconciliation');
     expect(read).not.toHaveBeenCalled();
     await expect(awaitActivationCompletion(
-      { ...accepted, terminalResult: 'failed_partial_effect' }, read, wait,
-    )).rejects.toThrow('failed_partial_effect');
+      { ...accepted, terminalResult: 'failed' }, read, wait,
+    )).rejects.toThrow('failed');
+    await expect(awaitActivationCompletion(
+      { ...accepted, terminalResult: 'connection_lost' }, read, wait,
+    )).rejects.toThrow('connection_lost');
   });
 
   it('waits for Prepare to finish before Enable and positive Active', async () => {
@@ -268,7 +272,7 @@ describe('explicit ordinary activation', () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
-  it('never enables after an unknown Prepare outcome or changed owner', async () => {
+  it('never enables after an unknown Prepare outcome and tolerates an owner rejoin', async () => {
     const commands: string[] = [];
     await expect(activateThroughOrdinaryLifecycle(
       async () => ({ snapshot: { ...snapshot, lifecycleState: 'declared' }, ownerEpoch: 'owner.1' }),
@@ -276,10 +280,17 @@ describe('explicit ordinary activation', () => {
     )).rejects.toThrow('outcome unknown');
     expect(commands).toEqual(['prepare']);
     let reads = 0;
-    await expect(activateThroughOrdinaryLifecycle(
-      async () => ({ snapshot, ownerEpoch: ++reads === 1 ? 'owner.1' : 'owner.2' }),
-      vi.fn(),
-    )).rejects.toThrow('owner or applied configuration changed');
+    let state: CCLCComponentSnapshot['lifecycleState'] = 'declared';
+    const rejoinCommands: CCLCLifecycleIntent[] = [];
+    await activateThroughOrdinaryLifecycle(
+      async () => ({ snapshot: { ...snapshot, lifecycleState: state, readiness: readiness(state) },
+        ownerEpoch: ++reads === 1 ? 'owner.1' : 'owner.2' }),
+      async (intent) => {
+        rejoinCommands.push(intent);
+        state = intent === 'prepare' ? 'prepared' : 'active';
+      },
+    );
+    expect(rejoinCommands).toEqual(['prepare', 'enable']);
   });
 
   it('uses authored order and stops the remaining sequence at the first failure', async () => {
@@ -342,6 +353,7 @@ type FakeDocument = {
 let hookRoot: { render: (value: ReactNode) => void; unmount: () => void } | null = null;
 let hook: ReturnType<typeof useCCLC> | null = null;
 async function mountCCLC(configuredComponentIds?: readonly string[]) {
+  let renderedConfiguredComponentIds = configuredComponentIds;
   const document = {
     nodeType: 9,
     documentElement: null,
@@ -381,12 +393,17 @@ async function mountCCLC(configuredComponentIds?: readonly string[]) {
 
   const { createRoot } = await import('react-dom/client');
   hookRoot = createRoot(makeNode('div') as unknown as Element);
-  function Harness({ enabled, generation }: { enabled: boolean; generation: number }) {
-    const controller = useCCLC(enabled, generation, configuredComponentIds);
+  function Harness({ enabled, generation }: { enabled: boolean; generation: number | null }) {
+    const controller = useCCLC(enabled, generation, renderedConfiguredComponentIds);
     useEffect(() => { hook = controller; }, [controller]);
     return null;
   }
-  const render = async (enabled: boolean, generation = 7) => {
+  const render = async (
+    enabled: boolean,
+    generation: number | null = 7,
+    ...nextConfiguredIds: [readonly string[] | null] | []
+  ) => {
+    if (nextConfiguredIds.length > 0) renderedConfiguredComponentIds = nextConfiguredIds[0] ?? undefined;
     await act(async () => { hookRoot?.render(createElement(Harness, { enabled, generation })); });
   };
   await render(true);
@@ -492,7 +509,7 @@ describe('mounted explicit activation API boundaries', () => {
     },
   );
 
-  it('rereads an activation-sequence conflict without losing its captured applied order', async () => {
+  it('keeps the captured applied order when rereading a component conflict', async () => {
     await mountCCLC();
     apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
     let activation!: Promise<boolean>;
@@ -500,7 +517,7 @@ describe('mounted explicit activation API boundaries', () => {
     const appliedReads = apiMock.deploymentWorkspace.get.mock.calls.length;
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
     await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
-    expect(apiMock.deploymentWorkspace.get.mock.calls.length).toBeGreaterThan(appliedReads);
+    expect(apiMock.deploymentWorkspace.get.mock.calls.length).toBe(appliedReads);
     expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent))
       .toEqual(['prepare', 'enable']);
     expect(apiMock.cclc.submitLifecycle.mock.calls.every(([request]) => (
@@ -510,7 +527,67 @@ describe('mounted explicit activation API boundaries', () => {
     expect(hook!.activationProgress).toBe('Activation sequence completed.');
   });
 
-  it('refuses a changed applied order before rereading a sequence conflict', async () => {
+  it('keeps control-mode checks for Execute offer and panel single-Activate reads', async () => {
+    await mountCCLC();
+    apiMock.execution.identity.mockResolvedValue({ ...execution, controlManagementMode: 'direct' });
+    await act(async () => { await hook!.refresh(); });
+    const directModeReason = hook!.readUnavailableReason;
+    expect(directModeReason).toContain('direct native control');
+    await expect(hook!.readActivationSequence(undefined, 'execute'))
+      .rejects.toThrow('direct native control');
+    await act(async () => { await hook!.activate(); });
+    expect(hook!.error).toBe(directModeReason);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('uses the generic activation stop reason when current state is unavailable without a read reason', async () => {
+    await mountCCLC();
+    await act(async () => { hook!.setControllableComponentId('component.other'); });
+    expect(hook!.snapshot).toBeNull();
+    expect(hook!.readUnavailableReason).toBeNull();
+    await act(async () => { await hook!.activate(); });
+    expect(hook!.error).toBe('Activation stopped: current component state is unavailable.');
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('skips the execution projection only during sequence activation verification', async () => {
+    await mountCCLC();
+    // Each ordered component progresses on its own, so the sequence activates both.
+    const states: Record<string, CCLCComponentSnapshot['lifecycleState']> = {
+      'component.other': 'declared', 'component.arm': 'declared' };
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: states[id]!, readiness: readiness(states[id]!) }));
+    apiMock.cclc.submitLifecycle.mockImplementation(async (request) => {
+      states[request.controllable_component_id] = request.intent === 'prepare' ? 'prepared' : 'active';
+      return acceptedLifecycle(request.intent);
+    });
+    apiMock.execution.identity.mockResolvedValue({ ...execution, controlManagementMode: 'direct' });
+    await act(async () => { await hook!.refresh(); });
+    expect(hook!.readUnavailableReason).toContain('direct native control');
+    apiMock.execution.identity.mockResolvedValue(execution);
+    const observation = await hook!.readActivationSequence(undefined, 'execute');
+    expect(hook!.readUnavailableReason).toContain('direct native control');
+    apiMock.execution.identity.mockClear();
+    apiMock.execution.identity.mockResolvedValue({ ...execution, controlManagementMode: 'direct' });
+    let succeeded = false;
+    await act(async () => {
+      succeeded = await hook!.activateSequence(observation.identity, observation.activationOrder);
+    });
+    expect(succeeded).toBe(true);
+    expect(apiMock.execution.identity).not.toHaveBeenCalled();
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent))
+      .toEqual(['prepare', 'enable', 'prepare', 'enable']);
+    expect(hook!.readUnavailableReason).toContain('direct native control');
+  });
+
+  it('keeps the ordinary read torn-projection check', async () => {
+    await mountCCLC();
+    apiMock.execution.identity.mockResolvedValue({ ...execution, graphRevision: 'graph.torn' });
+    await act(async () => { await hook!.refresh(); });
+    expect(hook!.readUnavailableReason).toContain('projections are torn');
+  });
+
+  it('does not replace the captured component set with a later Deployment read', async () => {
     await mountCCLC();
     apiMock.cclc.component.mockRejectedValueOnce(componentReadChanged());
     let activation!: Promise<boolean>;
@@ -521,9 +598,214 @@ describe('mounted explicit activation API boundaries', () => {
         graphRevision: snapshot.graphRevision, componentIds: ['component.arm'] },
     } });
     await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
-    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-    expect(hook!.error).toContain('applied configuration changed');
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.other', 'prepare'], ['component.other', 'enable']]);
+    expect(hook!.error).toBeNull();
     expect(hook!.busy).toBe(false);
+  });
+
+  it('refuses when a successful confirmation read has no activation order', async () => {
+    await mountCCLC();
+    let observation!: Awaited<ReturnType<NonNullable<typeof hook>['readActivationSequence']>>;
+    await act(async () => { observation = await hook!.readActivationSequence(undefined, 'execute'); });
+    apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
+      scenarioId: 'fixture', deploymentRevision: 'temporarily unavailable', activationOrder: null,
+    } });
+    let succeeded = false;
+    await act(async () => {
+      succeeded = await hook!.activateSequence(observation.identity, observation.activationOrder);
+    });
+    expect(succeeded).toBe(false);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toContain('no captured Deployment');
+  });
+
+  it('refuses a successful initial Deployment read with no activation order', async () => {
+    await mountCCLC();
+    apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
+      scenarioId: 'fixture', deploymentRevision: 'deployment.1', activationOrder: null,
+    } });
+    await expect(hook!.readActivationSequence(undefined, 'execute'))
+      .rejects.toThrow('no captured Deployment');
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('binds the first matching configured set that appears during the Execute offer read', async () => {
+    const render = await mountCCLC(undefined);
+    let releaseRead!: () => void;
+    let signalReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+      signalReadStarted();
+      await readGate;
+      return { ...snapshot, controllableComponentId: id, lifecycleState: state, readiness: readiness(state) };
+    });
+    let offer!: ReturnType<NonNullable<typeof hook>['readActivationSequence']>;
+    await act(async () => { offer = hook!.readActivationSequence(undefined, 'execute'); });
+    await readStarted;
+    await render(true, 7, ['component.other', 'component.arm']);
+    releaseRead();
+    let observation!: Awaited<typeof offer>;
+    await act(async () => { observation = await offer; });
+    expect(observation.activationOrder.componentIds).toEqual(['component.other', 'component.arm']);
+    expect(observation.identity).toBe(JSON.stringify([
+      JSON.stringify(['component.other', 'component.arm']),
+      JSON.stringify(['bundle.1', 'graph.1', ['component.other', 'component.arm']]),
+    ]));
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  });
+
+  it('accepts a matching first configured set that appears between Execute offer and confirmation', async () => {
+    const render = await mountCCLC(undefined);
+    const observation = await hook!.readActivationSequence(undefined, 'execute');
+    await render(true, 7, ['component.other', 'component.arm']);
+    let succeeded = false;
+    await act(async () => {
+      succeeded = await hook!.activateSequence(observation.identity, observation.activationOrder);
+    });
+    expect(succeeded).toBe(true);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.other', 'prepare'], ['component.other', 'enable']]);
+  });
+
+  it('accepts a matching first configured set that appears during activation', async () => {
+    const render = await mountCCLC(undefined);
+    const observation = await hook!.readActivationSequence(undefined, 'execute');
+    let releaseRead!: () => void;
+    let signalReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+      signalReadStarted();
+      await readGate;
+      return { ...snapshot, controllableComponentId: id, lifecycleState: state, readiness: readiness(state) };
+    });
+    let activation!: Promise<boolean>;
+    await act(async () => { activation = hook!.activateSequence(observation.identity, observation.activationOrder); });
+    await readStarted;
+    await render(true, 7, ['component.other', 'component.arm']);
+    releaseRead();
+    let succeeded = false;
+    await act(async () => { succeeded = await activation; });
+    expect(succeeded).toBe(true);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.other', 'prepare'], ['component.other', 'enable']]);
+  });
+
+  it('refuses a different first configured set after an unknown Execute offer', async () => {
+    const render = await mountCCLC(undefined);
+    const observation = await hook!.readActivationSequence(undefined, 'execute');
+    await render(true, 7, ['component.arm']);
+    let succeeded = true;
+    await act(async () => {
+      succeeded = await hook!.activateSequence(observation.identity, observation.activationOrder);
+    });
+    expect(succeeded).toBe(false);
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toContain('confirmed component set changed');
+  });
+
+  it('aborts an in-flight step when the first configured set differs from the confirmed order', async () => {
+    const render = await mountCCLC(undefined);
+    const observation = await hook!.readActivationSequence(undefined, 'execute');
+    let signalStarted!: () => void;
+    const dispatchStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const dispatch = { signal: null as AbortSignal | null };
+    apiMock.cclc.submitLifecycle.mockImplementation((_request, signal: AbortSignal) => {
+      dispatch.signal = signal;
+      signalStarted();
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    });
+    let activation!: Promise<boolean>;
+    await act(async () => { activation = hook!.activateSequence(observation.identity, observation.activationOrder); });
+    await dispatchStarted;
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+    await render(true, 7, ['component.arm']);
+    expect(dispatch.signal?.aborted).toBe(true);
+    await act(async () => { await activation; });
+    expect(apiMock.cclc.submitLifecycle).toHaveBeenCalledTimes(1);
+    expect(hook!.pendingActivationRequest).not.toBeNull();
+    expect(hook!.activationProgress).toContain('unknown request outcome');
+  });
+
+  it('uses the last known admission generation when the current value is empty', async () => {
+    const render = await mountCCLC();
+    await render(true, null);
+    await act(async () => { await hook!.activateSequence(); });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.expected_admission_generation))
+      .toEqual([7, 7]);
+  });
+
+  it('uses the latest admission generation observed during activation if the current value is empty at send', async () => {
+    const render = await mountCCLC();
+    let releaseRead!: () => void;
+    let signalReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+      signalReadStarted();
+      await readGate;
+      return { ...snapshot, controllableComponentId: id, lifecycleState: state, readiness: readiness(state) };
+    });
+    let activation!: Promise<boolean>;
+    await act(async () => { activation = hook!.activateSequence(); });
+    await readStarted;
+    await render(true, 8);
+    await render(true, null);
+    releaseRead();
+    await act(async () => { await activation; });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.expected_admission_generation))
+      .toEqual([8, 8]);
+  });
+
+  it('keeps the captured component set across an undefined Deployment projection during activation', async () => {
+    const configuredIds = ['component.other', 'component.arm'];
+    const render = await mountCCLC(configuredIds);
+    let releaseRead!: () => void;
+    let signalReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+      signalReadStarted();
+      await readGate;
+      return { ...snapshot, controllableComponentId: id, lifecycleState: state, readiness: readiness(state) };
+    });
+    let activation!: Promise<boolean>;
+    await act(async () => { activation = hook!.activateSequence(); });
+    await readStarted;
+    // `null` is the harness's explicit way to pass an undefined prop.
+    await render(true, 7, null);
+    await render(true, 7, configuredIds);
+    releaseRead();
+    await act(async () => { await activation; });
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.other', 'prepare'], ['component.other', 'enable']]);
+    expect(hook!.error).toBeNull();
+  });
+
+  it('stops activation when a genuinely loaded empty Deployment set replaces the captured set', async () => {
+    const configuredIds = ['component.other', 'component.arm'];
+    const render = await mountCCLC(configuredIds);
+    let releaseRead!: () => void;
+    let signalReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    apiMock.cclc.component.mockImplementationOnce(async (id: string) => {
+      signalReadStarted();
+      await readGate;
+      return { ...snapshot, controllableComponentId: id, lifecycleState: state, readiness: readiness(state) };
+    });
+    let activation!: Promise<boolean>;
+    await act(async () => { activation = hook!.activateSequence(); });
+    await readStarted;
+    await render(true, 7, []);
+    releaseRead();
+    await act(async () => { await activation; });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.error).toContain('configured components changed');
   });
 
   it('keeps persistent component-read conflicts effect-free until explicit Cancel', async () => {
@@ -585,7 +867,7 @@ describe('mounted explicit activation API boundaries', () => {
   );
 
   it.each(['host-owner', 'cclc-owner', 'publication'] as const)(
-    'preserves exact %s refusal after a transient component GET conflict', async (change) => {
+    'does not stop activation on server-owned %s changes after a transient GET conflict', async (change) => {
       await mountCCLC();
       apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
         lifecycleState: state, readiness: readiness(state, false) }));
@@ -607,12 +889,51 @@ describe('mounted explicit activation API boundaries', () => {
           requestOwnerEpoch: change === 'cclc-owner' ? 'replacement-cclc' : 'cclc-owner.1' },
         ...(change === 'publication' ? { publicationGeneration: 2, activePublicPointerDigest: 'pointer.2' } : {}) }));
       await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
-      expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-      expect(hook!.error).toContain(change === 'publication' ? 'applied publication changed'
-        : change === 'host-owner' ? 'execution owner changed' : 'owner or component identity changed');
+      expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['prepare', 'enable']);
+      expect(hook!.error).toBeNull();
+      expect(hook!.snapshot?.lifecycleState).toBe('active');
       expect(hook!.busy).toBe(false);
     },
   );
+
+  // M6 (item 36): Recover acknowledges only the incident on screen.
+  const withIncident = (incidentId: string | null): CCLCComponentSnapshot['lifecycleProgress'] => ({
+    phase: 'blocked', nextIntent: 'recover', blockingCauseClass: 'collision',
+    blockingReason: null, waitingSinceNs: 1, delayed: false,
+    incident: incidentId === null ? null : {
+      incidentId, causeClass: 'collision', vendorCodes: ['C31'], detectedAtNs: 1,
+      summary: 'Collision detected', acknowledged: false,
+    },
+  });
+
+  it('sends the shown incident with Recover and words a replaced incident refusal', async () => {
+    let shown = 'incident.a';
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: state, readiness: readiness(state), lifecycleProgress: withIncident(shown) }));
+    await mountCCLC();
+    expect(hook!.snapshot?.lifecycleProgress?.incident?.incidentId).toBe('incident.a');
+    shown = 'incident.b';
+    apiMock.cclc.submitLifecycle.mockRejectedValue(new ApiError('changed', 409, {
+      detail: { code: 'cclc_incident_changed', message: 'changed',
+        details: { effect: 'not_started', expected_incident_id: 'incident.a', incident_id: 'incident.b' } },
+    }));
+    await act(async () => { await hook!.submitLifecycle('recover'); });
+    expect(apiMock.cclc.submitLifecycle.mock.calls[0]![0].expected_incident_id).toBe('incident.a');
+    expect(hook!.error).toContain('The incident changed since it was shown');
+    // The refusal re-reads: incident B is now on screen.
+    expect(hook!.snapshot?.lifecycleProgress?.incident?.incidentId).toBe('incident.b');
+  });
+
+  it('sends no expected incident when none is shown or for other intents', async () => {
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: state, readiness: readiness(state), lifecycleProgress: withIncident(null) }));
+    await mountCCLC();
+    await act(async () => { await hook!.submitLifecycle('recover'); });
+    await act(async () => { await hook!.submitLifecycle('prepare'); });
+    for (const [request] of apiMock.cclc.submitLifecycle.mock.calls) {
+      expect(request.expected_incident_id).toBeUndefined();
+    }
+  });
 
   it('keeps ordinary explicit Refresh conflicts on the existing error path', async () => {
     await mountCCLC();
@@ -640,6 +961,24 @@ describe('mounted explicit activation API boundaries', () => {
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
     expect(hook!.error).toContain('applied configuration changed');
   });
+
+  it.each(['retainedBundleId', 'graphRevision'] as const)(
+    'uses the confirmed snapshot when %s changes before the first activation read', async (field) => {
+      await mountCCLC();
+      const changed = { [field]: `replacement.${field}` };
+      apiMock.execution.identity.mockResolvedValue({ ...execution, ...changed });
+      apiMock.cclc.component.mockImplementation(async (id: string) => ({
+        ...snapshot, ...changed, controllableComponentId: id,
+        lifecycleState: state, readiness: readiness(state),
+      }));
+      apiMock.cclc.routeTemplates.mockImplementation(async (id: string) => ({
+        ...templates, ...changed, controllableComponentId: id,
+      }));
+      await act(async () => { await hook!.activate(); });
+      expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+      expect(hook!.error).toContain('applied configuration changed');
+    },
+  );
 
   it.each([false, true])('keeps the selected snapshot and routes coherent when sequence fails=%s', async (fails) => {
     await mountCCLC();
@@ -700,14 +1039,13 @@ describe('mounted explicit activation API boundaries', () => {
   it.each([null, { retainedBundleId: 'new.bundle', graphRevision: 'new.graph', componentIds: ['component.arm'] }])(
     'stops when the exact applied order disappears or changes before submission', async (replacement) => {
       await mountCCLC();
-      apiMock.deploymentWorkspace.get.mockResolvedValueOnce({ managerApplied: {
-        scenarioId: 'fixture', deploymentRevision: 'deployment.1', activationOrder: {
-          retainedBundleId: snapshot.retainedBundleId, graphRevision: snapshot.graphRevision, componentIds: ['component.other'],
-        },
-      } }).mockResolvedValue({ managerApplied: { scenarioId: 'fixture', deploymentRevision: 'deployment.1', activationOrder: replacement } });
-      await act(async () => { await hook!.activateSequence(); });
+      // F1a (F1-CYCLE, audit L6): the order is bound once, at confirmation.
+      const observation = await hook!.readActivationSequence(undefined, 'execute');
+      apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
+        scenarioId: 'fixture', deploymentRevision: 'deployment.1', activationOrder: replacement } });
+      await act(async () => { await hook!.activateSequence(observation.identity, observation.activationOrder); });
       expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-      expect(hook!.error).toContain('applied configuration changed');
+      expect(hook!.error).toContain(replacement === null ? 'no captured Deployment' : 'applied configuration changed');
       await flushHook();
     },
   );
@@ -825,7 +1163,7 @@ describe('mounted explicit activation API boundaries', () => {
   it('keeps a readiness Prepare race refusal truthful without retrying or choosing another component', async () => {
     await mountCCLC();
     apiMock.cclc.submitLifecycle.mockResolvedValue({ ...acceptedLifecycle('prepare'), status: {
-      ...acceptedLifecycle('prepare').status, terminalResult: 'failed_known_no_effect', error: {
+      ...acceptedLifecycle('prepare').status, terminalResult: 'failed', error: {
         code: 'component_lifecycle_transition_missing', message: 'No transition satisfied',
         details: { reason: 'no_transition_satisfied', observed_state: 'declared', observed_controller_loaded: 'unknown',
           observed_fault_present: 'false', observed_transport_ready: 'false' } } } });
@@ -837,7 +1175,7 @@ describe('mounted explicit activation API boundaries', () => {
     expect(hook!.error).toBeNull();
   });
 
-  it.each(['publication', 'host-owner'])('ends a wait when only the exact %s changes', async (change) => {
+  it.each(['publication', 'host-owner'])('continues activation when only the server-owned %s changes', async (change) => {
     await mountCCLC();
     apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
       lifecycleState: state, readiness: readiness(state, false) }));
@@ -847,11 +1185,15 @@ describe('mounted explicit activation API boundaries', () => {
       apiMock.execution.identity.mockResolvedValue({ ...execution, activePublicationGeneration: 2 });
       apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
         lifecycleState: state, readiness: readiness(state), publicationGeneration: 2, activePublicPointerDigest: 'pointer.2' }));
-    } else apiMock.execution.identity.mockResolvedValue({ ...execution, ownerEpoch: 'replacement-host-owner' });
+    } else {
+      apiMock.execution.identity.mockResolvedValue({ ...execution, ownerEpoch: 'replacement-host-owner' });
+      apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+        lifecycleState: state, readiness: readiness(state) }));
+    }
     await act(async () => { await vi.advanceTimersByTimeAsync(250); await activation; });
-    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-    expect(hook!.componentHealth['component.arm']?.snapshot).toBeNull();
-    expect(hook!.error).toContain(change === 'publication' ? 'applied publication changed' : 'execution owner changed');
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['prepare', 'enable']);
+    expect(hook!.componentHealth['component.arm']?.snapshot?.lifecycleState).toBe('active');
+    expect(hook!.error).toBeNull();
   });
 
   it.each(['refresh', 'activate'] as const)('invalidates prior Ready when a newer %s GET fails', async (action) => {
@@ -897,7 +1239,7 @@ describe('mounted explicit activation API boundaries', () => {
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
   });
 
-  it('pins publication for the entire sequence across an Active skip and the next component', async () => {
+  it('does not stop activation on a publication generation change', async () => {
     await mountCCLC();
     apiMock.cclc.component.mockClear();
     let publication = 1;
@@ -905,17 +1247,18 @@ describe('mounted explicit activation API boundaries', () => {
     apiMock.cclc.component.mockImplementation(async (id: string) => {
       if (id === 'component.arm') publication = 2;
       return { ...snapshot, controllableComponentId: id, publicationGeneration: publication,
-        activePublicPointerDigest: `pointer.${publication}`, lifecycleState: id === 'component.other' ? 'active' : 'declared',
-        readiness: readiness(id === 'component.other' ? 'active' : 'declared') };
+        activePublicPointerDigest: `pointer.${publication}`, lifecycleState: id === 'component.other' ? 'active' : state,
+        readiness: readiness(id === 'component.other' ? 'active' : state) };
     });
-    // Execution identity must expose the same current publication when the next row is read.
+    // The lifecycle owner handles publication freshness; activation does not pin it in the GUI.
     apiMock.execution.identity.mockImplementation(async () => {
       if (apiMock.cclc.component.mock.calls.length >= 2) publication = 2;
       return { ...execution, activePublicationGeneration: publication };
     });
     await act(async () => { await hook!.activateSequence(); });
-    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-    expect(hook!.error).toContain('applied publication changed');
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => [request.controllable_component_id, request.intent]))
+      .toEqual([['component.arm', 'prepare'], ['component.arm', 'enable']]);
+    expect(hook!.error).toBeNull();
   });
 
   it('deactivates exactly the listed changed components in the given order with positive Disabled observations', async () => {
@@ -956,7 +1299,7 @@ describe('mounted explicit activation API boundaries', () => {
       lifecycleState: states[id]!, readiness: readiness(states[id]!) }));
     apiMock.cclc.submitLifecycle.mockImplementation(async (request) => ({
       ...acceptedLifecycle(request.intent),
-      status: { ...acceptedLifecycle(request.intent).status, terminalResult: 'failed_known_no_effect' as const,
+      status: { ...acceptedLifecycle(request.intent).status, terminalResult: 'failed' as const,
         error: { code: 'cell_not_idle', message: 'Only while the cell is idle', details: {} } },
     }));
     let observation!: Awaited<ReturnType<NonNullable<typeof hook>['readActivationSequence']>>;

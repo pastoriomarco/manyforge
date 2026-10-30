@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -21,6 +22,7 @@ import {
 } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import { browserRequestIdentity } from '../hooks/useCCLC';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { SettingsSubheading } from './SettingsScope';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -51,11 +53,17 @@ import {
   type RetainedSceneOwnerPresentation,
 } from '../state/sceneAuthoring';
 import {
+  sceneDetachReceiptAccepted,
+  sceneDetachRequest,
+  sceneDetachUnavailableReason,
+} from '../state/sceneDetach';
+import {
   candidateRobotPresentation,
   candidateGripperPresentation,
   candidateToolPresentation,
   createExecutionRobotPresentationReader,
   createMeasuredComparisonPresentationReader,
+  createMeasuredOverlayFrameWarningsReader,
   frozenMeasuredRobotPresentationReader,
   executionRobotPresentation,
   runtimeScenePresentation,
@@ -67,6 +75,7 @@ import {
   robotControlCandidatePresentationAllowed,
   robotControlHasActiveOperation,
   robotControlHasLocalDraft,
+  selectedTcpOf,
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
@@ -98,6 +107,11 @@ import type {
   MotionPreviewReceipt,
   Pose3Value,
 } from '../types/robotControl';
+import {
+  candidateDragReferenceIsStable,
+  snapshotRuntimeLinkTransform,
+  type CandidateDragReference,
+} from '../utils/robotControlDragStability';
 import type { PoseTuple } from '../utils/poseTransforms';
 import { poseValueFromTuple } from '../utils/poseTransforms';
 
@@ -335,10 +349,31 @@ function programResourceWithViewportTransform(
   };
 }
 
+/** The bound of a scene object's `metadata.mass_kg` (kg), as the Apply compiler checks it. */
+const MAX_OBJECT_MASS_KG = 1000;
+
+/**
+ * One representation of "no mass": a 0 kg `metadata.mass_kg` is removed, and
+ * `metadata` with it when nothing else is left (absent is 0 kg).
+ */
+function withoutZeroMass(resource: ProgramSceneResource): ProgramSceneResource {
+  if (resource.metadata?.mass_kg !== 0) return resource;
+  const metadata = { ...resource.metadata };
+  delete metadata.mass_kg;
+  const next: ProgramSceneResource = { ...resource, metadata };
+  if (Object.keys(metadata).length === 0) delete next.metadata;
+  return next;
+}
+
 function programSceneResourceError(resource: ProgramSceneResource | null): string | null {
   if (resource === null) return null;
   const positive = (value: number) => Number.isFinite(value) && value > 0;
   if (!resource.scene_resource_id.trim()) return 'Scene resource ID is required.';
+  const mass = resource.metadata?.mass_kg;
+  if (mass !== undefined && (typeof mass !== 'number' || !Number.isFinite(mass)
+    || mass < 0 || mass > MAX_OBJECT_MASS_KG)) {
+    return `Mass must be between 0 and ${MAX_OBJECT_MASS_KG} kg.`;
+  }
   if (!resource.pose.position_m.every(Number.isFinite)) return 'Pose position must be finite.';
   const orientation = 'xyzw' in resource.pose.orientation
     ? resource.pose.orientation.xyzw
@@ -908,18 +943,20 @@ export function ProgramSceneEditor({
     setStaged(selected);
   }, [draftRevision, selected]);
 
-  const dirty = staged !== null && selected !== null
-    && JSON.stringify(staged) !== JSON.stringify(selected);
+  // A typed 0 kg stays in the field while editing; it is committed as no key.
+  const committed = staged === null ? null : withoutZeroMass(staged);
+  const dirty = committed !== null && selected !== null
+    && JSON.stringify(committed) !== JSON.stringify(selected);
   const stagedError = programSceneResourceError(staged);
-  // Support contacts have their own editor; the rest of the metadata is shown raw.
+  // Support contacts and the mass have their own fields; the rest of the metadata is shown raw.
   const metadataEntries = Object.entries(staged?.metadata ?? {})
-    .filter(([key]) => key !== 'support_contacts');
+    .filter(([key]) => key !== 'support_contacts' && key !== 'mass_kg');
   const otherMetadata = metadataEntries.length === 0 ? null : Object.fromEntries(metadataEntries);
   const frameOptions = useMemo(() => programComponentFrameOptions(program), [program]);
   const commitStaged = () => {
-    if (busy || !dirty || staged === null || stagedError !== null) return;
+    if (busy || !dirty || committed === null || stagedError !== null) return;
     mutate('scene_draft_update_object', {
-      scene_resource: staged as unknown as JsonValue,
+      scene_resource: committed as unknown as JsonValue,
     });
   };
   const setPosePosition = (index: number, value: number) => {
@@ -952,11 +989,19 @@ export function ProgramSceneEditor({
       pose: { ...staged.pose, orientation: { rpy_deg: rpy } },
     });
   };
+  // `metadata.mass_kg`: empty is 0 kg, no key (no payload change).
+  const setMassKg = (text: string) => {
+    if (staged === null) return;
+    const empty = text.trim() === '';
+    const next = { ...staged, metadata: { ...staged.metadata, mass_kg: empty ? 0 : Number(text) } };
+    setStaged(empty ? withoutZeroMass(next) : next);
+  };
+  const massKg = staged?.metadata?.mass_kg;
   const addResource = (resource: ProgramSceneResource) => {
     onSelectResource(resource.scene_resource_id);
-    if (staged !== null && dirty) {
+    if (committed !== null && dirty) {
       mutate('scene_draft_upsert_objects', {
-        scene_resources: [staged, resource] as unknown as JsonValue,
+        scene_resources: [committed, resource] as unknown as JsonValue,
       });
       return;
     }
@@ -970,7 +1015,7 @@ export function ProgramSceneEditor({
     let identity = `${staged.scene_resource_id}_copy`;
     let suffix = 2;
     while (ids.has(identity)) identity = `${staged.scene_resource_id}_copy_${suffix++}`;
-    const duplicate = structuredClone(staged);
+    const duplicate = structuredClone(withoutZeroMass(staged));
     duplicate.scene_resource_id = identity;
     duplicate.pose.position_m = [
       duplicate.pose.position_m[0] + 0.05,
@@ -1153,6 +1198,22 @@ export function ProgramSceneEditor({
               ))}
             </div>
           )}
+          <label>
+            <span>Mass (kg)</span>
+            <input
+              type="number"
+              aria-label="Draft object mass (kg)"
+              min={0}
+              max={MAX_OBJECT_MASS_KG}
+              step={0.01}
+              placeholder="0"
+              value={typeof massKg === 'number' ? massKg : ''}
+              disabled={busy}
+              title={blockedTitle}
+              onChange={(event) => setMassKg(event.currentTarget.value)}
+            />
+          </label>
+          <p className="scene-contract-note hint">Added to the robot's payload while this object is attached.</p>
           <p className="scene-contract-note hint">
             Frame: <code>{staged.pose.frame_ref.kind}</code> · shape:{' '}
             <code>{staged.shape.type}</code>
@@ -1717,13 +1778,15 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     viewer?.resource_role_visibility,
   ]);
   const motionDescriptor = robotControl.selectedStatus?.directControl?.targetDescriptor ?? null;
+  // G4: carried parts are drawn at their holder's frame, independent of the
+  // Robot-control selection. G2: the measured ghost reads the owner frames
+  // itself (below), so no frame is read here.
   const sceneRuntimePresentation = useMemo(() => runtimeScenePresentation(
     presentationFacts?.sceneRuntime ?? null,
     presentationFacts?.logicalScene ?? null,
     sourceValue,
     readyManifest,
-    motionDescriptor,
-  ), [motionDescriptor, presentationFacts, readyManifest, sourceValue]);
+  ), [presentationFacts, readyManifest, sourceValue]);
   const executionObservationPresentation = useMemo(() => {
     const live = createExecutionRobotPresentationReader(
       source,
@@ -1739,13 +1802,28 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   }, [modelRetained, motionDescriptor, readyManifest, source, sourceValue]);
   // The measured comparison robot reads the same stream frames (their measured
   // rows), never the control-state pose sources: that snapshot deliberately
-  // does not republish while the robot moves.
+  // does not republish while the robot moves. G2: an outside measured source
+  // drives its robot; the other elements still follow the frames per sample.
+  const measuredRobotSources = sceneRuntimePresentation.measuredRobotSources;
   const measuredComparisonPresentation = useMemo(() => {
-    const live = createMeasuredComparisonPresentationReader(source, sourceValue, readyManifest);
-    return modelRetained
-      ? frozenMeasuredRobotPresentationReader(live.readMeasuredRobotPresentation())
-      : live;
-  }, [modelRetained, readyManifest, source, sourceValue]);
+    const live = createMeasuredComparisonPresentationReader(
+      source, sourceValue, readyManifest, measuredRobotSources,
+    );
+    if (!modelRetained) return live;
+    const presentation = live.readMeasuredRobotPresentation();
+    const frame = source.getLatestExecutionObservation();
+    const elapsedNs = frame?.outsideReceivedAtMonotonicMs === undefined ? 0
+      : Math.max(0, performance.now() - frame.outsideReceivedAtMonotonicMs) * 1_000_000;
+    const outside = (frame?.outsidePoseSources ?? []).filter((row) => (
+      row.source.payload_quality === 'good' && row.source.fresh
+      && row.ageAtDeliveryNs + elapsedNs <= row.freshnessBudgetNs
+    ));
+    const isOutside = outside.length === 1 && presentation !== null
+      && frame?.cellId === sourceValue?.cell_id
+      && frame?.retainedBundleId === sourceValue?.retained_bundle_id
+      && frame?.graphRevision === sourceValue?.graph_revision;
+    return frozenMeasuredRobotPresentationReader(isOutside ? null : presentation);
+  }, [measuredRobotSources, modelRetained, readyManifest, source, sourceValue]);
   // The measured robot pose comes only from the live observation stream. The
   // control-state copy of observed joints is refreshed only at control changes
   // and motion ends, so it can be older than the robot (and than a pose
@@ -1849,7 +1927,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       correctionGhost.receipt, readyManifest, correctionGhost.descriptor, measured.linkTransforms,
     );
   }, [correctionGhost, executionObservationPresentation, readyManifest]);
-  const dragReference = useRef<string | null>(null);
+  const dragReference = useRef<CandidateDragReference | null>(null);
   const readCandidateReference = () => {
     const status = robotControl.selectedStatus;
     // A candidate TCP needs a selected motion target (none for gripper-only).
@@ -1859,14 +1937,17 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     if (observationEpoch === null) return null;
     const frames = motion.targetDescriptor.frames;
     const base = frames.find((frame) => frame.frameRoleId === motion.baseFrameRoleId);
-    const tcp = frames.find((frame) => frame.frameRoleId === motion.tcpFrameRoleId);
+    // TCP-C: the selected TCP (the robot's or its mounted tool's).
+    const tcp = selectedTcpOf(motion) ?? undefined;
     const transforms = executionObservationPresentation.readMeasuredRobotPresentation()?.linkTransforms;
     const basePose = base === undefined ? undefined : transforms?.[base.compiledFrameName];
     const tcpPose = tcp === undefined ? undefined : transforms?.[tcp.compiledFrameName];
     if (base === undefined || basePose === undefined || tcpPose === undefined) return null;
     return {
-      key: JSON.stringify([observationEpoch, status.retainedBundleId, status.graphRevision,
-        motion.programBindingId, base, tcp, basePose, tcpPose]),
+      identity: JSON.stringify([observationEpoch, status.retainedBundleId, status.graphRevision,
+        motion.programBindingId, base, tcp]),
+      basePose: snapshotRuntimeLinkTransform(basePose),
+      tcpPose: snapshotRuntimeLinkTransform(tcpPose),
       base: { modelInstanceId: base.modelInstanceId, viewerLinkName: base.compiledFrameName,
         poseInCell: poseValueFromTuple({ position: basePose.position_m, quaternion: basePose.orientation_xyzw }) },
       motion,
@@ -1876,7 +1957,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     if (!candidatePresentationAllowed) return false;
     const reference = readCandidateReference();
     if (reference === null || !robotControl.beginPoseDrag()) return false;
-    dragReference.current = reference.key;
+    dragReference.current = reference;
     return true;
   };
   const finishCandidateDrag = (pose: Pose3Value | null, noChange?: GizmoNoChange) => {
@@ -1887,7 +1968,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     }
     const reference = readCandidateReference();
     const valid = candidatePresentationAllowed
-      && reference !== null && reference.key === dragReference.current;
+      && reference !== null && dragReference.current !== null
+      && candidateDragReferenceIsStable(dragReference.current, reference);
     dragReference.current = null;
     if (!valid) {
       // Discards the draft (revert) and says so.
@@ -2154,6 +2236,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     )}>
     <StructuralViewer
       viewerActive={active}
+      onViewerPoseRateChange={source.setViewerPoseRateHz}
       manifest={viewerManifest}
       modelPresentation={modelPresentation}
       onRetry={retryViewerModel}
@@ -2354,15 +2437,28 @@ export function SceneAuthoringWorkspace({
     () => facts?.logicalScene.snapshot?.objects ?? [],
     [facts],
   );
+  // G2: the overlay lines that follow the owner frames re-render this panel
+  // only when they change, never per sample.
+  const frameWarningsReader = useMemo(() => createMeasuredOverlayFrameWarningsReader(
+    headlessStateSource, facts?.sceneRuntime ?? null, sourceValue,
+  ), [facts, headlessStateSource, sourceValue]);
+  const frameWarnings = useSyncExternalStore(
+    frameWarningsReader.subscribeFrameWarnings,
+    frameWarningsReader.readFrameWarnings,
+    frameWarningsReader.readFrameWarnings,
+  );
   const runtimePresentation = useMemo(
     () => runtimeScenePresentation(
       facts?.sceneRuntime ?? null,
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
-      robotControl.selectedStatus?.directControl?.targetDescriptor ?? null,
+      headlessStateSource.getLatestExecutionObservation(),
     ),
-    [facts, manifest, robotControl.selectedStatus, sourceValue],
+    // The frame lines are the invalidation key: the latest owner frame is
+    // re-read only when they change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [facts, frameWarnings, headlessStateSource, manifest, sourceValue],
   );
   const runtimeStatus = runtimePresentation.status;
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
@@ -2441,6 +2537,39 @@ export function SceneAuthoringWorkspace({
   const selectedObject = objects.find(
     (object) => object.scene_resource_id === selectedOwnerObjectId,
   ) ?? null;
+  const selectedCarriedAttachment = selectedObject?.placement.kind === 'carried'
+    ? facts?.logicalScene.snapshot?.carried_object_attachments.find((attachment) => (
+      attachment.scene_resource_id === selectedObject.scene_resource_id
+    )) ?? null
+    : null;
+  const detachControlFreshness = useMemo(() => ({
+    transportStatus: headlessState.transportStatus,
+    semanticStatus: headlessState.semanticStatus,
+    transportError: headlessState.transportError,
+  }), [headlessState.semanticStatus, headlessState.transportError, headlessState.transportStatus]);
+  const detachUnavailableReason = sceneDetachUnavailableReason(
+    headlessState.snapshot,
+    facts,
+    selectedCarriedAttachment,
+    detachControlFreshness,
+  );
+  const detachCarriedObject = useCallback(async (attachment: NonNullable<typeof selectedCarriedAttachment>) => {
+    const unavailable = sceneDetachUnavailableReason(
+      headlessState.snapshot,
+      facts,
+      attachment,
+      detachControlFreshness,
+    );
+    if (unavailable !== null) throw new Error(unavailable);
+    if (facts === null) throw new Error('The current logical Scene owner is unavailable.');
+    const expectedProjection = facts.logicalScene.access.active_projection;
+    if (expectedProjection === null) throw new Error('The logical Scene has no active projection.');
+    const requestId = browserRequestIdentity('composer-scene-detach');
+    const response = await api.scene.commit(sceneDetachRequest(attachment, facts, requestId));
+    if (!sceneDetachReceiptAccepted(response, requestId, facts.sourceOwnerEpoch, expectedProjection)) {
+      throw new Error('The detach receipt does not confirm a successor Scene revision.');
+    }
+  }, [detachControlFreshness, facts, headlessState.snapshot]);
   const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
@@ -2651,7 +2780,7 @@ export function SceneAuthoringWorkspace({
           </label>
           {runtimeStatus.warnings.map((warning) => (
             <p className="scene-contract-note inline-message severity-warning" key={warning} role="status">
-              Measured overlay: {warning}
+              {warning}
             </p>
           ))}
           </section>
@@ -2670,9 +2799,13 @@ export function SceneAuthoringWorkspace({
           )}
           {selectedObject?.placement.kind === 'carried' && (
             <CarriedObjectPoseCard
+              key={selectedObject.scene_resource_id}
               measurement={runtimePresentation.attachedObjects.find((item) => (
                 item.object.scene_resource_id === selectedObject.scene_resource_id
               ))?.poseMeasurement ?? null}
+              attachment={selectedCarriedAttachment}
+              detachUnavailableReason={detachUnavailableReason}
+              onDetach={detachCarriedObject}
             />
           )}
           <details className="dcard">

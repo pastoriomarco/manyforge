@@ -2,7 +2,7 @@
   "api_version": "manyforge.program.v2",
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.8.0"
+    "content_version": "2.9.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -82,8 +82,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "lite6_arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "lite6_arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -144,8 +143,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "ur5e_arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "ur5e_arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -336,8 +334,7 @@
         "arm_collision"
       ],
       "required_frame_roles": [
-        "base",
-        "tcp"
+        "base"
       ],
       "required_model_roles": [
         "arm_model"
@@ -394,8 +391,7 @@
         "arm_collision"
       ],
       "required_frame_roles": [
-        "base",
-        "tcp"
+        "base"
       ],
       "required_model_roles": [
         "arm_model"

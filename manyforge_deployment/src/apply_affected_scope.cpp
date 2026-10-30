@@ -24,6 +24,11 @@ namespace core = manyforge::core;
   throw ApplyAffectedScopeError(detail);
 }
 
+[[noreturn]] void FailInstalledStateUnknown(const std::string &detail) {
+  throw ApplyAffectedScopeError("actual_installed_state_unknown",
+                                "actual_installed_state_unknown: " + detail);
+}
+
 template <typename Record, typename Id, typename Key>
 [[nodiscard]] std::map<Id, const Record *>
 IndexBy(const std::vector<Record> &records, Key key) {
@@ -609,7 +614,7 @@ derive_apply_configuration_fence_scope_verified_values(
   std::set<core::ControllableComponentId> actual_components;
   if (actual_terminal_products.size() > kMaximumApplyComponentDeltaRows ||
       actual_restart_components.size() > kMaximumApplyComponentDeltaRows) {
-    Fail("actual_installed_state_unknown: terminal source inventory exceeds "
+    FailInstalledStateUnknown("terminal source inventory exceeds "
          "its component bound");
   }
   if (!std::is_sorted(actual_restart_components.begin(),
@@ -622,7 +627,7 @@ derive_apply_configuration_fence_scope_verified_values(
   }
   for (const auto *source : actual_terminal_products) {
     if (!source || source->cell_graph.cell_id != old_graph.cell_id)
-      Fail("actual_installed_state_unknown: terminal product has a foreign "
+      FailInstalledStateUnknown("terminal product has a foreign "
            "cell");
     for (auto &[id, provider_source] : ProviderSources(*source)) {
       const auto &component =
@@ -634,13 +639,13 @@ derive_apply_configuration_fence_scope_verified_values(
       const auto [actual, inserted] =
           actual_domains.emplace(id, provider_source.domain);
       if (!inserted && *actual->second != *provider_source.domain)
-        Fail("actual_installed_state_unknown: terminal provider domains "
+        FailInstalledStateUnknown("terminal provider domains "
              "conflict");
       const auto [old, added] =
           old_provider_sources.emplace(id, provider_source);
       if (!added && (*old->second.domain != *provider_source.domain ||
                      old->second.outputs != provider_source.outputs))
-        Fail("actual_installed_state_unknown: terminal provider source "
+        FailInstalledStateUnknown("terminal provider source "
              "conflicts with predecessor");
       affected_provider_domains.insert(id);
     }
@@ -658,12 +663,12 @@ derive_apply_configuration_fence_scope_verified_values(
             return row.control_domain_id == binding.control_domain_id;
           });
       if (domain == source->cell_graph.control_domains.end())
-        Fail("actual_installed_state_unknown: terminal source binding has no "
+        FailInstalledStateUnknown("terminal source binding has no "
              "actual domain");
       const auto [found, inserted] =
           actual_domains.emplace(domain->control_domain_id, &*domain);
       if (!inserted && *found->second != *domain)
-        Fail("actual_installed_state_unknown: terminal products conflict on "
+        FailInstalledStateUnknown("terminal products conflict on "
              "actual domain revision");
     }
   }
@@ -751,7 +756,7 @@ derive_apply_configuration_fence_scope_verified_values(
     const auto [found, inserted] =
         old_bindings.emplace(binding->control_binding_id, binding);
     if (!inserted && *found->second != *binding)
-      Fail("actual_installed_state_unknown: terminal products conflict on "
+      FailInstalledStateUnknown("terminal products conflict on "
            "actual binding revision");
   }
   std::set<core::ControlBindingId> selected_binding_ids;
@@ -819,7 +824,7 @@ derive_apply_configuration_fence_scope_verified_values(
   for (const auto &[id, domain] : actual_domains) {
     const auto [found, inserted] = old_domains.emplace(id, domain);
     if (!inserted && *found->second != *domain)
-      Fail("actual_installed_state_unknown: terminal source conflicts with the "
+      FailInstalledStateUnknown("terminal source conflicts with the "
            "actual predecessor domain");
   }
   std::vector<core::ConfigurationFenceDomainScopeDTO> domains;
@@ -883,7 +888,7 @@ core::ConfigurationFenceScopeDTO derive_apply_configuration_fence_scope(
   sources.reserve(actual_terminal_products.size());
   for (const auto *product : actual_terminal_products) {
     if (!product || !verify_retained_bundle_identity(*product))
-      Fail("actual_installed_state_unknown: terminal source product failed "
+      FailInstalledStateUnknown("terminal source product failed "
            "byte identity proof");
     sources.push_back(&product->value());
   }

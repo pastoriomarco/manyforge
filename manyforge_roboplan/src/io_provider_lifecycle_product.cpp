@@ -286,7 +286,7 @@ IoProviderDriverRecord::Create(
     core::ResolvedLifecycleControlDomainScopeDTO domain,
     core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
     core::ProviderManifestDTO manifest, std::shared_ptr<core::IClock> clock,
-    core::Duration observation_freshness_ns) {
+    core::Duration observation_freshness_ns, core::Duration poll_period_ns) {
   using Reply = core::Result<std::shared_ptr<IoProviderDriverRecord>>;
   const auto *provider = domain.provider();
   if (!domain.locally_valid() || !provider || !clock ||
@@ -313,7 +313,7 @@ IoProviderDriverRecord::Create(
   auto port =
       RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
           record->domain().provider()->provider.controllable_component_id,
-          record->occurrence(),
+          record->occurrence(), record->catalog(),
           [weak, clock_pin = record->state_->clock](const auto &id, auto now) {
             // The borrowed clock is used by the brand port before this source
             // callback. Keep it alive even when only the port survives.
@@ -323,14 +323,12 @@ IoProviderDriverRecord::Create(
             return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
                 error("driver_retired"));
           },
-          *record->state_->clock, observation_freshness_ns,
+          *record->state_->clock, observation_freshness_ns, poll_period_ns,
           [weak](const auto &intent, auto cancellation) {
             if (auto driver = weak.lock())
               return driver->Dispatch(intent, cancellation);
             return RetainedExternallyManagedPrimitiveOutcome{
-                core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-                core::LifecyclePrimitiveEffectDTO::kNone,
-                {},
+                RetainedRos2ControlSwitchOutcome::kNotSent,
                 error("driver_retired")};
           });
   if (!port.ok())
@@ -680,12 +678,10 @@ IoProviderDriverRecord::ReadLifecycleHealth(const core::ControlDomainId &domain,
 RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
     const core::BrandLifecyclePrimitiveIntentDTO &intent,
     std::stop_token cancellation) {
-  using Dispatch = core::LifecyclePrimitiveDispatchStateDTO;
-  using Effect = core::LifecyclePrimitiveEffectDTO;
-  using Known = core::LifecyclePrimitiveKnownResultDTO;
+  using Outcome = RetainedRos2ControlSwitchOutcome;
   const auto refused = [](std::string reason) {
-    return RetainedExternallyManagedPrimitiveOutcome{
-        Dispatch::kNotDispatched, Effect::kNone, {}, error(std::move(reason))};
+    return RetainedExternallyManagedPrimitiveOutcome{Outcome::kNotSent,
+                                                     error(std::move(reason))};
   };
   auto lock = AcquireDelivery();
   const auto observed = state_->Snapshot();
@@ -736,10 +732,9 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
         state_->fault = planned.error();
         state_->state = Lifecycle::kFaulted;
         state_->CommitFacts();
-        return {Dispatch::kDispatchedKnown, Effect::kObserved, Known::kFailed,
-                planned.error()};
+        return {Outcome::kFailedEffectObserved, planned.error()};
       }
-      return {Dispatch::kNotDispatched, Effect::kNone, {}, planned.error()};
+      return {Outcome::kNotSent, planned.error()};
     }
   }
   if (!state_->Advance())
@@ -815,8 +810,7 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
     state_->fault = failure;
     state_->state = Lifecycle::kFaulted;
     state_->CommitFacts();
-    return {Dispatch::kDispatchedKnown, Effect::kObserved, Known::kFailed,
-            failure};
+    return {Outcome::kFailedEffectObserved, failure};
   }
   state_->enabled = enable;
   state_->fault.reset();
@@ -824,7 +818,7 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
                   : disable ? Lifecycle::kDisabled
                             : Lifecycle::kPrepared;
   state_->CommitFacts();
-  return {Dispatch::kDispatchedKnown, Effect::kObserved, Known::kSucceeded, {}};
+  return {Outcome::kSucceeded, std::nullopt};
 }
 
 void IoProviderDriverRecord::SetSupervisedProcessFaultSource(

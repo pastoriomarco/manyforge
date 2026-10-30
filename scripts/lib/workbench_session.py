@@ -165,22 +165,25 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
 
     Source predicates: DX1003 journal-terminal-predicates.md. Unknown formats
     and missing/native-WAL evidence remain unknown, independently of shutdown.
+    The schema version is the journal's own metadata (user_version, or the
+    Program metadata row); it is read, not pinned. A predicate that does not
+    fit the journal's layout fails and leaves that family unknown.
     """
     unknown, unresolved = [], []
     sources = [
-        ("program_cycle", "program-cycle.sqlite3", None, 7, [
+        ("program_cycle", "program-cycle.sqlite3", None, [
             "SELECT 1 FROM program_cycle WHERE state != 'idle_after_reset' OR program_run_id IS NOT NULL OR claim_json IS NOT NULL OR acquisition_pending_json IS NOT NULL LIMIT 1",
             "SELECT 1 FROM program_cycle_inflight_commands LIMIT 1",
             "SELECT 1 FROM program_persistent_value_requests WHERE outcome='storage_uncertain' LIMIT 1",
         ], []),
-        # v16 archives and current v17 journals share the stop_projections
-        # *_sequence columns (v16 CHECKs pair each with its payload column).
-        ("kernel_operation", "execution-state/operation-journal.sqlite3", 0x4D46454A, (16, 17), [
+        # v16 and v17 journals share the stop_projections *_sequence columns
+        # (v16 CHECKs pair each with its payload column).
+        ("kernel_operation", "execution-state/operation-journal.sqlite3", 0x4D46454A, [
             "SELECT 1 FROM operation_snapshots WHERE disposition='orphaned_by_host_replacement' OR state NOT IN ('completed','stopped','failed','intervention_required','cancelled_pre_dispatch') LIMIT 1",
             "SELECT 1 FROM cell_admission_claims WHERE release_owner_role IS NULL AND reconciled_sequence IS NULL LIMIT 1",
             "SELECT 1 FROM stop_projections WHERE terminal_sequence IS NULL OR (surveillance_sequence IS NOT NULL AND clear_sequence IS NULL) LIMIT 1",
         ], []),
-        ("cclc", "execution-state/cclc-journal.sqlite3", 0x4D464C4A, 21, [
+        ("cclc", "execution-state/cclc-journal.sqlite3", 0x4D464C4A, [
             "SELECT 1 FROM lifecycle_transactions WHERE terminal != 1 LIMIT 1",
             "SELECT 1 FROM route_selection_transactions WHERE terminal != 1 LIMIT 1",
             "SELECT 1 FROM cclc_effect_attempts WHERE completed_attempt_blob IS NULL LIMIT 1",
@@ -189,16 +192,15 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
             "SELECT 1 FROM cclc_native_apply_reservations LIMIT 1",
             "SELECT 1 FROM cclc_component_incidents WHERE acknowledged IS NULL OR acknowledged != 1 LIMIT 1",
         ], ["lifecycle_transactions", "route_selection_transactions", "cclc_effect_attempts", "cclc_route_effect_attempts"]),
-        ("manager", "manager/manager-bootstrap-journal.sqlite3", 1296450122, 1, [
+        ("manager", "manager/manager-bootstrap-journal.sqlite3", 1296450122, [
             "SELECT 1 FROM manager_bootstrap_intents i LEFT JOIN manager_bootstrap_accepted_targets t USING(bootstrap_id,bootstrap_generation) WHERE t.bootstrap_id IS NULL LIMIT 1",
         ], ["manager_bootstrap_intents"]),
-        ("manager", "manager/manager-apply-journal.sqlite3", 1296450128, 19, [
+        ("manager", "manager/manager-apply-journal.sqlite3", 1296450128, [
             "SELECT 1 FROM manager_apply_intents i LEFT JOIN manager_apply_terminal_outcomes t USING(apply_id,apply_generation) WHERE t.apply_id IS NULL LIMIT 1",
             "SELECT 1 FROM manager_apply_terminal_outcomes WHERE outcome_state='unknown_effect' OR effect_disposition='unknown' LIMIT 1",
         ], ["manager_apply_intents"]),
-        ("manager", "manager/active-bundle-publication.sqlite3", 1296449872, 1, [], ["active_bundle_publication_receipts"]),
-        # v9 stores are converted to v10 when the scene owner next opens them.
-        ("scene", "logical-scene.sqlite3", 1296454467, (9, 10), [
+        ("manager", "manager/active-bundle-publication.sqlite3", 1296449872, [], ["active_bundle_publication_receipts"]),
+        ("scene", "logical-scene.sqlite3", 1296454467, [
             "SELECT 1 FROM logical_scene_transaction_intents i LEFT JOIN logical_scene_request_outcomes t USING(transaction_sequence) WHERE t.transaction_sequence IS NULL LIMIT 1",
             "SELECT 1 FROM logical_scene_request_outcomes WHERE projection_status='failed_projection_uncertain' LIMIT 1",
             "SELECT 1 FROM logical_scene_maintenance_initialization_intents i LEFT JOIN logical_scene_maintenance_initialization_results r USING(initialization_sequence) WHERE r.initialization_sequence IS NULL LIMIT 1",
@@ -207,7 +209,7 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
             "SELECT 1 FROM logical_scene_initial_baseline_requests i LEFT JOIN logical_scene_initial_baseline_results r USING(initialization_sequence) WHERE r.initialization_sequence IS NULL OR r.state='interrupted' LIMIT 1",
         ], ["canonical_empty_scene_acceptance", "logical_scene_transaction_intents", "logical_scene_maintenance_initialization_intents", "logical_scene_initial_baseline_requests"]),
     ]
-    for family, relative, application, version, queries, opaque in sources:
+    for family, relative, application, queries, opaque in sources:
         path = folder / relative
         try:
             _safe_path(path, folder)
@@ -216,11 +218,11 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
                     raise ValueError("journal integrity unknown")
                 if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise ValueError("journal references unknown")
-                if application is not None and (database.execute("PRAGMA application_id").fetchone() != (application,) or database.execute("PRAGMA user_version").fetchone()[0] not in (version if isinstance(version, tuple) else (version,))):
-                    raise ValueError("unsupported journal schema")
+                if application is not None and (database.execute("PRAGMA application_id").fetchone() != (application,) or database.execute("PRAGMA user_version").fetchone()[0] < 1):
+                    raise ValueError("unformatted journal schema")
                 if family == "program_cycle":
-                    if database.execute("SELECT singleton,schema_version FROM program_cycle_metadata").fetchall() not in ([(1, 7)], [(1, 8)]):
-                        raise ValueError("unsupported Program journal schema")
+                    if database.execute("SELECT 1 FROM program_cycle_metadata WHERE singleton=1 AND schema_version >= 1").fetchone() is None:
+                        raise ValueError("unformatted Program journal schema")
                     if database.execute("SELECT singleton FROM program_cycle").fetchall() != [(1,)]:
                         raise ValueError("Program owner row absent or invalid")
                     # Ordinary Manager shutdown retains liveness reconciliation

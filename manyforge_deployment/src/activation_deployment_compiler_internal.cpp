@@ -11,6 +11,7 @@
 #include <cmath>
 #include <iomanip>
 #include <map>
+#include <numbers>
 #include <optional>
 #include <set>
 #include <span>
@@ -23,6 +24,8 @@
 
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_core/types/tcp_speed_check.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
@@ -66,22 +69,6 @@ arm_capabilities() {
   return kRosArmCapabilities;
 }
 
-[[nodiscard]] std::string
-component_type_id(const ActivationComponentProfile &profile,
-                  const bool has_gripper) {
-  if (is_model_free_runtime_kind(profile.runtime_kind))
-    throw std::logic_error(
-        "model-free type must come from its actual qualified structural "
-        "artifact");
-  // A Real arm without an authored gripper remains arm-only. An authored Real
-  // pneumatic gripper uses the same model-backed target as the Mock component.
-  const auto *ros = profile.runtime_restoration_profile.find_object_member(
-      "ros2_control_runtime");
-  if (ros != nullptr && ros->find_object_member("real_profile") != nullptr &&
-      !has_gripper)
-    return profile.model_asset_id + ".fixed_scale.arm_only.component";
-  return profile.model_asset_id + ".fixed_scale.component";
-}
 constexpr std::array<std::string_view, 14U> kCellCapabilities{{
     "collision.query.detailed",
     "collision.query.pre_execution",
@@ -161,6 +148,24 @@ constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{{
   Object result = object(source, "object");
   std::erase_if(result, [&](const auto &row) { return row.first == name; });
   return CanonicalValue(std::move(result));
+}
+
+// A component's authored lifecycle time budget (`configuration.
+// lifecycle_command_timeout_s`) becomes its own keyed row of the unit's
+// `lifecycle_command_timeouts`. I/O devices keep theirs in
+// `io_provider_devices`.
+[[nodiscard]] CanonicalValue with_lifecycle_budget(
+    const CanonicalValue &runtime_configuration,
+    const ActivationDeploymentComponent &component) {
+  const auto *budget =
+      component.configuration.find_object_member("lifecycle_command_timeout_s");
+  if (budget == nullptr) return runtime_configuration;
+  return object_with(
+      runtime_configuration, "lifecycle_command_timeouts",
+      CanonicalValue(Array{CanonicalValue(Object{
+          {"controllable_component_id", CanonicalValue(component.component_id)},
+          {"lifecycle_command_timeout_s", *budget},
+      })}));
 }
 
 // Q68: the controller profile a ROS component profile selects from the
@@ -280,6 +285,46 @@ source_joints(const ActivationComponentProfile &profile,
   return {};
 }
 
+// A tool's model has no arm joints: its one target is `gripper`, and it is
+// usually mounted on a robot's `flange` through an `attachments` row.
+[[nodiscard]] bool is_tool(const ActivationComponentProfile &profile) {
+  return source_joints(profile, "arm_joints").empty();
+}
+
+[[nodiscard]] std::string
+component_type_id(const ActivationComponentProfile &profile,
+                  const bool has_gripper) {
+  if (is_model_free_runtime_kind(profile.runtime_kind))
+    throw std::logic_error(
+        "model-free type must come from its actual qualified structural "
+        "artifact");
+  // A Real combined arm+gripper model without an authored gripper remains
+  // arm-only. An authored Real pneumatic gripper uses the same model-backed
+  // target as the Mock component. Split arm models have no fingers.
+  const auto *ros = profile.runtime_restoration_profile.find_object_member(
+      "ros2_control_runtime");
+  if (ros != nullptr && ros->find_object_member("real_profile") != nullptr &&
+      !has_gripper && !source_joints(profile, "fingers").empty())
+    return profile.model_asset_id + ".fixed_scale.arm_only.component";
+  return profile.model_asset_id + ".fixed_scale.component";
+}
+
+// D4: a pneumatic tool profile selects no controller lane. Its lane lives in
+// the I/O components its `pneumatic_io` references (Mock I/O devices on
+// Mock, `xarm_digital` on Real), so one tool row serves every lane.
+[[nodiscard]] bool lane_free_tool(const ActivationComponentProfile &profile) {
+  if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control ||
+      !is_tool(profile))
+    return false;
+  const auto &runtime = member(profile.runtime_restoration_profile,
+                               "ros2_control_runtime", "component profile");
+  for (const std::string_view name : {std::string_view("isaac_profile"),
+                                      std::string_view("mock_profile"),
+                                      std::string_view("real_profile")})
+    if (runtime.find_object_member(name) != nullptr) return false;
+  return true;
+}
+
 // CP8 step 1: a real robot reports measured state; Mock and Isaac stay
 // commanded (CP4 authority rule).
 [[nodiscard]] bool real_controller_profile(
@@ -291,18 +336,38 @@ source_joints(const ActivationComponentProfile &profile,
          controller_profile_selector(*runtime) == std::string_view("real_profile");
 }
 
+// V-B4: the vendor adapter family a Real row declares (`adapter_family`,
+// e.g. `xarm`); it selects the robot's vendor adapter and lifecycle
+// providers. A Real row without one is refused, typed.
+[[nodiscard]] std::string real_adapter_family(
+    const ActivationDeploymentComponent &component) {
+  const auto *configuration =
+      component.configuration.find_object_member("runtime_configuration");
+  const auto *family = configuration == nullptr
+                           ? nullptr
+                           : configuration->find_object_member("adapter_family");
+  if (family == nullptr || !family->is_string() || family->as_string().empty())
+    throw core::TypedError(
+        "real_adapter_family_unknown",
+        "Activation Deployment compiler: real_adapter_family_unknown: " +
+            component.component_id + " is a real robot without an adapter_family");
+  return family->as_string();
+}
+
 // R7 package 4: a Real component's ros2_control provider carries the Real
 // lifecycle catalog (arming at Prepare, D4 Disable, D10 Recover); it offers
 // what the shared provider offers. Mock and Isaac keep the shared provider.
-// Every Real profile is xArm-family today (`lite6_real`); another vendor's
-// row adds its own provider here. A Real gripper domain has its own provider:
-// the shared gripper plans, with Recover aligned to the arm's `disabled`
-// target (one common Recover target, spec 210 section 3.17).
+// V-B4: it is its adapter family's provider,
+// `manyforge.provider.ros2_control.<adapter_family>`. A Real gripper domain
+// has its own provider (`.gripper`): the shared gripper plans, with Recover
+// aligned to the arm's `disabled` target (one common Recover target, spec
+// 210 section 3.17).
 [[nodiscard]] std::string ros2_control_provider_id(
+    const ActivationDeploymentComponent &component,
     const ActivationComponentProfile &profile, std::string_view target) {
   if (!real_controller_profile(profile)) return "manyforge.provider.ros2_control";
-  return target == "gripper" ? "manyforge.provider.ros2_control.xarm.gripper"
-                             : "manyforge.provider.ros2_control.xarm";
+  return "manyforge.provider.ros2_control." + real_adapter_family(component) +
+         (target == "gripper" ? ".gripper" : "");
 }
 
 // One provider instance selects one manifest pair (spec 240), so a Real
@@ -314,12 +379,20 @@ source_joints(const ActivationComponentProfile &profile,
          (real_controller_profile(profile) && target == "gripper" ? ".gripper" : "");
 }
 
-// Do not infer a gripper from passive Real model geometry. A Real gripper is
-// present only when the component explicitly authors its pneumatic target.
+// A Real robot and a lane-free tool run no gripper controller of their own.
+[[nodiscard]] bool without_gripper_controller(
+    const ActivationComponentProfile &profile) {
+  return real_controller_profile(profile) || lane_free_tool(profile);
+}
+
+// Do not infer a gripper from passive Real model geometry. A Real or lane-free
+// gripper is present only when the component explicitly authors its pneumatic
+// target.
 [[nodiscard]] bool has_gripper_target(const ActivationDeploymentComponent &component,
                                       const ActivationComponentProfile &profile) {
   if (source_joints(profile, "fingers").empty()) return false;
-  if (!real_controller_profile(profile)) return true;
+  if (!without_gripper_controller(profile)) return true;
+  const bool real = real_controller_profile(profile);
   const auto *configuration =
       component.configuration.find_object_member("runtime_configuration");
   const auto *grippers = configuration == nullptr
@@ -333,11 +406,15 @@ source_joints(const ActivationComponentProfile &profile,
             "gripper") {
       if (text(member(row, "actuation_kind", "gripper target"), "gripper actuation") !=
           "pneumatic")
-        fail(component.component_id + " Real gripper must be pneumatic");
+        fail(real ? component.component_id + " Real gripper must be pneumatic"
+                  : "tool_lane_required: " + component.component_id +
+                        " only a pneumatic tool may omit its controller lane");
       if (text(member(row, "output_mode", "gripper target"), "gripper output") ==
               "commanded" && row.find_object_member("pneumatic_io") == nullptr)
-        fail("real_pneumatic_io_not_wired: " + component.component_id +
-             " commanded pneumatic I/O is not yet wired");
+        fail(real ? "real_pneumatic_io_not_wired: " + component.component_id +
+                        " commanded pneumatic I/O is not yet wired"
+                  : "tool_pneumatic_io_required: " + component.component_id +
+                        " a commanded lane-free pneumatic tool needs pneumatic_io");
       return true;
     }
   }
@@ -395,7 +472,21 @@ motion_limits(const ActivationDeploymentComponent &component,
       fail("authored ROS ordinary motion jerk is not yet supported");
     }
     const auto *speed = settings.find_object_member("maximum_tcp_linear_speed_mps");
-    if (speed == nullptr) continue;
+    const auto *speed_check = settings.find_object_member("tcp_speed_check");
+    if (speed == nullptr) {
+      if (speed_check != nullptr)
+        fail(component.component_id + "." + target +
+             ".tcp_speed_check requires maximum_tcp_linear_speed_mps");
+      continue;
+    }
+    // Spec 430 §1.2: the maximum holds at the active TCP, plus the robot
+    // flange by default. Materialized here so identity sees the default.
+    if (speed_check != nullptr &&
+        (!speed_check->is_string() ||
+         !core::parse_tcp_speed_check(speed_check->as_string()))) {
+      fail(component.component_id + "." + target +
+           ".tcp_speed_check must be active_tcp or active_tcp_and_flange");
+    }
     CanonicalValue jerk(Object{
         {"enabled", CanonicalValue(false)},
         {"joint_limits", CanonicalValue(Array{})},
@@ -409,6 +500,9 @@ motion_limits(const ActivationDeploymentComponent &component,
         {"command_target_id", CanonicalValue(target)},
         {"controllable_component_id", CanonicalValue(component.component_id)},
         {"maximum_tcp_linear_speed_mps", *speed},
+        {"tcp_speed_check", speed_check != nullptr
+                                ? *speed_check
+                                : CanonicalValue("active_tcp_and_flange")},
     };
     if (include_ordinary_jerk) {
       limit.emplace_back("ordinary_motion_jerk", std::move(jerk));
@@ -502,7 +596,10 @@ struct ComponentProjection final {
   const auto *timeout_seconds =
       timeout == nullptr ? nullptr : std::get_if<double>(&timeout->storage());
   if (fields.size() != 13U + static_cast<std::size_t>(timeout != nullptr) +
-                           static_cast<std::size_t>(pneumatic_io != nullptr) || duration == nullptr ||
+                           static_cast<std::size_t>(pneumatic_io != nullptr) +
+                           static_cast<std::size_t>(
+                               selected->find_object_member("grasp_confirmation") != nullptr) ||
+      duration == nullptr ||
       !execution_gripper_command_duration_is_valid(actuation, *duration) ||
       !ros_gripper_output_mode_is_valid(actuation, output) ||
       (timeout != nullptr &&
@@ -517,8 +614,9 @@ struct ComponentProjection final {
                                  : "manyforge.gripper_position_cancellation";
 }
 
-// CP9: measured joints remain required. A Real pneumatic gripper has no
-// gripper-feedback stream; the other lanes retain their existing requirement.
+// CP9: measured joints remain required. A pneumatic gripper without its own
+// controller (Real robot, lane-free tool) has no gripper-feedback stream; the
+// other lanes retain their existing requirement.
 void require_component_stream_rows(const ActivationDeploymentComponent &component,
                                    const CanonicalValue &configuration,
                                    const ActivationComponentProfile &profile) {
@@ -527,11 +625,15 @@ void require_component_stream_rows(const ActivationDeploymentComponent &componen
     const auto *selected = configuration.find_object_member(name);
     return selected == nullptr ? Array{} : array(*selected, name);
   };
-  std::set<std::string> expected{std::string(contract::kMeasuredJointsStreamId)};
+  // A lane-free tool runs no controller manager: it publishes no joint
+  // states and no gripper feedback, so it declares no stream.
+  std::set<std::string> expected;
+  if (!lane_free_tool(profile))
+    expected.insert(std::string(contract::kMeasuredJointsStreamId));
   for (const auto &row : rows("gripper_target_configurations")) {
     if (text(member(row, "controllable_component_id", "gripper target"),
              "gripper component") == component.component_id) {
-      if (!real_controller_profile(profile) ||
+      if (!without_gripper_controller(profile) ||
           text(member(row, "actuation_kind", "gripper target"), "gripper actuation") !=
               "pneumatic")
         expected.insert(std::string(contract::kGripperFeedbackStreamId));
@@ -548,8 +650,12 @@ void require_component_stream_rows(const ActivationDeploymentComponent &componen
   }
   if (declared != expected) {
     fail(component.component_id +
-         " component_streams must declare exactly measured_joints" +
-         (expected.size() == 2U ? " and gripper_feedback" : ""));
+         (expected.empty() ? " is a lane-free tool: component_streams must "
+                             "declare no stream"
+                           : " component_streams must declare exactly measured_joints" +
+                                 std::string(expected.size() == 2U
+                                                 ? " and gripper_feedback"
+                                                 : "")));
   }
 }
 
@@ -593,9 +699,90 @@ void validate_mapped_pneumatic_presets(
     const auto open = value_for(text(member(row, "open_state_ref", "gripper target"), "open preset"));
     const auto closed = value_for(text(member(row, "closed_state_ref", "gripper target"), "closed preset"));
     if (open && closed && *open == *closed)
-      fail("pneumatic_io_presets_coincident: " + component.component_id +
-           " Open and Close resolve to the same gripper coordinate");
+      // Typed: the GUI explains it by its catalog code; the text is unchanged.
+      throw core::TypedError("pneumatic_io_presets_coincident",
+          "Activation Deployment compiler: pneumatic_io_presets_coincident: " +
+              component.component_id + " Open and Close resolve to the same gripper coordinate");
   }
+}
+
+// An intent pose `{position_m, orientation: {rpy_deg} | {xyzw}}` as the graph
+// pose `{position_m, orientation_xyzw}`. rpy_deg is fixed-axis X-Y-Z (URDF
+// roll, pitch, yaw); q = Rz(yaw) Ry(pitch) Rx(roll).
+[[nodiscard]] CanonicalValue graph_pose(const CanonicalValue &pose) {
+  const auto &orientation = member(pose, "orientation", "pose");
+  const auto numbers = [](const CanonicalValue &value) {
+    std::vector<double> result;
+    for (const auto &item : value.as_array())
+      result.push_back(std::get<double>(item.storage()));
+    return result;
+  };
+  std::vector<double> xyzw;
+  if (const auto *rpy = orientation.find_object_member("rpy_deg")) {
+    const auto angles = numbers(*rpy);
+    const double half = std::numbers::pi_v<double> / 360.0;
+    const double cr = std::cos(angles[0] * half), sr = std::sin(angles[0] * half);
+    const double cp = std::cos(angles[1] * half), sp = std::sin(angles[1] * half);
+    const double cy = std::cos(angles[2] * half), sy = std::sin(angles[2] * half);
+    xyzw = {sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy};
+  } else {
+    xyzw = numbers(member(orientation, "xyzw", "pose.orientation"));
+  }
+  Array orientation_xyzw;
+  for (const double value : xyzw)
+    orientation_xyzw.emplace_back(value == 0.0 ? 0.0 : value);  // no -0
+  return CanonicalValue(Object{
+      {"position_m", member(pose, "position_m", "pose")},
+      {"orientation_xyzw", CanonicalValue(std::move(orientation_xyzw))},
+  });
+}
+
+// A component row's custom TCPs as graph rows: each parent resolves to a
+// link of the component's model, through a frame role of its asset (a
+// descriptor TCP, link-backed or offset) or else a URDF link. A custom TCP
+// never hangs off another custom TCP, and its id names no existing frame.
+[[nodiscard]] std::optional<CanonicalValue>
+custom_tcp_rows(const ActivationDeploymentComponent &component,
+                const SourceVerifiedModelAsset &asset) {
+  if (component.custom_tcps.empty()) return std::nullopt;
+  const auto &bindings = asset.value().frame_role_bindings;
+  const auto &links = asset.source_ir().urdf().links;
+  const auto role = [&](std::string_view id) {
+    return std::find_if(bindings.begin(), bindings.end(), [&](const auto &row) {
+      return row.frame_role_id.value() == id;
+    });
+  };
+  const auto link = [&](std::string_view name) {
+    return std::any_of(links.begin(), links.end(),
+                       [&](const auto &row) { return row.name == name; });
+  };
+  Array rows;
+  for (const auto &custom : component.custom_tcps) {
+    const std::string label =
+        component.component_id + " custom TCP '" + custom.tcp_id + "'";
+    if (role(custom.tcp_id) != bindings.end() || link(custom.tcp_id))
+      fail("custom_tcp_name_collision: " + label +
+           " names an existing frame of the component");
+    const bool chained = std::any_of(
+        component.custom_tcps.begin(), component.custom_tcps.end(),
+        [&](const auto &other) { return other.tcp_id == custom.parent_frame; });
+    std::string parent_link;
+    if (const auto found = role(custom.parent_frame); found != bindings.end())
+      parent_link = core::frame_role_link_name(*found);
+    else if (!chained && link(custom.parent_frame))
+      parent_link = custom.parent_frame;
+    else
+      fail("custom_tcp_parent_unknown: " + label + " has parent '" +
+           custom.parent_frame + "', which is " +
+           (chained ? "another custom TCP" : "no frame of the component"));
+    rows.emplace_back(Object{
+        {"frame_role_id", CanonicalValue(custom.tcp_id)},
+        {"parent_link_name", CanonicalValue(std::move(parent_link))},
+        {"pose_in_parent_link", graph_pose(custom.pose)},
+    });
+  }
+  return CanonicalValue(std::move(rows));
 }
 
 [[nodiscard]] ComponentProjection project_component(
@@ -603,12 +790,15 @@ void validate_mapped_pneumatic_presets(
     const ActivationComponentProfile &profile,
     const ActivationPreparedModel &model, CatalogSelection &catalog,
     std::string_view runtime_unit_id,
-    std::span<const QualifiedProviderManifest> provider_manifests) {
-  if (!component.root_pose_in_cell || !component.model_source)
-    fail("physical component projection requires its actual captured model and "
-         "pose");
+    std::span<const QualifiedProviderManifest> provider_manifests,
+    std::span<const QualifiedComponentType> component_types) {
+  // A mounted child has no root pose: the attachment places it.
+  if (!component.model_source)
+    fail("physical component projection requires its actual captured model");
   const bool ros2_control =
       profile.runtime_kind == ActivationRuntimeKind::kRos2Control;
+  const bool tool = is_tool(profile);
+  const bool lane_free = lane_free_tool(profile);
   if (ros2_control) {
     const auto *selected = profile.runtime_restoration_profile.find_object_member("ros2_control_runtime");
     const auto *configuration = component.configuration.find_object_member("runtime_configuration");
@@ -617,7 +807,9 @@ void validate_mapped_pneumatic_presets(
       for (const auto &row : array(*grippers, "gripper_target_configurations"))
         if (text(member(row, "controllable_component_id", "gripper target"), "gripper component") ==
                 component.component_id && row.find_object_member("pneumatic_io"))
-          fail("pneumatic_io_unsupported_on_isaac: Isaac uses its existing gripper transport");
+          throw core::TypedError("pneumatic_io_unsupported_on_isaac",
+              "Activation Deployment compiler: pneumatic_io_unsupported_on_isaac: Isaac uses "
+              "its existing gripper transport");
     }
     validate_mapped_pneumatic_presets(component, profile, model);
   }
@@ -631,6 +823,15 @@ void validate_mapped_pneumatic_presets(
   }
   const auto &component_ref = catalog.require(
       core::CatalogRecordKind::kComponentType, component_type_id(profile, has_gripper));
+  const auto component_type = std::find_if(
+      component_types.begin(), component_types.end(), [&](const auto &type) {
+        return type.value().component_type_id.value() ==
+                   core::catalog_record_id_value(component_ref) &&
+               type.value().component_type_revision.value() == revision(component_ref);
+      });
+  if (component_type == component_types.end())
+    fail(core::catalog_record_id_value(component_ref) +
+         " has no qualified component type");
   const auto &runtime_ref =
       catalog.require(core::CatalogRecordKind::kRuntimeProfile,
                       "manyforge.ros2_control_execution_runtime");
@@ -639,8 +840,14 @@ void validate_mapped_pneumatic_presets(
                                     profile.model_asset_id));
   const auto &configuration = member(component.configuration,
                                      "runtime_configuration", "configuration");
+  if (configuration.find_object_member("tool_payload") != nullptr) {
+    fail(component.component_id +
+         " runtime_configuration.tool_payload moved: a tool's payload comes "
+         "from its model (tool descriptor payload) and attached objects' "
+         "mass_kg");
+  }
   std::optional<CanonicalValue> controller_profile_row;
-  if (ros2_control) {
+  if (ros2_control && !lane_free) {
     const auto &profile_configuration =
         member(profile.runtime_restoration_profile, "ros2_control_runtime",
                "component profile");
@@ -675,26 +882,49 @@ void validate_mapped_pneumatic_presets(
     if (device_address_ref != nullptr) {
       row.emplace_back("device_address_ref", *device_address_ref);
     }
-    // D11: the component's tool payload rides its controller profile row;
-    // only a Real component's vendor adapter applies it (at Enable).
-    if (const auto *payload = configuration.find_object_member("tool_payload");
-        payload != nullptr) {
-      row.emplace_back("tool_payload", *payload);
+    // V-B4: a Real row's adapter family is known when the qualified catalog
+    // has its lifecycle provider; Mock and Isaac rows name none.
+    if (*selector == "real_profile") {
+      const auto family = real_adapter_family(component);
+      const auto provider_id = ros2_control_provider_id(component, profile, "arm");
+      if (std::none_of(provider_manifests.begin(), provider_manifests.end(),
+                       [&](const auto &manifest) {
+                         return manifest.value().provider_manifest_id.value() ==
+                                provider_id;
+                       }))
+        throw core::TypedError(
+            "real_adapter_family_unknown",
+            "Activation Deployment compiler: real_adapter_family_unknown: " +
+                component.component_id + " adapter_family '" + family +
+                "' has no lifecycle provider");
+      row.emplace_back("adapter_family", CanonicalValue(family));
+    } else if (configuration.find_object_member("adapter_family") != nullptr) {
+      fail(component.component_id + " adapter_family belongs to a real_profile only");
+    }
+    // The component's soft Stop lead-in anchor (absent: commanded).
+    if (const auto *anchor = configuration.find_object_member("stop_lead_in_anchor")) {
+      row.emplace_back("stop_lead_in_anchor", *anchor);
+    }
+    // M6b: the component's controller TCP offset sync (absent: on).
+    if (const auto *sync = configuration.find_object_member("controller_tcp_offset_sync")) {
+      row.emplace_back("controller_tcp_offset_sync", *sync);
     }
     controller_profile_row = CanonicalValue(std::move(row));
   }
-  const auto arm_resource_count =
-      array(resource_bindings(component.component_id, "arm", profile),
-            "arm resource bindings")
-          .size();
-  const auto &initial_joint_positions = array(
-      member(configuration, "initial_joint_positions_rad",
-             "runtime configuration"),
-      "initial_joint_positions_rad");
-  if (initial_joint_positions.size() != arm_resource_count) {
-    fail(component.component_id +
-         " initial_joint_positions_rad count does not match its "
-         "arm resource bindings");
+  if (!tool) {
+    const auto arm_resource_count =
+        array(resource_bindings(component.component_id, "arm", profile),
+              "arm resource bindings")
+            .size();
+    const auto &initial_joint_positions = array(
+        member(configuration, "initial_joint_positions_rad",
+               "runtime configuration"),
+        "initial_joint_positions_rad");
+    if (initial_joint_positions.size() != arm_resource_count) {
+      fail(component.component_id +
+           " initial_joint_positions_rad count does not match its "
+           "arm resource bindings");
+    }
   }
   const auto limits = motion_limits(component, !ros2_control);
   if (ros2_control) {
@@ -707,14 +937,27 @@ void validate_mapped_pneumatic_presets(
       fail("runtime_configuration.default_fault_stop_profiles must be "
            "authored as configuration.default_fault_stop_profile");
     }
+    if (configuration.find_object_member("lifecycle_command_timeouts") !=
+        nullptr) {
+      fail("runtime_configuration.lifecycle_command_timeouts must be "
+           "authored as configuration.lifecycle_command_timeout_s");
+    }
     require_component_stream_rows(component, configuration, profile);
     const auto &rows = array(limits, "motion limits");
-    if (rows.size() != 1U ||
-        text(member(rows.front(), "command_target_id", "motion limit"),
-             "target") != "arm") {
+    if (tool && !rows.empty())
+      fail(component.component_id + " is a tool: it has no TCP-speed maximum");
+    if (!tool && (rows.size() != 1U ||
+                  text(member(rows.front(), "command_target_id", "motion limit"),
+                       "target") != "arm")) {
       fail("authored ROS requires exactly one TCP-speed maximum for arm and no "
            "unknown target");
     }
+    if (!tool)
+      require_speed_check_flange(
+          component.component_id,
+          text(member(rows.front(), "tcp_speed_check", "motion limit"),
+               "tcp_speed_check"),
+          model.verified_asset.value().frame_role_bindings);
   }
   CanonicalValue runtime_configuration =
       object_with(configuration, "motion_target_limits", limits);
@@ -722,7 +965,7 @@ void validate_mapped_pneumatic_presets(
     // Q68: the unit carries each component's own controller profile.
     for (const std::string_view field :
          {"isaac_profile", "mock_profile", "real_profile", "device_address_ref",
-          "tool_payload"})
+          "adapter_family", "stop_lead_in_anchor", "controller_tcp_offset_sync"})
       runtime_configuration = object_without(runtime_configuration, field);
     runtime_configuration = object_with(
         runtime_configuration, "controller_profiles",
@@ -736,6 +979,7 @@ void validate_mapped_pneumatic_presets(
         runtime_configuration, "default_fault_stop_profiles",
         CanonicalValue(Array{fault_stop_profile_row(component, *fault_profile)}));
   }
+  runtime_configuration = with_lifecycle_budget(runtime_configuration, component);
   if (component.configuration.find_object_member(
           "native_lifecycle_management") != nullptr) {
     fail("native_lifecycle_management is obsolete; native component lifecycle "
@@ -744,8 +988,10 @@ void validate_mapped_pneumatic_presets(
 
   // The Real arm is measured; its pneumatic gripper has only commanded
   // expected-position display until a physical feedback source is configured.
+  // A lane-free tool's gripper is the same commanded display.
   const bool real = real_controller_profile(profile);
-  const std::string arm_provider_id = ros2_control_provider_id(profile, "arm");
+  const std::string arm_provider_id =
+      ros2_control_provider_id(component, profile, tool ? "gripper" : "arm");
   const auto &arm_provider_ref = catalog.require(
       core::CatalogRecordKind::kProviderManifest, arm_provider_id);
   const auto arm_provider_manifest = std::find_if(
@@ -776,11 +1022,12 @@ void validate_mapped_pneumatic_presets(
   for (const std::string_view target : {std::string_view("arm"),
                                         std::string_view("gripper")}) {
     // DX783: arm-only models expose no synthetic gripper target or resource.
-    if (target == "gripper" && !has_gripper)
+    // A tool has no arm target.
+    if ((target == "gripper" && !has_gripper) || (target == "arm" && tool))
       continue;
     const bool measured = real && target == "arm";
     const std::string_view authority_suffix = measured ? ".measured_state"
-        : real ? ".commanded_state" : ".commanded_sim_state";
+        : real || lane_free ? ".commanded_state" : ".commanded_sim_state";
     const std::string contract_id = std::string("manyforge.") + prefix + "_" +
                                     std::string(target) + "_position";
     const std::string topology_id = std::string("manyforge.") + prefix + "_" +
@@ -793,7 +1040,7 @@ void validate_mapped_pneumatic_presets(
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
                         : gripper_stop_policy_id(component, runtime_configuration));
-    const std::string provider_id = ros2_control_provider_id(profile, target);
+    const std::string provider_id = ros2_control_provider_id(component, profile, target);
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
@@ -900,29 +1147,40 @@ void validate_mapped_pneumatic_presets(
     return text(member(left, "control_binding_id", "binding"), "binding id") <
            text(member(right, "control_binding_id", "binding"), "binding id");
   });
+  Object component_record{
+      {"controllable_component_id", CanonicalValue(component.component_id)},
+      {"component_type_id", CanonicalValue(component_type_id(profile, has_gripper))},
+      {"component_type_revision", CanonicalValue(revision(component_ref))},
+      {"model_role_bindings",
+       CanonicalValue(Array{CanonicalValue(Object{
+           {"model_role_id", CanonicalValue(tool ? "tool_model" : "arm_model")},
+           {"model_instance_id",
+            CanonicalValue(component.component_id + ".model")},
+       })})},
+      {"runtime_unit_ids",
+       CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
+  };
+  if (component.root_pose_in_cell)
+    component_record.emplace_back("root_pose_in_cell", *component.root_pose_in_cell);
+  if (const auto tcp = compiled_default_tcp(component, component_type->value()))
+    component_record.emplace_back(
+        "default_tcp",
+        CanonicalValue(Object{
+            {"command_target_id", CanonicalValue(tcp->command_target_id.value())},
+            {"frame_role_id", CanonicalValue(tcp->frame_role_id.value())},
+        }));
+  Object model_instance{
+      {"model_instance_id", CanonicalValue(component.component_id + ".model")},
+      {"model_asset_id", CanonicalValue(profile.model_asset_id)},
+      {"model_revision",
+       CanonicalValue(model.catalog_reference.record_revision.value())},
+  };
+  if (auto custom = custom_tcp_rows(component, model.verified_asset))
+    model_instance.emplace_back("custom_tcps", std::move(*custom));
   return ComponentProjection{
       std::move(runtime_configuration),
-      CanonicalValue(Object{
-          {"model_instance_id",
-           CanonicalValue(component.component_id + ".model")},
-          {"model_asset_id", CanonicalValue(profile.model_asset_id)},
-          {"model_revision",
-           CanonicalValue(model.catalog_reference.record_revision.value())},
-      }),
-      CanonicalValue(Object{
-          {"controllable_component_id", CanonicalValue(component.component_id)},
-          {"component_type_id", CanonicalValue(component_type_id(profile, has_gripper))},
-          {"component_type_revision", CanonicalValue(revision(component_ref))},
-          {"model_role_bindings",
-           CanonicalValue(Array{CanonicalValue(Object{
-               {"model_role_id", CanonicalValue("arm_model")},
-               {"model_instance_id",
-                CanonicalValue(component.component_id + ".model")},
-           })})},
-          {"runtime_unit_ids",
-           CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
-          {"root_pose_in_cell", *component.root_pose_in_cell},
-      }),
+      CanonicalValue(std::move(model_instance)),
+      CanonicalValue(std::move(component_record)),
       std::move(domains), std::move(bindings)};
 }
 
@@ -1054,6 +1312,52 @@ void validate_mapped_pneumatic_presets(
 
 } // namespace
 
+void require_speed_check_flange(
+    std::string_view component_id, std::string_view tcp_speed_check,
+    std::span<const core::ModelFrameRoleBindingDTO> frame_role_bindings) {
+  if (tcp_speed_check != "active_tcp_and_flange") return;
+  if (std::none_of(frame_role_bindings.begin(), frame_role_bindings.end(),
+                   [](const auto &binding) {
+                     return binding.frame_role_id.value() == "flange";
+                   }))
+    fail("robot_flange_frame_missing: " + std::string(component_id) +
+         " has no flange frame, which tcp_speed_check active_tcp_and_flange "
+         "requires");
+}
+
+std::optional<core::ComponentDefaultTcpDTO> compiled_default_tcp(
+    const ActivationDeploymentComponent &component,
+    const core::ComponentTypeDTO &type) {
+  std::vector<core::ComponentDefaultTcpDTO> tcps;
+  std::vector<core::ComponentDefaultTcpDTO> declared;
+  for (const auto &target : type.command_targets) {
+    if (!target.default_tcp_frame_role_id.has_value()) continue;
+    declared.push_back({target.command_target_id, *target.default_tcp_frame_role_id});
+    for (const auto &frame : target.frame_roles)
+      if (frame.tcp) tcps.push_back({target.command_target_id, frame.frame_role_id});
+    for (const auto &custom : component.custom_tcps)
+      tcps.push_back({target.command_target_id, core::FrameRoleId(custom.tcp_id)});
+  }
+  // Typed: the GUI explains both by their catalog code; the text is unchanged.
+  if (component.default_tcp.has_value()) {
+    if (std::find(tcps.begin(), tcps.end(), *component.default_tcp) == tcps.end())
+      throw core::TypedError("component_default_tcp_unknown",
+          "Activation Deployment compiler: component_default_tcp_unknown: " +
+              component.component_id + " default_tcp {" +
+              component.default_tcp->command_target_id.value() + ", " +
+              component.default_tcp->frame_role_id.value() +
+              "} is not a TCP of its targets");
+    return component.default_tcp;
+  }
+  if (declared.size() == 1U) return declared.front();
+  if (!tcps.empty())
+    throw core::TypedError("component_default_tcp_required",
+        "Activation Deployment compiler: component_default_tcp_required: " +
+            component.component_id + " has TCPs on " +
+            std::to_string(declared.size()) + " targets; choose its default_tcp");
+  return std::nullopt;
+}
+
 CanonicalValue compile_activation_deployment(
     const ActivationDeploymentIntent &intent,
     const core::CellId &runtime_cell_id,
@@ -1063,7 +1367,8 @@ CanonicalValue compile_activation_deployment(
     const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
     const std::vector<ActivationPreparedIoType> &io_types,
     std::span<const QualifiedProviderManifest> provider_manifests,
-    const std::optional<ActivationAssistantProfile> &assistant_profile) {
+    const std::optional<ActivationAssistantProfile> &assistant_profile,
+    std::span<const QualifiedComponentType> component_types) {
   const auto physical_count = static_cast<std::size_t>(std::count_if(
       component_profiles.begin(), component_profiles.end(),
       [](const auto &profile) {
@@ -1084,8 +1389,43 @@ CanonicalValue compile_activation_deployment(
            ": authored interrupt declarations are not installed by this compiler");
     }
   }
-  if (!array(intent.attachments, "attachments").empty()) {
-    fail("component attachments are not yet supported by the authored compiler");
+  // Each authored mount becomes one graph attachment, identified by its child
+  // (one parent per child). The cell graph and structural validation own
+  // references, interfaces, accepted tags and capacity.
+  Array attachments;
+  for (const auto &row : array(intent.attachments, "attachments")) {
+    const auto endpoint = [&](std::string_view end) {
+      const auto &value = member(row, end, "attachment");
+      return CanonicalValue(Object{
+          {"controllable_component_id", member(value, "component_id", "attachment")},
+          {"attachment_interface_id", member(value, "interface", "attachment")},
+      });
+    };
+    const auto *pose = row.find_object_member("pose");
+    attachments.emplace_back(Object{
+        {"component_attachment_id",
+         member(member(row, "child", "attachment"), "component_id", "attachment")},
+        {"component_attachment_revision", CanonicalValue(std::string(kZeroDigest))},
+        {"parent", endpoint("parent")},
+        {"child", endpoint("child")},
+        {"child_interface_pose_in_parent_interface",
+         pose != nullptr ? *pose
+                         : CanonicalValue(Object{
+                               {"position_m", CanonicalValue(Array{
+                                   CanonicalValue(0.0), CanonicalValue(0.0),
+                                   CanonicalValue(0.0)})},
+                               {"orientation_xyzw", CanonicalValue(Array{
+                                   CanonicalValue(0.0), CanonicalValue(0.0),
+                                   CanonicalValue(0.0), CanonicalValue(1.0)})},
+                           })},
+    });
+    // B5: the primary tool of an interface; written only when true.
+    if (const auto *primary = row.find_object_member("primary");
+        primary != nullptr && primary->as_bool()) {
+      auto edge = attachments.back().as_object();
+      edge.emplace_back("primary", CanonicalValue(true));
+      attachments.back() = CanonicalValue(std::move(edge));
+    }
   }
   CatalogSelection catalog(catalog_records);
   const bool ros2_control = true;
@@ -1112,7 +1452,8 @@ CanonicalValue compile_activation_deployment(
         profile.runtime_restoration_profile.find_object_member(
             "ros2_control_runtime");
     return runtime != nullptr &&
-           controller_profile_selector(*runtime).has_value();
+           (controller_profile_selector(*runtime).has_value() ||
+            lane_free_tool(profile));
   };
   const auto lacking_ros_controller_profile = [&] {
     return std::find_if_not(component_profiles.begin(),
@@ -1185,8 +1526,16 @@ CanonicalValue compile_activation_deployment(
       const auto &component = intent.components[index];
       if (is_model_free_runtime_kind(component_profiles[index].runtime_kind))
         continue;
-      const auto &urdf =
-          prepared_model(index).verified_asset.source_ir().urdf();
+      // The published frames include the generated links of the asset's
+      // offset frame roles and of the row's custom TCPs.
+      auto urdf = prepared_model(index).verified_asset.source_ir().urdf();
+      for (const auto &binding :
+           prepared_model(index).verified_asset.value().frame_role_bindings) {
+        if (binding.pose_in_source_link)
+          urdf.links.push_back({binding.frame_role_id.value(), std::nullopt, {}, {}});
+      }
+      for (const auto &custom : component.custom_tcps)
+        urdf.links.push_back({custom.tcp_id, std::nullopt, {}, {}});
       for (const auto &link : urdf.links) {
         // Only the unprefixed root world is the shared global parent. A
         // prefixed link named world is still a component-owned published frame.
@@ -1233,6 +1582,7 @@ CanonicalValue compile_activation_deployment(
       for (const auto &[name, rows] :
            object(found->normalized_configuration, "model-free configuration"))
         configuration = object_with(configuration, name, rows);
+      configuration = with_lifecycle_budget(configuration, component);
       projections.push_back(
           {std::move(configuration),
            CanonicalValue(nullptr),
@@ -1253,21 +1603,23 @@ CanonicalValue compile_activation_deployment(
       projections.push_back(
           project_component(component, component_profiles[index],
                             prepared_model(index), catalog, runtime_id,
-                            provider_manifests));
+                            provider_manifests, component_types));
     }
   }
 
   Array controller_profiles;
+  Array motion_target_limits;
   for (const auto &projection : projections) {
-    const auto *rows = projection.runtime_configuration.find_object_member(
-        "controller_profiles");
-    if (rows == nullptr)
-      continue;
-    controller_profiles.insert(controller_profiles.end(),
-                               rows->as_array().begin(),
-                               rows->as_array().end());
+    for (const auto &[name, merged] :
+         {std::pair{"controller_profiles", &controller_profiles},
+          std::pair{"motion_target_limits", &motion_target_limits}}) {
+      const auto *rows = projection.runtime_configuration.find_object_member(name);
+      if (rows != nullptr)
+        merged->insert(merged->end(), rows->as_array().begin(), rows->as_array().end());
+    }
   }
-  require_no_exclusive_ros_controller_topic_collision(controller_profiles);
+  require_no_exclusive_ros_controller_topic_collision(controller_profiles,
+                                                      motion_target_limits);
   // One robot is driven by one component: two Real components naming the
   // same site device reference would command the same controller twice.
   std::set<std::string> device_address_refs;
@@ -1280,11 +1632,20 @@ CanonicalValue compile_activation_deployment(
     }
   }
 
-  const auto physical = std::find_if(
+  // Cell-wide runtime fields come from a robot; a tool row carries only its
+  // own merged rows (gripper target, streams, controller profile).
+  auto physical = std::find_if(
       component_profiles.begin(), component_profiles.end(),
       [](const auto &profile) {
-        return !is_model_free_runtime_kind(profile.runtime_kind);
+        return !is_model_free_runtime_kind(profile.runtime_kind) &&
+               !is_tool(profile);
       });
+  if (physical == component_profiles.end())
+    physical = std::find_if(
+        component_profiles.begin(), component_profiles.end(),
+        [](const auto &profile) {
+          return !is_model_free_runtime_kind(profile.runtime_kind);
+        });
   const auto base_index =
       physical == component_profiles.end()
           ? 0U
@@ -1297,7 +1658,8 @@ CanonicalValue compile_activation_deployment(
                                         "collision_monitor_period_ms"}) {
       const auto &expected = member(runtime_configuration, name, "runtime configuration");
       for (std::size_t index = 0; index != projections.size(); ++index) {
-        if (is_model_free_runtime_kind(component_profiles[index].runtime_kind))
+        if (is_model_free_runtime_kind(component_profiles[index].runtime_kind) ||
+            is_tool(component_profiles[index]))
           continue;
         const auto &projection = projections[index];
         if (member(projection.runtime_configuration, name,
@@ -1306,7 +1668,7 @@ CanonicalValue compile_activation_deployment(
         }
       }
     }
-    using MergedFields = std::array<std::string_view, 10U>;
+    using MergedFields = std::array<std::string_view, 11U>;
     // Q68: one ROS runtime unit hosts every component and each component
     // keeps its own controller profile, fault Stop profile, authored
     // gripper target rows and stream defaults; the ROS runtime schema has no
@@ -1316,7 +1678,8 @@ CanonicalValue compile_activation_deployment(
         "default_fault_stop_profiles", "gripper_target_configurations",
         "controller_profiles",         "io_signals",
         "io_provider_devices",         "pose_sources",
-        "ai_models",                   "component_streams"};
+        "ai_models",                   "component_streams",
+        "lifecycle_command_timeouts"};
     for (const std::string_view name : merged_fields) {
       if (name.empty()) continue;
       Array combined;
@@ -1390,7 +1753,7 @@ CanonicalValue compile_activation_deployment(
       {"controllable_components", CanonicalValue(std::move(components))},
       {"control_domains", CanonicalValue(std::move(domains))},
       {"control_bindings", CanonicalValue(std::move(bindings))},
-      {"component_attachments", CanonicalValue(Array{})},
+      {"component_attachments", CanonicalValue(std::move(attachments))},
   });
   const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
   const auto typed = decode_cell_graph_candidate(graph_parsed);
@@ -1411,7 +1774,8 @@ CanonicalValue compile_activation_deployment(
         prepared_model(index).verified_asset.source_ir().urdf();
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
-      if (target == "gripper" && !has_gripper_target(component, profile))
+      if ((target == "gripper" && !has_gripper_target(component, profile)) ||
+          (target == "arm" && is_tool(profile)))
         continue;
       const std::string topology_id =
           std::string("manyforge.") +
@@ -1466,7 +1830,7 @@ CanonicalValue compile_activation_deployment(
           core::CatalogRecordKind::kComponentType,
           component_type_id(profile, has_gripper_target(component, profile)));
       const std::string planning_provider_id =
-          ros2_control_provider_id(profile, target);
+          ros2_control_provider_id(component, profile, target);
       const auto &planning =
           catalog.require(core::CatalogRecordKind::kProviderManifest,
                           planning_provider_id);

@@ -22,6 +22,9 @@ struct PreparedMotionDiagnosticsDTO final {
   std::optional<double> requested_tcp_linear_speed_mps;
   double deployment_maximum_tcp_linear_speed_mps{};
   double admitted_tcp_linear_speed_mps{};
+  /// Frame roles held under the admitted speed (`tcp`, `flange`); empty when
+  /// the TCP alone was checked without a frame set.
+  std::vector<std::string> speed_check_frame_role_ids{};
 
   friend bool operator==(const PreparedMotionDiagnosticsDTO&,
                          const PreparedMotionDiagnosticsDTO&) = default;

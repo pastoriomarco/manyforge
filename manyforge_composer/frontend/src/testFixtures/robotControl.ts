@@ -9,6 +9,8 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     graphRevision: 'sha256:graph',
     retainedBundleId: 'sha256:bundle',
     directControl: {
+      activeTcp: { entry: { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'tcp' }, display: 'robot-a.tcp',
+        ownerEpoch, registrationGeneration: 1, sequence: 0 },
       controllableComponentId: 'robot-a',
       commandTargetId: 'arm',
       componentRoleId: 'controlled_component',
@@ -43,9 +45,10 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
         },
       ],
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
+        schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
         ordinaryJerk: null,
         controllableComponentId: 'robot-a',
+        endEffectorComponentId: null,
         commandTargetId: 'arm',
         componentRoleId: 'controlled_component',
         targetRoleId: 'command_target',
@@ -53,6 +56,13 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
           { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
           { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
         ],
+        tcps: [{
+          entry: { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'tcp' },
+          targetRoleId: 'command_target', controllableComponentId: 'robot-a', commandTargetId: 'arm',
+          frameRoleId: 'tcp', qualifiedName: 'robot-a.tcp', compiledFrameName: 'tool0',
+          modelInstanceId: 'robot-model', modelRevision: 'sha256:model', isDefault: true,
+          mountedHere: true, mountedElsewhere: false, contactBodyRoleIds: [],
+        }],
         joints: [
           { sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 },
           { sourceJointName: 'joint2', compiledJointName: 'robot__joint2', unit: 'rad', minPositionRad: -2, maxPositionRad: 2, maxVelocityRadS: 2, maxAccelerationRadS2: null },
@@ -147,6 +157,12 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       currentTcpPose: {
         position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
         orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+      tcpPoses: {
+        '["robot-a","arm","tcp"]': {
+          position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
+          orientation: { x: 0, y: 0, z: 0, w: 1 },
+        },
       },
     },
     observedGripper: {

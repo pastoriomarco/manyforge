@@ -247,7 +247,7 @@ protected:
           plans.catalog_digest};
       result.push_back(take(IoProviderDriverRecord::Create(
           std::move(scope), std::move(occurrence), manifest->value(), clock,
-          1'000'000'000LL)));
+          1'000'000'000LL, 10'000'000LL)));
     }
     if (!catalog_source)
       catalog_source =
@@ -511,6 +511,107 @@ TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualComposit
     access.replace_current(nullptr);
     EXPECT_EQ(access.product(), nullptr);
   }
+}
+
+TEST_F(HostIoProviderInstallationTest, TcpRegistryFollowsSelectedComposition) {
+  Build();
+  const core::ControllableComponentId first("tcp.robot.first");
+  const core::ControllableComponentId second("tcp.robot.second");
+  const core::ControllableComponentId third("tcp.robot.third");
+  const auto make_composition = [&](const core::ControllableComponentId &id) {
+    return std::make_unique<Composition>(
+        id, bundle, nullptr, nullptr, nullptr, nullptr, std::nullopt,
+        std::nullopt, std::nullopt, CanonicalValue(nullptr),
+        CanonicalValue(nullptr), nullptr, nullptr, projection,
+        publication->publication_generation, std::nullopt, std::nullopt);
+  };
+  auto predecessor = make_composition(first);
+  auto peer = make_composition(second);
+  auto candidate = make_composition(first);
+  auto retained_peer = make_composition(second);
+  auto added_peer = make_composition(third);
+  auto first_owner = std::make_shared<int>(0);
+  auto retained_owner = std::make_shared<int>(0);
+  auto candidate_owner = std::make_shared<int>(0);
+  auto added_owner = std::make_shared<int>(0);
+  const auto reader = [](const std::shared_ptr<int> &owner) -> HostRobotTcpReader {
+    return [weak = std::weak_ptr(owner)]() -> std::optional<ActiveTcp> {
+      const auto live = weak.lock();
+      if (!live) return std::nullopt;
+      ++*live;
+      return ActiveTcp{};
+    };
+  };
+  predecessor->staged_robot_tcp_reader = reader(first_owner);
+  peer->staged_robot_tcp_reader = reader(retained_owner);
+  predecessor->participant_compositions.push_back(std::move(peer));
+  candidate->staged_robot_tcp_reader = reader(candidate_owner);
+  retained_peer->staged_robot_tcp_reader = reader(retained_owner);
+  added_peer->staged_robot_tcp_reader = reader(added_owner);
+  candidate->participant_compositions.push_back(std::move(retained_peer));
+  candidate->participant_compositions.push_back(std::move(added_peer));
+
+  ExecutionCompositionAccess access;
+  struct ClearSelection {
+    ExecutionCompositionAccess &access;
+    ~ClearSelection() {
+      std::unique_lock lock(access.mutex);
+      access.replace_current(nullptr);
+    }
+  } cleanup{access};
+  const auto select = [&](Composition *selected) {
+    std::unique_lock lock(access.mutex);
+    access.replace_current(selected);
+  };
+
+  // Startup selection publishes every robot; merely building a candidate
+  // cannot overwrite a predecessor callback, even if it is discarded.
+  select(predecessor.get());
+  ASSERT_TRUE(ReadHostRobotTcps(first));
+  ASSERT_TRUE(ReadHostRobotTcps(second));
+  EXPECT_FALSE(ReadHostRobotTcps(third));
+  EXPECT_EQ(*first_owner, 1);
+  EXPECT_EQ(*retained_owner, 1);
+  EXPECT_EQ(*candidate_owner, 0);
+
+  auto discarded = make_composition(first);
+  discarded->staged_robot_tcp_reader = reader(candidate_owner);
+  discarded.reset();
+  ASSERT_TRUE(ReadHostRobotTcps(first));
+  EXPECT_EQ(*first_owner, 2);
+  EXPECT_EQ(*candidate_owner, 0);
+
+  // Once selected, a later setup failure leaves this exact inventory in
+  // place; selection itself does not restore the predecessor.
+  EXPECT_THROW({ select(candidate.get()); throw std::runtime_error("setup failed"); },
+               std::runtime_error);
+  EXPECT_EQ(access.current, candidate.get());
+  ASSERT_TRUE(ReadHostRobotTcps(first));
+  ASSERT_TRUE(ReadHostRobotTcps(second));
+  ASSERT_TRUE(ReadHostRobotTcps(third));
+  EXPECT_EQ(*candidate_owner, 1);
+  EXPECT_EQ(*retained_owner, 2);
+  EXPECT_EQ(*added_owner, 1);
+
+  // Expiration is unavailable, never a fallback to the old owner.
+  candidate_owner.reset();
+  EXPECT_FALSE(ReadHostRobotTcps(first));
+  EXPECT_EQ(*first_owner, 2);
+  candidate->participant_compositions.clear();
+  select(candidate.get());
+  EXPECT_FALSE(ReadHostRobotTcps(second));
+  EXPECT_FALSE(ReadHostRobotTcps(third));
+
+  // The production staged reader owns only a weak ROS handle.
+  candidate->ros2_control_runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
+  candidate->ros2_control_runtime_handle->InstallActiveTcp(first, {}, false);
+  candidate->StageRobotTcpReader();
+  select(candidate.get());
+  ASSERT_TRUE(ReadHostRobotTcps(first));
+  candidate->ros2_control_runtime_handle.reset();
+  EXPECT_FALSE(ReadHostRobotTcps(first));
+  select(nullptr);
+  EXPECT_FALSE(ReadHostRobotTcps(first));
 }
 
 TEST_F(

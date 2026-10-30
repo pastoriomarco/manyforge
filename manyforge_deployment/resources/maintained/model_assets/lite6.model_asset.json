@@ -1,0 +1,156 @@
+{
+  "api_version": "manyforge.model_asset.v1",
+  "collision_body_role_bindings": [
+    {
+      "collision_body_role_id": "arm_collision",
+      "source_link_names": [
+        "link1",
+        "link2",
+        "link3",
+        "link4",
+        "link5",
+        "link6",
+        "link_base"
+      ]
+    }
+  ],
+  "expanded_source": {
+    "artifacts": [
+      {
+        "byte_size": 42384,
+        "content_digest": "sha256:ac91231b9338ecc99dc4f318854f3288d427dbf7d36d5f1a916b7cdb00e0ee8b",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link1.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 61484,
+        "content_digest": "sha256:2945b39ecc4154da30d1ebe5a9b380e742a379fb0902148f2e286672f46ee1db",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link2.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 36184,
+        "content_digest": "sha256:9af8b412d1f9bc5714be78f4473f28f4ffa91caa0455f215e24e132c8ef433cd",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link3.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 379184,
+        "content_digest": "sha256:17ff580ba7a4477c120374b2e6396940bab2cdc8fad07a34af9ae44b08ee1515",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link4.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 352884,
+        "content_digest": "sha256:f69ec2478819438078db12412597d51bb815acb66d0e1aaa57d4d0f93630fc9c",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link5.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 17984,
+        "content_digest": "sha256:6c2492bd20f3b7216626f00f7e8b63cda12e3faec9b64c6216d1d53022f2ee18",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link6.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 69884,
+        "content_digest": "sha256:728a2e960227fe8b781e7220e0c9a171e2f746524c5db7875bb15b3a2ce2ff92",
+        "logical_uri": "asset://lite6/meshes/lite6/collision/link_base.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 172584,
+        "content_digest": "sha256:41d28af66c2fbd6a93b9fb5f9cfceb3c1de1f021928006871ae4e9d813f8459a",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link1.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 207084,
+        "content_digest": "sha256:d082d23629f1fe619bfc664208039e177cf774a6f953c2c1722aec20edd73ca4",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link2.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 621084,
+        "content_digest": "sha256:ff11c8164bb932cfdfedf27f875e5d5bd3ae13df128c44809da1bf15b712d759",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link3.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 752384,
+        "content_digest": "sha256:902ef2e6c6f66f0fa72b8b7e242ea75ea85af7dfd35581997ceaf475e25a4954",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link4.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 541084,
+        "content_digest": "sha256:3e0c201146a4444a08493d83a273f81b0298a723186a2bb27ede21c574237a41",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link5.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 247884,
+        "content_digest": "sha256:36a7bad22997a0938884485997f026b602bd952674a22d3a8e47cc160cde70d8",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link6.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 231884,
+        "content_digest": "sha256:84f69488a1de60c76c23f83b1759ed76e9235bd56b4b98b4c997c24c18ba7b42",
+        "logical_uri": "asset://lite6/meshes/lite6/visual/link_base.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 1941,
+        "content_digest": "sha256:de84a2c71dd3ea0cde67c2a3d859340d6bd357e33d30afd88d66ddebe430ab42",
+        "logical_uri": "asset://lite6/model.srdf",
+        "media_type": "application/xml"
+      },
+      {
+        "byte_size": 7243,
+        "content_digest": "sha256:fdee0c4b40884c304093a85e154253a4c0182993150a4f4bc0b7f752bcce3720",
+        "logical_uri": "asset://lite6/model.urdf",
+        "media_type": "application/xml"
+      }
+    ],
+    "srdf_logical_uri": "asset://lite6/model.srdf",
+    "urdf_logical_uri": "asset://lite6/model.urdf"
+  },
+  "frame_role_bindings": [
+    {
+      "frame_role_id": "base",
+      "source_link_name": "link_base"
+    },
+    {
+      "frame_role_id": "flange",
+      "source_link_name": "link_eef"
+    },
+    {
+      "frame_role_id": "root",
+      "source_link_name": "world"
+    }
+  ],
+  "instance_cardinality": "multiple_per_cell",
+  "model_asset_id": "lite6",
+  "model_group_role_bindings": [
+    {
+      "model_group_role_id": "arm",
+      "source_group_name": "lite6"
+    }
+  ],
+  "model_revision": "sha256:fdcb5ec818f0c2a41ec8de94cc99c9f2e55aae6d3a0e66f3a609f722a41c1930",
+  "resource_role_bindings": [
+    {
+      "resource_role_id": "arm_joints",
+      "source_joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ]
+    }
+  ],
+  "root_frame_role_id": "root"
+}

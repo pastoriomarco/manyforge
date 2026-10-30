@@ -5,6 +5,7 @@
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -74,6 +75,8 @@ struct Configuration final {
     core::CommandTargetId command_target_id;
     double maximum_tcp_linear_speed_mps{};
     OrdinaryMotionJerkSettings ordinary_motion_jerk{};
+    /// Points the maximum holds at (spec 430 §1.2); schema default.
+    core::TcpSpeedCheck tcp_speed_check{core::TcpSpeedCheck::kActiveTcpAndFlange};
 
     friend bool operator==(const MotionTargetLimit &,
                            const MotionTargetLimit &) = default;

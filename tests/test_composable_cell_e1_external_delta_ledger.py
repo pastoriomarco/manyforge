@@ -5,7 +5,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -230,3 +234,73 @@ def test_selected_patch_manifest_and_ledger_name_exactly_one_series() -> None:
     assert ledger_sources == manifest
     assert retired_paths
     assert retired_paths.isdisjoint(manifest)
+
+
+def test_clearance_margin_patch_is_carried_with_dossier_and_build_digest(
+    tmp_path: Path,
+) -> None:
+    """M6 clearance: patch 0015 is in the checked manifest, its ledger delta and
+    dossier exist, and the recorded build-content digest is the 0010-0015 tree."""
+
+    patch = "patches/0015-roboplan-070-scene-collision-pair-margins.patch"
+    manifest = [
+        line.split()
+        for line in (_PATCH_ROOT / "patches.sha256").read_text(encoding="utf-8").splitlines()
+    ]
+    assert manifest[-1][1] == patch
+    body = (_PATCH_ROOT / patch).read_text(encoding="utf-8")
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == manifest[-1][0]
+    touched = set(re.findall(r"^diff --git a/(\S+) ", body, re.MULTILINE))
+    assert touched == {
+        "roboplan_core/include/roboplan/core/scene.hpp",
+        "roboplan_core/src/core/scene.cpp",
+        "roboplan_core/src/core/scene_context.cpp",
+        "roboplan_core/test/test_scene.cpp",
+    }
+    assert "setCollisionPairMargins" in body
+    assert patch.removeprefix("patches/") in (_PATCH_ROOT / "README.md").read_text(
+        encoding="utf-8"
+    )
+
+    ledger = _load()
+    delta = next(
+        row
+        for row in ledger["deltas"]
+        if row["id"] == "roboplan_patch_0015_scene_collision_pair_margins"
+    )
+    assert delta["local_sources"][0]["sha256"] == manifest[-1][0]
+    assert (_REPO_ROOT / delta["disposition"]["upstream_dossier"]).is_file()
+
+    # When setup-docker has materialized the exact source, the six-patch series
+    # applies in manifest order, as both Dockerfiles do (umask 0002), and yields
+    # the recorded build-content digest.
+    source = _REPO_ROOT / ".docker" / "roboplan"
+    if not (source / "roboplan_core").is_dir():
+        pytest.skip("RoboPlan source is not materialized in .docker/roboplan")
+    root = tmp_path / "roboplan"
+    shutil.copytree(source, root, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    previous_umask = os.umask(0o002)
+    try:
+        for _, relative in manifest:
+            subprocess.run(
+                ["git", "-C", str(root), "apply", str(_PATCH_ROOT / relative)],
+                check=True,
+            )
+    finally:
+        os.umask(previous_umask)
+    subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts/ci/verify-external-source-closure.py"),
+            "--ledger",
+            str(_LEDGER),
+            "--source-id",
+            "roboplan_0_7_0_ua1_foundation",
+            "--root",
+            str(root),
+            "--content-kind",
+            "build",
+            "--allow-stripped-git",
+        ],
+        check=True,
+    )

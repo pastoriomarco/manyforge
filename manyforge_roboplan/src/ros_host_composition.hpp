@@ -57,6 +57,11 @@ struct CompositionIoResourcePreparation final {
   bool complete{};
 };
 
+struct CellFrameStateSource final {
+  RetainedSceneFrameStateSourceInput frame_source;
+  std::shared_ptr<const core::ObservedRobotStatePublication> numeric_publication;
+};
+
 // Common actual cell product data. Physical components borrow this SAME base;
 // a zero-component cell owns this value directly, without a dummy component.
 struct ExecutionProduct {
@@ -175,6 +180,9 @@ struct Composition final : ExecutionProduct {
   std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins;
   std::shared_ptr<RetainedPlannerSceneProjection> planner_scene_projection;
   std::shared_ptr<RetainedSceneFrameResolver> scene_frame_resolver;
+  // Same qualified physical sources as the cell frame resolver, including
+  // numeric channel metadata for authorities that must remain unavailable.
+  std::vector<CellFrameStateSource> cell_frame_state_sources;
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
   std::shared_ptr<void> pick_place_planning_fixture_lifetime;
 #endif
@@ -187,6 +195,9 @@ struct Composition final : ExecutionProduct {
   std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
       cclc_provider_manifest_source;
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
+  // Prepared with the candidate; published only when this composition is selected.
+  HostRobotTcpReader staged_robot_tcp_reader;
+  void StageRobotTcpReader();
   // Build-owned selected lane metadata; current route authority remains in
   // the existing runtime publisher and is rechecked for every source view.
   std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane;

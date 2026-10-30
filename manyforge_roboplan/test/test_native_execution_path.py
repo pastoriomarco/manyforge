@@ -867,8 +867,9 @@ def _planning_motion(
         "move_id": move_id,
         "base_frame_role_id": "frame-role:base",
         "tcp_endpoint": {
-            "target_role_id": "target-role:test",
-            "frame_role_id": "frame-role:tcp",
+            "kind": "entry", "entry": {"component_id": "component:test",
+                                      "target_id": "target:test",
+                                      "frame_role_id": "frame-role:tcp"},
         },
         "tolerances": {
             "joint_position_tol_rad": 0.01,
@@ -1018,10 +1019,7 @@ def _direct_control_joint_operation(
                 )
                 | {
                     "base_frame_role_id": command["base_frame_role_id"],
-                    "tcp_endpoint": {
-                        "target_role_id": command["target_role_id"],
-                        "frame_role_id": command["tcp_frame_role_id"],
-                    },
+                    "tcp_endpoint": {"kind": "current"},
                     "planning_profile": "balanced",
                     "speed_profile": {
                         "velocity_scale": 1.0,
@@ -2830,8 +2828,52 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         motion_descriptor = direct["target_descriptor"]
         assert motion_descriptor["schema_version"] == (
-            "manyforge.manual_control_motion_descriptor.v5"
+            "manyforge.manual_control_motion_descriptor.v6"
         )
+        assert "end_effector_component_id" in motion_descriptor
+        # TCP-C: the default TCP is `tcp`; the inventory includes Deployment
+        # rows for every tool, while observations include only carried rows.
+        tcps = motion_descriptor["tcps"]
+        component_id = motion_component["controllable_component_id"]
+        assert tcps[0]["default"] is True
+        assert tcps[0]["target_role_id"] == "command_target"
+        assert tcps[0]["entry"] == {
+            "component_id": component_id,
+            "target_id": "arm",
+            "frame_role_id": "tcp",
+        }
+        assert tcps[0]["display"] == f"{component_id}.tcp"
+        assert sum(1 for tcp in tcps if tcp["default"]) == 1
+        motion_row = next(row for row in first_status["control_state"]["observed_targets"]
+                          if row["operation_capability_id"] == "execution.trajectory.execute")
+        assert motion_row["active_tcp"]["owner_epoch"] == identity["owner_epoch"]
+        assert motion_row["active_tcp"]["entry"] == tcps[0]["entry"]
+        assert motion_row["active_tcp"]["display"] == tcps[0]["display"]
+        entries = {
+            (tcp["entry"]["component_id"], tcp["entry"]["target_id"],
+             tcp["entry"]["frame_role_id"])
+            for tcp in tcps
+        }
+        assert len(entries) == len(tcps)
+        pose_entries = {
+            (row["entry"]["component_id"], row["entry"]["target_id"],
+             row["entry"]["frame_role_id"])
+            for row in motion_observed["tcp_poses"]
+        }
+        assert pose_entries == {
+            (tcp["entry"]["component_id"], tcp["entry"]["target_id"],
+             tcp["entry"]["frame_role_id"])
+            for tcp in tcps if tcp["mounted_here"]
+        }
+        own_tcp_pose = next(
+            row["pose"] for row in motion_observed["tcp_poses"]
+            if row["entry"] == {
+                "component_id": component_id,
+                "target_id": "arm",
+                "frame_role_id": "tcp",
+            }
+        )
+        assert own_tcp_pose == motion_observed["current_tcp_pose"]
         assert (
             motion_descriptor["controllable_component_id"]
             == motion_component["controllable_component_id"]
@@ -5516,3 +5558,105 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
     finally:
         _stop_host(process)
         raw_api.close()
+
+
+def test_ordered_active_tcp_read_waits_for_queued_set_tcp(tmp_path: Path) -> None:
+    """The read is behind an already-enqueued Set TCP, not a send receipt."""
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    marker = tmp_path / "blocked-preview-worker"
+    process = _start_host(
+        fixture_root, state_root, run_root, manifest,
+        candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
+        fake_worker_marker=marker,
+    )
+    execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    internal = ExecutionCommandClient(run_root, timeout_seconds=2.0, attribution_transport="internal")
+    planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+    pinned = PinnedRunRoot(run_root)
+    clients: list[socket.socket] = []
+    preview_done = threading.Event()
+    preview_errors: list[Exception] = []
+    preview_thread: threading.Thread | None = None
+    try:
+        status = execution.diagnostics()["status"]
+        identity = status["identity"]
+        component, target = _status_target(status, presentation="motion")
+        positions = list(_status_observation(status, presentation="motion")["positions_rad"])
+        positions[0] = 0.03
+        motion = _direct_control_joint_operation(identity, target, request_id="tcp-barrier-preview",
+                                                 positions_rad=positions)
+        motion["participants"][0]["payload"]["tcp_endpoint"] = {"kind": "current"}
+        baseline = execution._exchange({"api_version": EXECUTION_COMMAND_VERSION,
+                                        "command": "read_active_tcp"})
+        assert baseline["ok"] is True
+        row = next(row for row in baseline["robots"]
+                   if row["component_id"] == component["controllable_component_id"]
+                   and row["entry"] is not None)
+        chosen_entry = next(
+            tcp["entry"] for tcp in target["command"]["target_descriptor"]["tcps"]
+            if tcp["mounted_here"] and tcp["entry"] != row["entry"]
+        )
+
+        def preview() -> None:
+            try:
+                planning.preview_motion(OperationIntentRequest.model_validate(motion), trusted_principal_id=None)
+            except Exception as error:
+                preview_errors.append(error)
+            finally:
+                preview_done.set()
+
+        preview_thread = threading.Thread(target=preview, daemon=True)
+        preview_thread.start()
+        deadline = time.monotonic() + 2.0
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert marker.exists()
+        set_tcp = _direct_control_joint_operation(identity, target, request_id="tcp-barrier-set",
+                                                  positions_rad=positions)
+        set_tcp["participants"][0]["payload"] = {"kind": "set_tcp", "tcp": {
+            "kind": "entry", "entry": chosen_entry}}
+        packets = [
+            {"api_version": EXECUTION_COMMAND_VERSION, "command": "submit",
+             "attribution": {"transport": "http", "assurance": "unverified", "principal_id": None},
+             "operation": set_tcp},
+            {"api_version": EXECUTION_COMMAND_VERSION, "command": "read_active_tcp", "ordered": True},
+        ]
+        for packet in packets:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            client.settimeout(5.0)
+            with pinned.socket_address("execution-command.sock") as address:
+                client.connect(address)
+            client.send(rfc8785.dumps(packet))
+            clients.append(client)
+        # The ordinary request has been handled after both connections, while
+        # the preview holds the submission lane. It is not an enqueue receipt.
+        assert execution._exchange({"api_version": EXECUTION_COMMAND_VERSION,
+                                    "command": "read_active_tcp"})["ok"] is True
+        clients[1].settimeout(0.05)
+        with pytest.raises(TimeoutError):
+            clients[1].recv(4 * 1024 * 1024)
+        clients[1].settimeout(5.0)
+        assert internal.stop_program_run(ProgramRunStopIntentRequest.model_validate({
+            "request_context": {"request_id": "tcp-barrier-stop",
+                                "request_owner_epoch": identity["owner_epoch"],
+                                "source_label": "test"},
+            "program_run_id": "program-run.tcp-barrier", "reason": "release blocked preview",
+        }))["ok"] is True
+        set_result = json.loads(clients[0].recv(4 * 1024 * 1024))
+        read_result = json.loads(clients[1].recv(4 * 1024 * 1024))
+        assert set_result["ok"] is True, set_result
+        assert read_result["ok"] is True, read_result
+        actual = next(item for item in read_result["robots"] if item["component_id"] == row["component_id"])
+        assert actual["entry"] == chosen_entry
+        assert actual["sequence"] > row["sequence"]
+    finally:
+        for client in clients:
+            client.close()
+        _stop_host(process)
+        if preview_thread is not None:
+            preview_thread.join(timeout=3.0)

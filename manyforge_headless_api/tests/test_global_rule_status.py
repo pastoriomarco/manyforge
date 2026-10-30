@@ -34,7 +34,11 @@ def _catalog(rule_ids: list[str], **extra: Any) -> dict[str, Any]:
     }
 
 
-def _ready(states: dict[str, str], through: int, **context: Any) -> dict[str, Any]:
+def _ready(
+    states: dict[str, str], through: int,
+    unavailable_reasons: dict[str, dict[str, Any]] | None = None,
+    **context: Any,
+) -> dict[str, Any]:
     return {
         "status": "ready",
         "snapshot": {
@@ -42,14 +46,24 @@ def _ready(states: dict[str, str], through: int, **context: Any) -> dict[str, An
             **context,
             "through_sequence": through,
             "states": [
-                {"rule_id": rule_id, "state": state, "triggering_acquisition": None}
+                {
+                    "rule_id": rule_id,
+                    "state": state,
+                    "triggering_acquisition": None,
+                    **({"unavailable_reason": unavailable_reasons[rule_id]}
+                       if unavailable_reasons is not None and rule_id in unavailable_reasons else {}),
+                }
                 for rule_id, state in sorted(states.items())
             ],
         },
     }
 
 
-def _row(sequence: int, rule_id: str, state: str, **context: Any) -> dict[str, Any]:
+def _row(
+    sequence: int, rule_id: str, state: str,
+    unavailable_reason: dict[str, Any] | None = None,
+    **context: Any,
+) -> dict[str, Any]:
     return {
         "sequence": sequence,
         "record_kind": "interrupt_rule_state_changed",
@@ -59,6 +73,7 @@ def _row(sequence: int, rule_id: str, state: str, **context: Any) -> dict[str, A
             "rule_id": rule_id,
             "state": state,
             "triggering_acquisition": None,
+            **({"unavailable_reason": unavailable_reason} if unavailable_reason is not None else {}),
         },
     }
 
@@ -169,3 +184,56 @@ def test_another_owner_is_a_wire_error() -> None:
     with pytest.raises(InterruptStateWireError):
         model.observe("kernel-2", _catalog(["door"]), None, [])
     assert model.rows() is None
+
+
+def test_pending_invalidates_only_notify_until_ready() -> None:
+    model = GlobalRuleStatusModel()
+    catalog = _catalog(["door", "light"], notify_rule_ids=["door"])
+    model.observe(_OWNER, catalog, _ready({"door": "tripped", "light": "latched"}, 0), [])
+    model.observe(_OWNER, catalog, {"status": "projection_pending"},
+                  [_row(1, "door", "tripped"), _row(2, "light", "clear")])
+    assert _states(model) == {"door": "pending", "light": "clear"}
+    reason = {
+        "code": "motion_interrupt_arm_failed",
+        "message": "Notify rule input is unavailable",
+        "details": {"reason": "io_rule_source_unavailable", "source": "door"},
+    }
+    ready = _ready(
+        {"door": "unknown", "light": "clear"}, 2,
+        unavailable_reasons={"door": reason},
+    )
+    model.observe(_OWNER, catalog, ready, [])
+    assert _states(model) == {"door": "unknown", "light": "clear"}
+    assert model.rows() == [
+        {"rule_id": "door", "state": "unknown", "keys": [], "unavailable_reason": reason},
+        {"rule_id": "light", "state": "clear", "keys": []},
+    ]
+    model.observe(_OWNER, catalog, _ready({"door": "tripped", "light": "clear"}, 3), [])
+    assert _states(model) == {"door": "tripped", "light": "clear"}
+    assert model.rows() == [
+        {"rule_id": "door", "state": "tripped", "keys": []},
+        {"rule_id": "light", "state": "clear", "keys": []},
+    ]
+
+
+def test_unknown_event_reason_is_shown_and_removed_on_fresh_recovery() -> None:
+    model = GlobalRuleStatusModel()
+    catalog = _catalog(["door"], notify_rule_ids=["door"])
+    baseline = _ready({"door": "clear"}, 1)
+    model.observe(_OWNER, catalog, baseline, [])
+    reason = {
+        "code": "motion_interrupt_arm_failed",
+        "message": "Notify rule input is unavailable",
+        "details": {"reason": "io_rule_source_unavailable"},
+    }
+
+    model.observe(
+        _OWNER, catalog, baseline,
+        [_row(2, "door", "unknown", unavailable_reason=reason)],
+    )
+    assert model.rows() == [
+        {"rule_id": "door", "state": "unknown", "keys": [], "unavailable_reason": reason},
+    ]
+
+    model.observe(_OWNER, catalog, baseline, [_row(3, "door", "clear")])
+    assert model.rows() == [{"rule_id": "door", "state": "clear", "keys": []}]

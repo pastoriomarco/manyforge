@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.component_type.v1
-schema_revision: sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4
+schema_revision: sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde
 schema_purpose: artifact_document
 root_definition_id: component_type
 definitions:
@@ -335,7 +335,7 @@ definitions:
             kind: absent
           value_schema:
             kind: array
-            min_items: 1
+            min_items: 0
             max_items: 256
             collection:
               kind: keyed_record_set
@@ -344,6 +344,16 @@ definitions:
             item_schema:
               kind: local_ref
               definition_id: command_target_capability
+        - field_id: default_tcp_frame_role_id
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
   - definition_id: command_target_model_group_role
     value_schema:
       kind: object
@@ -527,6 +537,14 @@ definitions:
               constraints:
                 - kind: string_format
                   value: portable_id
+        - field_id: tcp
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
   - definition_id: command_target_collision_body_role
     value_schema:
       kind: object

@@ -56,8 +56,6 @@ def _launch_context(module, *, profile: str = "ur10e") -> LaunchContext:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
     context.launch_configurations["isaac_profile"] = profile
-    # Host-owned: the gripper target configuration's value.
-    context.launch_configurations["gripper_state_freshness_timeout_s"] = "0.75"
     return context
 
 
@@ -124,7 +122,6 @@ def test_missing_artifact_refuses_before_runtime_action_construction(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
     context = _launch_context(module)
     context.launch_configurations[name] = str(tmp_path / "missing")
     monkeypatch.setattr(module, "Node", lambda **_kwargs: pytest.fail("runtime action constructed before artifact check"))
@@ -136,68 +133,42 @@ def test_artifact_paths_accept_readable_relative_files(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
     context = _launch_context(module)
     parent = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).parent
     monkeypatch.chdir(parent)
     for name, path in _SUPPLIED_ARTIFACTS.items():
         context.launch_configurations[name] = Path(path).name
-    assert len(module._launch_setup(context)) == 6
+    assert len(module._launch_setup(context)) == 5
 
 
-@pytest.mark.parametrize(
-    ("profile", "raw_gripper_topic", "starts_action_bridge"),
-    [
-        ("ur10e", "/isaac_gripper_state", True),
-        ("lite6", "/isaac_joint_commands_gripper", False),
-    ],
-)
-def test_profile_selection_preserves_distinct_gripper_transports(
-    profile: str,
-    raw_gripper_topic: str,
-    starts_action_bridge: bool,
-) -> None:
+@pytest.mark.parametrize("profile", ("ur10e", "lite6"))
+def test_profile_selection_accepts_only_the_retained_profiles(profile: str) -> None:
     module = _load_launch_module()
 
-    selected = module._profile_configuration(profile)
-    assert selected["raw_gripper_topic"] == raw_gripper_topic
-    assert (
-        module._resolve_start_gripper_action_bridge("auto", isaac_profile=profile)
-        is starts_action_bridge
-    )
-
-    if profile == "lite6":
-        with pytest.raises(ValueError, match="direct-effort"):
-            module._resolve_start_gripper_action_bridge(
-                "true", isaac_profile=profile
-            )
+    assert module._profile_configuration(profile) == {"name": profile}
+    with pytest.raises(ValueError, match="unsupported isaac_profile"):
+        module._profile_configuration("ur5e")
 
 
 def test_launch_attaches_controller_stack_with_inactive_arm_spawner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare,
-        "find",
-        lambda _self, _name: str(_PACKAGE_ROOT),
-    )
     context = _launch_context(module, profile="ur10e")
     actions = module._launch_setup(context)
 
-    assert len(actions) == 6
-    assert [_node_executable(action) for action in actions[:3]] == [
+    assert len(actions) == 5
+    assert [_node_executable(action) for action in actions[:2]] == [
         "robot_state_publisher",
         "static_transform_publisher",
-        "isaac_gripper_action_bridge",
     ]
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
-        for action in actions[:3]
+        for action in actions[:2]
     )
     timed_nodes = [
         getattr(action, "_TimerAction__actions")[0]
-        for action in actions[3:]
+        for action in actions[2:]
     ]
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
@@ -234,9 +205,6 @@ def test_explicit_prefix_changes_rsp_and_static_child_only(
     monkeypatch: pytest.MonkeyPatch, profile: str, prefix: str,
 ) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT),
-    )
     context = _launch_context(module, profile=profile)
     assert context.launch_configurations["frame_prefix"] == ""
     context.launch_configurations.update(
@@ -271,55 +239,26 @@ def test_explicit_prefix_changes_rsp_and_static_child_only(
     assert _node_namespace(rsp, context) == module.DEFAULT_RUNTIME_NAMESPACE
 
 
-def test_gripper_adapter_takes_host_freshness_and_refuses_without_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+# Merge 6: a gripper is its own tool component; its bridge runs in the tool's
+# launch (`isaac_gripper.launch.py`), never in the arm's.
+@pytest.mark.parametrize("profile", ("ur10e", "lite6"))
+def test_arm_launch_starts_no_gripper_bridge(profile: str) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
-    )
-    context = _launch_context(module, profile="ur10e")
-    bridge = next(
-        action for action in module._launch_setup(context)
-        if _node_executable(action) == "isaac_gripper_action_bridge"
-    )
-    parameters = evaluate_parameters(context, bridge._Node__parameters)
-    assert parameters[-1]["state_freshness_timeout_s"] == 0.75
-    assert "state_freshness_timeout_s" not in Path(str(parameters[0])).read_text(
-        encoding="utf-8"
-    )
-
-    context.launch_configurations["gripper_state_freshness_timeout_s"] = ""
-    with pytest.raises(ValueError, match="gripper_state_freshness_timeout_s"):
-        module._launch_setup(context)
-
-
-def test_launch_lite6_stack_omits_python_gripper_action_adapter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare,
-        "find",
-        lambda _self, _name: str(_PACKAGE_ROOT),
-    )
-    actions = module._launch_setup(_launch_context(module, profile="lite6"))
+    actions = module._launch_setup(_launch_context(module, profile=profile))
 
     assert "isaac_gripper_action_bridge" not in {
         _node_executable(action) for action in actions
     }
     assert len(actions) == 5
+    assert "gripper" not in _LAUNCH_FILE.read_text(encoding="utf-8").split(
+        "def _launch_setup", 1
+    )[1].split("def _shutdown", 1)[0]
 
 
 def test_launch_adds_demand_pointcloud_bridge_only_with_exact_cell_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare,
-        "find",
-        lambda _self, _name: str(_PACKAGE_ROOT),
-    )
     context = _launch_context(module, profile="ur10e")
     context.launch_configurations["pointcloud_topic"] = "/isaac_cell_cloud"
     context.launch_configurations["pointcloud_cell_id"] = "isaac.cell.1"

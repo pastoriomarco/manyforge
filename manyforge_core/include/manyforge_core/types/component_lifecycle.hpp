@@ -32,6 +32,10 @@ inline constexpr std::size_t kMaxLifecycleResolvedBindings = 4096U;
 inline constexpr std::size_t kMaxLifecycleStatusBindingUnion = 8192U;
 inline constexpr std::size_t kMaxLifecycleFacts = 256U;
 inline constexpr std::size_t kMaxLifecycleAttemptsPerDomain = 64U;
+/// V-B2: substeps one transition action reports, and feedback events one
+/// domain status retains.
+inline constexpr std::size_t kMaxLifecycleSubsteps = 64U;
+inline constexpr std::size_t kMaxLifecycleSubstepEvents = 64U;
 inline constexpr std::size_t kMaxLifecycleAttemptsPerStatus = 4096U;
 inline constexpr std::size_t kMaxLifecycleCurrentResources = 4096U;
 inline constexpr std::size_t kMaxLifecycleCancelledOperations = 4096U;
@@ -40,6 +44,11 @@ inline constexpr std::size_t kMaxLifecycleRequestLabelBytes = 256U;
 inline constexpr std::size_t kMaxLifecycleErrorCodeBytes = 128U;
 inline constexpr std::size_t kMaxLifecycleErrorMessageBytes = 1024U;
 inline constexpr std::size_t kMaxLifecycleErrorDetails = 8U;
+/// M6 XADAPT: the response cap of one component call (a controller-manager
+/// switch or hardware-state request, a vendor service): no answer within
+/// min(this cap, the step's remaining time) ends the wait. Maintainer
+/// 2026-10-28: 10 s until measured live.
+inline constexpr std::int64_t kComponentCallResponseCapNs = 10'000'000'000LL;
 inline constexpr std::size_t kMaxLifecycleErrorDetailKeyBytes = 64U;
 inline constexpr std::size_t kMaxLifecycleErrorDetailValueBytes = 256U;
 inline constexpr std::size_t kMaxLifecycleKinematicSourceProjections = 4096U;
@@ -88,21 +97,13 @@ enum class LifecycleFactValueKindDTO : std::uint8_t {
   kToken,
 };
 
-enum class LifecyclePrimitiveDispatchStateDTO : std::uint8_t {
-  kNotDispatched = 0,
-  kDispatchedKnown,
-  kDispatchedUncertain,
-};
-
-enum class LifecyclePrimitiveKnownResultDTO : std::uint8_t {
+/// V-B2 (V2-4): the result of one lifecycle transition and of each substep
+/// the adapter ran. CCLC never classifies partial or uncertain effects; an
+/// adapter's own distinctions survive only in the typed error.
+enum class LifecycleTransitionOutcomeDTO : std::uint8_t {
   kSucceeded = 0,
   kFailed,
-};
-
-enum class LifecyclePrimitiveEffectDTO : std::uint8_t {
-  kNone = 0,
-  kPossible,
-  kObserved,
+  kConnectionLost,
 };
 
 enum class LifecyclePostconditionResultDTO : std::uint8_t {
@@ -116,18 +117,8 @@ enum class ComponentLifecycleDomainActionStateDTO : std::uint8_t {
   kNotStarted,
   kExecuting,
   kVerifying,
-  kReconciling,
   kSucceeded,
   kFailed,
-  kOutcomeUnknown,
-};
-
-enum class ComponentLifecycleDomainEffectDTO : std::uint8_t {
-  kNone = 0,
-  kKnownNoEffect,
-  kEffectObserved,
-  kPartialEffectObserved,
-  kEffectUncertain,
 };
 
 enum class ComponentLifecycleTransactionPhaseDTO : std::uint8_t {
@@ -136,16 +127,16 @@ enum class ComponentLifecycleTransactionPhaseDTO : std::uint8_t {
   kContaining,
   kExecuting,
   kVerifying,
+  /// Only a stopped Apply bring-up (with `reconciliation_required`, VB2-O4).
   kOutcomeUnknown,
-  kReconciling,
   kSucceeded,
   kFailed,
 };
 
 enum class ComponentLifecycleTerminalResultDTO : std::uint8_t {
   kSucceeded = 0,
-  kFailedKnownNoEffect,
-  kFailedPartialEffect,
+  kFailed,
+  kConnectionLost,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(ComponentLifecycleIntentKindDTO value) noexcept {
@@ -182,6 +173,23 @@ enum class ComponentLifecycleTerminalResultDTO : std::uint8_t {
       return "disabled";
   }
   return {};
+}
+
+/// V-B2: the one adapter action CCLC dispatches per transition and domain.
+[[nodiscard]] inline LifecyclePrimitiveId LifecycleTransitionActionId(
+    ComponentLifecycleIntentKindDTO intent) {
+  return LifecyclePrimitiveId("transition." + std::string(to_string(intent)));
+}
+
+/// The intent of a transition action id; nothing for any other id.
+[[nodiscard]] inline std::optional<ComponentLifecycleIntentKindDTO> LifecycleTransitionIntent(
+    const LifecyclePrimitiveId& action) {
+  for (const auto intent :
+       {ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleIntentKindDTO::kEnable,
+        ComponentLifecycleIntentKindDTO::kDisable, ComponentLifecycleIntentKindDTO::kRecover}) {
+    if (action == LifecycleTransitionActionId(intent)) return intent;
+  }
+  return std::nullopt;
 }
 
 /// Typed warning: a component's current state could not be read from fresh
@@ -569,6 +577,9 @@ struct BrandLifecycleObservationDTO final {
                          const BrandLifecycleObservationDTO&) = default;
 };
 
+/// V-B2: one transition action (`transition.<intent>`) for one domain. The
+/// adapter runs its own substeps within `remaining_duration_ns`; a Recover
+/// carries the target CCLC chose in `requested_state`.
 struct BrandLifecyclePrimitiveIntentDTO final {
   LifecycleTransactionId lifecycle_transaction_id;
   LifecycleTransactionGeneration lifecycle_transaction_generation;
@@ -584,11 +595,46 @@ struct BrandLifecyclePrimitiveIntentDTO final {
   LifecyclePrimitiveAttemptId lifecycle_primitive_attempt_id;
   std::uint64_t expected_observation_generation;
   std::int64_t remaining_duration_ns;
+  ComponentLifecycleStateDTO requested_state;
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
   friend bool operator==(const BrandLifecyclePrimitiveIntentDTO&,
                          const BrandLifecyclePrimitiveIntentDTO&) = default;
+};
+
+/// One substep the adapter ran, for the record only: CCLC never interprets
+/// the list. `within` names the enclosing substep of a nested one.
+struct LifecycleSubstepResultDTO final {
+  LifecyclePrimitiveId substep_id;
+  std::optional<LifecyclePrimitiveId> within;
+  LifecycleTransitionOutcomeDTO outcome;
+  std::int64_t started_at_ns;
+  std::int64_t finished_at_ns;
+  std::optional<ErrorDTO> error;
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+
+  friend bool operator==(const LifecycleSubstepResultDTO&,
+                         const LifecycleSubstepResultDTO&) = default;
+};
+
+/// Feedback while a transition runs: a substep started or finished.
+struct LifecycleSubstepEventDTO final {
+  enum class Phase : std::uint8_t { kStarted = 0, kFinished };
+
+  LifecyclePrimitiveAttemptId attempt_id;
+  LifecyclePrimitiveId substep_id;
+  std::optional<LifecyclePrimitiveId> within;
+  Phase phase;
+  std::int64_t at_ns;
+  std::optional<LifecycleTransitionOutcomeDTO> outcome;  // finished only
+  std::optional<std::string> error_code;                 // finished only
+
+  [[nodiscard]] bool locally_valid() const noexcept;
+
+  friend bool operator==(const LifecycleSubstepEventDTO&,
+                         const LifecycleSubstepEventDTO&) = default;
 };
 
 struct BrandLifecyclePrimitiveResultDTO final {
@@ -605,10 +651,10 @@ struct BrandLifecyclePrimitiveResultDTO final {
   LifecyclePrimitiveId lifecycle_primitive_id;
   LifecyclePrimitiveAttemptId lifecycle_primitive_attempt_id;
   std::uint64_t expected_observation_generation;
-  LifecyclePrimitiveDispatchStateDTO dispatch_state;
-  LifecyclePrimitiveEffectDTO effect;
-  std::optional<LifecyclePrimitiveKnownResultDTO> known_result;
+  LifecycleTransitionOutcomeDTO outcome;
+  /// Required unless `outcome` is succeeded.
   std::optional<ErrorDTO> error;
+  std::vector<LifecycleSubstepResultDTO> substeps{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   [[nodiscard]] bool matches(const BrandLifecyclePrimitiveIntentDTO& intent) const noexcept;
@@ -617,23 +663,24 @@ struct BrandLifecyclePrimitiveResultDTO final {
                          const BrandLifecyclePrimitiveResultDTO&) = default;
 };
 
-struct LifecycleReconciliationEvidenceDTO final {
-  ProviderInstanceId provider_instance_id;
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  RuntimeUnitId provider_runtime_unit_id;
-  RuntimeEpoch provider_runtime_epoch;
-  std::uint64_t source_sequence;
-  std::uint64_t observation_generation;
+/// L3 at transition level: what CCLC observed before dispatch and after the
+/// transition (its verification on success, one fresh Observe after a
+/// dispatched failure).
+struct LifecycleTransitionObservationDTO final {
   ComponentLifecycleStateDTO observed_state;
-  LifecyclePostconditionResultDTO postcondition_result;
-  std::int64_t observed_at_ns;
+  std::vector<LifecycleFactDTO> facts;
+  std::uint64_t observation_generation;
+  std::uint64_t source_sequence;
+  std::int64_t at_ns;
 
   [[nodiscard]] bool locally_valid() const noexcept;
 
-  friend bool operator==(const LifecycleReconciliationEvidenceDTO&,
-                         const LifecycleReconciliationEvidenceDTO&) = default;
+  friend bool operator==(const LifecycleTransitionObservationDTO&,
+                         const LifecycleTransitionObservationDTO&) = default;
 };
+
+[[nodiscard]] LifecycleTransitionObservationDTO RecordLifecycleTransitionObservation(
+    const BrandLifecycleObservationDTO& observation);
 
 struct ProviderDomainActiveConfigurationDTO final {
   ActiveControlConfigurationId active_control_configuration_id;
@@ -805,10 +852,12 @@ struct ComponentLifecycleDomainStatusDTO final {
   std::optional<ComponentLifecycleStateDTO> current_state;
   ComponentLifecycleRequestedStateDTO requested_state;
   ComponentLifecycleDomainActionStateDTO action_state;
-  ComponentLifecycleDomainEffectDTO effect;
   std::vector<BrandLifecyclePrimitiveResultDTO> primitive_attempts;
-  std::optional<LifecycleReconciliationEvidenceDTO> reconciliation_evidence;
   std::optional<ErrorDTO> error;
+  /// Append-only feedback of the running transition action.
+  std::vector<LifecycleSubstepEventDTO> substep_events{};
+  std::optional<LifecycleTransitionObservationDTO> observed_before{};
+  std::optional<LifecycleTransitionObservationDTO> observed_after{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 

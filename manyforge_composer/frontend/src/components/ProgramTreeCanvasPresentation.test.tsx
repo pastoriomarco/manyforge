@@ -84,6 +84,7 @@ const environment: NodeEnvironmentResponse = {
     executablePackageId: 'manyforge_behavior',
     authoringAvailable: true,
     executionAvailable: false,
+    reasons: [],
     reasonCodes: ['native_program_product_unavailable'],
     restorationGates: ['N7'],
   })),

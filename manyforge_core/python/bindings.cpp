@@ -608,7 +608,9 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("peak_tcp_linear_speed_mps",
                      &manyforge::core::TrajectoryValidationMetricsDTO::peak_tcp_linear_speed_mps)
       .def_readwrite("cartesian_fidelity_metrics",
-                     &manyforge::core::TrajectoryValidationMetricsDTO::cartesian_fidelity_metrics);
+                     &manyforge::core::TrajectoryValidationMetricsDTO::cartesian_fidelity_metrics)
+      .def_readwrite("peak_tcp_linear_speed_frame",
+                     &manyforge::core::TrajectoryValidationMetricsDTO::peak_tcp_linear_speed_frame);
 
   py::class_<manyforge::core::ValidationResultDTO>(m, "ValidationResultDTO")
       .def(py::init<>())

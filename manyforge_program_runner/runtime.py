@@ -15,6 +15,7 @@ from typing import Any, Final, NoReturn
 import unicodedata
 from urllib.parse import urlsplit
 from uuid import uuid4
+from weakref import ref as weakref_ref
 
 import rfc8785
 
@@ -27,6 +28,7 @@ from manyforge_behavior.assistant_program_port import (
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
+from manyforge_behavior.failure_details import exception_failure_details
 from manyforge_behavior.kernel_client import KernelClient
 from manyforge_behavior.node_availability import (
     AvailabilityFact,
@@ -72,7 +74,7 @@ from manyforge_behavior.program_run_owner import (
     build_applied_program_run_admission,
 )
 from manyforge_behavior.program_runtime import NodeInputProposalError
-from manyforge_behavior.recovery import is_non_moving_recovery
+from manyforge_behavior.recovery import is_non_moving_recovery, observed_state_refusal
 from manyforge_behavior.program_scheduling import (
     ProgramInterventionRegistry,
     ProgramRunTickHost,
@@ -110,6 +112,7 @@ from .bbkey_publication import (
     ProgramBlackboardKeyPublisher,
     ProgramBlackboardPublicationScope,
 )
+from .active_tcp_mirror import ActiveTcpMirror, ActiveTcpWireError, decode_active_tcp_rows
 from .execution_transport import ProgramRunnerExecutionTransport
 from .interrupt_state_mirror import InterruptRuleStateMirror, RuleCatalog
 from .liveness import (
@@ -198,10 +201,12 @@ class ProgramRunnerError(RuntimeError):
         message: str,
         *,
         details: Mapping[str, Any] | None = None,
+        producer: str = "program_runner",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.details = deepcopy(dict(details or {}))
+        self.producer = producer
 
 
 def _persistent_storage_error(error: PersistentKeyRegisterError) -> ProgramRunnerError:
@@ -445,6 +450,13 @@ class ProgramRuntime:
         self._applied_condition_keys: tuple[str, ...] = ()
         self._bbkey_idle_store: ProgramValueStore | None = None
         self._bbkey_publishers_lock = RLock()
+        # The Run and between-Runs stores are registered independently of BB
+        # publication: W0 still needs the robot-owned Active TCP values.
+        self._active_tcp_stores_lock = Lock()
+        self._active_tcp_stores: dict[
+            str | None, tuple[ProgramValueStore, dict[str, tuple[str, ...]]]
+        ] = {}
+        self._active_tcp_mirror = ActiveTcpMirror(on_change=self._write_active_tcp)
         # F-2: one source creation at a time (check, retire, create, install,
         # start). Held across I/O, so never the publishers lock above.
         self._bbkey_source_lock = RLock()
@@ -513,6 +525,7 @@ class ProgramRuntime:
         self._execution_transport = execution_transport
         self._scene = HeadlessSceneProgramPort(
             self._headless,
+            resolve_attach_active_tcp=getattr(execution_transport, "resolve_attach_active_tcp", None),
             manager_command=(
                 None if self._manager_commands is None else self._manager_commands._exchange
             ),
@@ -554,6 +567,7 @@ class ProgramRuntime:
         self._native = NativeKernelProgramPort(
             self._kernel,
             current_owner_epoch=self._current_kernel_owner_epoch,
+            active_tcp_result=self._apply_active_tcp_result,
             stop_terminal=(
                 None
                 if self._interrupt_state_mirror is None
@@ -566,9 +580,11 @@ class ProgramRuntime:
             ),
         )
         simulator_control_port = self._simulation_control
-        if self._manager_commands is not None and simulator_control_port is not None:
+        if simulator_control_port is not None:
             simulator_control_port = SimulationResetPoseSourceTaskPort(
-                simulator_control_port, self._scene
+                simulator_control_port,
+                self._scene if self._manager_commands is not None else None,
+                on_reset=lambda _identity: self._reset_active_tcp(),
             )
         self._assistant = (
             None
@@ -1412,6 +1428,15 @@ class ProgramRuntime:
                 if profile_id != "manyforge.ros2_control_execution_runtime" or component in io_providers:
                     continue
                 matches = [row for row in ros_profiles(unit) if row.get("controllable_component_id") == component]
+                # A no-output pneumatic tool (merge 6 D4: No output, or driven
+                # through pneumatic I/O) is lane-free: no controller profile and
+                # no simulator row, as for the provider-only I/O component above.
+                if not matches and any(
+                        target.get("controllable_component_id") == component
+                        and target.get("actuation_kind") == "pneumatic"
+                        and (target.get("output_mode") == "none" or target.get("pneumatic_io") is not None)
+                        for target in rows(unit["configuration"].get("gripper_target_configurations", ()))):
+                    continue
                 if len(matches) != 1 or seen_profile:
                     raise ProgramRunOwnerError("Program simulation dependency has no unique ROS controller profile")
                 seen_profile = True
@@ -1452,7 +1477,10 @@ class ProgramRuntime:
 
     @staticmethod
     def _headless_error(error: HeadlessClientError) -> ProgramRunnerError:
-        return ProgramRunnerError(error.code, str(error), details=error.details)
+        return ProgramRunnerError(
+            error.code, str(error), details=error.details,
+            producer=error.producer,
+        )
 
     @staticmethod
     def _runner_error(error: Exception) -> ProgramRunnerError:
@@ -1953,9 +1981,6 @@ class ProgramRuntime:
         result["node_status_revision"] = (
             None if run is None else run["node_status_revision"]
         )
-        result["runtime_control_revision"] = (
-            None if controls is None else controls.revision
-        )
         result["recovery_offer"] = recovery_offer
         # This is the single shared browser observation. Publishing the exact
         # projections here prevents every connected browser from re-reading
@@ -1971,6 +1996,10 @@ class ProgramRuntime:
                 recovery_offer=recovery_offer,
                 execution_selections=selections,
             )
+        )
+        result["runtime_control_revision"] = (
+            None if result["runtime_controls"] is None
+            else result["runtime_controls"]["runtime_controls"]["runtime_control_revision"]
         )
         # Refine Program-tree-dependent availability in the complete owner
         # projection. The cycle journal remains the lifecycle authority; the
@@ -2586,13 +2615,13 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_reset_scene_preparation_failed",
                 str(error),
-                details={"cause_code": error.code},
+                details={"cause_code": error.code, "cause_producer": error.producer},
             ) from error
         except HeadlessClientError as error:
             raise ProgramRunnerError(
                 "program_cycle_reset_scene_preparation_failed",
                 str(error),
-                details={"cause_code": error.code},
+                details={"cause_code": error.code, "cause_producer": error.producer},
             ) from error
         except (ProgramRunOwnerError, ProgramSchedulingError) as error:
             cause = self._runner_error(error)
@@ -2731,12 +2760,6 @@ class ProgramRuntime:
                 raise ProgramRunnerError(
                     "authoring_not_ready",
                     "authoring admission is not ready for scene preparation",
-                    details=admission_details,
-                )
-            if generation != request.expected_admission_generation:
-                raise ProgramRunnerError(
-                    "stale_generation",
-                    "authoring admission changed before scene preparation",
                     details=admission_details,
                 )
             context_id = (
@@ -3243,6 +3266,9 @@ class ProgramRuntime:
             retired = [self._bbkey_publishers.pop(name, None) for name in names]
             if not idle_only:
                 self._bbkey_idle_store = None
+        if not idle_only:
+            with self._active_tcp_stores_lock:
+                self._active_tcp_stores.clear()
         for publisher in retired:
             if publisher is not None:
                 publisher.retire()
@@ -3259,6 +3285,7 @@ class ProgramRuntime:
         keys: tuple[str, ...],
         retained_bundle_id: str,
         graph_revision: str,
+        binding: Mapping[str, Any] | None = None,
     ) -> ProgramBlackboardKeyPublisher | None:
         """Subscribe the Run's fixed key union and send its baseline first."""
 
@@ -3273,6 +3300,7 @@ class ProgramRuntime:
                 keys=keys,
                 retained_bundle_id=retained_bundle_id,
                 graph_revision=graph_revision,
+                binding=binding,
             )
 
     def _start_run_bbkey_publication(
@@ -3287,13 +3315,21 @@ class ProgramRuntime:
         keys: tuple[str, ...],
         retained_bundle_id: str,
         graph_revision: str,
+        binding: Mapping[str, Any] | None = None,
     ) -> ProgramBlackboardKeyPublisher | None:
         # Previous sources (a reset Run's, the cell-level one) end here.
         self._retire_bbkey_publishers()
         self._interrupt_state_run_id = program_run_id
         context = (owner_epoch, active_publication_generation, retained_bundle_id, graph_revision)
+        store = self._owner.value_store(program_run_id)
+        if binding is not None:
+            self._register_active_tcp_store(
+                program_run_id, store, binding, owner_epoch
+            )
         if self._applied_global_rule_ids():
-            self._seed_interrupt_states(self._owner.value_store(program_run_id), context)
+            self._seed_interrupt_states(store, context)
+        else:
+            self._bind_interrupt_rule_catalog_reader(store, context)
         catalog = self._catalog_for_context(context)
         if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
             return None  # W0: no sender, no baseline.
@@ -3359,15 +3395,13 @@ class ProgramRuntime:
         ):
             return
         catalog = self._catalog_for_context(context)
-        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
-            self._retire_bbkey_publishers(idle_only=True)  # W0: no sender, no baseline.
-            return
+        no_publisher = not keys and catalog is not None and not catalog.referenced_program_blackboard_keys
         self._retire_bbkey_publishers(idle_only=True)
         program = self._with_global_rule_keys(
             Program.from_dict(deepcopy(applied["program"]), self._environment.catalog),
             retained_bundle_id=applied.get("retained_bundle_id"),
             graph_revision=applied.get("graph_revision"),
-        )
+        ).with_active_tcp_binding(applied["program_binding"])
         persistent = {
             key: declaration
             for key, declaration in program.blackboard_keys.items()
@@ -3380,6 +3414,9 @@ class ProgramRuntime:
             persistent_commit=lambda _declaration, _value, _metadata: None,
             persistent_forget=lambda _declaration, _metadata: None,
         )
+        self._register_active_tcp_store(None, store, applied["program_binding"], context[0])
+        if no_publisher:
+            return  # W0: Active TCP is mirrored, but no BB source is sent.
         # A fresh store: run-scoped keys hold their declared `initial`, or null
         # when omitted (the value the next Run starts from, contract 105),
         # node_outcome.* `none`.
@@ -3451,6 +3488,8 @@ class ProgramRuntime:
 
         with self._bbkey_publishers_lock:
             publisher = self._bbkey_publishers.pop(program_run_id, None)
+        with self._active_tcp_stores_lock:
+            self._active_tcp_stores.pop(program_run_id, None)
         if self._interrupt_state_run_id == program_run_id:
             self._interrupt_state_run_id = None
         with self._grasp_lost_mirror_lock:
@@ -3500,6 +3539,146 @@ class ProgramRuntime:
         for publisher in publishers:
             publisher.check_budget()
         self._retry_pending_bbkey_sources()
+
+    # Active TCP values belong to robot handles, independent of BB publishing.
+    @staticmethod
+    def _active_tcp_roles(binding: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+        roles: dict[str, list[str]] = {}
+        for row in binding.get("target_role_bindings", ()):
+            if not isinstance(row, Mapping) or "robot_tcps" not in row:
+                continue
+            robot, role = row.get("controllable_component_id"), row.get("target_role_id")
+            if isinstance(robot, str) and robot and isinstance(role, str) and role:
+                roles.setdefault(robot, []).append(role)
+        return {robot: tuple(sorted(set(names))) for robot, names in roles.items()}
+
+    @staticmethod
+    def _write_store_active_tcp(
+        store: ProgramValueStore, roles: Mapping[str, tuple[str, ...]],
+        robot: str, entry: Mapping[str, Any] | None,
+    ) -> None:
+        for role in roles.get(robot, ()):
+            store.write_active_tcp(role, entry)
+
+    def _write_active_tcp(self, robot: str, entry: Mapping[str, Any] | None) -> None:
+        with self._active_tcp_stores_lock:
+            stores = tuple(self._active_tcp_stores.values())
+        for store, roles in stores:
+            self._write_store_active_tcp(store, roles, robot, entry)
+
+    def _has_active_tcp_follower(self) -> bool:
+        follower = self._interrupt_state_follower
+        return (
+            follower is not None and follower.is_alive()
+            and callable(getattr(self._execution_transport, "subscribe_events", None))
+        )
+
+    def _apply_active_tcp_reading(self, response: Mapping[str, Any], *, ordered: bool) -> set[str]:
+        rows = response.get("robots")
+        readings = decode_active_tcp_rows(rows)
+        owners = {reading[1] for reading in readings}
+        if len(owners) > 1:
+            raise ActiveTcpWireError("Active TCP read names multiple owners")
+        if owners:
+            owner = next(iter(owners))
+            # Without a follower, only an ordered read may establish an owner.
+            # LR-2: concurrent reads across owner replacement can return out of
+            # order; a late old-owner answer can replace the newer owner/value.
+            if ordered and not self._has_active_tcp_follower():
+                self._active_tcp_mirror.set_owner(owner)
+        applied_robots: set[str] = set()
+        for robot, owner, generation, sequence, entry in readings:
+            applied = self._active_tcp_mirror.apply_result_row({
+                "component_id": robot, "owner_epoch": owner,
+                "registration_generation": generation, "sequence": sequence,
+                "entry": entry,
+            })
+            if applied is False:
+                raise ActiveTcpWireError("Active TCP read could not be delivered")
+            if applied is True:
+                applied_robots.add(robot)
+        return applied_robots
+
+    def _read_active_tcp_ordered(self) -> None:
+        # The host orders accepted commands; a connection delayed before its
+        # enqueue remains the explicitly approved LR-1 residual (DX-3074).
+        self._apply_active_tcp_reading(self._kernel.read_active_tcp(ordered=True), ordered=True)
+
+    def _refresh_active_tcp(self) -> None:
+        try:
+            self._read_active_tcp_ordered()
+        except Exception:
+            if not self._has_active_tcp_follower():
+                self._active_tcp_mirror.stream_lost()
+            _LOGGER.warning("Active TCP refresh unavailable", exc_info=True)
+
+    def _reset_active_tcp(self) -> None:
+        response = self._kernel.reset_active_tcp()
+        with self._active_tcp_stores_lock:
+            required = {robot for _store, roles in self._active_tcp_stores.values() for robot in roles}
+        self._active_tcp_mirror.apply_reset_rows(
+            response.get("robots"), required,
+            ordered_owner=not self._has_active_tcp_follower(),
+        )
+
+    def _register_active_tcp_store(
+        self, name: str | None, store: ProgramValueStore, binding: Mapping[str, Any],
+        owner_epoch: str,
+    ) -> None:
+        roles = self._active_tcp_roles(binding)
+        # This epoch came from the captured execution identity or the existing
+        # cell-admission owner fence, not from a stream record.
+        self._active_tcp_mirror.set_owner_if_absent(owner_epoch)
+        def register() -> None:
+            with self._active_tcp_stores_lock:
+                self._active_tcp_stores[name] = (store, roles)
+
+        try:
+            ordered = name is not None or not self._has_active_tcp_follower()
+            response = self._kernel.read_active_tcp(ordered=ordered)
+            rows = response.get("robots")
+            readings = decode_active_tcp_rows(rows)
+            read_robots = self._apply_active_tcp_reading(response, ordered=ordered)
+            fenced_owner = readings[0][1] if readings else None
+        except Exception:
+            # One read only: unavailable keys fail their ordinary Current
+            # input until a later confirmed stream or result supplies them.
+            _LOGGER.warning("Active TCP baseline read unavailable", exc_info=True)
+            self._active_tcp_mirror.seed(lambda _robot, _entry: None, register=register)
+            return
+        self._active_tcp_mirror.seed(
+            lambda robot, entry: (
+                self._write_store_active_tcp(store, roles, robot, entry)
+                if robot in read_robots else None
+            ),
+            owner_epoch=fenced_owner,
+            register=register,
+        )
+
+    def _apply_active_tcp_result(self, run_id: str, robot: str, rows: object) -> bool:
+        """Apply the result's robot reading before the owner task settles."""
+
+        readings = decode_active_tcp_rows(rows)
+        matches = [reading for reading in readings if reading[0] == robot]
+        with self._active_tcp_stores_lock:
+            registered = self._active_tcp_stores.get(run_id)
+        if len(matches) != 1 or registered is None or robot not in registered[1]:
+            raise ActiveTcpWireError("Active TCP result has no exact bound robot")
+        component, owner, generation, sequence, entry = matches[0]
+        store, roles = registered
+        applied = self._active_tcp_mirror.apply_result_row(
+            {
+                "component_id": component, "owner_epoch": owner,
+                "registration_generation": generation, "sequence": sequence,
+                "entry": entry,
+            },
+            write_current=lambda robot_id, current: self._write_store_active_tcp(
+                store, roles, robot_id, current
+            ),
+        )
+        if applied is False:
+            raise ActiveTcpWireError("Active TCP result is not current for the fenced owner")
+        return applied is True
 
     # Global-rule state mirror (contract 64) ---------------------------------
 
@@ -3567,17 +3746,54 @@ class ProgramRuntime:
         streams them; ``shutdown`` stops it within one receive slice."""
 
         mirror = self._interrupt_state_mirror
-        if mirror is None or self._liveness is None or self._interrupt_state_follower is not None:
+        if (
+            mirror is None or self._liveness is None or self._interrupt_state_follower is not None
+            or not callable(getattr(self._execution_transport, "subscribe_events", None))
+        ):
             return
         follower = Thread(
             target=mirror.follow,
             args=(self._interrupt_state_stop,),
-            kwargs={"on_read": self._on_interrupt_state_read},
+            kwargs={
+                "on_read": self._on_interrupt_state_read,
+                "on_message": self._on_active_tcp_message,
+                "on_disconnect": self._on_active_tcp_stream_lost,
+            },
             name="interrupt-state-mirror",
             daemon=True,
         )
         self._interrupt_state_follower = follower
         follower.start()
+
+    def _on_active_tcp_stream_lost(self, _error: BaseException) -> None:
+        self._active_tcp_mirror.stream_lost()
+
+    def _on_active_tcp_message(self, message: Mapping[str, Any]) -> None:
+        kind = message.get("type")
+        if kind not in {"snapshot", "state", "event"}:
+            return
+        owner = message.get("owner_epoch")
+        if not isinstance(owner, str) or not owner:
+            raise ActiveTcpWireError("Active TCP stream omitted its owner")
+        if kind == "snapshot":
+            # The shared subscription's owner-fenced snapshot establishes
+            # the stream owner; Start-time capture does not override it.
+            self._active_tcp_mirror.set_owner(owner)
+        elif owner != self._active_tcp_mirror.owner_epoch:
+            return
+        if kind in {"snapshot", "state"}:
+            state = message.get("state")
+            if not isinstance(state, Mapping):
+                raise ActiveTcpWireError("Active TCP stream state is invalid")
+            rows = state.get("active_tcp_baseline")
+            if any(reading[1] != owner for reading in decode_active_tcp_rows(rows)):
+                raise ActiveTcpWireError("Active TCP baseline names another owner")
+            self._active_tcp_mirror.apply_rows(rows)
+        else:
+            event = message.get("event")
+            if not isinstance(event, Mapping):
+                raise ActiveTcpWireError("Active TCP stream event is invalid")
+            self._active_tcp_mirror.apply_event(owner, event)
 
     def _on_interrupt_state_read(self) -> None:
         # Every read is a reading, also when no state changed: a motion node
@@ -3793,10 +4009,37 @@ class ProgramRuntime:
         (owner epoch, publication, bundle, graph) from its first tick; states
         of another context are unavailable for it (SX-2207)."""
 
+        self._bind_interrupt_rule_catalog_reader(store, context)
         mirror = self._interrupt_state_mirror
         self._write_interrupt_states(
             store, None if mirror is None else mirror.current(context)
         )
+
+    def _bind_interrupt_rule_catalog_reader(
+        self, store: ProgramValueStore, context: tuple[str, int, str, str]
+    ) -> None:
+        """Let gate retries query the latest catalog for this exact Run."""
+
+        mirror = self._interrupt_state_mirror
+        if mirror is None:
+            store.set_interrupt_notify_rule_reader(None)
+            return
+        mirror_ref = weakref_ref(mirror)
+
+        def read_notify_rule_ids() -> tuple[str, ...] | None:
+            current = mirror_ref()
+            if current is None:
+                return None
+            try:
+                catalog = current.catalog()
+            except Exception:
+                _LOGGER.exception("interrupt rule catalog could not be read")
+                return None
+            if catalog is None or catalog.context != context:
+                return None
+            return catalog.notify_rule_ids
+
+        store.set_interrupt_notify_rule_reader(read_notify_rule_ids)
 
     def _stop_for_bbkey_publication_fault(self, program_run_id: str) -> None:
         """The Run's own Program Stop, tried before the health failure."""
@@ -3805,6 +4048,35 @@ class ProgramRuntime:
             program_run_id, reason=BBKEY_PUBLICATION_FAULT_CODE
         )
         self._record_terminal_snapshot(snapshot.to_dict())
+
+    def _require_end_effector_tcps(self) -> None:
+        """B-run-1: refuse Execute while a robot has no End-effector TCP.
+
+        The execution owner states the fact per robot motion target: its
+        Robot Control ``tcp_frame_role_id`` is null exactly when the robot has
+        no End-effector TCP (the tool on its flange has no default TCP). The
+        rule itself is not evaluated here.
+        """
+
+        inventory = self._kernel.targets().get("targets")
+        components = inventory.get("components") if isinstance(inventory, Mapping) else None
+        if not isinstance(components, list):
+            raise ProgramRunnerError(
+                "execution_command_response_invalid",
+                "execution targets omitted their component inventory",
+            )
+        for component in components:
+            for target in component.get("targets", ()):
+                if (
+                    target.get("presentation") == "motion"
+                    and target.get("command", {}).get("tcp_frame_role_id") is None
+                ):
+                    robot = component.get("controllable_component_id")
+                    raise ProgramRunnerError(
+                        "program_end_effector_tcp_unavailable",
+                        f"{robot} has no end-effector TCP: the tool on its flange has no TCP",
+                        details={"controllable_component_id": robot},
+                    )
 
     def _verify_required_components_active(
         self, applied: Mapping[str, Any]
@@ -4095,6 +4367,7 @@ class ProgramRuntime:
                 if declared is not run_admission.program:
                     run_admission = replace(run_admission, program=declared)
                 self._verify_required_components_active(applied)
+                self._require_end_effector_tcps()
                 pre_claim_dropped: tuple[Any, ...] = ()
                 if self._persistent_keys is not None:
                     # Spec 400 §7.3: Run is refused, not started, while the
@@ -4152,59 +4425,43 @@ class ProgramRuntime:
                     )
                 self._starting_kernel_owner_epoch = kernel_epoch
                 abort_if_stop_won()
-                # Acquire Run only from the current owner admission generation.
-                # A Manager heartbeat can publish this Run's own ``starting``
-                # readiness between the read and the claim; the Kernel then
-                # advances the generation (its semantics are unchanged) and
-                # definitely rejects the claim with no effect. Only that exact
-                # rejection is retried, once, from a fresh read.
-                for acquire_try in (1, 2):
-                    owner_admission = admission_client.get()
-                    generation = self._admission_generation(owner_admission)
-                    claim_intent["expected_admission_generation"] = generation
-                    try:
-                        journal.refresh_pending_acquire(
-                            expected_generation=cycle.cycle_generation,
-                            provisional_run_id=program_run_id,
-                            evidence=claim_intent,
-                        )
-                    except RuntimeError:
-                        abort_if_stop_won()
-                        raise
-                    try:
-                        acquire_attempted = True
-                        claim = admission_client.acquire(claim_intent)
-                        acquired_for_request = True
-                    except CellAdmissionError as error:
-                        if error.outcome_unknown:
-                            journal.mark_acquire_unknown(
-                                expected_generation=cycle.cycle_generation
-                            )
-                            raise
-                        abort_if_stop_won()
-                        if (
-                            acquire_try == 1
-                            and error.code == "stale_generation"
-                            and error.details.get("reason")
-                            == "expected_generation_stale"
-                        ):
-                            # A rejected claim records nothing in the Kernel,
-                            # so the same request identity stays acceptable
-                            # and a failure before the retry is pre-acquire.
-                            acquire_attempted = False
-                            self._verify_required_components_active(applied)
-                            continue
-                        journal.cancel_rejected_acquire(
-                            expected_generation=cycle.cycle_generation
-                        )
-                        starting_committed = False
-                        raise
-                    except Exception:
+                # The admission generation read here is claim evidence only:
+                # the Kernel admits the claim on its current facts, so a
+                # generation moved by this Run's own ``starting`` publication
+                # is no refusal.
+                owner_admission = admission_client.get()
+                generation = self._admission_generation(owner_admission)
+                claim_intent["expected_admission_generation"] = generation
+                try:
+                    journal.refresh_pending_acquire(
+                        expected_generation=cycle.cycle_generation,
+                        provisional_run_id=program_run_id,
+                        evidence=claim_intent,
+                    )
+                except RuntimeError:
+                    abort_if_stop_won()
+                    raise
+                try:
+                    acquire_attempted = True
+                    claim = admission_client.acquire(claim_intent)
+                    acquired_for_request = True
+                except CellAdmissionError as error:
+                    if error.outcome_unknown:
                         journal.mark_acquire_unknown(
                             expected_generation=cycle.cycle_generation
                         )
                         raise
-                    break
+                    abort_if_stop_won()
+                    journal.cancel_rejected_acquire(
+                        expected_generation=cycle.cycle_generation
+                    )
+                    starting_committed = False
+                    raise
+                except Exception:
+                    journal.mark_acquire_unknown(
+                        expected_generation=cycle.cycle_generation
+                    )
+                    raise
                 try:
                     journal.remember_acquired_claim(
                         expected_generation=cycle.cycle_generation,
@@ -4389,6 +4646,7 @@ class ProgramRuntime:
                     keys=self._learn_condition_keys(run_admission.program),
                     retained_bundle_id=applied["retained_bundle_id"],
                     graph_revision=applied["graph_revision"],
+                    binding=run_admission.program_binding,
                 )
                 # Capture first, then publish the durable Running owner state,
                 # and only then enable the first effectful tree tick.
@@ -4414,7 +4672,10 @@ class ProgramRuntime:
                 else:
                     retain_unacquired_start_uncertainty()
             except CellAdmissionError as error:
-                outcome = ProgramRunnerError(error.code, str(error), details=error.details)
+                outcome = ProgramRunnerError(
+                    error.code, str(error), details=error.details,
+                    producer=error.producer or "program_runner",
+                )
                 release_scene_context()
                 if acquired_for_request:
                     self._terminalize_failed_start(
@@ -4499,6 +4760,12 @@ class ProgramRuntime:
                                 "host_state": "failed",
                                 "host_run_revision": terminal.get("run_revision"),
                             },
+                            producer=(
+                                terminal.get("producer")
+                                if isinstance(terminal.get("producer"), str)
+                                and terminal.get("producer")
+                                else "program_runner"
+                            ),
                         )
                 details = {
                     **outcome.details,
@@ -4520,6 +4787,7 @@ class ProgramRuntime:
                             f"Program run {failed_cycle.program_run_id} stopped during start. "
                             "Reset the Program cycle before another Run.",
                             details={**details, "stopped_by_operator": True},
+                            producer=outcome.producer,
                         )
                     else:
                         # A held Program-cycle claim is an accepted start, even
@@ -4528,7 +4796,7 @@ class ProgramRuntime:
                             "program_run_started_then_failed",
                             f"Program run {failed_cycle.program_run_id} started, then failed: "
                             f"{outcome}. Reset the Program cycle before another Run.",
-                            details=details,
+                            details={**details, "cause_producer": outcome.producer},
                         )
                     journal.complete_request(
                         owner_epoch=request.request_owner_epoch,
@@ -4541,7 +4809,7 @@ class ProgramRuntime:
                     # an ordinary refusal or a synthetic terminal result.
                     outcome = ProgramRunnerError(
                         "program_cycle_reconciliation_required",
-                        str(outcome), details=details,
+                        str(outcome), details={**details, "cause_producer": outcome.producer},
                     )
             else:
                 if outcome.code == "program_run_superseded_by_stop":
@@ -4560,6 +4828,7 @@ class ProgramRuntime:
                             "Reset the Program cycle before another Run.",
                             details={**outcome.details,
                                      "cause_code": outcome.code,
+                                     "cause_producer": outcome.producer,
                                      "cause_message": str(outcome),
                                      "program_run_id": program_run_id,
                                      "claim_generation": None,
@@ -4670,7 +4939,7 @@ class ProgramRuntime:
             return result
 
         try:
-            node_id, parameters = self._owner.preview_node_inputs(
+            node_id, parameters, blackboard = self._owner.preview_node_inputs(
                 program_run_id,
                 node_instance_id=request.node_instance_id,
                 proposed=[
@@ -4697,6 +4966,7 @@ class ProgramRuntime:
                 node_id,
                 parameters,
                 request_id=request.request_id,
+                active_tcp=blackboard.get("active_tcp"),
             )
         except ProgramMotionPreviewUnavailableError as error:
             return unavailable(error.reason_code, str(error))
@@ -5167,7 +5437,10 @@ class ProgramRuntime:
         self._applied_condition_keys = (
             () if program is None else program.interrupt_condition_keys
         )
-        self._follow_cell_bbkey_source()
+        # No committed Program (e.g. after New): no between-Runs source to ask
+        # for (BBSRC; the start would refuse `program_not_selected` anyway).
+        if program is not None:
+            self._follow_cell_bbkey_source()
         return {
             "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
             "outcome": reconciliation.outcome,
@@ -5628,6 +5901,34 @@ class ProgramRuntime:
                     "operator_stop_requires_owner_recovery",
                     "operator Stop must resume through the exact owner action",
                 )
+            if intervention.owner_task_id is not None:
+                # Offers do not expire: re-read the owner's assessment now,
+                # like the Resume and replan presses, before any release.
+                previous = intervention.owner_assessment
+                try:
+                    intervention = self._owner.refresh_failure_assessment(
+                        program_run_id, node_attempt_id=request.node_attempt_id
+                    )
+                    refusal = observed_state_refusal(
+                        previous if isinstance(previous, Mapping) else None,
+                        intervention.owner_assessment,
+                    )
+                except Exception as error:
+                    raise ProgramRunnerError(
+                        "recovery_action_rejected",
+                        "manual result: the owner's current assessment is unavailable "
+                        f"({str(error) or type(error).__name__})",
+                        details={
+                            "reason": "owner_assessment_unavailable",
+                            "action": "manual_result",
+                        },
+                    ) from error
+                if refusal is not None:
+                    raise ProgramRunnerError(
+                        "recovery_action_rejected",
+                        "manual result: the robot is not observed fresh and at rest now",
+                        details={"reason": refusal, "action": "manual_result"},
+                    )
             allowed, disabled_reason = manual_result_availability(
                 intervention,
                 (
@@ -5642,6 +5943,7 @@ class ProgramRuntime:
                     ("manual result is unavailable for the exact held " "attempt"),
                 )
             controls.require_event_revisions()
+            self._refresh_active_tcp()
             snapshot = self._host.resume_recovery(
                 program_run_id,
                 node_attempt_id=request.node_attempt_id,
@@ -5650,7 +5952,9 @@ class ProgramRuntime:
                     if request.outcome == "succeeded"
                     else "manual_failure"
                 ),
-                result=request.output,
+                # A failed result has no output; its resolution never carries
+                # Continue's marker (item 11).
+                result=request.output if request.outcome == "succeeded" else None,
             )
             controls.audit_value(
                 "manual_result_staged",
@@ -5711,6 +6015,7 @@ class ProgramRuntime:
                         error.code,
                         str(error),
                         details={**error.details, "recovery_offer": latest_offer},
+                        producer=error.producer,
                     )
                 self._retain_rejection(
                     journal,
@@ -5937,10 +6242,14 @@ class ProgramRuntime:
                         reason=request.reason,
                     )
                     owner_effect_accepted = True
+                    self._refresh_active_tcp()
                     snapshot = self._host.resume_recovery(
                         program_run_id,
                         node_attempt_id=intervention.identity.node_attempt_id,
                         action="manual_failure",
+                        # Marks Continue apart from a staged failed result: on
+                        # an unconfirmed-Stop hold it is the Acknowledge.
+                        result="continue_with_failure",
                     )
                     owner_result = {"accepted": True, "action": request.action_id}
                     cycle_resumed = True
@@ -5963,6 +6272,7 @@ class ProgramRuntime:
                         reason=request.reason,
                     )
                     owner_effect_accepted = True
+                    self._refresh_active_tcp()
                     snapshot = self._host.resume_recovery(
                         program_run_id,
                         node_attempt_id=intervention.identity.node_attempt_id,
@@ -5973,6 +6283,7 @@ class ProgramRuntime:
                     cycle_resumed = True
                 elif request.action_id == "retry_runtime_step":
                     effect_started = True
+                    self._refresh_active_tcp()
                     snapshot = self._host.resume_recovery(
                         program_run_id,
                         node_attempt_id=intervention.identity.node_attempt_id,
@@ -5986,6 +6297,7 @@ class ProgramRuntime:
                     and request.action_id == "replan_from_stopped_state"
                 ):
                     effect_started = True
+                    self._refresh_active_tcp()
                     snapshot = self._host.resume_motion(
                         program_run_id,
                         expected_run_revision=self._owner.read(
@@ -6024,13 +6336,36 @@ class ProgramRuntime:
                             and isinstance(error.get("message"), str)
                             else "addressed owner rejected recovery"
                         )
-                        reject(ProgramRunnerError(code, message))
+                        producer = (
+                            error.get("producer")
+                            if isinstance(error, Mapping)
+                            else None
+                        )
+                        # The owner's details carry the typed reason (e.g. a
+                        # stale or moving start state found at the press).
+                        details = (
+                            error.get("details")
+                            if isinstance(error, Mapping)
+                            else None
+                        )
+                        reject(ProgramRunnerError(
+                            code, message,
+                            details=(
+                                details if isinstance(details, Mapping) else None
+                            ),
+                            producer=(
+                                producer
+                                if isinstance(producer, str) and producer
+                                else "program_runner"
+                            ),
+                        ))
                     owner_effect_accepted = True
                     if request.action_id == "acknowledge_and_continue":
                         snapshot = self._owner.note_runtime_control_change(
                             program_run_id
                         )
                     else:
+                        self._refresh_active_tcp()
                         snapshot = self._host.resume_recovery(
                             program_run_id,
                             node_attempt_id=(intervention.identity.node_attempt_id),
@@ -6125,12 +6460,6 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        if request.expected_owner_epoch != self.owner_epoch:
-            raise ProgramRunnerError(
-                "program_run_owner_stale",
-                "Program-run owner epoch changed before Stop",
-            )
-
         intent = request.model_dump(mode="json")
         key = ("execution", request.request_owner_epoch, request.request_id)
         retained: _InflightStop | None = None
@@ -6157,7 +6486,10 @@ class ProgramRuntime:
             if retained.result is not None:
                 return deepcopy(retained.result)
             if retained.error is not None:
-                raise ProgramRunnerError(retained.error.code, str(retained.error))
+                raise ProgramRunnerError(
+                    retained.error.code, str(retained.error),
+                    producer=retained.error.producer,
+                )
             raise ProgramRunnerError(
                 "program_cycle_reconciliation_required",
                 "resident Stop outcome is unavailable",
@@ -6318,12 +6650,6 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        if request.expected_owner_epoch != self.owner_epoch:
-            raise ProgramRunnerError(
-                "program_run_owner_stale",
-                "Program-run owner epoch changed before motion Stop",
-            )
-
         intent = request.model_dump(mode="json")
         key = ("motion", request.request_owner_epoch, request.request_id)
         retained: _InflightStop | None = None
@@ -6351,6 +6677,7 @@ class ProgramRuntime:
                 raise ProgramRunnerError(
                     retained.error.code,
                     str(retained.error),
+                    producer=retained.error.producer,
                 )
             raise ProgramRunnerError(
                 "program_motion_stop_outcome_unknown",
@@ -6417,6 +6744,7 @@ class ProgramRuntime:
         def effect() -> dict[str, Any]:
             self._verify_selected_motion_feedback(program_run_id, request.group_ids)
             try:
+                self._refresh_active_tcp()
                 snapshot = self._host.resume_motion(
                     program_run_id,
                     expected_run_revision=request.expected_run_revision,
@@ -6453,6 +6781,7 @@ class ProgramRuntime:
 
         def effect() -> dict[str, Any]:
             self._verify_selected_motion_feedback(program_run_id, request.group_ids)
+            self._refresh_active_tcp()
             snapshot = self._host.start_motion(
                 program_run_id,
                 expected_run_revision=request.expected_run_revision,
@@ -6545,12 +6874,6 @@ class ProgramRuntime:
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        if request.expected_owner_epoch != self.owner_epoch:
-            raise ProgramRunnerError(
-                "program_run_owner_stale",
-                "Program-run owner epoch changed before Full Stop",
-            )
-
         intent = request.model_dump(mode="json")
         key = ("full", request.request_owner_epoch, request.request_id)
         retained: _InflightStop | None = None
@@ -6580,6 +6903,7 @@ class ProgramRuntime:
                 raise ProgramRunnerError(
                     retained.error.code,
                     str(retained.error),
+                    producer=retained.error.producer,
                 )
             raise ProgramRunnerError(
                 "program_full_stop_outcome_unknown",
@@ -6652,6 +6976,7 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
+            self._refresh_active_tcp()
             snapshot = self._host.resume_full_stop(
                 program_run_id,
                 request_id=request.request_id,
@@ -6825,7 +7150,19 @@ class ProgramRuntime:
         if cycle.reset_phase == "restoring_scene":
             try:
                 if request.reload_initial_scene:
+                    # Keys first: a refused key reset leaves the Scene as it is.
+                    self._reset_persistent_keys_to_initial(request)
                     self._prepare_scene_after_reset(request, authorization)
+                    try:
+                        self._reset_active_tcp()
+                    except Exception as error:
+                        details = dict(exception_failure_details(error) or {})
+                        details["cause_code"] = "active_tcp_reset_failed"
+                        raise ProgramRunnerError(
+                            "program_cycle_reset_scene_preparation_failed",
+                            "Active TCP reset failed",
+                            details=details,
+                        ) from error
                 journal.update_reset_phase(
                     expected_generation=cycle.cycle_generation, program_run_id=request.program_run_id,
                     expected_phase="restoring_scene",
@@ -6856,6 +7193,48 @@ class ProgramRuntime:
                     "program_cycle_reset_position_failed", str(error) or type(error).__name__
                 ) from error
         return cycle
+
+    def _reset_persistent_keys_to_initial(self, request: ProgramCycleResetRequest) -> None:
+        """Reload initial scene also resets the Applied Scenario's persistent
+        keys: each starts again from `initial:` (or empty), whatever its access.
+
+        The register forgets the stored values in one write, audited with this
+        Reset's request; a failure refuses this Reset by name and leaves both
+        the values and the Scene as they are (the phase can be retried).
+        """
+
+        register = self._persistent_keys
+        if register is None:
+            return
+        try:
+            projection = self._committed_projection()
+            if projection["origin"]["kind"] != "scenario":
+                return
+            activation, program, _reconciliation = self._reconcile_persistent_keys(
+                register, projection=projection
+            )
+            if program is None:
+                return
+            register.reset_to_initial(
+                activation.project_path,
+                program.blackboard_keys,
+                edit=PersistentKeyEdit(
+                    request.request_id,
+                    "program_reset",
+                    program_run_id=request.program_run_id,
+                ),
+            )
+        except (PersistentKeyRegisterError, ProgramRunnerError) as error:
+            cause = (
+                error
+                if isinstance(error, ProgramRunnerError)
+                else _persistent_storage_error(error)
+            )
+            raise ProgramRunnerError(
+                "program_cycle_reset_persistent_keys_failed",
+                f"persistent keys could not be reset to their initial values: {cause}",
+                details={"cause_code": cause.code},
+            ) from error
 
     @staticmethod
     def _accepted_reset_context(
@@ -6915,7 +7294,10 @@ class ProgramRuntime:
         try:
             response = None if not callable(capability) else capability()
         except HeadlessApiError as error:
-            raise ProgramRunnerError("program_cycle_reset_position_unavailable", str(error)) from error
+            raise ProgramRunnerError(
+                "program_cycle_reset_position_unavailable",
+                str(error),
+            ) from error
         if response is None or not response["reset_robot_position"]["available"]:
             raise ProgramRunnerError("program_cycle_reset_position_unavailable",
                 self._reset_robot_position_availability()["reason"] if response is None
@@ -6949,10 +7331,21 @@ class ProgramRuntime:
             self._execution_transport.reset_robot_position(body)
         except Exception as error:
             if isinstance(error, HeadlessApiError) and error.details.get("effect_disposition") == "known_no_effect":
-                raise ProgramRunnerError(error.code, str(error)) from error
-            raise ProgramRunnerError("program_cycle_reconciliation_required",
+                raise ProgramRunnerError(
+                    error.code, str(error),
+                    producer=error.producer,
+                ) from error
+            cause_details = {
+                "cause_code": getattr(error, "code", type(error).__name__)
+            }
+            cause_producer = getattr(error, "producer", None)
+            if isinstance(cause_producer, str) and cause_producer:
+                cause_details["cause_producer"] = cause_producer
+            raise ProgramRunnerError(
+                "program_cycle_reconciliation_required",
                 "Robot position unknown after a failed position reset. Restart the workbench to recover.",
-                details={"cause_code": getattr(error, "code", type(error).__name__)}) from error
+                details=cause_details,
+            ) from error
 
     @staticmethod
     def _idle_reset_occurrence(
@@ -7071,20 +7464,8 @@ class ProgramRuntime:
         if intent["owner_epoch"] != self.owner_epoch:
             raise ProgramRunnerError("program_cycle_reconciliation_required", "Idle Reset claim belongs to a previous owner")
         if retained["claim"] is None:
-            # As Run's refresh_pending_acquire: a Reset retry after a refused
-            # acquire (which left no claim) targets the current admission
-            # generation. An uncertain acquire (reconciliation) replays exactly.
-            generation = self._admission_generation(admission.get())
-            if (
-                not cycle.reconciliation_required
-                and intent["expected_admission_generation"] != generation
-            ):
-                refreshed = {**retained, "intent": {**intent, "expected_admission_generation": generation}}
-                journal.remember_reset_effect_claim(
-                    expected_generation=cycle.cycle_generation, expected=retained, retained=refreshed,
-                )
-                retained = refreshed
-                intent = refreshed["intent"]
+            # A retry after a refused or uncertain acquire replays the retained
+            # intent exactly; its admission generation is evidence only.
             try:
                 claim = admission.acquire(intent)
                 if claim.get("intent") != intent:
@@ -7098,6 +7479,8 @@ class ProgramRuntime:
                 raise ProgramRunnerError(
                     "program_cycle_reconciliation_required" if error.outcome_unknown else error.code,
                     str(error),
+                    producer=("program_runner" if error.outcome_unknown
+                              else error.producer or "program_runner"),
                 ) from error
             except Exception as error:
                 raise ProgramRunnerError(
@@ -7147,6 +7530,8 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_reconciliation_required" if error.outcome_unknown else error.code,
                 str(error),
+                producer=("program_runner" if error.outcome_unknown
+                          else error.producer or "program_runner"),
             ) from error
         except Exception as error:
             raise ProgramRunnerError(
@@ -7206,6 +7591,18 @@ class ProgramRuntime:
                                 "expected_admission_generation": self._admission_generation(current_admission),
                             },
                         )
+                    if request.reload_initial_scene:
+                        # No Applied Scenario, no initial scene: refuse before
+                        # the cycle, the claim or the stored keys change.
+                        try:
+                            self._headless.program_applied()
+                        except HeadlessClientError as error:
+                            if error.code != "program_applied_selection_not_found":
+                                raise
+                            raise ProgramRunnerError(
+                                "program_applied_selection_not_found",
+                                "Reload initial scene needs a loaded Scenario; Load one first",
+                            ) from error
                     journal.begin_idle_resetting(
                         expected_generation=cycle.cycle_generation, owner_epoch=self.owner_epoch,
                         correlation_id=request.correlation_id or request.request_id,
@@ -7874,8 +8271,14 @@ class ProgramRuntime:
                             journal.require_reconciliation(
                                 expected_generation=cycle.cycle_generation
                             )
-                            reject(ProgramRunnerError(error.code, str(error)))
-                        reject(ProgramRunnerError(error.code, str(error)))
+                            reject(ProgramRunnerError(
+                                error.code, str(error),
+                                producer=error.producer or "program_runner",
+                            ))
+                        reject(ProgramRunnerError(
+                            error.code, str(error),
+                            producer=error.producer or "program_runner",
+                        ))
                     except Exception:
                         journal.require_reconciliation(
                             expected_generation=cycle.cycle_generation

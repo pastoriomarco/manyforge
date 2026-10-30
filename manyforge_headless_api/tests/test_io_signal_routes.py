@@ -185,7 +185,6 @@ def test_mock_input_wire_uses_internal_attribution_and_checks_the_echo() -> None
     "mutate",
     [
         lambda reply: reply.update(command="query_target"),
-        lambda reply: reply["target_observation"].update(resource_role_id="other"),
         lambda reply: reply["target_observation"].update(source_epoch="3"),
         lambda reply: reply["target_observation"].pop("evaluated_at_ns"),
         lambda reply: reply["target_observation"].update(evaluated_at_ns=-1),

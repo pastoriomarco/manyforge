@@ -22,6 +22,15 @@ enum class ManagerSelectedRuntimeCompositionPhase {
   kFinalize,
 };
 
+/// The native host's clean refusal of one prepared candidate: composing it
+/// found a data or setup inconsistency. The candidate was never installed or
+/// published; `details.cause` carries the original message. Its effects are
+/// known, so the Apply ends `failed`, never `unknown_effect`.
+inline constexpr std::string_view kScenarioCompositionRefusedCode =
+    "scenario_composition_refused";
+/// The producer of that refusal (the native execution host).
+inline constexpr std::string_view kExecutionHostProducer = "execution_host";
+
 /// Exact Manager-to-managed-host request to install the already selected
 /// product composition while its durable Kernel configuration fence is held.
 /// This is a private Apply effect, not caller authorization or a command

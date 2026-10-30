@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
 #include <stdexcept>
@@ -11,13 +12,19 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kSourceModelProjectionApiVersion =
-    "manyforge.source_model_projection.v2";
+    "manyforge.source_model_projection.v3";
 inline constexpr std::uint64_t kMaximumSourceModelProjectionBytes = 64ULL * 1024ULL * 1024ULL;
 
 class SourceModelProjectionError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
+
+/// The projection's `components[]` rows: one per graph component, sorted by
+/// id, each `{component_id, mounted_on}` where `mounted_on` is the parent
+/// `{component_id, interface_id}` of its mount edge, or null.
+[[nodiscard]] manyforge::content_identity::CanonicalValue SourceModelComponents(
+    const manyforge::core::CellGraphDTO& graph);
 
 /// Verified authoring projection of one exact retained model namespace.
 ///

@@ -328,9 +328,46 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             trace->Preregister(action, epoch, key, participant);
           };
         }
+        // TOOLCTX, Active TCP (M7): before each new goal (its own action,
+        // M6b) the robot's Active TCP becomes the move's TCP entry: nothing
+        // when it already is, else the confirmed TCP step and the commit
+        // (Mock and Isaac: the commit alone). A preempt never gets here.
+        {
+          const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
+              runtime_handle->weak_from_this();
+          participant_config.apply_tool_context =
+              [owner](const core::PreparedOperationParticipantDTO& prepared) {
+                const auto handle = owner.lock();
+                if (!handle)
+                  return core::Result<void>::Err(
+                      {"execution_rejected", "the runtime handle has retired",
+                       {{"reason", "ros2_control_handle_retired"}}});
+                const auto entry = core::prepared_motion_tcp_entry(prepared);
+                if (!entry)
+                  return core::Result<void>::Err(
+                      {"execution_rejected", "the motion has no TCP entry",
+                       {{"reason", "runtime_motion_endpoint_unresolved"}}});
+                const auto payload = handle->ApplyLatestCommittedToolPayload();
+                if (!payload.ok()) return payload;
+                return handle->ApplyMotionToolContext(*entry, prepared.program_binding_id);
+              };
+        }
+        // M6 ADAPTERM, the same pre-motion hook one step earlier: before an
+        // admitted motion is planned (the robot at rest), a Real arm moved
+        // from its own interface is re-engaged by its vendor adapter, so the
+        // plan starts from the fresh current pose (nothing on Mock, Isaac).
+        const std::weak_ptr<RetainedRos2ControlRuntimeHandle> reengage_owner =
+            runtime_handle->weak_from_this();
         const core::ExecutionPortParticipantStateAuthority state_authority{
             &motion_channel->publication().numeric_publication(),
-            [] { return core::Result<void>::Ok(); }};
+            [reengage_owner] {
+              const auto handle = reengage_owner.lock();
+              if (!handle)
+                return core::Result<void>::Err(
+                    {"execution_rejected", "the runtime handle has retired",
+                     {{"reason", "ros2_control_handle_retired"}}});
+              return handle->ReengageMotionAtRest();
+            }};
         const auto bound = runtime_handle->Bind(
             std::move(resources), clock, std::move(selected.arm),
             [&](std::shared_ptr<core::IExecutionPort> port) {
@@ -355,6 +392,10 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             motion_channel;
         if (selected.participant.stop.trip_authority ==
             core::StateAuthorityClass::kMeasured) {
+          // M6: the display channel follows a vendor's own joint states
+          // (used only with an adapter that names a vendor joint topic).
+          const auto display = runtime_handle->BindMotionDisplayChannel(motion_channel);
+          if (!display.ok()) throw std::invalid_argument(display.error().message);
           // CP8 step 1: the measured lane's JointState is the addressed arm
           // state. Samples are reordered by the controller's (source) joint
           // names; a missing, duplicated or non-finite joint publishes an
@@ -441,6 +482,24 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
             std::shared_ptr<core::ExecutionPortParticipant>(runtime_handle,
                                                             participant.get());
         result.execution = owned_participant;
+        // Active TCP (M7, T-MQ15, T-A2): the robot's Set TCP, an immediate
+        // Kernel step; it holds the robot with the checkbox on.
+        {
+          const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
+              runtime_handle->weak_from_this();
+          result.set_tcp = core::SetTcpStep{
+              runtime_handle->ActiveTcpHoldsRobot(),
+              [owner](const core::TcpEntryDTO& entry, const bool robot_control) {
+                const auto handle = owner.lock();
+                if (!handle)
+                  return core::Result<void>::Err(
+                      {"execution_rejected", "the runtime handle has retired",
+                       {{"reason", "ros2_control_handle_retired"}}});
+                return handle->SetActiveTcp(
+                    entry, robot_control ? core::ActiveTcpChangeSource::kRobotControl
+                                         : core::ActiveTcpChangeSource::kProgram);
+              }};
+        }
         if (gripper_binding.has_value()) {
           result.gripper = std::shared_ptr<core::IGripperCommandBackend>(
               runtime_handle, gripper_pointer);
@@ -474,8 +533,10 @@ make_retained_ros2_control_gripper_backend(
     const std::shared_ptr<RetainedRos2ControlRuntimeHandle>& handle) {
   const bool no_output = config.gripper && config.gripper->output_mode == core::GripperOutputMode::kNone &&
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
+  // A commanded owner either drives its own controller manager (Mock) or an
+  // Isaac transport with no controller-manager primitive (merge 6 tool).
   if (!handle || !channel || !config.gripper ||
-      (!no_output && (!config.arm.gripper_controller || !config.arm.measured_joint_state_lane)) ||
+      (!no_output && !config.arm.measured_joint_state_lane) ||
       (no_output && config.arm.gripper_controller) || !binding.value().control_path ||
       binding.value().control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
       channel->binding().value() != binding.value() || binding.value().resources.size() != 1U)

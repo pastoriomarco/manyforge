@@ -412,10 +412,7 @@ Result<void> ValidateCellAdmissionRecoveryReceiptQuery(
   if (query.expected_claim.has_value()) {
     const auto& claim = *query.expected_claim;
     if (claim.intent != query.intent || !claim.claim_generation.nonzero() ||
-        !claim.acquired_admission_generation.nonzero() ||
-        claim.acquired_admission_generation !=
-            claim.intent.expected_admission_generation ||
-        claim.accepted_at_ns < 0) {
+        !claim.acquired_admission_generation.nonzero() || claim.accepted_at_ns < 0) {
       return Invalid<void>("recovery_expected_claim_invalid");
     }
   }

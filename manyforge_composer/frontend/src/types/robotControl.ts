@@ -60,9 +60,41 @@ export interface ManualControlContracts {
   supportingProviders: ManualControlProviderContract[];
 }
 
-export interface ManualControlMotionDescriptor {
-  schemaVersion: 'manyforge.manual_control_motion_descriptor.v5';
+export interface TcpEntryIdentity {
+  componentId: string;
+  targetId: string;
+  frameRoleId: string;
+}
+
+/** A stable in-memory key. The display name is never parsed or sent. */
+export function tcpEntryIdentityKey(entry: TcpEntryIdentity): string {
+  return JSON.stringify([entry.componentId, entry.targetId, entry.frameRoleId]);
+}
+
+/** One TCP Robot Control can move a robot at, identified by its exact owner. */
+export interface DirectControlTcp {
+  entry: TcpEntryIdentity;
+  /** Interim: present only for rows covered by the legacy endpoint binding. */
+  targetRoleId: string | null;
   controllableComponentId: string;
+  commandTargetId: string;
+  frameRoleId: string;
+  /** Display-only; IDs may contain dots and this value is never parsed. */
+  qualifiedName: string;
+  compiledFrameName: string;
+  modelInstanceId: string;
+  modelRevision: string;
+  isDefault: boolean;
+  mountedHere: boolean;
+  mountedElsewhere: boolean;
+  contactBodyRoleIds: string[];
+}
+
+export interface ManualControlMotionDescriptor {
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v6';
+  controllableComponentId: string;
+  /** Exact component selected by Applied at this robot's flange; null if empty. */
+  endEffectorComponentId: string | null;
   commandTargetId: string;
   componentRoleId: string;
   targetRoleId: string;
@@ -72,6 +104,9 @@ export interface ManualControlMotionDescriptor {
     modelInstanceId: string;
     modelRevision: string;
   }>;
+  /** All Deployment TCP rows for the robot and tools, with the active default
+   * (the end-effector TCP) first; only carried rows have observed poses. */
+  tcps: DirectControlTcp[];
   joints: Array<DirectControlJoint & { compiledJointName: string; unit: 'rad' }>;
   operationalJointLimits: DirectControlOperationalJointLimit[];
   ordinaryJerk: {
@@ -113,6 +148,8 @@ export interface ManualControlGripperDescriptor {
   stateAuthorityClass: 'measured' | 'commanded' | 'predicted' | null;
   completionPolicy: 'goal_fenced_target_reached' | 'output_delivery' | 'no_output';
   graspConfirmationPolicy: 'binding_feedback_required' | 'not_required';
+  /** The Applied row's opt-in grasp confirmation; absent when not required. */
+  graspConfirmation?: 'required';
   sourceGroupName: string | null;
   sourceCoordinateName: string;
   sourceKind: ResourceSourceKind;
@@ -168,12 +205,21 @@ export interface TargetStopResponse {
 }
 
 export interface DirectControlMotionStatus {
+  activeTcp: { entry: TcpEntryIdentity | null; display: string | null; ownerEpoch: string;
+    registrationGeneration: number; sequence: number } | null;
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
   targetRoleId: string;
   baseFrameRoleId: string;
-  tcpFrameRoleId: string;
+  /** The end-effector TCP's frame role, null when the robot has none (B1);
+   * in a selected-status projection, the selected TCP's frame role. */
+  tcpFrameRoleId: string | null;
+  /** Selected-status projection only: the selected TCP's direct-control
+   * target role (the robot's, or the mounted tool's). */
+  tcpTargetRoleId?: string | null;
+  /** Selected-status projection: exact identity of the selected TCP row. */
+  selectedTcpEntryKey?: string;
   operationCapabilityId: string;
   planningCapabilityIds: string[];
   frameRoleIds: string[];
@@ -219,7 +265,11 @@ export interface ObservedMotionTarget {
   sourceJointNames: string[];
   positionsRad: number[];
   complete: boolean;
-  currentTcpPose: Pose3Value;
+  /** The end-effector TCP's pose, null when the robot has none (B1); in a
+   * selected-status projection, the selected TCP's. */
+  currentTcpPose: Pose3Value | null;
+  /** TCP-C: carried TCP poses in the base frame, by exact entry identity key. */
+  tcpPoses: Record<string, Pose3Value>;
 }
 
 export interface ObservedGripperTarget {
@@ -444,10 +494,7 @@ export interface MotionParticipantPayload {
   kind: 'motion';
   move_id: string;
   base_frame_role_id: string;
-  tcp_endpoint: {
-    target_role_id: string;
-    frame_role_id: string;
-  };
+  tcp_endpoint: { kind: 'current' };
   tolerances: {
     joint_position_tol_rad: number;
     translation_tol_m: number;
@@ -476,6 +523,8 @@ export interface MotionParticipantPayload {
   }>;
   motion_interrupt_scopes: [];
   runtime_object_bindings: [];
+  /** Collision clearance (m) for this move; absent keeps the Deployment's. */
+  clearance_m?: number;
 }
 
 export interface CapabilityCommandParticipantPayload {
@@ -538,6 +587,18 @@ export interface DirectControlOperationIntent {
 }
 
 export type JointMotionOperationIntent = DirectControlOperationIntent;
+
+export type DirectControlSetTcpIntent = Omit<DirectControlOperationIntent, 'participants'> & {
+  participants: [{
+    component_role_id: string;
+    target_role_id: string;
+    required_capability_id: string;
+    action_span: null;
+    payload: { kind: 'set_tcp'; tcp: { kind: 'entry'; entry: {
+      component_id: string; target_id: string; frame_role_id: string;
+    } } };
+  }];
+};
 
 export interface MotionPreviewReceipt {
   schemaVersion: 'manyforge.direct_control_motion_preview.v1';

@@ -18,6 +18,14 @@ namespace {
 
 using namespace manyforge::core;
 
+/// The catalog an observer-only port is created with (its admission is not
+/// queried here).
+[[nodiscard]] BrandLifecyclePlanCatalogDTO
+UnusedCatalog(const ResolvedLifecycleProviderOccurrenceDTO &occurrence) {
+  return {occurrence.provider_manifest_id, occurrence.provider_manifest_revision,
+          occurrence.lifecycle_plan_catalog_digest, {}};
+}
+
 [[nodiscard]] ControllerLifecycleExpectedDomain MakeExpectedDomain() {
   const ControllerRoleId controller_role("native_execution");
   const ControlDomainId domain_id("domain.arm");
@@ -373,11 +381,11 @@ TEST(RetainedExternallyManagedLifecyclePorts,
                "component=robot.1 signal=11 Apply=apply.7",
                {}}};
   auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
-      occurrence,
+      occurrence, UnusedCatalog(occurrence),
       [&](const ControlDomainId &, const TimePoint) {
         return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
       },
-      clock, 1'000);
+      clock, 1'000, 1'000);
   ASSERT_TRUE(created.ok());
   const BrandLifecycleObservationQueryDTO query{
       LifecycleTransactionId("transaction"),
@@ -441,7 +449,7 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   std::size_t source_reads = 0U;
   std::optional<ErrorDTO> source_error;
   auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
-      occurrence,
+      occurrence, UnusedCatalog(occurrence),
       [&](const ControlDomainId &domain, const TimePoint now) {
         ++source_reads;
         EXPECT_EQ(domain, occurrence.control_domain_id);
@@ -451,7 +459,7 @@ TEST(RetainedExternallyManagedLifecyclePorts,
         }
         return Result<RetainedExternallyManagedDomainSnapshot>::Ok(external);
       },
-      clock, 1'000);
+      clock, 1'000, 1'000);
   ASSERT_TRUE(created.ok()) << created.error().message;
   const BrandLifecycleObservationQueryDTO query{
       LifecycleTransactionId("transaction"),
@@ -481,15 +489,15 @@ TEST(RetainedExternallyManagedLifecyclePorts,
       query.provider_manifest_revision,
       query.provider_runtime_unit_id,
       query.provider_runtime_epoch,
-      LifecyclePrimitiveId("external.wait_for_ready"),
+      LifecyclePrimitiveId("transition.enable"),
       LifecyclePrimitiveAttemptId("attempt.1"),
       observed.value().observation_generation,
-      100};
-  const auto result = created.value()->Dispatch(intent, std::stop_token{});
+      100,
+      ComponentLifecycleStateDTO::kUndeclared};
+  const auto result = created.value()->Dispatch(intent, {}, std::stop_token{});
   ASSERT_TRUE(result.locally_valid());
-  EXPECT_EQ(result.dispatch_state,
-            LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(result.effect, LifecyclePrimitiveEffectDTO::kNone);
+  EXPECT_EQ(result.outcome, LifecycleTransitionOutcomeDTO::kFailed);
+  EXPECT_TRUE(result.substeps.empty());
   ASSERT_TRUE(result.error.has_value());
   EXPECT_EQ(result.error->details.at("reason"),
             "external_brand_lifecycle_observer_only");
@@ -557,12 +565,12 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   // binding changes between two observers' samples.
   std::atomic<std::uint64_t> generation{0U};
   auto created = RetainedExternallyManagedBrandLifecyclePort::Create(
-      occurrence,
+      occurrence, UnusedCatalog(occurrence),
       [&generation](const ControlDomainId &, const TimePoint) {
         return Result<RetainedExternallyManagedDomainSnapshot>::Ok(
             {++generation, ComponentLifecycleStateDTO::kActive, true, {}});
       },
-      clock, 1'000);
+      clock, 1'000, 1'000);
   ASSERT_TRUE(created.ok()) << created.error().message;
   const BrandLifecycleObservationQueryDTO query{
       LifecycleTransactionId("transaction"),
@@ -587,6 +595,25 @@ TEST(RetainedExternallyManagedLifecyclePorts,
   }
   for (auto &observer : observers) observer.join();
   EXPECT_EQ(rejected.load(), 0);
+}
+
+// V-B2 §2.2: every handle outcome maps to a substep's three outcomes; the
+// unresponsive codes are a lost connection whatever the outcome (D8,
+// including the unanswered baseline that is not sent), and the error is
+// never rewritten.
+TEST(RetainedExternallyManagedLifecyclePorts, TransitionOutcomeMapsEveryHandleOutcome) {
+  using Handle = RetainedRos2ControlSwitchOutcome;
+  const ErrorDTO refused{"execution_rejected", "refused", {{"reason", "refused"}}};
+  EXPECT_EQ(TransitionOutcome({Handle::kSucceeded, std::nullopt}),
+            LifecycleTransitionOutcomeDTO::kSucceeded);
+  for (const auto handle : {Handle::kNotSent, Handle::kFailed, Handle::kFailedNoEffect,
+                            Handle::kFailedEffectObserved, Handle::kUncertain}) {
+    EXPECT_EQ(TransitionOutcome({handle, refused}), LifecycleTransitionOutcomeDTO::kFailed);
+    for (const auto *code : {"controller_manager_unresponsive", "robot_controller_unresponsive"})
+      EXPECT_EQ(TransitionOutcome({handle, ErrorDTO{code, "no answer", {}}}),
+                LifecycleTransitionOutcomeDTO::kConnectionLost)
+          << code;
+  }
 }
 
 } // namespace

@@ -28,6 +28,7 @@ _MAX_COMPONENTS = 128
 _MAX_ATTACHMENTS = 256
 _MAX_PACKAGE_ROOTS = 128
 _MAX_TARGETS = 128
+_TCP_SPEED_CHECKS = ("active_tcp", "active_tcp_and_flange")
 _MAX_PATH_BYTES = 4096
 
 
@@ -152,6 +153,69 @@ def _validate_pose(value: Any, label: str) -> dict[str, list[float]]:
     return result
 
 
+_MAX_CUSTOM_TCPS = 256
+
+
+def _finite_numbers(value: Any, length: int, label: str) -> list[float]:
+    if (
+        type(value) is not list
+        or len(value) != length
+        or any(type(item) not in {int, float} or not math.isfinite(float(item)) for item in value)
+    ):
+        _fail(f"custom_tcp_invalid: {label} must contain {length} finite numbers")
+    return [float(item) for item in value]
+
+
+def _validate_authoring_pose(value: Any, label: str) -> dict[str, Any]:
+    """`{position_m, orientation: {rpy_deg} | {xyzw}}`; xyzw must be unit."""
+    pose = _require_object(value, label)
+    _require_exact_fields(pose, required={"position_m", "orientation"}, label=label)
+    orientation = _require_object(pose["orientation"], f"{label}.orientation")
+    key = "rpy_deg" if "rpy_deg" in orientation else "xyzw"
+    _require_exact_fields(orientation, required={key}, label=f"{label}.orientation")
+    values = _finite_numbers(
+        orientation[key], 3 if key == "rpy_deg" else 4, f"{label}.orientation.{key}"
+    )
+    if key == "xyzw" and abs(sum(item * item for item in values) - 1.0) > 1e-6:
+        _fail(f"custom_tcp_invalid: {label}.orientation.xyzw must be a unit quaternion")
+    return {
+        "position_m": _finite_numbers(pose["position_m"], 3, f"{label}.position_m"),
+        "orientation": {key: values},
+    }
+
+
+def _validate_custom_tcps(value: Any, label: str) -> list[dict[str, Any]]:
+    """`custom_tcps` rows `{tcp_id, parent_frame, pose}`, sorted by tcp_id.
+
+    `parent_frame` names a frame of the component's model (a descriptor frame
+    role or a URDF link); the compiler resolves it and refuses chaining and
+    name collisions. The pose is the spec 210 authoring shape.
+    """
+    if type(value) is not list or len(value) > _MAX_CUSTOM_TCPS:
+        _fail(f"{label} must be a bounded list")
+    rows: list[dict[str, Any]] = []
+    for index, raw in enumerate(value):
+        row_label = f"{label}[{index}]"
+        row = _require_object(raw, row_label)
+        _require_exact_fields(
+            row, required={"tcp_id", "parent_frame", "pose"}, label=row_label
+        )
+        pose = _validate_authoring_pose(row["pose"], f"{row_label}.pose")
+        rows.append(
+            {
+                "tcp_id": _require_id(row["tcp_id"], f"{row_label}.tcp_id"),
+                "parent_frame": _require_text(
+                    row["parent_frame"], f"{row_label}.parent_frame", 1024
+                ),
+                "pose": pose,
+            }
+        )
+    rows.sort(key=lambda row: row["tcp_id"])
+    if len({row["tcp_id"] for row in rows}) != len(rows):
+        _fail(f"custom_tcp_duplicate: {label} repeats a tcp_id")
+    return rows
+
+
 def _validate_target_settings(value: Any, label: str) -> dict[str, dict[str, Any]]:
     settings = _require_object(value, label)
     if len(settings) > _MAX_TARGETS:
@@ -172,6 +236,14 @@ def _validate_target_settings(value: Any, label: str) -> dict[str, dict[str, Any
             )
         if speed is not None:
             row["maximum_tcp_linear_speed_mps"] = float(speed)
+        if "tcp_speed_check" in row and (
+            speed is None or row["tcp_speed_check"] not in _TCP_SPEED_CHECKS
+        ):
+            _fail(
+                f"{label}.{target_id}.tcp_speed_check must be one of "
+                f"{', '.join(_TCP_SPEED_CHECKS)} on a row with "
+                "maximum_tcp_linear_speed_mps"
+            )
         if "controlled_stop" in row:
             row["controlled_stop"] = _validate_controlled_stop(
                 row["controlled_stop"], f"{label}.{target_id}.controlled_stop"
@@ -358,6 +430,21 @@ def _validate_model_free_component(
     }
 
 
+def _validate_default_tcp(value: Any, label: str) -> dict[str, str]:
+    """B5 `default_tcp` `{command_target_id, frame_role_id}`; the compiler
+    checks the pair against the component's TCPs."""
+    row = _require_object(value, label)
+    _require_exact_fields(
+        row, required={"command_target_id", "frame_role_id"}, label=label
+    )
+    return {
+        "command_target_id": _require_id(
+            row["command_target_id"], f"{label}.command_target_id"
+        ),
+        "frame_role_id": _require_id(row["frame_role_id"], f"{label}.frame_role_id"),
+    }
+
+
 def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     """Validate and normalize the profile-independent authored envelope.
 
@@ -403,6 +490,14 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         _fail(f"{source}: components must be a bounded list")
     normalized_components: list[dict[str, Any]] = []
     component_ids: set[str] = set()
+    # A child mounted through an attachment row takes its placement from the
+    # parent interface and omits root_pose_in_cell. Preparation owns the row.
+    mounted: set[Any] = set()
+    if type(intent["attachments"]) is list:
+        for row in intent["attachments"]:
+            child = row.get("child") if type(row) is dict else None
+            if type(child) is dict:
+                mounted.add(child.get("component_id"))
     for index, raw_component in enumerate(components):
         label = f"{source}: components[{index}]"
         component = _require_object(raw_component, label)
@@ -413,17 +508,18 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
             component_ids.add(normalized["component_id"])
             normalized_components.append(normalized)
             continue
+        is_mounted = component.get("component_id") in mounted
         _require_exact_fields(
             component,
             required={
                 "component_id",
                 "component_profile_id",
                 "model_source",
-                "root_pose_in_cell",
                 "target_settings",
                 "configuration",
-            },
-            optional={"frame_prefix"},
+            }
+            | (set() if is_mounted else {"root_pose_in_cell"}),
+            optional={"frame_prefix", "custom_tcps", "default_tcp"},
             label=label,
         )
         component_id = _require_id(component["component_id"], f"{label}.component_id")
@@ -463,26 +559,34 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         frame_prefix = _require_frame_prefix(
             component.get("frame_prefix", ""), f"{label}.frame_prefix"
         )
-        normalized_components.append(
-            {
-                "component_id": component_id,
-                "frame_prefix": frame_prefix,
-                "component_profile_id": _require_id(
-                    component["component_profile_id"],
-                    f"{label}.component_profile_id",
-                ),
-                "model_source": normalized_source,
-                "root_pose_in_cell": _validate_pose(
-                    component["root_pose_in_cell"], f"{label}.root_pose_in_cell"
-                ),
-                "target_settings": _validate_target_settings(
-                    component["target_settings"], f"{label}.target_settings"
-                ),
-                "configuration": deepcopy(
-                    _require_object(component["configuration"], f"{label}.configuration")
-                ),
-            }
-        )
+        normalized: dict[str, Any] = {
+            "component_id": component_id,
+            "frame_prefix": frame_prefix,
+            "component_profile_id": _require_id(
+                component["component_profile_id"],
+                f"{label}.component_profile_id",
+            ),
+            "model_source": normalized_source,
+            "target_settings": _validate_target_settings(
+                component["target_settings"], f"{label}.target_settings"
+            ),
+            "configuration": deepcopy(
+                _require_object(component["configuration"], f"{label}.configuration")
+            ),
+        }
+        if not is_mounted:
+            normalized["root_pose_in_cell"] = _validate_pose(
+                component["root_pose_in_cell"], f"{label}.root_pose_in_cell"
+            )
+        if "custom_tcps" in component:
+            normalized["custom_tcps"] = _validate_custom_tcps(
+                component["custom_tcps"], f"{label}.custom_tcps"
+            )
+        if "default_tcp" in component:
+            normalized["default_tcp"] = _validate_default_tcp(
+                component["default_tcp"], f"{label}.default_tcp"
+            )
+        normalized_components.append(normalized)
     normalized_components.sort(key=lambda row: row["component_id"])
     result["components"] = normalized_components
 

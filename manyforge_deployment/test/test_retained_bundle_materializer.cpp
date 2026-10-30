@@ -1315,9 +1315,10 @@ TEST(RetainedBundleMaterializer,
             test::kLite6ArmTargetId);
   EXPECT_EQ(array_member(targets.front(), "model_groups").size(), 1U);
   const auto &frames = array_member(targets.front(), "frames");
-  ASSERT_EQ(frames.size(), 2U);
+  ASSERT_EQ(frames.size(), 3U);
   EXPECT_EQ(string_member(frames[0], "frame_role_id"), "base");
-  EXPECT_EQ(string_member(frames[1], "frame_role_id"), "tcp");
+  EXPECT_EQ(string_member(frames[1], "frame_role_id"), "flange");
+  EXPECT_EQ(string_member(frames[2], "frame_role_id"), "tcp");
   EXPECT_EQ(array_member(targets.front(), "collision_bodies").size(), 1U);
 }
 
@@ -1865,40 +1866,59 @@ TEST(RetainedBundleMaterializer,
   EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
                    core::JsonValueDTO::Array{missing}, false)),
                RetainedBundleError);
+  // tcp_speed_check: absent is the schema default; only the two modes decode.
+  EXPECT_EQ(valid.front().tcp_speed_check, core::TcpSpeedCheck::kActiveTcpAndFlange);
+  const auto checked = [&](core::JsonValueDTO mode) {
+    auto value = row(0.25);
+    std::get<core::JsonObjectDTO>(value.value).emplace("tcp_speed_check", std::move(mode));
+    return detail::decode_execution_motion_target_limits(core::JsonValueDTO::Array{value},
+                                                         false);
+  };
+  EXPECT_EQ(checked(core::JsonValueDTO{std::string("active_tcp")}).front().tcp_speed_check,
+            core::TcpSpeedCheck::kActiveTcp);
+  EXPECT_EQ(checked(core::JsonValueDTO{std::string("active_tcp_and_flange")})
+                .front()
+                .tcp_speed_check,
+            core::TcpSpeedCheck::kActiveTcpAndFlange);
+  for (auto invalid : {core::JsonValueDTO{std::string("flange")}, core::JsonValueDTO{1.0}})
+    EXPECT_THROW(static_cast<void>(checked(std::move(invalid))), RetainedBundleError);
 }
 
-// D11: a controller profile row's tool payload decodes exactly or refuses.
-TEST(RetainedBundleMaterializer, Ros2ControlToolPayloadDecodesExactlyOrRefuses) {
+// A controller profile row is closed: the removed robot-row `tool_payload`
+// (a tool's payload now comes from its model) is refused, not ignored.
+TEST(RetainedBundleMaterializer, Ros2ControlControllerProfileRefusesToolPayload) {
+  const auto plans = manyforge::roboplan_backend::detail::
+      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+      core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
+  ASSERT_TRUE(semantic.ok());
+  const auto fixture =
+      test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+          semantic.value().value());
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+  const auto &unit = bundle->value().cell_graph.runtime_units.front();
+  ASSERT_TRUE(detail::ros2_control_execution_runtime_configuration_is_qualified(
+      unit.configuration));
   using Json = core::JsonValueDTO;
-  const auto payload = [](Json mass, Json::Array center) {
-    return Json{core::JsonObjectDTO{{"mass_kg", std::move(mass)},
-                                    {"center_of_mass_m", Json{std::move(center)}}}};
-  };
-  const auto decoded = detail::decode_ros2_control_tool_payload(
-      payload(Json{0.3}, {Json{0.0}, Json{0.01}, Json{0.05}}));
-  EXPECT_DOUBLE_EQ(decoded.mass_kg, 0.3);
-  EXPECT_EQ(decoded.center_of_mass_m, (std::array<double, 3>{0.0, 0.01, 0.05}));
-  EXPECT_DOUBLE_EQ(detail::decode_ros2_control_tool_payload(
-                       payload(Json{0.0}, {Json{0.0}, Json{0.0}, Json{0.0}}))
-                       .mass_kg,
-                   0.0);
-  auto extra = payload(Json{0.3}, {Json{0.0}, Json{0.0}, Json{0.0}});
-  std::get<core::JsonObjectDTO>(extra.value).emplace("unit", Json{std::string("kg")});
-  for (const auto &invalid : {
-           payload(Json{-0.1}, {Json{0.0}, Json{0.0}, Json{0.0}}),
-           payload(Json{std::numeric_limits<double>::quiet_NaN()},
-                   {Json{0.0}, Json{0.0}, Json{0.0}}),
-           payload(Json{std::string("0.3")}, {Json{0.0}, Json{0.0}, Json{0.0}}),
-           payload(Json{0.3}, {Json{0.0}, Json{0.0}}),
-           payload(Json{0.3}, {Json{0.0}, Json{0.0}, Json{std::string("z")}}),
-           payload(Json{0.3},
-                   {Json{0.0}, Json{0.0}, Json{std::numeric_limits<double>::infinity()}}),
-           extra,
-           Json{0.3},
-       }) {
-    EXPECT_THROW(static_cast<void>(detail::decode_ros2_control_tool_payload(invalid)),
-                 RetainedBundleError);
-  }
+  auto with_tool_payload = unit.configuration;
+  auto &profiles = std::get<Json::Array>(
+      with_tool_payload.at("controller_profiles").value);
+  ASSERT_EQ(profiles.size(), 1U);
+  std::get<core::JsonObjectDTO>(profiles.front().value)
+      .emplace("tool_payload",
+               Json{core::JsonObjectDTO{
+                   {"mass_kg", Json{0.3}},
+                   {"center_of_mass_m",
+                    Json{Json::Array{Json{0.0}, Json{0.0}, Json{0.05}}}}}});
+  EXPECT_FALSE(detail::ros2_control_execution_runtime_configuration_is_qualified(
+      with_tool_payload));
 }
 
 TEST(RetainedBundleMaterializer,
@@ -2145,6 +2165,9 @@ TEST(RetainedBundleMaterializer,
             std::optional<std::string>("lite6"));
   EXPECT_FALSE(
       runtime_configuration.controller_profiles.front().mock_profile.has_value());
+  // Not authored: the soft Stop lead-in keeps the default (command position).
+  EXPECT_FALSE(runtime_configuration.controller_profiles.front()
+                   .stop_lead_in_anchor.has_value());
   ASSERT_EQ(runtime_configuration.motion_target_limits.size(), 1U);
   const auto &motion_limit = runtime_configuration.motion_target_limits.front();
   EXPECT_EQ(motion_limit.controllable_component_id.value(),
@@ -2170,6 +2193,9 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(runtime_configuration.runtime_dynamic_body_max_age_cap_ms,
             1000.0);
   EXPECT_EQ(runtime_configuration.validation_collision_workers, 4U);
+  // Not declared: the kernel's collision clearance and check-step defaults.
+  EXPECT_FALSE(runtime_configuration.collision_clearance_m.has_value());
+  EXPECT_FALSE(runtime_configuration.collision_check_step_rad.has_value());
   EXPECT_TRUE(runtime_configuration.default_fault_stop_profiles.empty());
 
   const auto changed_configuration = canonical_json(replace_object_member(

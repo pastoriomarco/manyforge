@@ -44,3 +44,27 @@ export interface CanonicalEmptySelection {
   candidate_graph_revision: string;
   admission_digest: string;
 }
+/** Item 37: one step of an operator Force close (Headless runs each step). */
+/** `end` (SX-616): sent on every exit after the Full Stop; it ends the server's attachment exception. */
+export type ForceCloseStep = 'stop' | 'close_operations' | 'end';
+export interface ForceCloseRequest {
+  request_context: { request_id: string; request_owner_epoch: string; source_label: string; correlation_id: string | null };
+  step: ForceCloseStep;
+  /** Step `stop` only: the cell's current expected Stop generation. */
+  expected_stop_generation?: number;
+}
+/** What the Kernel step moved into history; its effect stays unknown. */
+export interface ForceClosedOperation {
+  operationId: string;
+  operationRevision: number;
+  state: string;
+  containmentUncertain: boolean;
+  targets: { controllableComponentId: string; commandTargetId: string; outputUnknown: boolean }[];
+}
+export interface ForceCloseResult {
+  step: ForceCloseStep;
+  stopGeneration: number;
+  operations: ForceClosedOperation[];
+  /** The cell-wide motion block of an unresolved operation closure was cleared. */
+  motionBlockCleared: boolean;
+}

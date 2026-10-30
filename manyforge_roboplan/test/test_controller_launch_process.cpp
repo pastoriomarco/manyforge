@@ -288,16 +288,62 @@ TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
   for (const auto &argument : single.argv) {
     EXPECT_NE(argument.rfind("frame_prefix:=", 0), 0U) << argument;
   }
-  // The gripper target configuration's freshness reaches the gripper adapter
-  // as one host-owned argument; a changed value is another launch identity.
-  const auto with_gripper = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane(), 0.75);
-  EXPECT_EQ(with_gripper.argv.back(), "gripper_state_freshness_timeout_s:=0.75");
-  EXPECT_NE(with_gripper.identity, single.identity);
-  EXPECT_NE(isaac_controller_launch_command(isaac_artifacts(root.path()),
-                                            isaac_lane(), 1.0)
-                .identity,
-            with_gripper.identity);
+  // Merge 6: the arm's launch carries no gripper argument; a gripper is its
+  // own tool component with its own launch.
+  for (const auto &argument : single.argv) {
+    EXPECT_EQ(argument.find("gripper"), std::string::npos) << argument;
+  }
+}
+
+// Merge 6: an Isaac tool (gripper-only) component runs its own launch: its
+// description in its own namespace and, for an action transport, the bridge
+// with its gripper_feedback budget. The description path never joins the
+// identity; the bridge facts and the budget do.
+TEST(ControllerLaunchCommand, IsaacToolCommandCarriesItsDescriptionAndBridge) {
+  TemporaryRoot first;
+  TemporaryRoot second;
+  const auto artifacts = write_isaac_gripper_launch_artifacts(
+      first.path(), "ur10e_gripper", "ur10e", "<robot name=\"tool\"/>", "tool/");
+  EXPECT_EQ(artifacts.lane, ControllerLaunchLane::kIsaac);
+  EXPECT_EQ(artifacts.runtime_namespace, "/manyforge/ur10e_gripper");
+  EXPECT_TRUE(artifacts.controllers_file.empty());
+  const IsaacGripperBridgeLane bridge{"robotiq_gripper_controller/gripper_cmd",
+                                      "/isaac_gripper_state", "/isaac_joint_states",
+                                      "isaac_robotiq_2f_140_gripper_bridge.yaml"};
+  const auto command = isaac_gripper_launch_command(artifacts, bridge, 0.75);
+  const std::vector<std::string> expected{
+      "ros2", "launch", "manyforge_ros_bringup", "isaac_gripper.launch.py",
+      "robot_description_file:=" + artifacts.robot_description_file.string(),
+      "runtime_namespace:=/manyforge/ur10e_gripper",
+      "frame_prefix:=tool/",
+      "gripper_bridge_parameters:=isaac_robotiq_2f_140_gripper_bridge.yaml",
+      "gripper_action_name:=robotiq_gripper_controller/gripper_cmd",
+      "gripper_command_topic:=/isaac_gripper_state",
+      "gripper_state_topic:=/isaac_joint_states",
+      "gripper_state_freshness_timeout_s:=0.75"};
+  EXPECT_EQ(command.argv, expected);
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kIsaac);
+  EXPECT_EQ(command.controllable_component_id, "ur10e_gripper");
+  EXPECT_TRUE(command.keep_across_apply);
+  const auto same = isaac_gripper_launch_command(
+      write_isaac_gripper_launch_artifacts(second.path(), "ur10e_gripper", "ur10e",
+                                           "<robot name=\"tool\"/>", "tool/"),
+      bridge, 0.75);
+  EXPECT_NE(same.argv, command.argv);
+  EXPECT_EQ(same.identity, command.identity);
+  EXPECT_NE(isaac_gripper_launch_command(artifacts, bridge, 1.0).identity,
+            command.identity);
+  // A direct-effort transport (Lite6) starts no bridge and needs no budget.
+  const auto direct = isaac_gripper_launch_command(artifacts, std::nullopt, std::nullopt);
+  for (const auto &argument : direct.argv) {
+    EXPECT_EQ(argument.rfind("gripper_", 0), std::string::npos) << argument;
+  }
+  EXPECT_NE(direct.identity, command.identity);
+  EXPECT_THROW(static_cast<void>(isaac_gripper_launch_command(artifacts, bridge, std::nullopt)),
+               ControllerLaunchProcessError);
+  EXPECT_THROW(static_cast<void>(isaac_gripper_launch_command(
+                   mock_artifacts(first.path()), std::nullopt, std::nullopt)),
+               ControllerLaunchProcessError);
 }
 
 TEST(ControllerLaunchCommand,

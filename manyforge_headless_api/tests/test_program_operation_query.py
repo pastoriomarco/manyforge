@@ -84,8 +84,6 @@ def test_operation_query_rejects_unbounded_or_caller_invented_scope(change):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("program_run_id", "foreign"),
-        ("program_binding_id", "sha256:" + "b" * 64),
         ("operation_id", ""),
         ("operation_revision", True),
         ("operation_revision", 0),
@@ -105,14 +103,21 @@ def test_crossed_operation_response_is_rejected_not_retried(field, value):
     assert len(requests) == 1
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [("owner_epoch", "foreign"), ("target_role_id", "gripper"), ("command", "read")],
-)
-def test_operation_response_must_echo_exact_owner_and_target(field, value):
-    client, requests = _client({**_response(), field: value})
-    with pytest.raises(HeadlessApiError):
+def test_operation_response_must_have_its_command_kind():
+    client, requests = _client({**_response(), "command": "read"})
+    with pytest.raises(HeadlessApiError) as error:
         client.query_operation(ProgramOperationQuery.model_validate(QUERY))
+    assert error.value.code == "execution_operation_context_invalid"
+    assert len(requests) == 1
+
+
+def test_operation_response_echo_is_not_compared():
+    # Each exchange is its own connection: the echoed identity is not compared.
+    response = _response()
+    response.update(owner_epoch="foreign", target_role_id="gripper")
+    response["operation"]["program_run_id"] = "foreign"
+    client, requests = _client(response)
+    assert client.query_operation(ProgramOperationQuery.model_validate(QUERY)) == response
     assert len(requests) == 1
 
 
@@ -149,8 +154,16 @@ def test_operation_scale_wire_keeps_generation_and_never_changes_persistent_sele
     assert len(requests) == 1
     assert requests[0]["request"] == request.model_dump(mode="json")
     assert "selector" not in requests[0]["request"]
-    response["accepted"]["runtime_scale_generation"] = 5
+    # Like Stop, the Kernel resolves scaling to the current operation revision.
+    response["accepted"]["operation_revision"] = 3
     client, requests = _client(response)
-    with pytest.raises(HeadlessApiError):
+    assert (
         client.set_operation_runtime_scale(request, trusted_principal_id=None)
+        == response
+    )
+    response["command"] = "query_operation"
+    client, requests = _client(response)
+    with pytest.raises(HeadlessApiError) as error:
+        client.set_operation_runtime_scale(request, trusted_principal_id=None)
+    assert error.value.code == "execution_command_response_invalid"
     assert len(requests) == 1

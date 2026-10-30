@@ -12,8 +12,10 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numbers>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -2416,7 +2418,19 @@ void validate_declared_bindings(const core::ModelAssetDTO& asset,
   }
   for (const auto& binding : asset.frame_role_bindings) {
     if (!links.contains(binding.source_link_name)) {
-      fail("model frame role references an unknown URDF link");
+      // An offset frame's parent is a source link, never another offset
+      // frame (no chaining): generated links are not source links.
+      fail(binding.pose_in_source_link.has_value()
+               ? "tcp_parent_unknown: offset frame role '" +
+                     binding.frame_role_id.value() +
+                     "' names no URDF link as its parent"
+               : std::string("model frame role references an unknown URDF "
+                             "link"));
+    }
+    if (binding.pose_in_source_link.has_value() &&
+        links.contains(binding.frame_role_id.value())) {
+      fail("tcp_name_duplicate: offset frame role '" +
+           binding.frame_role_id.value() + "' names an existing URDF link");
     }
   }
   for (const auto& binding : asset.model_group_role_bindings) {
@@ -3223,6 +3237,135 @@ std::string emit_canonical_urdf_document(
 std::string emit_canonical_srdf_document(
     const SrdfDocumentIr& document) {
   return emit_srdf_document(document);
+}
+
+UrdfOriginIr urdf_origin_from_pose(const core::PlacementPoseDTO& pose) {
+  const double x = pose.orientation_xyzw[0];
+  const double y = pose.orientation_xyzw[1];
+  const double z = pose.orientation_xyzw[2];
+  const double w = pose.orientation_xyzw[3];
+  const double sinr_cosp = 2.0 * (w * x + y * z);
+  const double cosr_cosp = 1.0 - 2.0 * (x * x + y * y);
+  const double sinp = 2.0 * (w * y - z * x);
+  const double siny_cosp = 2.0 * (w * z + x * y);
+  const double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
+  UrdfOriginIr result;
+  result.element_authored = true;
+  result.authored_xyz_m = pose.position_m;
+  result.authored_rpy_rad = ModelSourceVector3{
+      std::atan2(sinr_cosp, cosr_cosp),
+      std::abs(sinp) >= 1.0 ? std::copysign(std::numbers::pi_v<double> / 2.0, sinp)
+                            : std::asin(sinp),
+      std::atan2(siny_cosp, cosy_cosp)};
+  // Gimbal lock (cos pitch ~ 0): roll and yaw turn about one axis and both
+  // atan2 pairs above are rounding noise. Yaw is 0 there and roll carries the
+  // whole turn, read from R01 and R11 (sign by pitch).
+  if (std::hypot(sinr_cosp, cosr_cosp) < 1e-9) {
+    const double r01 = 2.0 * (x * y - w * z);
+    const double r11 = 1.0 - 2.0 * (x * x + z * z);
+    result.authored_rpy_rad = ModelSourceVector3{
+        std::atan2(std::copysign(1.0, sinp) * r01, r11),
+        std::copysign(std::numbers::pi_v<double> / 2.0, sinp), 0.0};
+  }
+  result.xyz_m = pose.position_m;
+  result.rpy_rad = *result.authored_rpy_rad;
+  return result;
+}
+
+std::string offset_frame_joint_name(std::string_view link_name) {
+  // '~' sorts after every authored sibling name, so a generated joint takes
+  // the last parent-local mf2 rank and never renumbers a source joint.
+  return "~tcp/" + std::string(link_name);
+}
+
+std::vector<OffsetFrameLinkIr> occurrence_offset_frames(
+    std::span<const core::ModelFrameRoleBindingDTO> asset_bindings,
+    std::span<const core::ModelCustomTcpDTO> custom_tcps) {
+  std::vector<OffsetFrameLinkIr> result;
+  for (const auto& binding : asset_bindings) {
+    if (binding.pose_in_source_link.has_value()) {
+      result.push_back({binding.frame_role_id.value(),
+                        binding.source_link_name,
+                        *binding.pose_in_source_link, false});
+    }
+  }
+  for (const auto& custom : custom_tcps) {
+    result.push_back({custom.frame_role_id.value(), custom.parent_link_name,
+                      custom.pose_in_parent_link, true});
+  }
+  return result;
+}
+
+UrdfDocumentIr with_offset_frame_links(
+    UrdfDocumentIr urdf, std::span<const OffsetFrameLinkIr> frames) {
+  if (frames.empty()) return urdf;
+  std::unordered_set<std::string> source_links;
+  for (const auto& link : urdf.links) source_links.insert(link.name);
+  std::unordered_set<std::string> descriptor_links;
+  std::unordered_set<std::string> joints;
+  for (const auto& joint : urdf.joints) joints.insert(joint.name);
+  for (const auto& frame : frames) {
+    if (!frame.custom) descriptor_links.insert(frame.link_name);
+  }
+  std::unordered_set<std::string> generated;
+  for (const auto& frame : frames) {
+    // Descriptor offsets hang off source links; a custom TCP may also hang
+    // off a descriptor offset, never off another custom TCP (no chaining).
+    const bool parent_known =
+        source_links.contains(frame.parent_link_name) ||
+        (frame.custom && descriptor_links.contains(frame.parent_link_name));
+    if (!parent_known) {
+      fail(std::string(frame.custom ? "custom_tcp_parent_unknown"
+                                    : "tcp_parent_unknown") +
+           ": '" + frame.link_name + "' has no parent frame '" +
+           frame.parent_link_name + "'");
+    }
+    const auto joint_name = offset_frame_joint_name(frame.link_name);
+    if (source_links.contains(frame.link_name) ||
+        !generated.insert(frame.link_name).second ||
+        !joints.insert(joint_name).second) {
+      fail(std::string(frame.custom ? "custom_tcp_name_collision"
+                                    : "tcp_name_duplicate") +
+           ": '" + frame.link_name + "' collides with an existing frame");
+    }
+    urdf.links.push_back(UrdfLinkIr{frame.link_name, std::nullopt, {}, {}});
+    urdf.joints.push_back(offset_frame_joint(frame));
+  }
+  canonicalize_urdf_document(urdf);
+  return urdf;
+}
+
+UrdfJointIr offset_frame_joint(const OffsetFrameLinkIr& frame) {
+  return UrdfJointIr{offset_frame_joint_name(frame.link_name),
+                     UrdfJointType::kFixed, UrdfCoordinateKind::kNone,
+                     frame.parent_link_name, frame.link_name,
+                     urdf_origin_from_pose(frame.pose), std::nullopt,
+                     std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                     std::nullopt};
+}
+
+std::string append_fixed_links(std::string_view urdf_bytes,
+                               std::span<const UrdfJointIr> joints) {
+  if (joints.empty()) return std::string(urdf_bytes);
+  const auto end = urdf_bytes.rfind("</robot>");
+  if (end == std::string_view::npos) {
+    fail("URDF text has no </robot> end tag for its static frames");
+  }
+  std::string elements;
+  for (const auto& joint : joints) {
+    if (joint.type != UrdfJointType::kFixed) {
+      fail("only fixed joints can carry appended static frames");
+    }
+    elements.append("<link");
+    append_attribute(elements, "name", joint.child_link_name);
+    elements.append("/>");
+    emit_joint(elements, joint);
+    elements.push_back('\n');
+  }
+  std::string result(urdf_bytes.substr(0U, end));
+  result += elements;
+  result += urdf_bytes.substr(end);
+  return result;
 }
 
 ParsedModelDocuments parse_model_documents_for_projection(

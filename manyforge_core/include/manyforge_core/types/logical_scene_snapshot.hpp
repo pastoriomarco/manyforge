@@ -146,6 +146,9 @@ struct SceneObjectSnapshotDTO final {
   /// Portable authored support relationships retained independently of any
   /// planner's generated collision-body ids.
   std::vector<SupportContactDTO> support_contacts{};
+  /// Object mass (kg), added to the carrier's controller payload while the
+  /// object is attached; 0 when unknown or massless.
+  double mass_kg{0.0};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   friend bool operator==(const SceneObjectSnapshotDTO&,
@@ -447,6 +450,7 @@ inline bool SceneObjectProviderEvidenceDTO::valid() const noexcept {
 
 inline bool SceneObjectSnapshotDTO::locally_valid() const noexcept {
   if (scene_resource_id.empty() || collision_shapes.empty() ||
+      !std::isfinite(mass_kg) || mass_kg < 0.0 ||
       !std::all_of(collision_shapes.begin(), collision_shapes.end(),
                    logical_scene_detail::ValidCollisionShape) ||
       (provider_evidence.has_value() && !provider_evidence->valid()) ||

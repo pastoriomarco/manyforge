@@ -397,11 +397,13 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
   for (const auto& role : asset.frame_role_bindings) {
     frame_roles.emplace_back(CanonicalValue::Object{
         {"frame_role_id", CanonicalValue(role.frame_role_id.value())},
-        {"source_link_name", CanonicalValue(role.source_link_name)},
+        {"source_link_name",
+         CanonicalValue(core::frame_role_link_name(role))},
         {"compiled_link_name",
          CanonicalValue(require_compiled(
              symbols, occurrence.model_instance_id,
-             OccurrenceSymbolKind::kLink, {}, role.source_link_name))},
+             OccurrenceSymbolKind::kLink, {},
+             core::frame_role_link_name(role)))},
     });
   }
 

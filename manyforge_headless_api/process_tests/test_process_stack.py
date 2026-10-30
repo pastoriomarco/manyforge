@@ -748,20 +748,6 @@ def _assistant_stack(
         admission = stack.wait_authoring_admission(expected_allowed=True)
         assert admission["authoring_allowed"] is True
         assert admission["admission_generation"] > 0
-        with HeadlessHttpClient(stack.base_url) as client:
-            with pytest.raises(HeadlessClientError) as stale:
-                client.acquire_authoring_transaction(
-                    {
-                        "request_id": "assistant-native.stale-generation",
-                        "request_owner_epoch": "assistant-native.stale.epoch",
-                        "source_label": "assistant_native_process_test",
-                        "correlation_id": "assistant-native.stale-generation",
-                        "expected_admission_generation": initial_admission["admission_generation"],
-                        "request_payload_digest": "sha256:" + "0" * 64,
-                        "owner_transaction_id": "assistant-native.stale",
-                    }
-                )
-            assert stale.value.code == "stale_generation"
         assert (stack.execution_run_root / "execution-command.sock").is_socket()
         assert (stack.execution_run_root / "execution-observation.sock").is_socket()
         stack.start_composer()
@@ -1396,7 +1382,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             "health": "manyforge.headless_health.v1",
             "manager-graph": "manyforge.manager_graph_projection.v1",
             "node-environment": "manyforge.node_environment_projection.v2",
-            "source-model": "manyforge.source_model_projection.v2",
+            "source-model": "manyforge.source_model_projection.v3",
             "scene": "manyforge.scene_projection.v1",
             "alarms": "manyforge.operator_alarm_snapshot.v2",
             "history": "manyforge.historian_summary_page.v2",

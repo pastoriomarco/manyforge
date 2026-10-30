@@ -445,11 +445,19 @@ TEST(ProgramIoConditionCompilerTest,
   ASSERT_FALSE(outcome.ok());
   EXPECT_EQ(outcome.error().details.at("reason"),
             "interrupt_condition_key_refused");
-  V::Array operands;
-  for (unsigned i = 0; i != 17U; ++i)
-    operands.push_back(compare("key_" + std::to_string(i), "==", V(false)));
-  const auto bound = d::detail::compile_authored_deployment_io_condition(
-      V(V::Object{{"all", V(std::move(operands))}}), {}, context.signals, true);
+  // Spec 260 §2.7 (D7, contract 137): a condition's only limits are 64
+  // authored nodes and depth 8; there is no separate input cap. One `all`
+  // with 63 comparisons is 64 nodes and compiles; 64 comparisons exceed the
+  // node bound and are refused.
+  const auto all_of = [&](unsigned count) {
+    V::Array operands;
+    for (unsigned i = 0; i != count; ++i)
+      operands.push_back(compare("key_" + std::to_string(i), "==", V(false)));
+    return d::detail::compile_authored_deployment_io_condition(
+        V(V::Object{{"all", V(std::move(operands))}}), {}, context.signals, true);
+  };
+  EXPECT_TRUE(all_of(63U).ok());
+  const auto bound = all_of(64U);
   ASSERT_FALSE(bound.ok());
   EXPECT_EQ(bound.error().details.at("reason"), "interrupt_condition_invalid");
   const auto malformed = d::detail::compile_authored_deployment_io_condition(

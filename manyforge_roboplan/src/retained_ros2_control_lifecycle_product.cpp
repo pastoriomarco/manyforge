@@ -12,7 +12,7 @@
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
-#include <manyforge_xarm_control/lifecycle_profile.hpp>
+#include <manyforge_roboplan/retained_vendor_device_status.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -22,18 +22,6 @@ namespace {
                                            std::string reason) {
   return {std::move(code), std::move(message),
           {{"reason", std::move(reason)}}};
-}
-
-// R7 package 4: a Real xArm-family arm's provider has its own catalog (data);
-// every other physical ROS provider uses the shared ros2_control catalog.
-[[nodiscard]] bool real_xarm_provider(const core::ProviderManifestId &id) {
-  return id.value() ==
-         xarm_control::kXArmRos2ControlLifecycleProviderManifestId;
-}
-
-// Its gripper domain's provider: the shared plans, Recover aligned to the arm.
-[[nodiscard]] bool real_xarm_gripper_provider(const core::ProviderManifestId &id) {
-  return id.value() == kXArmRos2ControlGripperLifecycleProviderManifestId;
 }
 
 // The catalog of `plans`, anchored by its own provider manifest.
@@ -60,11 +48,16 @@ anchored_catalog(const core::ProviderManifestDTO &manifest,
 core::Result<core::BrandLifecyclePlanCatalogDTO>
 make_retained_physical_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest) {
-  if (real_xarm_provider(manifest.provider_manifest_id))
-    return xarm_control::make_xarm_ros2_control_lifecycle_catalog(manifest);
-  if (real_xarm_gripper_provider(manifest.provider_manifest_id))
+  // R7 package 4 / V-A: a registered vendor family's Real arm provider has
+  // its own catalog (vendor data), its gripper's provider the Real gripper
+  // plans; every other physical ROS provider uses the shared catalog.
+  if (const auto vendor =
+          find_vendor_lifecycle_provider(manifest.provider_manifest_id.value())) {
+    if (vendor->role == VendorLifecycleProviderRole::kArm)
+      return vendor->family->make_arm_catalog(manifest);
     return anchored_catalog(manifest,
                             retained_ros2_control_gripper_lifecycle_plans());
+  }
   return make_retained_ros2_control_lifecycle_catalog(manifest);
 }
 
@@ -109,6 +102,7 @@ RetainedHostLifecycleProduct::Create(
     const std::vector<std::shared_ptr<RetainedRos2ControlRuntimeHandle>>
         &runtime_handles,
     core::IClock &clock, const core::Duration observation_freshness_ns,
+    const core::Duration poll_period_ns,
     const std::vector<std::shared_ptr<host_detail::IoProviderDriverRecord>>
         &provider_drivers) {
   if (retained_bundle == nullptr ||
@@ -296,8 +290,8 @@ RetainedHostLifecycleProduct::Create(
     // physical factory's fixed provider requirement.
     if (selected_path->provider_manifest_id.value() !=
             kRos2ControlLifecycleProviderManifestId &&
-        !real_xarm_provider(selected_path->provider_manifest_id) &&
-        !real_xarm_gripper_provider(selected_path->provider_manifest_id))
+        !find_vendor_lifecycle_provider(
+            selected_path->provider_manifest_id.value()))
       return core::Result<std::unique_ptr<RetainedHostLifecycleProduct>>::Err(
           product_error(
               "ros2_control_lifecycle_product_unsupported",
@@ -346,7 +340,8 @@ RetainedHostLifecycleProduct::Create(
                         "a desired domain has no live ROS runtime handle",
                         "domain_handle_missing"));
     auto port = RetainedExternallyManagedBrandLifecyclePort::Create(
-        occurrence, snapshot_source, clock, observation_freshness_ns,
+        occurrence, entry->second.catalog, snapshot_source, clock,
+        observation_freshness_ns, poll_period_ns,
         handle->second->lifecycle_primitive_dispatcher());
     if (!port.ok()) {
       return core::Result<std::unique_ptr<RetainedHostLifecycleProduct>>::Err(

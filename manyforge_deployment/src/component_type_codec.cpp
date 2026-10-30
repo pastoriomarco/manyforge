@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -271,6 +272,14 @@ decode_frame_roles(const CanonicalValue& value) {
             value, "contact_body_role_ids"));
       }
     }
+    bool tcp = false;
+    if (const auto* tagged = item.find_object_member("tcp")) {
+      const auto* flag = std::get_if<bool>(&tagged->storage());
+      if (flag == nullptr) {
+        fail("component-type normalized field is not a boolean: tcp");
+      }
+      tcp = *flag;
+    }
     result.push_back({
         core::FrameRoleId(require_string(
             require_member(item, "frame_role_id"), "frame_role_id")),
@@ -280,6 +289,7 @@ decode_frame_roles(const CanonicalValue& value) {
             require_member(item, "asset_frame_role_id"),
             "asset_frame_role_id")),
         std::move(contact_body_role_ids),
+        tcp,
     });
   }
   return result;
@@ -328,6 +338,12 @@ decode_command_targets(const CanonicalValue& value) {
   std::vector<core::ComponentTypeCommandTargetDTO> result;
   result.reserve(source.size());
   for (const auto& item : source) {
+    std::optional<core::FrameRoleId> default_tcp;
+    if (const auto* selected =
+            item.find_object_member("default_tcp_frame_role_id")) {
+      default_tcp = core::FrameRoleId(
+          require_string(*selected, "default_tcp_frame_role_id"));
+    }
     result.push_back({
         core::CommandTargetId(require_string(
             require_member(item, "command_target_id"),
@@ -338,6 +354,7 @@ decode_command_targets(const CanonicalValue& value) {
         decode_collision_body_roles(
             require_member(item, "collision_body_roles")),
         decode_capabilities(require_member(item, "capabilities")),
+        std::move(default_tcp),
     });
   }
   return result;
@@ -629,6 +646,41 @@ void validate_target(
           }
         },
         resource);
+  }
+
+  // TCPs: a target that tags any frame role as a TCP names one of them as
+  // its default; a motion target (it executes trajectories) also exposes
+  // its robot `flange` as a TCP, the point the vendor speed rating refers to.
+  const auto tagged = [&target](const core::FrameRoleId& id) {
+    return std::any_of(
+        target.frame_roles.begin(), target.frame_roles.end(),
+        [&id](const auto& frame) { return frame.tcp && frame.frame_role_id == id; });
+  };
+  const bool has_tcp = std::any_of(
+      target.frame_roles.begin(), target.frame_roles.end(),
+      [](const auto& frame) { return frame.tcp; });
+  if (has_tcp != target.default_tcp_frame_role_id.has_value() ||
+      (has_tcp && !tagged(*target.default_tcp_frame_role_id))) {
+    fail("default_tcp_unknown: command target '" +
+         target.command_target_id.value() +
+         "' must name exactly one of its TCP frame roles as default TCP");
+  }
+  const bool motion_target = std::any_of(
+      target.capabilities.begin(), target.capabilities.end(),
+      [](const auto& capability) {
+        return capability.capability_id.value() ==
+               "execution.trajectory.execute";
+      });
+  if (has_tcp && motion_target && !tagged(core::FrameRoleId("flange"))) {
+    fail("robot_flange_tcp_missing: motion target '" +
+         target.command_target_id.value() + "' exposes no flange TCP");
+  }
+  // O5: a passive tool's frame-only target (frame and collision roles only)
+  // selects no capability.
+  if (target.capabilities.empty() &&
+      (!target.model_group_roles.empty() || !target.resource_roles.empty())) {
+    fail("component-type target without capabilities may expose only frame "
+         "and collision-body roles");
   }
 
   bool requires_control_binding = false;

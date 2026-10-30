@@ -51,17 +51,19 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_BUILTIN_CATALOG_DIGEST
-    assert len(catalog.entries) == 49
-    assert (
-        len(
-            {
-                (entry.id, engine_id, implementation_id)
-                for entry in catalog.entries
-                for engine_id, implementation_id in entry.runner_implementation_ids.items()
-            }
-        )
-        == 49
-    )
+    # Presence, not cardinality: the required nodes are present and every
+    # entry has a runner implementation; extra entries are accepted.
+    entry_ids = {entry.id for entry in catalog.entries}
+    assert {
+        "gripper.command_position",
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.set_tcp",
+        "planning.plan_pick_sequence",
+        "planning.plan_place_sequence",
+    } <= entry_ids
+    assert len(entry_ids) == len(catalog.entries)
+    assert all(entry.runner_implementation_ids for entry in catalog.entries)
 
 
 @pytest.mark.parametrize("node_id,parameter_id", [
@@ -312,13 +314,55 @@ def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scope
         assert synthesis.properties[offset].ref == "#/schema_types/motion_reference"
     move = {parameter.id: parameter for parameter in catalog.get("motion.move_to_pose").parameters}
     assert registry.resolve(move["base_frame_role"].schema).semantic_scope_parameter == "target_role"
-    assert move["tcp_endpoint"].required and not move["tcp_endpoint"].has_default
+    assert move["tcp_endpoint"].required is False and move["tcp_endpoint"].has_default
     endpoint = registry.resolve(move["tcp_endpoint"].schema)
-    assert endpoint.required == ("target_role", "frame_role")
+    assert endpoint.required == ("kind",)
+    assert endpoint.properties["kind"].enum_values == ("current", "default_of_role", "entry")
     assert registry.resolve(endpoint.properties["target_role"]).semantic_type == "target_role"
     assert registry.resolve(endpoint.properties["frame_role"]).semantic_type == "frame_role"
+    assert move["tcp_endpoint"].default == {"kind": "current"}
+    for node_id in (
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
+        "motion.move_until_signal",
+        "motion.probe_search",
+    ):
+        selector = next(
+            row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint"
+        )
+        assert selector.required is False
+        assert selector.default == {"kind": "current"}
+        assert selector.schema.ref == "#/schema_types/tcp_selector"
+
+    set_tcp = catalog.get("motion.set_tcp")
+    assert set_tcp.execution.owner_api == "kernel.operation"
+    assert set_tcp.execution.blocking and set_tcp.execution.cancellable
+    set_tcp_selector = next(row for row in set_tcp.parameters if row.id == "tcp")
+    assert set_tcp_selector.schema.ref == "#/schema_types/tcp_selector"
+    assert {
+        (row.capability_id, row.scope, row.effectful)
+        for row in set_tcp.required_capabilities
+    } == {("execution.trajectory.execute", "target_binding", True)}
+
+    for node_id in ("planning.plan_pick_sequence", "planning.plan_place_sequence"):
+        selector = next(
+            row for row in catalog.get(node_id).parameters if row.id == "tcp_endpoint"
+        )
+        assert selector.required is False
+        assert selector.default == {"kind": "current"}
+        assert selector.schema.ref == "#/schema_types/tcp_selector"
+
+    attach = {
+        row.id: row for row in catalog.get("scene.attach_carried_object").parameters
+    }
+    assert attach["carrier_frame_role"].required is False
+    assert attach["carrier_frame"].schema.ref == "#/schema_types/active_tcp_carrier_frame"
     # Geometry and Scene nodes choose any declared frame.
-    offset = {parameter.id: parameter for parameter in catalog.get("geometry.offset_pose").parameters}
+    offset = {
+        parameter.id: parameter
+        for parameter in catalog.get("geometry.offset_pose").parameters
+    }
     assert offset["offset_frame"].required is False and not offset["offset_frame"].has_default
     assert offset["offset_frame"].schema.ref == "#/schema_types/pose_frame_ref"
     object_pose = {
@@ -332,6 +376,74 @@ def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scope
         ("scene.get_object_pose", "the cell frame when absent"),
     ):
         assert phrase in catalog.get(node_id).description
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"kind": "current"}, True),
+        ({"kind": "default_of_role", "role": "tool"}, True),
+        ({"kind": "entry", "target_role": "tool", "frame_role": "tcp"}, True),
+        ({"kind": "entry", "target_role": "tool"}, False),
+        ({"kind": "default_of_role", "target_role": "tool", "frame_role": "tcp"}, False),
+        ({"kind": "current", "role": "tool"}, False),
+        ({"kind": "unknown"}, False),
+    ],
+)
+def test_tcp_selector_schema_has_three_closed_forms(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    selector = catalog.schema_registry.types["tcp_selector"]
+
+    assert (not validate_value(selector, value, registry=catalog.schema_registry)) is valid
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"kind": "active_tcp"}, True),
+        ({"kind": "frame_role", "frame_role": "flange"}, False),
+        ({"kind": "active_tcp", "extra": True}, False),
+    ],
+)
+def test_attach_active_tcp_frame_schema_is_explicit(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = {row.id: row for row in catalog.get("scene.attach_carried_object").parameters}
+
+    assert (
+        not validate_value(
+            attach["carrier_frame"].schema,
+            value,
+            registry=catalog.schema_registry,
+        )
+    ) is valid
+
+
+@pytest.mark.parametrize(
+    "value,valid",
+    [
+        ({"component_id": "arm", "target_id": "robot", "frame_role_id": "flange"}, True),
+        ({"component_id": "arm", "target_id": "robot"}, False),
+        (
+            {
+                "component_id": "arm",
+                "target_id": "robot",
+                "frame_role_id": "flange",
+                "extra": 1,
+            },
+            False,
+        ),
+    ],
+)
+def test_tcp_entry_schema_is_the_structured_runtime_identity(value, valid) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+
+    assert (
+        not validate_value(
+            catalog.schema_registry.types["tcp_entry"],
+            value,
+            registry=catalog.schema_registry,
+        )
+    ) is valid
 
 
 def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -> None:

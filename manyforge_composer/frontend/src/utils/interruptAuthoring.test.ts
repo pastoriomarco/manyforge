@@ -27,6 +27,7 @@ import {
   qualifiedStopStages,
   stopStagesForTargetRole,
   successThroughStages,
+  type GlobalInterruptRule,
 } from './interruptAuthoring';
 import { programBlackboardKeys } from './programAuthoring';
 
@@ -230,9 +231,10 @@ describe('global interrupt rules', () => {
     const withRule = (patch: Record<string, JsonValue>) => ({ ...(rule as unknown as Record<string, JsonValue>), ...patch });
     expect(globalRuleProblem(valid, ['rule_2'], choices)).toContain('already uses');
     expect(globalRuleProblem(withRule({ priority: 101 }), [], choices)).toContain('0 to 100');
-    // On trip: gate (default, omitted) or full_stop; latch_release is folded into it.
+    // On trip: gate (default, omitted), full_stop or notify; legacy latch fields stay unknown.
     expect(globalRuleProblem(withRule({ on_trip: 'gate' }), [], choices)).toBeNull();
     expect(globalRuleProblem(withRule({ on_trip: 'full_stop' }), [], choices)).toBeNull();
+    expect(globalRuleProblem(withRule({ on_trip: 'notify' }), [], choices)).toBeNull();
     expect(globalRuleProblem(withRule({ on_trip: 'never' }), [], choices)).toContain('On trip');
     expect(globalRuleProblem(withRule({ latch_release: 'operator' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ fallback_outcome: 'fail_node' }), [], choices)).toContain('Unknown');
@@ -254,10 +256,29 @@ describe('global interrupt rules', () => {
     expect(globalRuleScopeGroups({ execution_groups: ['a', 'b'] })).toEqual(['a', 'b']);
     expect(globalRuleProblem(withRule({ idle_behaviour: 'pause' }), [], choices)).toContain('latch or ignore');
     expect(globalRuleProblem(withRule({ on_trip: 'full_stop', idle_behaviour: 'ignore' }), [], choices)).toBeNull();
-    // A gate always gates: idle behaviour belongs to Full Stop only.
+    expect(globalRuleProblem(withRule({ on_trip: 'notify', idle_behaviour: 'latch' }), [], choices)).toContain('full_stop only');
+    expect(globalRuleProblem(withRule({ on_trip: 'notify', stop_entry_stage_id: 'stage.one' }), [], choices))
+      .toContain('does not apply to on_trip notify');
+    // Only Full Stop has an idle behaviour.
     expect(globalRuleProblem(withRule({ idle_behaviour: 'ignore' }), [], choices)).toContain('full_stop only');
     expect(globalRuleProblem(withRule({ condition: { compare: { operand, op: '>', value: true } } }), [], choices))
       .toContain('does not apply');
+  });
+
+  it('includes notify in the typed global rule reaction', () => {
+    const rule: GlobalInterruptRule = {
+      rule_id: 'signal_notice',
+      condition: {
+        compare: {
+          operand: { signal: { controllable_component_id: 'station', signal_name: 'part_present' } },
+          op: '==',
+          value: true,
+        },
+      },
+      scope: 'all_motion',
+      on_trip: 'notify',
+    };
+    expect(rule.on_trip).toBe('notify');
   });
 });
 

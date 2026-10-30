@@ -240,6 +240,22 @@ def _require_admitted_program(value: Mapping[str, Any]) -> None:
         )
 
 
+def _preparer_cause(output: bytes) -> dict[str, str]:
+    """`{"cause_code": code}` of a typed preparer refusal, else empty.
+
+    A typed refusal prints only that object on stdout; an untyped one nothing.
+    """
+
+    try:
+        cause = json.loads(output.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError):
+        return {}
+    code = cause.get("cause_code") if isinstance(cause, dict) else None
+    if isinstance(code, str) and code:
+        return {"cause_code": code}
+    return {}
+
+
 def _read_stored_prepared_activation(
     activation_root: Path, prepared_activation_id: str
 ) -> bytes:
@@ -660,7 +676,10 @@ class ActivationPreparer:
                 raise HeadlessApiError(
                     "activation_preparation_failed",
                     "Activation preparation failed",
-                    details={"preparer_detail": detail[:4096]},
+                    details={
+                        "preparer_detail": detail[:4096],
+                        **_preparer_cause(output),
+                    },
                 )
             try:
                 receipt = json.loads(output.decode("utf-8", errors="strict"))

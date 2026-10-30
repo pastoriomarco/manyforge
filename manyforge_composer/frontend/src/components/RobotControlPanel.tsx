@@ -7,9 +7,13 @@ import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import {
   isCapabilityCommandReceipt,
   manualOperationRequiresRecovery,
+  MAX_CLEARANCE_M,
   operationStateIsTerminal,
   quaternionFromRpyDegrees,
   robotControlHasActiveOperation,
+  directControlTcpDisabledReason,
+  selectedTcpOf,
+  visibleRobotControlTcps,
   robotControlHasLocalDraft,
   robotControlPreviewApprovable,
   rpyDegreesFromQuaternion,
@@ -20,6 +24,7 @@ import type {
   RobotControlPhase,
 } from '../state/robotControl';
 import type { Pose3Value } from '../types/robotControl';
+import { tcpEntryIdentityKey } from '../types/robotControl';
 import type { LogicalSceneProjection, ProgramTreeNode } from '../types/api';
 import {
   boundProgramTargetRoleIds,
@@ -222,7 +227,7 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   const settings = state.motionSettings;
   const cartesian = state.mode === 'cartesian_path';
   type MotionSettingField = {
-    key: Exclude<keyof ManualMotionSettings, 'jointLimits'>;
+    key: Exclude<keyof ManualMotionSettings, 'jointLimits' | 'clearanceM'>;
     label: string; fullLabel: string; unit: string; factor: number; step: number;
     min?: number; max?: number;
   };
@@ -268,6 +273,18 @@ function ManualMotionSettingsControls({ controller, disabled }: {
         {advancedFields.length > 0 && <div className="robot-control-advanced-settings-grid">
           {advancedFields.map(settingControl)}
         </div>}
+        <div className="robot-control-advanced-settings-grid">
+          <label title="Collision clearance (mm) for manual moves. Empty keeps the applied Deployment clearance; 0 turns it off for these moves.">
+            <span>Clearance (mm)</span>
+            <RobotNumberInput label="Manual collision clearance (mm)"
+              value={settings.clearanceM === null ? null : settings.clearanceM * 1000}
+              min={0} max={MAX_CLEARANCE_M * 1000} step={0.5} disabled={disabled} limitUnit="mm"
+              hint="Collision clearance (mm) for manual moves; empty keeps the applied Deployment clearance."
+              onCommit={(value) => editMotionSettings({ clearanceM: value / 1000 })} />
+          </label>
+          <button type="button" disabled={disabled || settings.clearanceM === null}
+            onClick={() => editMotionSettings({ clearanceM: null })}>Use Deployment clearance</button>
+        </div>
         <h5>Joint limits</h5>
         <div className="robot-control-joint-settings-grid">
           <span>Joint</span><span>Velocity (deg/s)</span><span>Acceleration (deg/s²)</span>
@@ -324,6 +341,7 @@ export function RobotControlPanelView({
   const { angularStepDeg, linearStepM, space: tcpTransformSpace } = gizmo.settings;
   const tcpTransformMode = gizmo.settings.mode === 'scale' ? 'translate' : gizmo.settings.mode;
   const [coordinateStep, setCoordinateStep] = useState(0.01);
+  const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
   const [moveSourceGroup, setMoveSourceGroup] = useState<MoveToSource['group'] | ''>('');
   const [previewInfoOpen, setPreviewInfoOpen] = useState(false);
   const [dismissedPreviewNotice, setDismissedPreviewNotice] = useState<string | null>(null);
@@ -370,23 +388,33 @@ export function RobotControlPanelView({
   const gripper = status?.directControlGripper ?? null;
   // Null for a component without motion (gripper-only, H1a-IF.2).
   const motion = status?.directControl ?? null;
+  const selectedTcp = motion === null ? null : selectedTcpOf(motion);
+  // B1: no end-effector TCP and no TCP picked.
+  const noTcp = motion !== null && motion.tcpFrameRoleId === null;
   const observedMotion = status?.observedMotion ?? null;
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
   const inputResetKey = [status?.ownerEpoch, motion?.programBindingId,
+    motion?.tcpTargetRoleId, motion?.tcpFrameRoleId, motion?.selectedTcpEntryKey,
     gripper?.programBindingId,
     status?.retainedBundleId, status?.graphRevision, programActive,
     state.selectedControllableComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
     state.mode, inputRebase].join('\u0000');
   const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
   const operationActive = robotControlHasActiveOperation(state);
-  const active = operationActive || !controller.manualControlAllowed;
+  const tcpBlocksCartesian = controller.tcpApplying && (state.mode === 'pose_goal' || state.mode === 'cartesian_path'
+    || (state.mode === 'move_to' && state.moveToKind === 'pose'));
+  const active = operationActive || !controller.manualControlAllowed || tcpBlocksCartesian;
   const authoringBlocked = active || state.operation?.resident === true;
   const previewNoticeKey = [status?.ownerEpoch, state.generation, state.error, state.previewIssue].join('\u0000');
   const expectedTargetRejection = state.previewIssue != null;
   const previewRejectionLabel = expectedTargetRejection ? 'Target not executable' : 'Preview unavailable';
-  const canApprove = controller.manualControlAllowed && !state.poseDragging && pendingInputs.size === 0
+  const tcpActionUnavailable = state.mode !== 'joint' && state.mode !== 'gripper'
+    && !(state.mode === 'move_to' && state.moveToKind === 'joint')
+    && (selectedTcp === null || directControlTcpDisabledReason(selectedTcp) !== null);
+  const canApprove = controller.manualControlAllowed && !tcpBlocksCartesian && !state.poseDragging && pendingInputs.size === 0
+    && !tcpActionUnavailable
     && robotControlPreviewApprovable(state);
   const canRevert = !active && (
     state.phase !== 'idle'
@@ -432,7 +460,7 @@ export function RobotControlPanelView({
       >{controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}</button>
     </>
   );
-  const presentedPose = robotControlHasLocalDraft(state) || observedMotion === null
+  const presentedPose = robotControlHasLocalDraft(state) || observedMotion?.currentTcpPose == null
     ? state.draftPose : observedMotion.currentTcpPose;
   const rpy = rpyDegreesFromQuaternion(presentedPose.orientation);
   const applied = program?.state.applied ?? null;
@@ -441,9 +469,14 @@ export function RobotControlPanelView({
     && applied?.retainedBundleId === status?.retainedBundleId ? applied?.program : null;
   const moveSources = useMemo<MoveToSource[]>(() => {
     if (status === null || motion === null || observedMotion === null) return [];
+    // Move To is unavailable without a TCP (B1).
+    const tcpFrameRoleId = motion.tcpFrameRoleId;
+    const currentTcpPose = observedMotion.currentTcpPose;
+    if (tcpFrameRoleId === null) return [];
     const planningCapabilities = motion.targetDescriptor.contracts
       .supportingProviders.map((provider) => provider.capabilityId);
-    const poseAvailable = planningCapabilities.includes('planning.motion.pose_goal');
+    const poseAvailable = currentTcpPose !== null
+      && planningCapabilities.includes('planning.motion.pose_goal');
     const jointAvailable = planningCapabilities.includes('planning.motion.joint_goal');
     const sources: MoveToSource[] = [];
     const boundTargetRoles = new Set(boundProgramTargetRoleIds(
@@ -456,9 +489,7 @@ export function RobotControlPanelView({
         position: [0, 0, 0],
         quaternion: [0, 0, 0, 1],
       }],
-      [motion.tcpFrameRoleId, observedPose(
-        observedMotion.currentTcpPose,
-      )],
+      ...(currentTcpPose === null ? [] : [[tcpFrameRoleId, observedPose(currentTcpPose)] as [string, PoseTuple]]),
     ]);
     const sceneResourcePoses = new Map<string, PoseTuple>();
     if (controlBasePoseInCell !== null) {
@@ -479,13 +510,13 @@ export function RobotControlPanelView({
         }
       }
     }
-    if (poseAvailable) {
+    if (poseAvailable && currentTcpPose !== null) {
       sources.push({
         id: 'observed:tcp',
         label: `Current ${motion.commandTargetId} TCP`,
         kind: 'pose',
         group: 'current',
-        pose: observedPose(observedMotion.currentTcpPose),
+        pose: observedPose(currentTcpPose),
       });
       for (const frame of motion.targetDescriptor.frames) {
         const pose = frame.frameRoleId === motion.baseFrameRoleId
@@ -493,9 +524,18 @@ export function RobotControlPanelView({
               position: [0, 0, 0] as [number, number, number],
               quaternion: [0, 0, 0, 1] as [number, number, number, number],
             }
-          : frame.frameRoleId === motion.tcpFrameRoleId
-            ? observedPose(observedMotion.currentTcpPose)
-            : null;
+          : frame.frameRoleId === tcpFrameRoleId
+              && motion.activeTcp?.entry?.componentId === motion.controllableComponentId
+              && motion.activeTcp.entry.targetId === motion.commandTargetId
+            ? observedPose(currentTcpPose)
+            // TCP-C: every other robot TCP's observed pose too.
+            : (() => {
+              const tcp = motion.targetDescriptor.tcps.find((row) => (
+                row.targetRoleId === motion.targetRoleId && row.frameRoleId === frame.frameRoleId));
+              const tcpPose = tcp === undefined
+                ? undefined : observedMotion.tcpPoses[tcpEntryIdentityKey(tcp.entry)];
+              return tcpPose === undefined ? null : observedPose(tcpPose);
+            })();
         if (pose !== null) sources.push({
           id: `frame:${frame.frameRoleId}`,
           label: `Frame · ${frame.frameRoleId} · ${
@@ -633,6 +673,8 @@ export function RobotControlPanelView({
     if (mode === 'gripper') return gripper !== null;
     // Motion modes need a selected motion target (none for gripper-only).
     if (motion === null) return false;
+    // Without a TCP, joint jog only (B1, C-P2).
+    if (mode !== 'joint' && noTcp) return false;
     if (mode === 'move_to') {
       return motion.targetDescriptor.contracts.supportingProviders.some((provider) => (
         provider.capabilityId === 'planning.motion.pose_goal'
@@ -683,11 +725,26 @@ export function RobotControlPanelView({
     : observedGripperPosition ?? state.draftGripperPosition;
   const selectedTools = controller.gripperTargets.filter((target) => (
     status !== null
-      && target.controllableComponentId
-        === (motion ?? gripper)?.controllableComponentId
+      && target.controllableComponentId === (state.mountedToolByRobot[state.selectedControllableComponentId ?? '']
+        ?? (motion ?? gripper)?.controllableComponentId)
   ));
   const targetLabel = (target: { commandTargetId: string; controllableComponentId: string }) =>
     `${target.controllableComponentId} · ${target.commandTargetId}`;
+  // A tool mounted on a robot is its own component: each component without a
+  // motion target is offered next to the robots, by its gripper target.
+  const targetChoices = [
+    ...controller.motionTargets.map((target) => ({
+      target, value: `${target.controllableComponentId}\u0000${target.commandTargetId}`,
+    })),
+    ...[...new Map(controller.gripperTargets
+      .filter((target) => !controller.motionTargets.some((candidate) => (
+        candidate.controllableComponentId === target.controllableComponentId
+        || state.mountedToolByRobot[candidate.controllableComponentId] === target.controllableComponentId
+      )))
+      .map((target) => [target.controllableComponentId, {
+        target, value: `${target.controllableComponentId}\u0000`,
+      }] as const)).values()],
+  ];
 
   return (
     <RobotInputContext.Provider value={inputContext}>
@@ -756,7 +813,7 @@ export function RobotControlPanelView({
           )}
           {controller.motionTargets.length > 0 && (
             <div className="robot-control-target-selectors" aria-label="Direct control target">
-              {controller.motionTargets.length > 1 && (
+              {targetChoices.length > 1 && (
                 <label>
                   <span>Robot</span>
                   <select
@@ -767,19 +824,18 @@ export function RobotControlPanelView({
                       const [controllableComponentId, motionTargetId] = event.currentTarget.value.split('\u0000');
                       if (controllableComponentId !== undefined && motionTargetId !== undefined) {
                         controller.selectRobot(controllableComponentId, motionTargetId);
+                        // A tool has only its gripper target.
+                        if (motionTargetId === '') controller.selectMode('gripper');
                       }
                     }}
                   >
-                    {controller.motionTargets.map((target) => (
-                      <option
-                        key={`${target.controllableComponentId}\u0000${target.commandTargetId}`}
-                        value={`${target.controllableComponentId}\u0000${target.commandTargetId}`}
-                      >{targetLabel(target)}</option>
+                    {targetChoices.map(({ target, value }) => (
+                      <option key={value} value={value}>{targetLabel(target)}</option>
                     ))}
                   </select>
                 </label>
               )}
-              {controller.motionTargets.length === 1 && (
+              {targetChoices.length === 1 && (
                 <span className="robot-control-target-identity" title="The only addressed robot currently offered by the execution owner.">
                   <span>Robot</span>
                   <code>{(motion ?? gripper) === null ? '' : targetLabel((motion ?? gripper)!)}</code>
@@ -815,6 +871,55 @@ export function RobotControlPanelView({
                   <span>No qualified attached tool</span>
                 </span>
               )}
+              {state.mode !== 'gripper' && motion !== null && motion.activeTcp !== null
+                && (motion.targetDescriptor.tcps.length > 1 || (noTcp && motion.targetDescriptor.tcps.length > 0)) && (
+                <label title="Sets this robot's Active TCP. TCPs of tools on other robots are listed with the reason they can't be used here.">
+                  <span>TCP</span>
+                  <select
+                    aria-label="Robot Control TCP"
+                    value={selectedTcp === null ? '' : tcpEntryIdentityKey(selectedTcp.entry)}
+                    disabled={controller.tcpApplying || operationActive}
+                    onChange={(event) => controller.selectTcp(event.currentTarget.value)}
+                  >
+                    {noTcp && <option value="" disabled>No End-effector TCP; choose one</option>}
+                    {visibleRobotControlTcps(motion, showOtherRobotTcps).map((tcp) => {
+                      const disabledReason = directControlTcpDisabledReason(tcp);
+                      const key = tcpEntryIdentityKey(tcp.entry);
+                      return <option key={key} value={key}
+                        title={disabledReason ?? undefined}>
+                        {tcp.qualifiedName}{tcp.isDefault ? ' (default)' : ''}
+                        {disabledReason === null ? '' : ` — ${disabledReason}`}
+                      </option>;
+                    })}
+                  </select>
+                </label>
+              )}
+              {state.mode !== 'gripper' && motion !== null && motion.activeTcp !== null && motion.targetDescriptor.tcps.some((tcp) => tcp.mountedElsewhere) && (
+                <label title="Useful only once tool change is implemented: today a TCP whose tool is on another robot is refused when used.">
+                  <input type="checkbox" checked={showOtherRobotTcps}
+                    onChange={(event) => setShowOtherRobotTcps(event.currentTarget.checked)} />
+                  Show TCPs of tools mounted on other robots
+                </label>
+              )}
+              {state.mode !== 'gripper' && controller.tcpApplying && <span role="status">Applying…</span>}
+              {state.mode !== 'gripper' && controller.tcpError !== null && <span role="alert">{controller.tcpError}</span>}
+              {state.mode !== 'gripper' && motion !== null && motion.activeTcp !== null && motion.targetDescriptor.tcps.length === 1 && !noTcp && (
+                <span className="robot-control-target-identity" title="The robot's only TCP.">
+                  <span>TCP</span>
+                  <code>{motion.activeTcp?.display}</code>
+                  {directControlTcpDisabledReason(motion.targetDescriptor.tcps[0]) !== null && (
+                    <span className="robot-control-target-unavailable" role="status">
+                      {directControlTcpDisabledReason(motion.targetDescriptor.tcps[0])}
+                    </span>
+                  )}
+                </span>
+              )}
+              {state.mode !== 'gripper' && selectedTcp !== null
+                && observedMotion !== null && observedMotion.currentTcpPose === null && (
+                <span className="robot-control-target-identity" aria-label="Selected TCP pose">
+                  <span>TCP pose</span><code>—</code>
+                </span>
+              )}
             </div>
           )}
           <nav className="robot-control-modes dseg" aria-label="Manual control mode">
@@ -831,6 +936,14 @@ export function RobotControlPanelView({
               </button>
             ))}
           </nav>
+          {state.mode !== 'gripper' && motion?.activeTcp === null && (
+            <p className="robot-control-pose-note hint" role="status">Robot status unavailable.</p>
+          )}
+          {state.mode !== 'gripper' && motion?.activeTcp != null && motion.tcpFrameRoleId === null && (
+            <p className="robot-control-pose-note hint" role="status">
+              {`No TCP: joint jog only.${motion.targetDescriptor.tcps.length > 0 ? ' Choose a TCP for Cartesian moves.' : ''}`}
+            </p>
+          )}
 
           <div
             className="robot-control-step-controls"
@@ -1151,7 +1264,9 @@ export function RobotControlPanelView({
                           }`;
                     })()}</code>.{' '}
                     {state.mode === 'cartesian_path'
-                      ? 'The current owner-issued TCP pose is the explicit first waypoint.'
+                      ? observedMotion?.currentTcpPose == null
+                        ? 'The current TCP pose is unavailable. Select a TCP with a reported pose to preview a Cartesian path.'
+                        : 'The current owner-issued TCP pose is the explicit first waypoint.'
                       : 'Pose planning chooses a valid joint-space realization.'}
                   </p>
                   </>)}

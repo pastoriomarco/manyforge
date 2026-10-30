@@ -29,6 +29,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 import { NodePaletteItem } from './NodePaletteItem';
 import {
+  executionAvailability,
   ProgramNodePalette,
   defaultCollapsedCatalogCategories,
 } from './ProgramNodePalette';
@@ -112,6 +113,7 @@ const environment: NodeEnvironmentResponse = {
     executablePackageId: 'manyforge_behavior',
     authoringAvailable: true,
     executionAvailable: false,
+    reasons: [],
     reasonCodes: ['native_program_product_unavailable'],
     restorationGates: ['N7'],
   })),
@@ -329,6 +331,7 @@ describe('Program authoring panels', () => {
       implementations: environment.implementations.map((row) => ({
         ...row,
         executionAvailable: true,
+        reasons: [],
         reasonCodes: [],
         restorationGates: [],
       })),
@@ -357,6 +360,100 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('execution available');
     expect(markup).not.toContain('Execution available for the current binding');
     expect(markup).not.toContain('Executable when configured');
+  });
+
+  it('shows typed Deployment availability reasons and keeps nodes authorable', () => {
+    const modelQuery: CatalogEntry = {
+      ...timer,
+      id: 'assistant.query_model',
+      name: 'Query model',
+      category: sequence.category,
+    };
+    const modelReason = {
+      code: 'model_not_configured',
+      message: 'No model is configured',
+      details: {},
+    };
+    const missingCapability = {
+      code: 'capability_not_offered',
+      message: 'No component offers tool.gripper.command',
+      details: { capability: 'tool.gripper.command' },
+    };
+    const modelEnvironment: NodeEnvironmentResponse = {
+      ...environment,
+      implementations: [
+        ...environment.implementations.filter((row) => row.nodeId !== modelQuery.id),
+        {
+          nodeId: modelQuery.id,
+          engineId: 'py_trees',
+          implementationId: 'assistant_query_model_v1',
+          executablePackageId: 'manyforge_behavior',
+          authoringAvailable: true,
+          executionAvailable: false,
+          reasons: [modelReason],
+          reasonCodes: ['model_not_configured'],
+          restorationGates: [],
+        },
+      ],
+    };
+    const gripperNode: CatalogEntry = {
+      ...timer,
+      id: 'gripper.command',
+      name: 'Command gripper',
+      requiredCapabilities: [{
+        capabilityId: 'tool.gripper.command',
+        scope: 'component',
+        effectful: true,
+      }],
+    };
+    const gripperEnvironment: NodeEnvironmentResponse = {
+      ...environment,
+      implementations: [
+        ...environment.implementations.filter((row) => row.nodeId !== gripperNode.id),
+        {
+          nodeId: gripperNode.id,
+          engineId: 'py_trees',
+          implementationId: 'gripper_command_v1',
+          executablePackageId: 'manyforge_behavior',
+          authoringAvailable: true,
+          executionAvailable: false,
+          reasons: [missingCapability],
+          reasonCodes: ['capability_not_offered'],
+          restorationGates: [],
+        },
+      ],
+    };
+
+    expect(executionAvailability(modelQuery, modelEnvironment)).toEqual({
+      available: false,
+      note: 'Authorable · unavailable · No model configured',
+    });
+    expect(executionAvailability(gripperNode, gripperEnvironment)).toEqual({
+      available: false,
+      note: 'Authorable · unavailable · Required capability unavailable (tool.gripper.command)',
+    });
+
+    const expandedPaletteEnvironment: NodeEnvironmentResponse = {
+      ...modelEnvironment,
+      implementations: modelEnvironment.implementations.map((row) => (
+        row.nodeId === sequence.id
+          ? { ...row, executionAvailable: true, reasons: [], reasonCodes: [], restorationGates: [] }
+          : row
+      )),
+    };
+    const markup = renderToStaticMarkup(
+      <ProgramNodePalette
+        roots={[tree]}
+        catalogEntries={[sequence, modelQuery]}
+        catalogIdentity={null}
+        environment={expandedPaletteEnvironment}
+        busy={false}
+        onMutate={vi.fn()}
+      />,
+    );
+    expect(markup).toContain('Query model; double-click or drag to add');
+    expect(markup).toContain('draggable="true"');
+    expect(markup).toContain('node-info-button execution-unavailable');
   });
 
   it('exposes templates and contact policy authoring as Draft-only surfaces', () => {
@@ -427,7 +524,7 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Selected motion endpoint');
   });
 
-  it('renders one declared qualified TCP endpoint selector', () => {
+  it('renders the three portable TCP selector forms', () => {
     const entry: CatalogEntry = {
       ...timer,
       id: 'motion.move_to_pose',
@@ -439,8 +536,8 @@ describe('Program authoring panels', () => {
         { id: 'tcp_endpoint', required: true, hasDefault: false,
           schema: {
             type: 'object', additionalProperties: false,
-            required: ['target_role', 'frame_role'],
-            properties: { target_role: { type: 'string' }, frame_role: { type: 'string' } },
+            required: ['kind', 'target_role', 'frame_role'],
+            properties: { kind: { type: 'string' }, target_role: { type: 'string' }, frame_role: { type: 'string' } },
           }, schemaHash: 'sha256:tcp-endpoint' },
       ],
     };
@@ -449,7 +546,7 @@ describe('Program authoring panels', () => {
       instance_id: 'move',
       parameters: {
         target_role: 'arm', base_frame_role: 'base',
-        tcp_endpoint: { target_role: 'arm', frame_role: 'tcp' },
+        tcp_endpoint: { kind: 'entry', target_role: 'arm', frame_role: 'tcp' },
       },
       children: [],
     };
@@ -471,18 +568,15 @@ describe('Program authoring panels', () => {
     />);
 
     expect(markup).toContain('aria-label="Motion TCP endpoint"');
-    expect(markup).toContain(
-      'same physical component as the motion target; this is checked when the motion starts',
-    );
-    expect(markup).not.toContain('Apply checks that the endpoint shares');
-    expect(markup).toContain(
-      'Current-pose capture is available when the selected endpoint matches the robot’s current TCP.',
-    );
+    expect(markup).toContain('Moves: arm');
+    expect(markup).toContain('Current');
+    expect(markup).toContain('Default TCP of tool');
+    expect(markup).toContain('Show TCPs of tools mounted on other robots');
     expect(markup).toContain('arm · tcp');
     expect(markup).toContain('tool · jaw_contact');
     expect(node.parameters).toEqual({
       target_role: 'arm', base_frame_role: 'base',
-      tcp_endpoint: { target_role: 'arm', frame_role: 'tcp' },
+      tcp_endpoint: { kind: 'entry', target_role: 'arm', frame_role: 'tcp' },
     });
   });
 
@@ -1396,6 +1490,7 @@ describe('Program authoring panels', () => {
       selectionPending: [],
       controlPending: null,
         error: null,
+        errorRefusal: null,
       },
       cycleState: null,
       cycleFailure: null,
@@ -1591,6 +1686,7 @@ describe('Program authoring panels', () => {
       selectionPending: [],
       controlPending: null,
         error: null,
+        errorRefusal: null,
       },
       cycleState: 'idle_after_reset',
       cycleFailure: null,
@@ -1683,5 +1779,53 @@ describe('Program authoring panels', () => {
     expect(settingsSource).toContain(
       'currentScenario.programBindingId === appliedBinding.program_binding_id',
     );
+  });
+});
+
+describe('Set TCP source transition', () => {
+  it('restores Current after a key-only selector with no saved literal', () => {
+    const node: ProgramTreeNode = {
+      node_id: 'motion.set_tcp', instance_id: 'set', parameters: { target_role: 'arm' },
+      value_sources: { tcp: { kind: 'blackboard_key', reference: 'active_tcp.arm' } },
+      children: [],
+    };
+    const field = {
+      id: 'tcp', required: true, hasDefault: false,
+      schema: { type: 'object' }, schemaHash: 'sha256:tcp',
+    };
+    const restored = typeValuesTransition(node, 'tcp', field, []);
+    expect(restored).toEqual({ transition: { kind: 'type_values', literal: { kind: 'current' } } });
+    if ('transition' in restored) {
+      const mutation = buildProgramParameterMutation(node, 'tcp', restored.transition);
+      expect(mutation.args.parameters).toEqual({ target_role: 'arm', tcp: { kind: 'current' } });
+      expect(mutation.args.value_sources).toEqual({});
+    }
+  });
+});
+
+describe('Set TCP source control', () => {
+  it('shows the key source chip for an authored tcp_entry source', () => {
+    const entry: CatalogEntry = {
+      ...timer, id: 'motion.set_tcp',
+      parameters: [{ id: 'tcp', required: true, hasDefault: false,
+        schema: { type: 'object' }, schemaHash: 'sha256:tcp' }],
+      requiredCapabilities: [],
+    };
+    const node: ProgramTreeNode = {
+      node_id: entry.id, instance_id: 'set', parameters: { target_role: 'arm' },
+      value_sources: { tcp: { kind: 'blackboard_key', reference: 'active_tcp.arm' } },
+      children: [],
+    };
+    const program: ProgramAuthoringDocument = {
+      ...authoringProgram([node]),
+      target_roles: { arm: { component_role: 'robot', required_capabilities: [
+        { capability_id: 'execution.trajectory.execute', parameters: {}, disposition: 'required' },
+      ] } },
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="set" catalogEntries={[entry]} program={program}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
+    expect(markup).toContain('key.active_tcp.arm');
+    expect(markup).not.toContain('must be a literal selection');
   });
 });

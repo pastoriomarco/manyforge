@@ -32,11 +32,6 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(
              CanonicalCodecValue(encoded, "scene transaction request")},
         }));
     RequireExactObjectSize(response, 10U, "Manager scene commit response");
-    Require(Text(response, "request_id") ==
-                    request.request_context.request_id.value() &&
-                Text(response, "request_owner_epoch") ==
-                    request.request_context.request_owner_epoch.value(),
-            "Manager scene commit response changed request identity");
     std::optional<core::ErrorDTO> error;
     const auto &encoded_error = Member(response, "error");
     if (!std::holds_alternative<std::nullptr_t>(encoded_error.storage())) {
@@ -74,16 +69,6 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(
         update_status};
     Require(result.presence_valid(),
             "Manager scene commit response is internally inconsistent");
-    if (result.success) {
-      Require(
-          result.committed_projection_revision->retained_bundle_id ==
-                  request.expected_projection_revision.retained_bundle_id &&
-              result.committed_projection_revision->graph_revision ==
-                  request.expected_projection_revision.graph_revision &&
-              result.committed_projection_revision->scene_revision.scene_id ==
-                  request.expected_projection_revision.scene_revision.scene_id,
-          "Manager scene commit changed structural or scene-lineage identity");
-    }
     return result;
   }
 
@@ -176,16 +161,12 @@ ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
           DecodeManagerError(Member(response, "error")));
     }
     RequireExactObjectSize(response, 4U, "Manager scene pose response");
-    Require(core::ProjectionIsSameOrForwardInLineage(
-                DecodeProjectionRevision(Member(response, "projection_revision")),
-                current.projection_revision),
-            "Manager scene pose response changed projection identity");
+    static_cast<void>(
+        DecodeProjectionRevision(Member(response, "projection_revision")));
     const auto &poses = Array(response, "poses");
     Require(poses.size() == 1U, "Manager scene pose response is incomplete");
     const auto &row = poses.front();
     RequireExactObjectSize(row, 2U, "Manager scene pose row");
-    Require(Text(row, "scene_resource_id") == scene_resource_id.value(),
-            "Manager scene pose response changed resource identity");
     const auto &pose = Member(row, "pose_in_cell");
     RequireExactObjectSize(pose, 2U, "Manager scene pose");
     const auto &position = Member(pose, "position_m");
@@ -275,9 +256,10 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
         }
         RequireExactObjectSize(response, 10U,
                                "Manager before-planning latch response");
-        RequireRuntimeIdentity(Member(response, "runtime_identity"));
-        const auto initial = DecodeProjectionRevision(
-            Member(response, "initial_projection_revision"));
+        RequireExactObjectSize(Member(response, "runtime_identity"), 5U,
+                               "Manager scene-runtime latch identity");
+        static_cast<void>(DecodeProjectionRevision(
+            Member(response, "initial_projection_revision")));
         const auto projection =
             DecodeProjectionRevision(Member(response, "projection_revision"));
         const auto latched = Counter(response, "latched_observation_count", 0U);
@@ -289,11 +271,8 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
             Counter(response, "skipped_attached_observation_count", 0U);
         static_cast<void>(
             Counter(response, "scene_runtime_source_generation", 1U));
-        Require(core::ProjectionIsSameOrForwardInLineage(projection, initial) &&
-                    projection.retained_bundle_id == retained_bundle_id_ &&
-                    projection.graph_revision == graph_revision_ &&
-                    latched == committed + already_applied + skipped_attached,
-                "Manager before-planning latch response crossed its request");
+        Require(latched == committed + already_applied + skipped_attached,
+                "Manager before-planning latch response counts are inconsistent");
         for (std::size_t convergence_attempt = 0U;
              convergence_attempt < kPlanningSceneSynchronizationAttempts;
              ++convergence_attempt) {
@@ -339,17 +318,5 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
         {"retained_bundle_id", CanonicalValue(retained_bundle_id_.value())},
         {"runtime_generation", CanonicalValue(generation)},
     });
-  }
-
-void ManagerPlanningSceneSynchronizer::RequireRuntimeIdentity(const CanonicalValue &value) const {
-    RequireExactObjectSize(value, 5U, "Manager scene-runtime latch identity");
-    Require(Text(value, "retained_bundle_id") == retained_bundle_id_.value() &&
-                Text(value, "graph_revision") == graph_revision_.value() &&
-                Counter(value, "deployment_generation", 1U) ==
-                    publication_generation_.value() &&
-                Counter(value, "program_generation", 0U) == 0U &&
-                Counter(value, "runtime_generation", 1U) ==
-                    publication_generation_.value(),
-            "Manager scene-runtime latch identity changed");
   }
 } // namespace manyforge::roboplan_backend::host_detail

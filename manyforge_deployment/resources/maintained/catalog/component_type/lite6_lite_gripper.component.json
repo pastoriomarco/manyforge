@@ -89,6 +89,7 @@
         }
       ],
       "command_target_id": "arm",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "base",
@@ -96,9 +97,16 @@
           "model_role_id": "arm_model"
         },
         {
+          "asset_frame_role_id": "flange",
+          "frame_role_id": "flange",
+          "model_role_id": "arm_model",
+          "tcp": true
+        },
+        {
           "asset_frame_role_id": "tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -149,6 +157,7 @@
         }
       ],
       "command_target_id": "gripper",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "gripper_tcp",
@@ -156,7 +165,8 @@
             "gripper_fingers"
           ],
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -181,7 +191,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "lite6_lite_gripper.component",
-  "component_type_revision": "sha256:4808bd5d97c2c7c6761701aa8090cadc078dc217ab7563e2b235c963a41308ca",
+  "component_type_revision": "sha256:7894b6a7cc51dc614f8586bccb0e5771c01154682b37ff552e336d9fe367bf56",
   "model_mounts": [],
   "model_roles": [
     {

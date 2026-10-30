@@ -8,6 +8,7 @@ import {
   motionInterlockMessage,
   operatorAlarmView,
   nonBlockingAttentionAlarms,
+  partitionRepresentedAlarms,
   redAcknowledgementMembers,
   runtimeAttentionSummary,
   runtimeErrorItemCount,
@@ -40,6 +41,30 @@ describe('headless Composer presentation adapters', () => {
       id: 'recovery.cell', severity: 'error', domain: 'recovery',
       title: 'Cell recovery required', message: 'physical rest unproven.',
     }])).toBe('Cell recovery required · physical rest unproven.');
+  });
+
+  it('shows a lifecycle-fault alarm inside the incident item only for that component (ERRUI)', () => {
+    const lifecycle = (subjectId: string): OperatorAlarmRecord => ({
+      conditionId: `condition-${subjectId}`, activationId: `activation-${subjectId}`,
+      recordRevision: 1, activatedAtNs: 100,
+      definitionId: 'manyforge.runtime.component_lifecycle_fault',
+      lifecycleState: 'active_unacknowledged', active: true, acknowledged: false,
+      priority: 'high', alarmClass: 'runtime_health', title: 'Controlled-component lifecycle fault',
+      message: `Lifecycle fault on ${subjectId}`, consequence: '', operatorResponse: '',
+      occurrenceCount: 1, acknowledgementRequired: true, requiresMotionAttention: true,
+      subject: { subjectKind: 'controllable_component', subjectId, resourceIds: [] }, details: {},
+    });
+    const incident = {
+      id: 'recovery.cell', severity: 'error' as const, domain: 'recovery' as const,
+      title: 'Open incident on lite6_robot', message: 'Press Recover cell.',
+      alarmDefinitionIds: ['manyforge.motion.stop_fault'],
+      alarmSubjects: [{ definitionId: 'manyforge.runtime.component_lifecycle_fault', subjectId: 'lite6_robot' }],
+    };
+    const { standalone, represented } = partitionRepresentedAlarms(
+      [lifecycle('lite6_robot'), lifecycle('gripper')], [incident],
+    );
+    expect(represented.get('recovery.cell')?.map((alarm) => alarm.subject.subjectId)).toEqual(['lite6_robot']);
+    expect(standalone.map((alarm) => alarm.subject.subjectId)).toEqual(['gripper']);
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {

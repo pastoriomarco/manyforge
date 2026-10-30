@@ -1,20 +1,65 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.8.0
+content_version: 2.9.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:5ffd4dac211459905977367414bfb7684842045ee4b32c5cb3da5f513a03d134
+catalog_digest: sha256:cb77330e3362a78d9ac74177a486a3a60a8c2e20c42105b6bac8dd7f9474791c
 schema_types:
-  motion_endpoint_ref:
+  tcp_selector:
     type: object
     additional_properties: false
     required:
-    - target_role
-    - frame_role
+    - kind
     properties:
+      kind:
+        type: enum
+        values:
+        - current
+        - default_of_role
+        - entry
+      role:
+        type: string
+        semantic_type: target_role
+        required_when:
+          kind: default_of_role
+        allowed_when:
+          kind: default_of_role
       target_role:
         type: string
         semantic_type: target_role
+        required_when:
+          kind: entry
+        allowed_when:
+          kind: entry
       frame_role:
+        type: string
+        semantic_type: frame_role
+        required_when:
+          kind: entry
+        allowed_when:
+          kind: entry
+  active_tcp_carrier_frame:
+    type: object
+    additional_properties: false
+    required:
+    - kind
+    properties:
+      kind:
+        type: enum
+        values:
+        - active_tcp
+  tcp_entry:
+    type: object
+    additional_properties: false
+    required:
+    - component_id
+    - target_id
+    - frame_role_id
+    properties:
+      component_id:
+        type: string
+      target_id:
+        type: string
+      frame_role_id:
         type: string
         semantic_type: frame_role
   coordinate_position:
@@ -862,8 +907,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
     schema_ref: '#/schema_types/joint_target_list'
@@ -906,6 +953,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: clearance_m
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 0.05
   - id: per_joint_dynamics_limits
     required: false
     default: {}
@@ -1075,8 +1129,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
     schema_ref: '#/schema_types/motion_pose'
@@ -1125,6 +1181,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: clearance_m
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 0.05
   - id: per_joint_dynamics_limits
     required: false
     default: {}
@@ -1294,8 +1357,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: path
     required: true
     schema_ref: '#/schema_types/cartesian_path'
@@ -1394,6 +1459,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: clearance_m
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 0.05
   - id: per_joint_dynamics_limits
     required: false
     default: {}
@@ -1562,8 +1634,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -1582,6 +1656,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: clearance_m
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 0.05
   - id: velocity_scale
     required: false
     default: 1.0
@@ -1782,8 +1863,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -1802,6 +1885,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: clearance_m
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
+        max_inclusive: 0.05
   - id: velocity_scale
     required: false
     default: 1.0
@@ -1974,6 +2064,47 @@ entries:
   runners:
     py_trees:
       implementation_id: motion_probe_search_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.set_tcp
+  name: Set TCP
+  category: motion
+  description: Set the robot's Active TCP, the TCP its Current moves use.
+  stability: stable
+  tags:
+  - motion
+  - tcp
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: tcp
+    required: true
+    schema_ref: '#/schema_types/tcp_selector'
+  required_capabilities:
+  - capability_id: execution.trajectory.execute
+    scope: target_binding
+    target_parameter: target_role
+    effectful: true
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: kernel.operation
+  outcomes:
+    success: operation_succeeded
+    failure: operation_failed
+    interrupted: operation_terminal
+  runners:
+    py_trees:
+      implementation_id: motion_set_tcp_v1
   observability:
     event_family: manyforge.program.node
 - id: scene.add_object
@@ -2169,11 +2300,14 @@ entries:
       type: string
       semantic_type: target_role
   - id: carrier_frame_role
-    required: true
+    required: false
     schema:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
+  - id: carrier_frame
+    required: false
+    schema_ref: '#/schema_types/active_tcp_carrier_frame'
   - id: touch_body_roles
     required: true
     schema:
@@ -3917,8 +4051,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: carrier_frame_role
     required: true
     schema:
@@ -4115,8 +4251,10 @@ entries:
       semantic_type: frame_role
       semantic_scope_parameter: target_role
   - id: tcp_endpoint
-    required: true
-    schema_ref: '#/schema_types/motion_endpoint_ref'
+    required: false
+    default:
+      kind: current
+    schema_ref: '#/schema_types/tcp_selector'
   - id: carrier_frame_role
     required: true
     schema:

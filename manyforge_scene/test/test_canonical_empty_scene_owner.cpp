@@ -261,6 +261,9 @@ public:
   enum class LostReply { kNone, kAcquire, kRelease };
   void LoseNextReply(LostReply reply) { lost_reply_ = reply; }
   void RejectNextClaim(ErrorDTO error) { next_rejection_ = std::move(error); }
+  void RunBeforeNextAcquire(std::function<void()> action) {
+    before_next_acquire_ = std::move(action);
+  }
 
   void RefuseApplyClaimLookupAfter(std::size_t successful_reads) {
     std::lock_guard lock(mutex_);
@@ -320,6 +323,9 @@ public:
   [[nodiscard]] core::Result<core::CellAdmissionClaimDTO>
   AcquireCellAdmissionClaim(
       const core::CellAdmissionClaimIntentDTO &intent) override {
+    if (auto action = std::exchange(before_next_acquire_, nullptr)) {
+      action();
+    }
     std::lock_guard lock(mutex_);
     if (next_rejection_.has_value()) {
       return core::Result<core::CellAdmissionClaimDTO>::Err(
@@ -485,6 +491,7 @@ private:
   bool reject_program_reset_scene_authorization_{};
   LostReply lost_reply_{LostReply::kNone};
   std::optional<ErrorDTO> next_rejection_;
+  std::function<void()> before_next_acquire_;
   mutable std::optional<std::size_t> remaining_apply_claim_reads_;
 };
 
@@ -1436,6 +1443,49 @@ TEST(LogicalSceneTransactionCodec, AttachGraspLostBoundIsOptionalAndRoundTrips) 
   refused(R"("detach":true)", R"("detach":"yes")");
 }
 
+TEST(LogicalSceneTransactionCodec, ObjectMassIsAbsentAtZeroAndPositiveWhenPresent) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  auto request = AddBoxRequest(expected, CellId("cell-a"));
+  const auto plain = logical_scene_codec_internal::EncodeRequest(request);
+  // A zero mass is absent, so massless requests keep their bytes.
+  EXPECT_EQ(plain.find("mass_kg"), std::string::npos);
+  EXPECT_DOUBLE_EQ(std::get<core::AddObjectRequestDTO>(
+                       DecodeCanonicalSceneTransactionRequest(plain).operation)
+                       .mass_kg,
+                   0.0);
+  std::get<core::AddObjectRequestDTO>(request.operation).mass_kg = 2.5;
+  const auto heavy = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_NE(heavy.find(R"("mass_kg":2.5)"), std::string::npos);
+  const auto decoded = DecodeCanonicalSceneTransactionRequest(heavy);
+  EXPECT_DOUBLE_EQ(
+      std::get<core::AddObjectRequestDTO>(decoded.operation).mass_kg, 2.5);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded), heavy);
+
+  const auto &add = std::get<core::AddObjectRequestDTO>(request.operation);
+  request.operation = core::UpsertObjectRequestDTO{
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref,
+      add.support_contacts, add.mass_kg};
+  const auto upsert = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_DOUBLE_EQ(std::get<core::UpsertObjectRequestDTO>(
+                       DecodeCanonicalSceneTransactionRequest(upsert).operation)
+                       .mass_kg,
+                   2.5);
+
+  // A present mass must be positive finite numeric data.
+  for (const std::string invalid : {"0", "-1", R"("2.5")", "null"}) {
+    auto text = heavy;
+    const std::string from = R"("mass_kg":2.5)";
+    text.replace(text.find(from), from.size(), R"("mass_kg":)" + invalid);
+    EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(text),
+                 std::invalid_argument)
+        << text;
+  }
+}
+
 TEST(LogicalSceneTransactionCodec,
      CanonicalInternalRequestRoundTripsAndRejectsWireDrift) {
   const ProjectionRevisionDTO expected{
@@ -1594,6 +1644,29 @@ TEST(CanonicalEmptySceneOwner,
   auto missing = request;
   missing.request_context.request_id = core::RequestId("scene-program-missing");
   EXPECT_FALSE(owner.ReadCommitResult(missing).has_value());
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ForeignWriterDuringCommitIsAnIntegrityErrorNotAStaleRequest) {
+  TemporaryDirectory directory("scene-foreign-writer");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  LogicalSceneOwner owner(database_path, admission, publication_reader,
+                          cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  // Commit is the only writer of its store; a commit by another connection
+  // while it runs is reported as a store integrity failure.
+  cell_admission.RunBeforeNextAcquire([&] {
+    ExecuteSql(database_path,
+               "CREATE TABLE test_foreign_writer(value INTEGER)");
+  });
+  EXPECT_THROW(
+      owner.Commit(AddBoxRequest(active, admission.cell_id(), "foreign")),
+      LogicalSceneOwnerIntegrityError);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -5357,6 +5430,8 @@ TEST(CanonicalEmptySceneOwner,
           core::ControllableComponentId("component.1"),
           core::ModelInstanceId("model.1"),
           core::FrameRoleId("tool_frame")};
+  // The object mass rides along the add, attach and both detaches.
+  std::get<core::AddObjectRequestDTO>(add.operation).mass_kg = 1.5;
   const auto added = owner.Commit(add);
   ASSERT_TRUE(added.success)
       << (added.error.has_value() ? added.error->message : "missing error");
@@ -5364,6 +5439,7 @@ TEST(CanonicalEmptySceneOwner,
   active = *added.committed_projection_revision;
   auto snapshot = owner.LogicalSnapshot();
   ASSERT_EQ(snapshot->objects.size(), 1U);
+  EXPECT_DOUBLE_EQ(snapshot->objects.front().mass_kg, 1.5);
   const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
       &snapshot->objects.front().placement);
   ASSERT_NE(fixed, nullptr);
@@ -5454,6 +5530,14 @@ TEST(CanonicalEmptySceneOwner,
       << (attached.error.has_value() ? attached.error->message
                                      : "missing error");
   ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  // The owner preview names the older projection of this Scene and resolves
+  // against the current one, where the attachment already exists.
+  const auto old_projection_preview =
+      owner.PreviewResolvedSceneCandidate(preview_request);
+  ASSERT_FALSE(old_projection_preview.ok());
+  EXPECT_EQ(old_projection_preview.error().code, "scene_object_state_conflict");
+  EXPECT_EQ(old_projection_preview.error().details.at("reason"),
+            "carried_attachment_already_exists");
   // Planning can finish against its already captured input after live Scene
   // truth advances. This pure preview neither commits nor repeats the attach.
   const auto planned_after_live_change = BuildResolvedSceneCandidatePreview(
@@ -5485,6 +5569,12 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(projection.transactions().back().original_request_digest,
             preview.value().request_digest);
   ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+  EXPECT_DOUBLE_EQ(snapshot->objects.front().mass_kg, 1.5);
+  {
+    const auto bytes = EncodeLogicalSceneSnapshot(*snapshot);
+    EXPECT_NE(bytes.find(R"("mass_kg":1.5)"), std::string::npos);
+    EXPECT_EQ(DecodeLogicalSceneSnapshot(bytes), *snapshot);
+  }
   EXPECT_EQ(snapshot->carried_object_attachments.front()
                 .carrier_frame_ref,
             core::SceneFrameRefDTO(core::ComponentSceneFrameRefDTO{
@@ -5557,6 +5647,7 @@ TEST(CanonicalEmptySceneOwner,
   active = *detached_current.committed_projection_revision;
   snapshot = owner.LogicalSnapshot();
   ASSERT_TRUE(snapshot->carried_object_attachments.empty());
+  EXPECT_DOUBLE_EQ(snapshot->objects.front().mass_kg, 1.5);
   fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
       &snapshot->objects.front().placement);
   ASSERT_NE(fixed, nullptr);
@@ -5599,6 +5690,9 @@ TEST(CanonicalEmptySceneOwner,
   active = *detached.committed_projection_revision;
   snapshot = owner.LogicalSnapshot();
   ASSERT_TRUE(snapshot->carried_object_attachments.empty());
+  EXPECT_DOUBLE_EQ(snapshot->objects.front().mass_kg, 1.5);
+  // The relative object was added without a mass.
+  EXPECT_DOUBLE_EQ(snapshot->objects.back().mass_kg, 0.0);
   fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
       &snapshot->objects.front().placement);
   ASSERT_NE(fixed, nullptr);
@@ -5606,20 +5700,23 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.y_m, 2.0);
   EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.0);
 
-  auto stale_attach = attach;
-  stale_attach.request_context =
-      SceneRequestContext("scene-request-stale-attach", active);
-  stale_attach.expected_projection_revision = active;
-  auto &stale_operation =
-      std::get<core::AttachCarriedObjectRequestDTO>(stale_attach.operation);
-  stale_operation.expected_component_attachment_revisions = {
-      core::ComponentAttachmentRevision("stale-revision")};
-  const auto stale = owner.Commit(stale_attach);
-  ASSERT_FALSE(stale.success);
-  ASSERT_TRUE(stale.error.has_value());
-  EXPECT_EQ(stale.error->code, "stale_revision");
-  EXPECT_EQ(stale.error->details.at("reason"),
-            "carrier_attachment_revision_mismatch");
+  // An old carrier structural-attachment revision is not a precondition:
+  // the carrier resolves against the current attachments (last arrival wins).
+  auto old_revision_attach = attach;
+  old_revision_attach.request_context =
+      SceneRequestContext("scene-request-old-revision-attach", active);
+  old_revision_attach.expected_projection_revision = active;
+  auto &old_revision_operation = std::get<core::AttachCarriedObjectRequestDTO>(
+      old_revision_attach.operation);
+  old_revision_operation.expected_component_attachment_revisions = {
+      core::ComponentAttachmentRevision("old-revision")};
+  const auto old_revision = owner.Commit(old_revision_attach);
+  ASSERT_TRUE(old_revision.success)
+      << (old_revision.error.has_value() ? old_revision.error->message
+                                         : "missing error");
+  ASSERT_TRUE(old_revision.committed_projection_revision.has_value());
+  active = *old_revision.committed_projection_revision;
+  EXPECT_EQ(owner.LogicalSnapshot()->carried_object_attachments.size(), 1U);
 
   for (auto &participant : projections) {
     participant->SetResolvedModelInstanceOverride(
@@ -5659,18 +5756,18 @@ TEST(CanonicalEmptySceneOwner,
             "scene_frame_reference_ambiguous");
 
   for (std::size_t index = 0U; index < projections.size(); ++index) {
-    EXPECT_EQ(projections[index]->calls(), 6U);
+    EXPECT_EQ(projections[index]->calls(), 7U);
     // One runtime unit hosts every projection: only its first answers.
     EXPECT_EQ(projections[index]->frame_resolution_calls(),
               index == 0U ? 10U : 0U);
-    EXPECT_EQ(projections[index]->policy_projection_calls(), index == 0U ? 8U : 7U);
+    EXPECT_EQ(projections[index]->policy_projection_calls(), index == 0U ? 9U : 8U);
     EXPECT_EQ(projections[index]->retained_lease_count(), 0U);
   }
   const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.transaction_intent_count, 6);
-  EXPECT_EQ(integrity.request_outcome_count, 6);
+  EXPECT_EQ(integrity.transaction_intent_count, 7);
+  EXPECT_EQ(integrity.request_outcome_count, 7);
   EXPECT_EQ(integrity.projection_attempt_count,
-            static_cast<std::int64_t>(6U * projections.size()));
+            static_cast<std::int64_t>(7U * projections.size()));
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -5898,6 +5995,32 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(resolved->effective_policy.revision.content_hash,
               resolved->configured_policy.revision.content_hash);
   }
+
+  // A later edit naming the old configured-policy revision is accepted
+  // against the current policy: the last arrival wins.
+  const auto old_revision =
+      std::get<core::SetCollisionPolicyRequestDTO>(request.operation)
+          .expected_configured_policy_revision;
+  const auto current_revision =
+      owner.LogicalSnapshot()->configured_collision_policy.revision;
+  ASSERT_NE(old_revision, current_revision);
+  auto last = owner.LogicalSnapshot()->configured_collision_policy;
+  last.require_full_diagnostics = !last.require_full_diagnostics;
+  core::SceneTransactionRequestDTO last_request{
+      SceneRequestContext("scene-request-policy-last-arrival",
+                          *result.committed_projection_revision),
+      {},
+      *result.committed_projection_revision,
+      core::SetCollisionPolicyRequestDTO{last, old_revision},
+      core::AdmissionGeneration(1U),
+  };
+  const auto last_result = owner.Commit(last_request);
+  ASSERT_TRUE(last_result.success)
+      << (last_result.error.has_value() ? last_result.error->message
+                                        : "missing error");
+  const auto stored = owner.LogicalSnapshot()->configured_collision_policy;
+  EXPECT_EQ(stored.require_full_diagnostics, last.require_full_diagnostics);
+  EXPECT_EQ(stored.revision.revision_id, current_revision.revision_id + 1U);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -7396,8 +7519,8 @@ TEST(CanonicalEmptySceneOwner,
 
     // Compaction is transparent: the triggering request settles the held
     // claim, prunes, and then continues in the unchanged epoch. Settling
-    // advanced the admission generation, so this request's own claim gets
-    // the ordinary no-effect admission refusal; compaction asks no refresh.
+    // advanced the admission generation; the request's own claim still names
+    // the older one, which is evidence only, so it commits without a refresh.
     const auto revision_before_compaction = owner.CurrentProjectionRevision();
     const auto cleanup_started = std::chrono::steady_clock::now();
     const auto compacted = owner.Commit(compaction_probe);
@@ -7407,17 +7530,15 @@ TEST(CanonicalEmptySceneOwner,
         "scene_compaction_settlement_us",
         std::chrono::duration_cast<std::chrono::microseconds>(cleanup_elapsed)
             .count());
-    ASSERT_FALSE(compacted.success);
-    ASSERT_TRUE(compacted.error.has_value());
-    EXPECT_EQ(compacted.error->code, "stale_generation");
-    EXPECT_EQ(compacted.error->details.at("reason"),
-              "expected_generation_stale");
+    ASSERT_TRUE(compacted.success)
+        << (compacted.error.has_value() ? compacted.error->message
+                                        : "missing error");
     EXPECT_EQ(compacted.replay_status,
               core::RequestReplayStatusDTO::kAcceptedNew);
     EXPECT_EQ(compacted.projection_status,
-              core::SceneProjectionCommitStatusDTO::kNotAttempted);
+              core::SceneProjectionCommitStatusDTO::kCommitted);
     EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), old_request_epoch);
-    EXPECT_EQ(owner.CurrentProjectionRevision(), revision_before_compaction);
+    EXPECT_NE(owner.CurrentProjectionRevision(), revision_before_compaction);
     const auto after_compaction = owner.VerifyIntegrity();
     EXPECT_EQ(after_compaction.transaction_intent_count, 1);
     EXPECT_EQ(after_compaction.request_outcome_count, 1);

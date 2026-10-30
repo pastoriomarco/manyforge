@@ -1,12 +1,9 @@
+import { parseSceneRuntimePoseSource } from '../api/parsers/scene';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { api, resolveStructuralAssetUrl } from '../api/client';
-import {
-  MotionIntentGate, narrowRearm, rearmRequiredFromResult, sendWithRearm,
-  type NarrowRearmPorts, type RobotRearmPorts,
-} from '../state/robotRearm';
-import { cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from './useCCLC';
+import { VIEWER_POSE_RATE_HZ } from '../state/composerSettings';
+import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
-import { commandRefusalText, receiptRefusal } from '../state/commandRefusal';
+import { CommandRefusalError, receiptRefusal } from '../state/commandRefusal';
 import { structuredErrorText } from '../state/structuredError';
 import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
@@ -27,8 +24,6 @@ import type {
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
-import type { CCLCOwnerIdentity } from '../types/cclc';
-import type { ExecutionIdentity } from '../types/robotControl';
 import type {
   ExecutionObservationFrame,
   ExecutionObservationTarget,
@@ -103,6 +98,8 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
   };
   const record = object(raw, [
     'cell_id',
+    'delivery_sequence',
+    'outside_pose_sources',
     'graph_revision',
     'measured_targets',
     'owner_epoch',
@@ -179,10 +176,29 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     }
     return targets;
   };
+  if (!Array.isArray(record.outside_pose_sources) || record.outside_pose_sources.length > 64) {
+    throw new Error('Outside observation source count is invalid.');
+  }
+  const outsidePoseSources = record.outside_pose_sources.map((raw, index) => {
+    const row = object(raw, ['source', 'age_at_delivery_ns', 'freshness_budget_ns']);
+    return {
+      source: parseSceneRuntimePoseSource(row.source, `outside_pose_sources[${index}].source`),
+      ageAtDeliveryNs: integer('age_at_delivery_ns', row),
+      freshnessBudgetNs: integer('freshness_budget_ns', row),
+    };
+  });
+  const sourceIds = outsidePoseSources.map(({ source }) => source.source_id);
+  if (new Set(sourceIds).size !== sourceIds.length
+    || outsidePoseSources.some(({ source }) => source.policy_id !== 'viewer.measured_robot'
+      || source.payload.kind !== 'joint_state')) {
+    throw new Error('Outside observation sources are invalid.');
+  }
   const targets = parseTargets('targets');
   const measuredTargets = parseTargets('measured_targets');
   return Object.freeze({
     schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
+    deliverySequence: integer('delivery_sequence'),
+    outsidePoseSources,
     ownerEpoch: text('owner_epoch'),
     cellId: text('cell_id'),
     retainedBundleId: text('retained_bundle_id'),
@@ -782,8 +798,14 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private observationSocket: WebSocket | null = null;
   private observationReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private observationRenewalTimer: ReturnType<typeof setTimeout> | null = null;
+  private outsideExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerDemandGeneration = 0;
   private viewerDemand = false;
+  private viewerPoseRateHz: number | null = null;
+  // Credits belong to one socket; the retained applied frame may be from an
+  // earlier connection and must not be acknowledged on its replacement.
+  private observationCreditFrame: ExecutionObservationFrame | null = null;
+  private observationReceivedOnSocket = false;
   private shellTimer: ReturnType<typeof setTimeout> | null = null;
   private viewerFrame: number | ReturnType<typeof setTimeout> | null = null;
   private observationFrame: number | ReturnType<typeof setTimeout> | null = null;
@@ -902,76 +924,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
     this.presentedFrame === null ? null : { ...this.presentedFrame };
 
-  /** m5.5: "Re-arming robot…" while a motion command re-arms a moved robot. */
-  private rearmStatus: string | null = null;
-  private readonly rearmStatusListeners = new Set<Listener>();
-  readonly subscribeRearmStatus = (listener: Listener) => {
-    this.rearmStatusListeners.add(listener);
-    return () => this.rearmStatusListeners.delete(listener);
-  };
-  readonly getRearmStatus = (): string | null => this.rearmStatus;
-
-  /**
-   * m5.5 FIX6: every command but runtime scale (Stop, Reset, a newer motion
-   * command) and Close supersede a motion command waiting for its re-arm.
-   */
-  private readonly motionIntents = new MotionIntentGate();
-  /** Close and the "Re-arming robot…" notice's Cancel: nothing is re-sent. */
-  readonly cancelPendingMotionIntent = () => { this.motionIntents.cancel(); };
-
-  /** The narrow re-arm's owner reads and its fenced component Recover. */
-  private readonly narrowRearmPorts: NarrowRearmPorts<ExecutionIdentity, CCLCOwnerIdentity> = {
-    identity: () => api.execution.identity(),
-    owner: () => api.cclc.owner(),
-    component: (id) => api.cclc.component(id),
-    admission: () => this.latest?.authoringAdmission ?? null,
-    submit: (snapshot, execution, owner, admissionGeneration) => api.cclc.submitLifecycle(
-      lifecycleRequestFromSnapshot(
-        snapshot,
-        'recover',
-        requestContext(
-          cclcRequestOwnerEpoch(owner, snapshot, execution),
-          `rearm:${snapshot.controllableComponentId}`,
-        ),
-        admissionGeneration,
-      ),
-    ),
-  };
-
-  private rearmPorts(): RobotRearmPorts {
-    return {
-      rearmComponent: (id, isCurrent) => narrowRearm(this.narrowRearmPorts, id, isCurrent),
-      component: (id) => api.cclc.component(id),
-      sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
-      now: () => Date.now(),
-      onStatus: (status) => {
-        this.rearmStatus = status;
-        for (const listener of this.rearmStatusListeners) listener();
-      },
-    };
-  }
-
-  /**
-   * One press (m5.5): a motion command refused `component_rearm_required`
-   * re-arms the robot with Recover cell, waits until it is active and is sent
-   * once more with the then-current fences (`robotRearm.ts`).
-   */
   readonly sendExecutionCommand = (
-    commandKind: ExecutionControlCommandKind,
-    payload: Record<string, unknown>,
-    correlationId: string,
-  ): Promise<ExecutionCommandReceipt> => {
-    // Synchronously, before anything is sent: the Stop lane is not delayed.
-    const isCurrent = this.motionIntents.issue(commandKind);
-    return sendWithRearm(
-      commandKind,
-      () => this.sendExecutionCommandOnce(commandKind, payload, correlationId),
-      this.rearmPorts(),
-      () => this.enabled && isCurrent(),
-    );
-  };
-
-  private readonly sendExecutionCommandOnce = (
     commandKind: ExecutionControlCommandKind,
     payload: Record<string, unknown>,
     correlationId: string,
@@ -1065,9 +1018,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 ? 'Run stopped before start' : 'Run stopped';
               throw new Error(`${stopped}. Reset required. ${structuredErrorText(outcome)}`);
             }
-            throw new Error(error === null
-              ? `Execution command rejected (HTTP ${response.status}).`
-              : commandRefusalText(error));
+            if (error !== null) throw new CommandRefusalError(error);
+            throw new Error(`Execution command rejected (HTTP ${response.status}).`);
           }
           if (body === null || typeof body !== 'object' || Array.isArray(body)) {
             throw new Error('Execution command response is invalid.');
@@ -1096,11 +1048,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           }
           acknowledged = true;
           if (value.disposition === 'rejected') {
-            const text = commandRefusalText(
-              receiptRefusal(value.code as string, record.result), { withCode: true },
+            const refusal = new CommandRefusalError(
+              receiptRefusal(value.code as string, record.result), { withCode: true, executionResult: record.result },
             );
-            throw rearmRequiredFromResult(value.code as string, record.result, text)
-              ?? new Error(text);
+            throw refusal;
           }
           return {
             correlationId,
@@ -1262,6 +1213,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       generation: snapshot.runtime.projectionGeneration,
     };
     this.advancePresentedFrame(this.latest);
+  };
+
+  readonly setViewerPoseRateHz = (rate: number): void => {
+    if (!Number.isInteger(rate) || rate < VIEWER_POSE_RATE_HZ.min || rate > VIEWER_POSE_RATE_HZ.max) {
+      throw new Error('Viewer pose rate is out of range.');
+    }
+    if (this.viewerPoseRateHz === rate) return;
+    this.viewerPoseRateHz = rate;
+    this.sendObservationCredit(this.observationCreditFrame);
   };
 
   setViewerDemand(active: boolean): void {
@@ -1436,6 +1396,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       this.qualificationRecord.socketActive = false;
       publishHeadlessQualification();
     }
+    this.invalidateOutsideObservation();
     this.discardUnappliedExecutionObservation();
     socket?.close(1000, reason);
   }
@@ -1661,10 +1622,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 && (cause as Record<string, unknown>).code === code
                 && (cause as Record<string, unknown>).correlation_id === correlationId
                 && typeof (cause as Record<string, unknown>).message === 'string';
-              const text = commandRefusalText(
+              const refusal = new CommandRefusalError(
                 receiptRefusal(code, addressed ? cause : null), { withCode: true },
               );
-              pending.reject(rearmRequiredFromResult(code, record.result, text) ?? new Error(text));
+              pending.reject(refusal);
             } else {
               pending.resolve(parsed);
             }
@@ -2062,6 +2023,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     if (this.suspendEmptyObservation()) return;
     if (this.observationSocket !== null) return;
     const serial = ++this.observationSerial;
+    this.observationCreditFrame = null;
+    this.observationReceivedOnSocket = false;
     const socket = new WebSocket(websocketUrl('/ws/scene/viewer'));
     this.observationSocket = socket;
     headlessSocketCreations += 1;
@@ -2086,13 +2049,25 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       // not request or replay motion missed while hidden or disconnected.
       this.sendObservationCredit(null);
     };
+    let lastDelivery: ExecutionObservationFrame | null = null;
     socket.onmessage = (message) => {
       if (serial !== this.observationSerial) return;
       try {
+        const receivedAt = performance.now();
         const candidate = parseExecutionObservationFrame(
           JSON.parse(String(message.data)) as unknown,
         );
         const current = this.latestExecutionObservation;
+        if (lastDelivery !== null && candidate.deliverySequence! <= lastDelivery.deliverySequence!) {
+          if (candidate.deliverySequence !== lastDelivery.deliverySequence
+            || JSON.stringify(candidate) !== JSON.stringify(lastDelivery)) {
+            socket.close(4002, 'invalid viewer delivery sequence');
+            return;
+          }
+          if (this.appliedExecutionObservation === current) this.sendObservationCredit(current);
+          return;
+        }
+        lastDelivery = candidate;
         if (
           current !== null
           && candidate.ownerEpoch === current.ownerEpoch
@@ -2112,10 +2087,6 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             socket.close(4002, 'changed execution observation at one sequence');
             return;
           }
-          this.publishObservationTransportStatus('live', null);
-          if (current === this.appliedExecutionObservation) this.sendObservationCredit(current);
-          else this.scheduleExecutionObservation();
-          return;
         }
         recordViewerObservationReceived(
           {
@@ -2126,7 +2097,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           },
           current !== null && current !== this.appliedExecutionObservation,
         );
-        this.latestExecutionObservation = candidate;
+        this.observationReceivedOnSocket = true;
+        const delivered = { ...candidate, outsideReceivedAtMonotonicMs: receivedAt };
+        this.latestExecutionObservation = delivered;
+        this.scheduleOutsideExpiry(delivered, receivedAt);
         this.publishObservationTransportStatus('live', null);
         this.scheduleExecutionObservation();
       } catch {
@@ -2144,6 +2118,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       ) return;
       this.qualificationRecord.socketActive = false;
       publishHeadlessQualification();
+      this.invalidateOutsideObservation();
       this.publishObservationTransportStatus(
         'reconnecting',
         'The live measured-state viewer transport failed and is reconnecting.',
@@ -2164,6 +2139,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       // Clear the transport reference before notifying presentation readers.
       // A discarded prior-model frame must not recursively try to close the
       // socket that has already emitted this close event.
+      this.invalidateOutsideObservation();
       this.discardUnappliedExecutionObservation();
       const synchronizing = this.observationTransportStatus.phase === 'synchronizing';
       if (!synchronizing && this.observationTransportStatus.phase !== 'reconnecting') {
@@ -2188,6 +2164,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     const socket = this.observationSocket;
     if (
       socket === null
+      || this.viewerPoseRateHz === null
       || (
         typeof socket.readyState === 'number'
         && typeof WebSocket.OPEN === 'number'
@@ -2198,20 +2175,27 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       || !this.viewerDemand
       || this.disposed
     ) return;
+    // Before this socket has delivered anything, a retained frame is not a
+    // cursor in its subscription. Start with null even if a reader requests
+    // credit for that retained frame during reconnect.
+    const creditFrame = this.observationReceivedOnSocket ? frame : null;
     socket.send(JSON.stringify({
-      last_applied: frame === null ? null : {
-        owner_epoch: frame.ownerEpoch,
-        source_epoch: frame.sourceEpoch,
-        source_sequence: frame.sourceSequence,
+      last_applied: creditFrame === null ? null : {
+        owner_epoch: creditFrame.ownerEpoch,
+        source_epoch: creditFrame.sourceEpoch,
+        source_sequence: creditFrame.sourceSequence,
+        delivery_sequence: creditFrame.deliverySequence,
       },
+      pose_rate_hz: this.viewerPoseRateHz,
       schema_version: EXECUTION_OBSERVATION_CREDIT_SCHEMA,
     }));
+    this.observationCreditFrame = creditFrame;
     if (this.observationRenewalTimer !== null) {
       clearTimeout(this.observationRenewalTimer);
     }
     this.observationRenewalTimer = setTimeout(() => {
       this.observationRenewalTimer = null;
-      this.sendObservationCredit(this.appliedExecutionObservation);
+      this.sendObservationCredit(this.observationCreditFrame);
     }, EXECUTION_OBSERVATION_RENEWAL_MS);
   }
 
@@ -2390,6 +2374,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   }
 
   private clearExecutionObservation(): void {
+    this.invalidateOutsideObservation();
     if (this.latestExecutionObservation === null) return;
     this.latestExecutionObservation = null;
     this.appliedExecutionObservation = null;
@@ -2424,6 +2409,48 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         && this.observationTransportStatus.phase === 'connecting'
         && this.observationSocket === null && this.observationReconnectTimer === null) {
       this.connectObservation();
+    }
+  }
+
+  private scheduleOutsideExpiry(frame: ExecutionObservationFrame, receivedAt: number): void {
+    if (this.outsideExpiryTimer !== null) clearTimeout(this.outsideExpiryTimer);
+    const expire = () => {
+      this.outsideExpiryTimer = null;
+      const current = this.latestExecutionObservation;
+      if (current === null || current.deliverySequence !== frame.deliverySequence) return;
+      const elapsedNs = Math.max(0, performance.now() - receivedAt) * 1_000_000;
+      const rows = current.outsidePoseSources ?? [];
+      const active = rows.filter((row) => row.source.fresh
+        && row.ageAtDeliveryNs + elapsedNs <= row.freshnessBudgetNs);
+      if (active.length !== rows.length) {
+        const updated = { ...current, outsidePoseSources: active };
+        this.latestExecutionObservation = updated;
+        if (this.appliedExecutionObservation === current) this.appliedExecutionObservation = updated;
+        for (const listener of this.executionObservationListeners) listener();
+      }
+      if (active.length > 0) {
+        const remainingMs = Math.min(...active.map((row) =>
+          (row.freshnessBudgetNs - row.ageAtDeliveryNs - elapsedNs) / 1_000_000));
+        this.outsideExpiryTimer = setTimeout(expire, Math.max(1, Math.ceil(remainingMs + 1)));
+      }
+    };
+    expire();
+  }
+
+  private invalidateOutsideObservation(): void {
+    if (this.outsideExpiryTimer !== null) clearTimeout(this.outsideExpiryTimer);
+    this.outsideExpiryTimer = null;
+    const strip = (frame: ExecutionObservationFrame | null): ExecutionObservationFrame | null => (
+      frame !== null && frame.outsidePoseSources?.length
+        ? { ...frame, outsidePoseSources: [] } : frame
+    );
+    const latest = this.latestExecutionObservation;
+    const applied = this.appliedExecutionObservation;
+    this.latestExecutionObservation = strip(latest);
+    this.appliedExecutionObservation = applied === latest
+      ? this.latestExecutionObservation : strip(applied);
+    if (latest !== this.latestExecutionObservation) {
+      for (const listener of this.executionObservationListeners) listener();
     }
   }
 

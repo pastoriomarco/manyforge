@@ -295,6 +295,10 @@ public:
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
+  /// Item 37: one History row per operator Force close, naming what the
+  /// Kernel step left in an unknown state.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  RecordScenarioForceClose(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   IngestOperationEvent(
       std::string source_owner_epoch, std::uint64_t source_sequence,
@@ -489,7 +493,7 @@ private:
                                  std::string tracking_id);
   void TrackAdmittedOperationConditionLocked(OperationConditionKind kind,
                                              const std::string &tracking_id,
-                                             const AlarmSubject &subject);
+                                             const AlarmConditionUpdate &update);
   void ForgetRefusedOperationConditionLocked(std::string_view definition_id,
                                              std::string_view tracking_id);
   void ReconsiderRefusedOperationConditionsLocked();
@@ -591,7 +595,12 @@ private:
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;
   std::set<std::string> observed_operation_faults_;
-  std::map<std::string, AlarmSubject> active_runtime_collisions_;
+  /// A runtime-monitor Stop alarm: a collision, or lost measured robot state.
+  struct RuntimeMonitorStopCondition final {
+    std::string definition_id;
+    AlarmSubject subject;
+  };
+  std::map<std::string, RuntimeMonitorStopCondition> active_runtime_collisions_;
   std::set<std::string> observed_runtime_collisions_;
   std::map<std::string, AlarmSubject> active_stop_faults_;
   std::string current_stop_fault_fingerprint_;

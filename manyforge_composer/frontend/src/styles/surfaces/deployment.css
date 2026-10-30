@@ -35,6 +35,32 @@
   overflow-y: auto;
 }
 
+/* Components section: the component list beside the selected component's
+   page; one column when the workspace is narrow. */
+.components-workspace {
+  container: components-workspace / inline-size;
+}
+
+.components-layout {
+  display: grid;
+  grid-template-columns: minmax(12rem, 18rem) minmax(0, 1fr);
+  align-items: start;
+  gap: 0.5rem;
+}
+
+.components-column {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 0.5rem;
+}
+
+@container components-workspace (max-width: 40rem) {
+  .components-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .deployment-candidate-summary {
   display: grid;
   grid-template-columns: auto minmax(10rem, 1fr) minmax(8rem, auto);

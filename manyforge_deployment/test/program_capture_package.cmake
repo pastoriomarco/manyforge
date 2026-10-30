@@ -8,13 +8,21 @@ endforeach()
 set(package "${BUILD_ROOT}/program_capture_package")
 file(REMOVE_RECURSE "${package}")
 file(MAKE_DIRECTORY "${package}")
+# Every maintained family (robots and, since merge 6, their tools), each
+# prepared by the build under generated/<family>_structural.
+file(READ "${WORKSPACE}/manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"
+  description)
+string(JSON family_count LENGTH "${description}" model_families)
+math(EXPR family_last "${family_count} - 1")
+set(prepared "")
+foreach(index RANGE ${family_last})
+  string(JSON family_id GET "${description}" model_families ${index} model_family_id)
+  list(APPEND prepared --prepared
+    "${family_id}=${BUILD_ROOT}/generated/${family_id}_structural")
+endforeach()
 execute_process(
   COMMAND "${TOOL}" --check --workspace-root "${WORKSPACE}" --package-root "${package}"
-    --prepared "lite6_lite_gripper=${BUILD_ROOT}/generated/lite6_lite_gripper_structural"
-    --prepared "uf850_xarm_gripper=${BUILD_ROOT}/generated/uf850_xarm_gripper_structural"
-    --prepared "ur10e_robotiq_2f_140=${BUILD_ROOT}/generated/ur10e_robotiq_2f_140_structural"
-    --prepared "ur5_roboplan=${BUILD_ROOT}/generated/ur5_roboplan_structural"
-    --prepared "ur5e_robotiq_2f_85=${BUILD_ROOT}/generated/ur5e_robotiq_2f_85_structural"
+    ${prepared}
   RESULT_VARIABLE result)
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "maintained Program capture fixture failed: ${result}")

@@ -142,6 +142,23 @@ class _Harness:
                 owner, self.rows, "intervention_required" if self.rows else "running"
             )
 
+        # The owner's assessment re-read at a manual-result press (None:
+        # unchanged); the Program's non-moving acknowledgement is kept.
+        self.fresh: dict[str, Any] | None = None
+        self.refresh_error: Exception | None = None
+
+        def refresh(_run, *, node_attempt_id):
+            if self.refresh_error is not None:
+                raise self.refresh_error
+            hold = self.holds[node_attempt_id]
+            if self.fresh is not None:
+                acknowledged = (hold.owner_assessment or {}).get("acknowledged_non_moving")
+                hold.owner_assessment = {
+                    **self.fresh, "acknowledged_non_moving": acknowledged is True,
+                }
+            return hold
+
+        owner.refresh_failure_assessment = refresh
         owner.continue_failure_pause = lambda run, **_k: owner.read(run)
         owner.retry_failure_pause = lambda run, **_k: owner.read(run)
         owner.apply_owner_recovery = lambda *_a, **_k: {"accepted": True}
@@ -346,6 +363,38 @@ def test_refused_release_neither_advances_nor_clears(harness, adapter) -> None:
     assert [state for state, *_ in observer.states()] == ["active", "active"]
 
 
+def test_stale_press_refusal_keeps_the_owner_typed_reason(harness, adapter) -> None:
+    """Offers do not expire, so freshness is checked at the press: the owner's
+    refusal reaches the caller with its code, producer and typed details."""
+    run = harness("operator_stop_policy")
+    source, observer = adapter
+    _observe(source, run)
+    before = run.revision()
+    run.owner.apply_owner_recovery = lambda *_a, **_k: {
+        "accepted": False,
+        "error": {
+            "code": "recovery_action_rejected",
+            "message": "Recovery action rejected",
+            "producer": "kernel",
+            "details": {
+                "reason": "observed_state_stale",
+                "assessment_status": "waiting",
+            },
+        },
+    }
+    with pytest.raises(ProgramRunnerError) as refused:
+        run.apply("acknowledge_and_continue", "stale-press.1")
+    assert refused.value.code == "recovery_action_rejected"
+    assert str(refused.value) == "Recovery action rejected"
+    assert refused.value.producer == "kernel"
+    assert refused.value.details["reason"] == "observed_state_stale"
+    assert refused.value.details["assessment_status"] == "waiting"
+    assert refused.value.details["recovery_offer"] == run.offer
+    assert run.revision() == before and run.effects == []
+    _observe(source, run)
+    assert [state for state, *_ in observer.states()] == ["active", "active"]
+
+
 def test_unknown_release_outcome_keeps_the_held_occurrence_active(
     harness, adapter
 ) -> None:
@@ -397,10 +446,12 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
     # The held operation's owner confirmed the non-moving state.
     run.holds["attempt.1"].owner_assessment = {"acknowledged_non_moving": True}
     actions: list[str] = []
+    results: list[Any] = []
     release = run.host.resume_recovery
 
     def resume_recovery(run_id, **kwargs):
         actions.append(kwargs["action"])
+        results.append(kwargs.get("result"))
         return release(run_id, **kwargs)
 
     run.host.resume_recovery = resume_recovery
@@ -418,10 +469,15 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
                 "node_instance_id": "move.1",
                 "node_attempt_id": "attempt.1",
                 "outcome": outcome,
+                # SX-610: a failed result never carries Continue's marker,
+                # even when a caller sends it as output.
+                **({"output": "continue_with_failure"} if outcome == "failed" else {}),
             }
         ),
     )
     assert result["accepted"] is True and actions == [action]
+    if outcome == "failed":
+        assert results == [None]
     assert run.revision() == activation + 1
     assert run.journal.read().state == "running"
     assert not run.journal.read().reconciliation_required
@@ -429,3 +485,102 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
     assert observer.states()[2:] == [("clear", "attempt.1", activation + 1)]
     _observe(source, run)
     assert len(observer.calls) == 3
+
+
+def _stage_manual_success(run, request_id: str):
+    from manyforge_program_runner.models import ManualResultStageRequest
+
+    return run.runtime.stage_manual_result(
+        _RUN,
+        ManualResultStageRequest.model_validate(
+            {
+                "request_id": request_id,
+                "request_owner_epoch": "client.1",
+                "source_label": "test",
+                "program_run_id": _RUN,
+                "expected_owner_epoch": run.runtime.owner_epoch,
+                "expected_run_revision": run.owner.read(_RUN).run_revision,
+                "node_instance_id": "move.1",
+                "node_attempt_id": "attempt.1",
+                "outcome": "succeeded",
+            }
+        ),
+    )
+
+
+_AT_REST = {
+    "observed_state_available": True,
+    "observed_state_fresh": True,
+    "observed_state_at_rest": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("fresh", "refresh_error", "reason"),
+    [
+        ({**_AT_REST, "observed_state_fresh": False, "observed_state_at_rest": False},
+         None, "observed_state_stale"),
+        ({**_AT_REST, "observed_state_at_rest": False}, None, "observed_state_not_at_rest"),
+        ({**_AT_REST, "observed_state_available": False}, None, "observed_state_unavailable"),
+        (None, RuntimeError("owner unreachable"), "owner_assessment_unavailable"),
+    ],
+)
+def test_manual_result_rechecks_the_owner_at_the_press(
+    harness, adapter, fresh, refresh_error, reason
+) -> None:
+    """SX-648: offers do not expire, so a manual success re-reads the owner's
+    assessment at the press. Old non-moving evidence with a stale, moving or
+    unreadable robot state is refused typed, before any release."""
+
+    run = harness()
+    source, observer = adapter
+    run.holds["attempt.1"].owner_assessment = {
+        "acknowledged_non_moving": True,
+        "observed_state_available": True,
+        "observed_state_valid_until_ns": 0,
+    }
+    run.fresh, run.refresh_error = fresh, refresh_error
+    _observe(source, run)
+    before = run.revision()
+    with pytest.raises(ProgramRunnerError) as refused:
+        _stage_manual_success(run, "manual.stale")
+    assert refused.value.code == "recovery_action_rejected"
+    assert refused.value.details["reason"] == reason
+    assert refused.value.details["action"] == "manual_result"
+    assert run.effects == [] and run.revision() == before
+    assert not run.journal.read().reconciliation_required
+
+
+def test_manual_result_with_an_unreadable_owner_deadline_refuses_cleanly(harness, adapter) -> None:
+    """SX-677: an owner deadline the exact scalar parser rejects is the typed
+    unavailable-assessment refusal: no release, no reconciliation, no 500."""
+
+    run = harness()
+    source, _observer = adapter
+    run.holds["attempt.1"].owner_assessment = {
+        "acknowledged_non_moving": True,
+        "observed_state_available": True,
+    }
+    run.fresh = {**_AT_REST, "observed_state_valid_until_ns": "not-a-number"}
+    _observe(source, run)
+    before = run.revision()
+    with pytest.raises(ProgramRunnerError) as refused:
+        _stage_manual_success(run, "manual.invalid")
+    assert refused.value.code == "recovery_action_rejected"
+    assert refused.value.details["reason"] == "owner_assessment_unavailable"
+    assert run.effects == [] and run.revision() == before
+    assert not run.journal.read().reconciliation_required
+
+
+def test_manual_result_with_a_fresh_at_rest_owner_releases_the_hold(harness, adapter) -> None:
+    run = harness()
+    source, _observer = adapter
+    run.holds["attempt.1"].owner_assessment = {
+        "acknowledged_non_moving": True,
+        "observed_state_available": True,
+        "observed_state_valid_until_ns": 0,
+    }
+    run.fresh = dict(_AT_REST)
+    _observe(source, run)
+    result = _stage_manual_success(run, "manual.fresh")
+    assert result["accepted"] is True and run.effects == ["attempt.1"]

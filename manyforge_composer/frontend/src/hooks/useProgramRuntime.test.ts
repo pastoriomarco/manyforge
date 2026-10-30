@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   AppliedProgramSelection,
+  CurrentScenarioResponse,
   PersistentKeyValues,
   ProgramRuntimeControlProjection,
   ProgramRunStatus,
@@ -13,7 +14,9 @@ import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
   buildProgramStartRequest,
+  bindExecuteIdentity,
   controlPendingAfterProjection,
+  executeIdentity,
   persistentValuesFence,
   programPendingAfterProjection,
   programRunProjectionKey,
@@ -93,6 +96,61 @@ describe('Program runtime idle selection', () => {
       ...waiting, programCycle: { ...waiting.programCycle,
         failure: { code: 'program_scene_preparation_failed', message: 'Scene convergence failed', details: {} } },
     })).toBeNull();
+  });
+  it('binds only the GUI-owned Execute identity and treats empty reads as unknown', () => {
+    const { applied, workspace, snapshot } = admissionFixtures();
+    const scenario = {
+      schemaVersion: 'manyforge.current_scenario.v1', ready: true, unavailableReasons: [],
+      currentScenario: {
+        scenarioId: applied.scenarioId, sourceDocumentDigest: applied.sourceDocumentDigest,
+        deploymentArtifactId: 'deployment', deploymentRevision: 'deployment.revision',
+        retainedBundleId: 'bundle', graphRevision: 'graph', programId: 'program',
+        programRevision: applied.programRevision, programBindingId: 'binding',
+      },
+    } as CurrentScenarioResponse;
+    const confirmed = executeIdentity(true, applied, scenario, snapshot, workspace, false);
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, null, null, null, null, false))).toEqual(confirmed);
+    const noScenario = { schemaVersion: 'manyforge.current_scenario.v1', ready: false,
+      unavailableReasons: ['scenario_not_ready'], currentScenario: null } as CurrentScenarioResponse;
+    const confirmedWithoutScenario = executeIdentity(true, applied, noScenario, snapshot, workspace, false);
+    expect(confirmedWithoutScenario.slice(1, 4)).toEqual([applied.recordDigest, undefined, undefined]);
+    expect(bindExecuteIdentity(confirmedWithoutScenario,
+      executeIdentity(true, null, noScenario, snapshot, workspace, false))).toEqual(confirmedWithoutScenario);
+    expect(bindExecuteIdentity(confirmedWithoutScenario,
+      executeIdentity(true, { ...applied, recordDigest: digest('d') }, noScenario, snapshot, workspace, false))).toBeNull();
+    const ownerOnlyChange = {
+      ...snapshot,
+      receiverEpoch: 'receiver.restarted',
+      authoringWorkspace: { ...snapshot.authoringWorkspace, workspaceEpoch: 'workspace.2', workspaceRevision: 99 },
+      programCycle: { ...snapshot.programCycle, programRunnerOwnerEpoch: 'runner.2', cycleClaimGeneration: 99 },
+    } as ComposerHeadlessState;
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, { ...applied, sourceOwnerEpoch: 'applied.2', sourceGeneration: 99 },
+        scenario, ownerOnlyChange, workspace, false))).toEqual(confirmed);
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, applied, scenario, snapshot,
+        { ...workspace, draft: { ...workspace.draft, draftRevision: workspace.draft.draftRevision + 1 } }, false))).toBeNull();
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, applied, scenario, {
+        ...snapshot, authoringWorkspace: {
+          ...snapshot.authoringWorkspace,
+          deploymentDraftRevision: snapshot.authoringWorkspace.deploymentDraftRevision + 1,
+        },
+      }, workspace, false))).toBeNull();
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, applied, scenario, {
+        ...snapshot, authoringWorkspace: {
+          ...snapshot.authoringWorkspace,
+          deploymentDraftId: 'deployment-draft-2',
+        },
+      }, workspace, false))).toBeNull();
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, { ...applied, recordDigest: digest('d') }, scenario, snapshot, workspace, false))).toBeNull();
+    expect(bindExecuteIdentity(confirmed,
+      executeIdentity(true, applied, scenario, {
+        ...snapshot, programCycle: { ...snapshot.programCycle, cycleGeneration: snapshot.programCycle.cycleGeneration + 1 },
+      }, workspace, false))).toBeNull();
   });
   it('uses semantic owner revisions instead of a fixed browser poll', () => {
     const source = readFileSync(new URL('./useProgramRuntime.ts', import.meta.url), 'utf8');

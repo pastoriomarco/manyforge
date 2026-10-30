@@ -10,7 +10,7 @@
     },
     {
       "component_role_id": "tool",
-      "controllable_component_id": "lite6_robot"
+      "controllable_component_id": "lite_gripper"
     }
   ],
   "target_roles": [

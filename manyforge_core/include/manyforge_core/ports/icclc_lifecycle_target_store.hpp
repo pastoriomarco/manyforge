@@ -48,6 +48,12 @@ struct ComponentLifecycleTargetFactsDTO final {
   /// The present target; absent when the component has none.
   std::optional<ComponentLifecycleTargetDTO> target;
   std::uint64_t recovery_generation{};
+  /// M6 (item 35): the recovery generation under which the component's last
+  /// Recover was accepted, the operator's ordinary Recover or the driver's
+  /// own; absent before the first. Equal to `recovery_generation` when that
+  /// generation's one Recover attempt already ran, so the driver submits no
+  /// further Recover for a recovered cause that persists (ADR-0026 §7).
+  std::optional<std::uint64_t> recover_attempt_generation;
   std::vector<ComponentLifecycleInterventionCauseDTO> intervention_causes;
   std::optional<ComponentIncidentRecordDTO> open_incident;
 
@@ -85,6 +91,15 @@ class ICCLCLifecycleTargetStore {
   /// causes and open incident, read in one journal snapshot.
   [[nodiscard]] virtual Result<ComponentLifecycleTargetFactsDTO> LoadLifecycleTargetFacts(
       const ControllableComponentId& component) = 0;
+
+  /// M6: an incident retired the component's Active target and Active was
+  /// not restored since. It survives the re-enable's own Recover and Prepare
+  /// (and a restart); reaching Active, an operator Disable, Close or an Apply
+  /// that replaces the component end it. A store without rows has none.
+  [[nodiscard]] virtual Result<bool> ActiveTargetRetiredByIncident(
+      const ControllableComponentId&) {
+    return Result<bool>::Ok(false);
+  }
 
   /// Record the latest intervention-required cause for one domain (`nullopt`
   /// removes the row; only the journal's own Recover and cancellation paths

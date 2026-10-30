@@ -53,6 +53,7 @@ _IMPLEMENTATION_FIELDS = {
     "node_id",
     "owner_health_available",
     "reason_codes",
+    "reasons",
     "restoration_gates",
 }
 
@@ -218,6 +219,12 @@ def _validate_availability(
             row["restoration_gates"],
             f"availability.implementations[{index}].restoration_gates",
         )
+        if not isinstance(row["reasons"], list) or any(
+            not isinstance(reason, dict) for reason in row["reasons"]
+        ):
+            raise _invalid(
+                f"availability.implementations[{index}].reasons must be a list of objects"
+            )
         if row["execution_available"] and not all(
             row[field]
             for field in (

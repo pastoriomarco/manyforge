@@ -26,6 +26,28 @@ The settings also include a Stop time, joint limits for controlled Stops and
 fallback stages. The available fields and values are shown in the Deployment
 editor. They are separate from the speed limits of ordinary motion.
 
+## Lead-in
+
+A `soft_on_path` Stop (and the braking half of `spring_back_hold`) first
+continues the motion the controller is already commanding for a short lead-in
+of 0.1 s, then brakes along the path.
+
+A Real robot component has a **Stop lead-in start** setting, shown in the
+Deployment editor under *Native runtime configuration* and saved as the
+component's `stop_lead_in_anchor`:
+
+- **Commanded position** (`commanded`, the default): the lead-in starts at the
+  controller's command position.
+- **Measured position** (`measured`): the lead-in starts at the robot's
+  measured position. On a real arm the measured position trails the command,
+  so the lead-in can be used up before the Stop trajectory can start. The Stop
+  then falls back to the hard-stop stage.
+
+Mock and Isaac components always start the lead-in at the command position.
+With either value the measured position is still checked: a robot too far off
+the planned path, or moving off it, escalates to the hard-stop stage. Like other
+Deployment settings, a change takes effect after Apply.
+
 If controlled stages cannot complete, Stop handling can escalate to a hard-stop
 stage, using an available hard deceleration or controller cancel. This stage is
 not a selectable controlled Stop mode in the Deployment editor.
@@ -48,3 +70,12 @@ on the selected policy, supervisory work may continue while motion is held.
 Use the available owner-reported controls to resume or reset; a full-cell Stop
 and a fault can require separate recovery. Never infer physical standstill
 from a browser state or a lost response.
+
+For a Stop fault, owner-reported evidence that every captured resource has no
+active goal, together with the Kernel reporting none reserved, dispatched or
+stopping, satisfies the stopped check without a fresh measured-rest sample.
+This replaces measured-rest, post-terminal surveillance, and trigger
+rest/reconciliation checks. Recovery still waits for durable Stop acceptance
+and terminal records, reconciled configuration and Reset state, and the absence
+of blocking Stop certificates, uncertain operations and orphan resources. A
+stopped check alone does not clear the cell latch.

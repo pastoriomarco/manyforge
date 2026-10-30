@@ -594,27 +594,22 @@ def _observed_move_arguments(
                 "capturing the current robot pose",
                 status_code=409,
             )
-    tcp_endpoint = None
+    tcp_selector = parameters.get("tcp_endpoint", {"kind": "current"})
     if observed_kind == "tcp_pose":
-        candidate_endpoint = (
-            parameters.get("tcp_endpoint") if isinstance(parameters, dict) else None
-        )
-        if (
-            not isinstance(candidate_endpoint, dict)
-            or set(candidate_endpoint) != {"target_role", "frame_role"}
-            or any(
-                type(candidate_endpoint.get(field)) is not str
-                or not candidate_endpoint[field]
-                for field in ("target_role", "frame_role")
-            )
-        ):
+        kind = tcp_selector.get("kind") if isinstance(tcp_selector, dict) else None
+        fields = ({"current": {"kind"}, "default_of_role": {"kind", "role"},
+                   "entry": {"kind", "target_role", "frame_role"}}.get(kind)
+                  if type(kind) is str else None)
+        if (fields is None or set(tcp_selector) != fields or any(
+            type(tcp_selector.get(field)) is not str or not tcp_selector[field]
+            for field in fields - {"kind"}
+        )):
             raise DraftSessionError(
                 "observed_move_role_missing",
-                "the selected move has no valid TCP endpoint; choose its target and frame "
-                "roles before capturing the current robot pose",
+                "the selected move has no valid TCP selector; choose a TCP before "
+                "capturing the current robot pose",
                 status_code=409,
             )
-        tcp_endpoint = candidate_endpoint
     applied, unavailable = _applied_context(state)
     if applied is None and unavailable is not None:
         raise DraftSessionError(
@@ -669,7 +664,18 @@ def _observed_move_arguments(
             status_code=409,
         )
     direct = matching_direct[0]
+    matching_observed = [
+        row for row in observed_rows
+        if row.get("controllable_component_id") == direct.get("controllable_component_id")
+        and row.get("command_target_id") == direct.get("command_target_id")
+        and row.get("operation_capability_id") == direct.get("operation_capability_id")
+        and isinstance(row.get("observed"), dict)
+        and row["observed"].get("kind") == "joint_positions"
+    ]
+    observed_row = matching_observed[0] if len(matching_observed) == 1 else None
+    observed = observed_row.get("observed") if observed_row is not None else None
     frame_ref = None
+    observed_tcp_entry = None
     if observed_kind == "tcp_pose":
         command = direct["command"]
         base_row = next(
@@ -684,38 +690,67 @@ def _observed_move_arguments(
                 f"target role {node_target_role!r} in the Applied Program",
                 status_code=409,
             )
-        assert tcp_endpoint is not None
-        endpoint_targets = [
-            row for row in applied.binding_document["target_role_bindings"]
-            if row["target_role_id"] == tcp_endpoint["target_role"]
-        ]
-        if len(endpoint_targets) != 1:
-            raise DraftSessionError(
-                "observed_move_target_unbound",
-                f"TCP endpoint target role {tcp_endpoint['target_role']!r} is not bound in "
-                "the Applied Program",
-                status_code=409,
-            )
-        endpoint_target = endpoint_targets[0]
-        if endpoint_target["controllable_component_id"] != bound["controllable_component_id"]:
-            raise DraftSessionError(
-                "observed_move_target_unbound",
-                f"TCP endpoint target role {tcp_endpoint['target_role']!r} does not share "
-                f"motion target role {node_target_role!r}'s component",
-                status_code=409,
-            )
-        tcp_frame_row = next(
-            (row for row in endpoint_target["frame_role_bindings"]
-             if row["frame_role_id"] == tcp_endpoint["frame_role"]),
-            None,
+        kind = tcp_selector["kind"]
+        tcp_frame_row = None
+        if kind == "current":
+            active = observed_row.get("active_tcp") if observed_row is not None else None
+            requested_entry = active.get("entry") if isinstance(active, dict) else None
+            if not isinstance(requested_entry, dict):
+                raise DraftSessionError(
+                    "observed_move_unavailable",
+                    "the robot has no available Active TCP for current-pose capture",
+                    status_code=409,
+                )
+        else:
+            role = tcp_selector["role"] if kind == "default_of_role" else tcp_selector["target_role"]
+            endpoint_targets = [
+                row for row in applied.binding_document["target_role_bindings"]
+                if row["target_role_id"] == role
+            ]
+            if len(endpoint_targets) != 1:
+                raise DraftSessionError(
+                    "observed_move_target_unbound",
+                    f"TCP target role {role!r} is not bound in the Applied Program",
+                    status_code=409,
+                )
+            endpoint_target = endpoint_targets[0]
+            if kind == "default_of_role":
+                requested_entry = endpoint_target.get("default_tcp")
+                if not isinstance(requested_entry, dict):
+                    raise DraftSessionError(
+                        "observed_move_target_unbound",
+                        f"TCP target role {role!r} has no default TCP in the Applied Program",
+                        status_code=409,
+                    )
+            else:
+                frame_role = tcp_selector["frame_role"]
+                tcp_frame_row = next(
+                    (row for row in endpoint_target["frame_role_bindings"]
+                     if row["frame_role_id"] == frame_role), None,
+                )
+                if tcp_frame_row is None:
+                    raise DraftSessionError(
+                        "observed_move_target_unbound",
+                        f"TCP endpoint target role {role!r} frame role {frame_role!r} "
+                        "is not bound in the Applied Program", status_code=409,
+                    )
+                requested_entry = {
+                    "component_id": endpoint_target.get("controllable_component_id"),
+                    "target_id": endpoint_target.get("command_target_id"),
+                    "frame_role_id": frame_role,
+                }
+        # The Applied robot list carries the retained frame identity even when
+        # Current or a component default has no separately authored frame role.
+        binding_tcp = next(
+            (row for row in bound.get("robot_tcps", [])
+             if isinstance(row, dict) and row.get("entry") == requested_entry), None,
         )
-        if tcp_frame_row is None:
-            raise DraftSessionError(
-                "observed_move_target_unbound",
-                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
-                f"{tcp_endpoint['frame_role']!r} is not bound in the Applied Program",
-                status_code=409,
-            )
+        if tcp_frame_row is None and binding_tcp is not None:
+            tcp_frame_row = binding_tcp.get("frame")
+        entry_display = " · ".join(
+            str(requested_entry.get(field, ""))
+            for field in ("component_id", "target_id", "frame_role_id")
+        )
         descriptor_frames = command["target_descriptor"]["frames"]
         direct_base_role = command.get("base_frame_role_id")
         direct_base_row = next(
@@ -739,31 +774,44 @@ def _observed_move_arguments(
                  "the robot target does not report a base frame for its current pose"),
                 status_code=409,
             )
-        direct_tcp_role = command.get("tcp_frame_role_id")
+        # TCP-C: capture works at any exact listed TCP entry with an observed
+        # pose, not only the default. Match its component/target/frame identity
+        # and retained model before reading the pose row.
+        requested = tcp_frame_row.get("compiled_frame_name") if isinstance(tcp_frame_row, dict) else None
+        tcp_rows = [
+            row for row in command["target_descriptor"].get("tcps", [])
+            if isinstance(row, dict)
+        ]
         direct_tcp_row = next(
-            (row for row in descriptor_frames
-             if row["frame_role_id"] == direct_tcp_role),
+            (row for row in tcp_rows
+             if row.get("entry") == requested_entry),
             None,
         )
-        observed_frame = (
-            direct_tcp_row.get("compiled_frame_name")
-            if isinstance(direct_tcp_row, dict) else None
-        )
-        requested = tcp_frame_row.get("compiled_frame_name")
-        if requested is None or requested != observed_frame:
-            message = (
-                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
-                f"{tcp_endpoint['frame_role']!r} resolves to {requested!r}, but the robot "
-                f"reports its current pose with TCP frame {observed_frame!r}; current-pose "
-                "capture requires the selected endpoint to match the robot's current TCP"
-                if observed_frame is not None else
-                f"the robot target does not report its current TCP frame for endpoint target "
-                f"role {tcp_endpoint['target_role']!r} frame role "
-                f"{tcp_endpoint['frame_role']!r}"
-            )
+        direct_frame = direct_tcp_row.get("frame") if direct_tcp_row is not None else None
+        if (
+            requested is None
+            or binding_tcp is None
+            or direct_tcp_row is None
+            or direct_tcp_row.get("mounted_here") is not True
+            or not isinstance(direct_frame, dict)
+            or direct_frame.get("compiled_frame_name") != requested
+        ):
+            reported = sorted({
+                str((row.get("frame") or {}).get("compiled_frame_name"))
+                for row in tcp_rows
+                if isinstance(row.get("frame"), dict)
+                and isinstance(observed, dict)
+                and any(
+                    isinstance(pose, dict) and pose.get("entry") == row.get("entry")
+                    and isinstance(pose.get("pose"), dict)
+                    for pose in (observed.get("tcp_poses") or [])
+                )
+            })
             raise DraftSessionError(
                 "observed_move_frame_mismatch",
-                message,
+                f"TCP entry {entry_display} resolves to {requested!r}, but the robot "
+                f"reports its current pose only at the TCP frames {reported!r}; current-pose "
+                "capture requires the selected endpoint to be one of the robot's TCPs",
                 status_code=409,
             )
         model_identity = (
@@ -771,10 +819,8 @@ def _observed_move_arguments(
             tcp_frame_row.get("model_revision"),
         )
         observed_model_identity = (
-            direct_tcp_row.get("model_instance_id")
-            if isinstance(direct_tcp_row, dict) else None,
-            direct_tcp_row.get("model_revision")
-            if isinstance(direct_tcp_row, dict) else None,
+            direct_frame.get("model_instance_id") if isinstance(direct_frame, dict) else None,
+            direct_frame.get("model_revision") if isinstance(direct_frame, dict) else None,
         )
         if (
             any(type(value) is not str or not value for value in model_identity)
@@ -782,22 +828,13 @@ def _observed_move_arguments(
         ):
             raise DraftSessionError(
                 "observed_move_frame_mismatch",
-                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
-                f"{tcp_endpoint['frame_role']!r} and the robot's current TCP do not share "
+                f"TCP entry {entry_display} and the robot's TCP do not share "
                 "the same retained model instance and revision",
                 status_code=409,
             )
+        observed_tcp_entry = requested_entry
         frame_ref = {"kind": "target_frame", "target_role": node_target_role,
                      "frame_role": parameters["base_frame_role"]}
-    matching_observed = [
-        row.get("observed") for row in observed_rows
-        if row.get("controllable_component_id") == direct.get("controllable_component_id")
-        and row.get("command_target_id") == direct.get("command_target_id")
-        and row.get("operation_capability_id") == direct.get("operation_capability_id")
-        and isinstance(row.get("observed"), dict)
-        and row["observed"].get("kind") == "joint_positions"
-    ]
-    observed = matching_observed[0] if len(matching_observed) == 1 else None
     if (
         targets_projection.get("ok") is not True
         or control_projection.get("ok") is not True
@@ -822,8 +859,10 @@ def _observed_move_arguments(
             "positions_rad": deepcopy(observed.get("positions_rad")),
         }
         if observed_kind == "joint"
-        else {"current_tcp_pose": deepcopy(observed.get("current_tcp_pose")),
-              "frame_ref": frame_ref}
+        else {"current_tcp_pose": deepcopy(next((
+                  row.get("pose") for row in (observed.get("tcp_poses") or [])
+                  if isinstance(row, dict) and row.get("entry") == observed_tcp_entry
+              ), None)), "frame_ref": frame_ref}
     )
     if observed_kind == "joint":
         names = resolved_observation["source_joint_names"]
@@ -1242,7 +1281,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             )
         )
         bundle, graph, _manager_epoch = state._manager_current(
-            state.headless_client.manager_status()
+            state.headless_client.manager_status(), phase="program_activation.preview"
         )
         intent = {
             "scene_initialization": "preserve",
@@ -1392,10 +1431,21 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 expected_revision=body.expected_draft_revision,
                 discard_changes=body.confirm_discard,
             )
+            def legacy_attach_context() -> tuple[Any, Any]:
+                # An external Apply may change these facts before Open installs
+                # the Draft; attach still checks the selected TCP at run time.
+                publication = state.published_scenario().get("published_scenario")
+                context = (state.applied_activation_for_publication(publication)
+                           if isinstance(publication, dict) else None)
+                if not isinstance(context, dict):
+                    return None, None
+                return context.get("deployment"), context.get("program_role_assignment")
+
             program, source_path = load_program_artifact(
                 body.path,
                 allowed_roots=state.allowed_fs_roots,
                 catalog=_active_catalog(state),
+                legacy_attach_context=legacy_attach_context,
             )
             prepared = state.draft_session.prepare_open_replacement(
                 program, source_path=source_path

@@ -83,6 +83,7 @@ def _program(
     document = Program(
         _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
     ).to_dict()
+    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
     document["parameters"] = sorted(
         [*document["parameters"], *deepcopy(_PARAMETERS)],
         key=lambda row: row["parameter_id"],
@@ -391,6 +392,7 @@ def _conformance_program(case: dict[str, Any]) -> Program:
     document = Program(
         _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
     ).to_dict()
+    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
     document["parameters"] = sorted(
         [*document["parameters"], *deepcopy(_SOURCE_CONFORMANCE["parameters"])],
         key=lambda row: row["parameter_id"],
@@ -448,6 +450,7 @@ def _pose_conformance_program(case: dict[str, Any]) -> Program:
     document = Program(
         _ROOT / "examples/pick_and_place_minimal.program.yaml", _catalog()
     ).to_dict()
+    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
     document["scene"] = deepcopy(_POSE_CONFORMANCE["scene"])
     document["blackboard"] = {
         "namespaces": [],

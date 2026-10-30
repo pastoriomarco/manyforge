@@ -7,6 +7,7 @@
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/prepared_planning_codec.hpp>
+#include <manyforge_core/program_frame_identity.hpp>
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
@@ -36,43 +37,6 @@ template <class Value>
       ErrorDTO{"prepared_operation_participant_invalid",
                "prepared operation participant is not an exact closed Prepare product",
                {{"reason", std::move(reason)}}});
-}
-
-[[nodiscard]] const CanonicalValue& member(const CanonicalValue& value, std::string_view name) {
-  const auto* result = value.find_object_member(name);
-  if (result == nullptr) fail("required_member_missing");
-  return *result;
-}
-
-void exact(const CanonicalValue& value, std::initializer_list<std::string_view> names) {
-  if (!value.is_object() || value.as_object().size() != names.size()) {
-    fail("unknown_or_missing_member");
-  }
-  for (const auto name : names) static_cast<void>(member(value, name));
-}
-
-[[nodiscard]] std::string text(const CanonicalValue& value) {
-  if (!value.is_string()) fail("string_required");
-  return value.as_string();
-}
-
-[[nodiscard]] bool boolean(const CanonicalValue& value) {
-  if (!value.is_bool()) fail("boolean_required");
-  return value.as_bool();
-}
-
-[[nodiscard]] double finite_number(const CanonicalValue& value) {
-  if (!value.is_number() || !std::isfinite(value.as_number())) fail("finite_number_required");
-  return value.as_number();
-}
-
-[[nodiscard]] std::uint64_t unsigned_integer(const CanonicalValue& value, bool nonzero = false) {
-  const auto number = finite_number(value);
-  if (number < (nonzero ? 1.0 : 0.0) || number > kMaximumSafeInteger ||
-      std::floor(number) != number) {
-    fail("safe_unsigned_integer_required");
-  }
-  return static_cast<std::uint64_t>(number);
 }
 
 [[nodiscard]] bool portable(std::string_view value) noexcept {
@@ -113,15 +77,6 @@ template <class Id>
   return CanonicalValue(std::move(rows));
 }
 
-template <class Id>
-[[nodiscard]] std::vector<Id> parse_id_array(const CanonicalValue& value) {
-  if (!value.is_array() || value.as_array().size() > kMaximumRows) fail("identity_array_invalid");
-  std::vector<Id> rows;
-  rows.reserve(value.as_array().size());
-  for (const auto& item : value.as_array()) rows.emplace_back(text(item));
-  return rows;
-}
-
 [[nodiscard]] CanonicalValue model_bindings_value(
     const std::vector<ProgramModelRoleBindingDTO>& values) {
   CanonicalValue::Array rows;
@@ -132,21 +87,6 @@ template <class Id>
         {"model_revision", CanonicalValue(value.model_revision.value())}});
   }
   return CanonicalValue(std::move(rows));
-}
-
-[[nodiscard]] std::vector<ProgramModelRoleBindingDTO> parse_model_bindings(
-    const CanonicalValue& value) {
-  if (!value.is_array() || value.as_array().empty() || value.as_array().size() > kMaximumRows) {
-    fail("model_bindings_invalid");
-  }
-  std::vector<ProgramModelRoleBindingDTO> rows;
-  for (const auto& row : value.as_array()) {
-    exact(row, {"model_role_id", "model_instance_id", "model_revision"});
-    rows.push_back({ModelRoleId(text(member(row, "model_role_id"))),
-                    ModelInstanceId(text(member(row, "model_instance_id"))),
-                    ModelRevision(text(member(row, "model_revision")))});
-  }
-  return rows;
 }
 
 [[nodiscard]] CanonicalValue frame_bindings_value(
@@ -163,29 +103,6 @@ template <class Id>
     rows.emplace_back(std::move(fields));
   }
   return CanonicalValue(std::move(rows));
-}
-
-[[nodiscard]] std::vector<ProgramFrameRoleBindingDTO> parse_frame_bindings(
-    const CanonicalValue& value) {
-  if (!value.is_array() || value.as_array().empty() || value.as_array().size() > kMaximumRows) {
-    fail("frame_bindings_invalid");
-  }
-  std::vector<ProgramFrameRoleBindingDTO> rows;
-  for (const auto& row : value.as_array()) {
-    const auto* roles = row.find_object_member("contact_body_role_ids");
-    if (roles)
-      exact(row, {"frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name",
-                  "contact_body_role_ids"});
-    else
-      exact(row, {"frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"});
-    rows.push_back(
-        {FrameRoleId(text(member(row, "frame_role_id"))),
-         ModelInstanceId(text(member(row, "model_instance_id"))),
-         ModelRevision(text(member(row, "model_revision"))),
-         text(member(row, "compiled_frame_name")),
-         roles ? parse_id_array<CollisionBodyRoleId>(*roles) : std::vector<CollisionBodyRoleId>{}});
-  }
-  return rows;
 }
 
 [[nodiscard]] CanonicalValue motion_endpoint_value(const RuntimeMotionEndpointBindingDTO& value) {
@@ -212,39 +129,6 @@ template <class Id>
                              {"contact_body_bindings", CanonicalValue(std::move(bodies))}});
 }
 
-[[nodiscard]] RuntimeMotionEndpointBindingDTO parse_motion_endpoint(const CanonicalValue& value) {
-  exact(value, {"target_role_id", "command_target_id", "frame", "contact_body_bindings"});
-  RuntimeMotionEndpointBindingDTO result{
-      TargetRoleId(text(member(value, "target_role_id"))),
-      CommandTargetId(text(member(value, "command_target_id"))),
-      parse_frame_bindings(CanonicalValue(CanonicalValue::Array{member(value, "frame")})).front(),
-      {}};
-  const auto& bodies = member(value, "contact_body_bindings");
-  if (!bodies.is_array() || bodies.as_array().size() > kMaximumRows)
-    fail("endpoint_bodies_invalid");
-  for (const auto& body : bodies.as_array()) {
-    exact(body, {"component_role_id", "target_role_id", "controllable_component_id",
-                 "command_target_id", "model_role_id", "collision_body_role_id",
-                 "model_instance_id", "model_revision", "collision_body_ids"});
-    const auto& model_role = member(body, "model_role_id");
-    const auto& ids = member(body, "collision_body_ids");
-    if (!ids.is_array() || ids.as_array().size() > kMaximumRows) fail("endpoint_body_ids_invalid");
-    std::vector<std::string> decoded_ids;
-    for (const auto& id : ids.as_array()) decoded_ids.push_back(text(id));
-    result.contact_body_bindings.push_back(
-        {ComponentRoleId(text(member(body, "component_role_id"))),
-         TargetRoleId(text(member(body, "target_role_id"))),
-         ControllableComponentId(text(member(body, "controllable_component_id"))),
-         CommandTargetId(text(member(body, "command_target_id"))),
-         model_role.is_null() ? std::nullopt
-                              : std::optional<ModelRoleId>(ModelRoleId(text(model_role))),
-         CollisionBodyRoleId(text(member(body, "collision_body_role_id"))),
-         ModelInstanceId(text(member(body, "model_instance_id"))),
-         ModelRevision(text(member(body, "model_revision"))), std::move(decoded_ids)});
-  }
-  return result;
-}
-
 [[nodiscard]] CanonicalValue provider_value(const PreparedProviderRuntimeOccurrenceDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
       {"provider_instance_id", CanonicalValue(value.provider_instance_id.value())},
@@ -252,16 +136,6 @@ template <class Id>
       {"provider_manifest_revision", CanonicalValue(value.provider_manifest_revision.value())},
       {"runtime_unit_id", CanonicalValue(value.runtime_unit_id.value())},
       {"runtime_epoch", CanonicalValue(value.runtime_epoch.value())}});
-}
-
-[[nodiscard]] PreparedProviderRuntimeOccurrenceDTO parse_provider(const CanonicalValue& value) {
-  exact(value, {"provider_instance_id", "provider_manifest_id", "provider_manifest_revision",
-                "runtime_unit_id", "runtime_epoch"});
-  return {ProviderInstanceId(text(member(value, "provider_instance_id"))),
-          ProviderManifestId(text(member(value, "provider_manifest_id"))),
-          ProviderManifestRevision(text(member(value, "provider_manifest_revision"))),
-          RuntimeUnitId(text(member(value, "runtime_unit_id"))),
-          RuntimeEpoch(text(member(value, "runtime_epoch")))};
 }
 
 [[nodiscard]] CanonicalValue capability_provider_value(
@@ -272,16 +146,6 @@ template <class Id>
                              {"capability_provider_binding_revision",
                               CanonicalValue(value.capability_provider_binding_revision.value())},
                              {"provider", provider_value(value.provider)}});
-}
-
-[[nodiscard]] PreparedCapabilityProviderRuntimeOccurrenceDTO parse_capability_provider(
-    const CanonicalValue& value) {
-  exact(value,
-        {"capability_provider_binding_id", "capability_provider_binding_revision", "provider"});
-  return {CapabilityProviderBindingId(text(member(value, "capability_provider_binding_id"))),
-          CapabilityProviderBindingRevision(
-              text(member(value, "capability_provider_binding_revision"))),
-          parse_provider(member(value, "provider"))};
 }
 
 [[nodiscard]] CanonicalValue interfaces_value(
@@ -295,18 +159,6 @@ template <class Id>
   return CanonicalValue(std::move(rows));
 }
 
-[[nodiscard]] std::vector<ControllerInterfaceInstanceDTO> parse_interfaces(
-    const CanonicalValue& value) {
-  if (!value.is_array() || value.as_array().size() > kMaximumRows) fail("interfaces_invalid");
-  std::vector<ControllerInterfaceInstanceDTO> rows;
-  for (const auto& row : value.as_array()) {
-    exact(row, {"resource_id", "interface_name"});
-    rows.push_back(
-        {ResourceId(text(member(row, "resource_id"))), text(member(row, "interface_name"))});
-  }
-  return rows;
-}
-
 [[nodiscard]] CanonicalValue endpoint_value(const ControllerLifecycleExpectedEndpointDTO& value) {
   return CanonicalValue(CanonicalValue::Object{
       {"control_binding_id", CanonicalValue(value.control_binding_id.value())},
@@ -316,19 +168,6 @@ template <class Id>
       {"logical_endpoint_symbol", CanonicalValue(value.logical_endpoint_symbol)},
       {"is_command_endpoint", CanonicalValue(value.is_command_endpoint)},
       {"is_state_endpoint", CanonicalValue(value.is_state_endpoint)}});
-}
-
-[[nodiscard]] ControllerLifecycleExpectedEndpointDTO parse_endpoint(const CanonicalValue& value) {
-  exact(value,
-        {"control_binding_id", "control_binding_revision", "control_route_id", "endpoint_role_id",
-         "logical_endpoint_symbol", "is_command_endpoint", "is_state_endpoint"});
-  return {ControlBindingId(text(member(value, "control_binding_id"))),
-          ControlBindingRevision(text(member(value, "control_binding_revision"))),
-          ControlRouteId(text(member(value, "control_route_id"))),
-          EndpointRoleId(text(member(value, "endpoint_role_id"))),
-          text(member(value, "logical_endpoint_symbol")),
-          boolean(member(value, "is_command_endpoint")),
-          boolean(member(value, "is_state_endpoint"))};
 }
 
 [[nodiscard]] CanonicalValue endpoint_contract_value(
@@ -352,25 +191,6 @@ template <class Id>
       value);
 }
 
-[[nodiscard]] PreparedParticipantEndpointContractDTO parse_endpoint_contract(
-    const CanonicalValue& value) {
-  if (!value.is_object() || value.as_object().size() != 1U) fail("endpoint_contract_tag_invalid");
-  if (const auto* focused = value.find_object_member("focused_port")) {
-    exact(*focused, {"runtime_unit_id"});
-    return PreparedParticipantFocusedPortDTO{
-        RuntimeUnitId(text(member(*focused, "runtime_unit_id")))};
-  }
-  const auto& selected = member(value, "selected_route");
-  exact(selected, {"endpoints"});
-  const auto& values = member(selected, "endpoints");
-  if (!values.is_array() || values.as_array().empty() || values.as_array().size() > kMaximumRows) {
-    fail("selected_route_endpoints_invalid");
-  }
-  PreparedParticipantSelectedRouteDTO result;
-  for (const auto& row : values.as_array()) result.endpoints.push_back(parse_endpoint(row));
-  return result;
-}
-
 [[nodiscard]] CanonicalValue epochs_value(const std::vector<RuntimeUnitEpochBindingDTO>& values) {
   CanonicalValue::Array rows;
   for (const auto& value : values) {
@@ -381,19 +201,6 @@ template <class Id>
   return CanonicalValue(std::move(rows));
 }
 
-[[nodiscard]] std::vector<RuntimeUnitEpochBindingDTO> parse_epochs(const CanonicalValue& value) {
-  if (!value.is_array() || value.as_array().empty() || value.as_array().size() > kMaximumRows) {
-    fail("runtime_unit_epochs_invalid");
-  }
-  std::vector<RuntimeUnitEpochBindingDTO> rows;
-  for (const auto& row : value.as_array()) {
-    exact(row, {"runtime_unit_id", "runtime_epoch"});
-    rows.push_back({RuntimeUnitId(text(member(row, "runtime_unit_id"))),
-                    RuntimeEpoch(text(member(row, "runtime_epoch")))});
-  }
-  return rows;
-}
-
 [[nodiscard]] CanonicalValue structured_value(const InterruptStructuredValue& value) {
   if (interrupt_structured_value_error(value).has_value()) fail("structured_value_invalid");
   CanonicalValue::Object result;
@@ -402,25 +209,6 @@ template <class Id>
                         std::visit([](const auto& item) { return CanonicalValue(item); }, scalar));
   }
   return CanonicalValue(std::move(result));
-}
-
-[[nodiscard]] InterruptStructuredValue parse_structured(const CanonicalValue& value) {
-  if (!value.is_object() || value.as_object().size() > kMaxInterruptStructuredValueEntries) {
-    fail("structured_value_invalid");
-  }
-  InterruptStructuredValue result;
-  for (const auto& [name, scalar] : value.as_object()) {
-    if (scalar.is_bool())
-      result.emplace(name, interrupt_structured_bool(scalar.as_bool()));
-    else if (scalar.is_number() && std::isfinite(scalar.as_number()))
-      result.emplace(name, interrupt_structured_number(scalar.as_number()));
-    else if (scalar.is_string())
-      result.emplace(name, interrupt_structured_string(scalar.as_string()));
-    else
-      fail("structured_scalar_invalid");
-  }
-  if (interrupt_structured_value_error(result).has_value()) fail("structured_value_invalid");
-  return result;
 }
 
 [[nodiscard]] CanonicalValue position_value(const CoordinatePositionDTO& value) {
@@ -440,16 +228,6 @@ template <class Id>
       value);
 }
 
-[[nodiscard]] CoordinatePositionDTO parse_position(const CanonicalValue& value) {
-  if (text(member(value, "coordinate_kind")) == "angular_rad") {
-    exact(value, {"coordinate_kind", "value_rad"});
-    return AngularPositionDTO{finite_number(member(value, "value_rad"))};
-  }
-  exact(value, {"coordinate_kind", "value_m"});
-  if (text(member(value, "coordinate_kind")) != "linear_m") fail("position_kind_invalid");
-  return LinearPositionDTO{finite_number(member(value, "value_m"))};
-}
-
 [[nodiscard]] CanonicalValue effort_value(const CoordinateEffortDTO& value) {
   return std::visit(
       [](const auto& selected) -> CanonicalValue {
@@ -467,16 +245,6 @@ template <class Id>
       value);
 }
 
-[[nodiscard]] CoordinateEffortDTO parse_effort(const CanonicalValue& value) {
-  if (text(member(value, "coordinate_kind")) == "angular_newton_meter") {
-    exact(value, {"coordinate_kind", "value_nm"});
-    return AngularEffortDTO{finite_number(member(value, "value_nm"))};
-  }
-  exact(value, {"coordinate_kind", "value_n"});
-  if (text(member(value, "coordinate_kind")) != "linear_newton") fail("effort_kind_invalid");
-  return LinearEffortDTO{finite_number(member(value, "value_n"))};
-}
-
 [[nodiscard]] CanonicalValue command_value(const CapabilityCommandValueDTO& value) {
   if (const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&value))
     return CanonicalValue(CanonicalValue::Object{{"io_signal_write", CanonicalValue(CanonicalValue::Object{
@@ -487,23 +255,6 @@ template <class Id>
   if (command.max_effort) fields.emplace_back("max_effort", effort_value(*command.max_effort));
   return CanonicalValue(
       CanonicalValue::Object{{"gripper_position", CanonicalValue(std::move(fields))}});
-}
-
-[[nodiscard]] CapabilityCommandValueDTO parse_command_value(const CanonicalValue& value) {
-  if (const auto* selected = value.find_object_member("io_signal_write")) {
-    exact(value, {"io_signal_write"});
-    exact(*selected, {"resource_role_id", "value"});
-    return IoSignalWriteCommandValueDTO{ResourceRoleId(text(member(*selected, "resource_role_id"))),
-                                       boolean(member(*selected, "value"))};
-  }
-  exact(value, {"gripper_position"});
-  const auto& gripper = member(value, "gripper_position");
-  const bool has_effort = gripper.find_object_member("max_effort") != nullptr;
-  exact(gripper, has_effort ? std::initializer_list<std::string_view>{"position", "max_effort"}
-                            : std::initializer_list<std::string_view>{"position"});
-  GripperPositionCommandValueDTO result{parse_position(member(gripper, "position")), std::nullopt};
-  if (has_effort) result.max_effort = parse_effort(member(gripper, "max_effort"));
-  return result;
 }
 
 [[nodiscard]] CanonicalValue capability_payload_value(const PreparedCapabilityCommandDTO& value) {
@@ -549,67 +300,6 @@ template <class Id>
       {"stop_evidence_requirements", CanonicalValue(std::move(evidence))}});
 }
 
-[[nodiscard]] PreparedCapabilityCommandDTO parse_capability_payload(const CanonicalValue& value) {
-  exact(value,
-        {"command_schema_id", "command_schema_revision", "command_value", "validated_options",
-         "resource_bindings", "channel_bindings", "completion_timeout_s", "completion_rule",
-         "confirmation_rule", "stop_evidence_requirements"});
-  PreparedCapabilityCommandDTO result{
-      CommandSchemaId(text(member(value, "command_schema_id"))),
-      CommandSchemaRevision(text(member(value, "command_schema_revision"))),
-      parse_command_value(member(value, "command_value")),
-      {},
-      {},
-      {},
-      0.0,
-      CommandCompletionRule::kGoalFencedTargetReached,
-      CommandConfirmationRule::kBindingFeedbackRequired,
-      {}};
-  const auto& options = member(value, "validated_options");
-  if (!options.is_array() || options.as_array().size() > kMaxOperationCommandOptions)
-    fail("command_options_invalid");
-  for (const auto& row : options.as_array()) {
-    exact(row, {"option_id", "value_s"});
-    result.validated_options.push_back(
-        {CommandOptionId(text(member(row, "option_id"))), finite_number(member(row, "value_s"))});
-  }
-  const auto& resources = member(value, "resource_bindings");
-  if (!resources.is_array() || resources.as_array().size() > kMaximumRows)
-    fail("command_resource_bindings_invalid");
-  for (const auto& row : resources.as_array()) {
-    exact(row, {"resource_role_id", "resource_id", "interface_name"});
-    result.resource_bindings.push_back({ResourceRoleId(text(member(row, "resource_role_id"))),
-                                        ResourceId(text(member(row, "resource_id"))),
-                                        text(member(row, "interface_name"))});
-  }
-  const auto& channels = member(value, "channel_bindings");
-  if (!channels.is_array() || channels.as_array().size() > kMaximumRows)
-    fail("command_channel_bindings_invalid");
-  for (const auto& row : channels.as_array()) {
-    exact(row, {"channel_role_id", "resource_id", "interface_name"});
-    result.channel_bindings.push_back({ChannelRoleId(text(member(row, "channel_role_id"))),
-                                       ResourceId(text(member(row, "resource_id"))),
-                                       text(member(row, "interface_name"))});
-  }
-  result.completion_timeout_s = finite_number(member(value, "completion_timeout_s"));
-  if (text(member(value, "completion_rule")) != "goal_fenced_target_reached" ||
-      text(member(value, "confirmation_rule")) != "binding_feedback_required") {
-    fail("command_rule_invalid");
-  }
-  result.completion_rule = CommandCompletionRule::kGoalFencedTargetReached;
-  result.confirmation_rule = CommandConfirmationRule::kBindingFeedbackRequired;
-  const auto& evidence = member(value, "stop_evidence_requirements");
-  if (!evidence.is_array() || evidence.as_array().empty() ||
-      evidence.as_array().size() > kMaxCommandSchemaStopRequirements) {
-    fail("command_stop_evidence_invalid");
-  }
-  for (const auto& row : evidence.as_array()) {
-    if (text(row) != "command_terminal") fail("command_stop_evidence_invalid");
-    result.stop_evidence_requirements.push_back(CommandStopEvidenceRequirement::kCommandTerminal);
-  }
-  return result;
-}
-
 [[nodiscard]] std::string activation_mode_token(MotionInterruptActivationMode value) {
   switch (value) {
     case MotionInterruptActivationMode::kRequireInactiveAtArm:
@@ -624,16 +314,6 @@ template <class Id>
   fail("interrupt_activation_mode_invalid");
 }
 
-[[nodiscard]] MotionInterruptActivationMode parse_activation_mode(std::string_view value) {
-  if (value == "require_inactive_at_arm")
-    return MotionInterruptActivationMode::kRequireInactiveAtArm;
-  if (value == "fresh_edge_after_arm") return MotionInterruptActivationMode::kFreshEdgeAfterArm;
-  if (value == "trip_if_already_active") return MotionInterruptActivationMode::kTripIfAlreadyActive;
-  if (value == "maintain_level_with_hysteresis")
-    return MotionInterruptActivationMode::kMaintainLevelWithHysteresis;
-  fail("interrupt_activation_mode_invalid");
-}
-
 [[nodiscard]] std::string node_category_token(MotionInterruptNodeCategory value) {
   switch (value) {
     case MotionInterruptNodeCategory::kGeneric:
@@ -641,12 +321,6 @@ template <class Id>
     case MotionInterruptNodeCategory::kPrecisionContact:
       return "precision_contact";
   }
-  fail("interrupt_node_category_invalid");
-}
-
-[[nodiscard]] MotionInterruptNodeCategory parse_node_category(std::string_view value) {
-  if (value == "generic") return MotionInterruptNodeCategory::kGeneric;
-  if (value == "precision_contact") return MotionInterruptNodeCategory::kPrecisionContact;
   fail("interrupt_node_category_invalid");
 }
 
@@ -714,82 +388,6 @@ template <class Id>
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] PreparedMotionInterruptScopeDTO parse_motion_scope(
-    const CanonicalValue& value, const ResolvedStopBasePlanDTO& base,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> defaults) {
-  const bool arm = value.find_object_member("arm_timeout_ns") != nullptr;
-  const bool fault = value.find_object_member("preemption_action") != nullptr;
-  const bool entry_present = value.find_object_member("stop_entry") != nullptr;
-  std::vector<std::string_view> names{
-      "scope_id",     "interrupt_policy_id", "activation_mode", "required",
-      "stop_profile", "node_category",       "metadata",        "stop_plan"};
-  if (arm) names.push_back("arm_timeout_ns");
-  if (fault) names.push_back("preemption_action");
-  if (entry_present) {
-    names.push_back("stop_entry");
-    names.push_back("success_through");
-  }
-  if (!value.is_object() || value.as_object().size() != names.size())
-    fail("interrupt_scope_fields_invalid");
-  for (const auto name : names) static_cast<void>(member(value, name));
-  const auto category = parse_node_category(text(member(value, "node_category")));
-  auto stop = DecodePreparedParticipantStopPlan(
-      content_identity::canonical_json(member(value, "stop_plan")), base, resources, defaults,
-      category);
-  if (!stop.ok()) fail("interrupt_scope_stop_plan_invalid");
-  if (fault) {
-    if (text(member(value, "preemption_action")) != "preempt_trajectory" ||
-        !member(value, "stop_profile").is_null())
-      fail("interrupt_scope_action_invalid");
-  } else {
-    if (!stop.value().participant_stop_profile) fail("interrupt_scope_stop_plan_invalid");
-    const auto expected_profile = content_identity::parse_canonical_json(
-        EncodePreparedParticipantStopPlan(base, stop.value(), resources, defaults, category)
-            .value());
-    if (content_identity::canonical_json(member(value, "stop_profile")) !=
-        content_identity::canonical_json(member(expected_profile, "participant_stop_profile")))
-      fail("interrupt_scope_stop_profile_mismatch");
-  }
-  std::optional<IoRulePreparedStopEntryDTO> entry;
-  std::optional<IoRulePreparedStopEntryDTO> success_through;
-  if (entry_present) {
-    const auto& value_entry = member(value, "stop_entry");
-    if (!value_entry.is_object() || value_entry.as_object().size() != 3U)
-      fail("interrupt_scope_stop_entry_invalid");
-    entry = IoRulePreparedStopEntryDTO{
-        ResolvedStopBasePlanId(text(member(value_entry, "resolved_stop_base_plan_id"))),
-        StopEscalationStageId(text(member(value_entry, "stop_escalation_stage_id"))),
-        unsigned_integer(member(value_entry, "stage_index"))};
-    const auto& threshold = member(value, "success_through");
-    if (!threshold.is_object() || threshold.as_object().size() != 3U)
-      fail("interrupt_scope_success_through_invalid");
-    success_through = IoRulePreparedStopEntryDTO{
-        ResolvedStopBasePlanId(text(member(threshold, "resolved_stop_base_plan_id"))),
-        StopEscalationStageId(text(member(threshold, "stop_escalation_stage_id"))),
-        unsigned_integer(member(threshold, "stage_index"))};
-    if (!VerifyPreparedIoRuleSuccessThrough(stop.value(), *entry, *success_through).ok() ||
-        (fault && *success_through != *entry))
-      fail("interrupt_scope_stop_entry_invalid");
-  }
-  std::optional<std::int64_t> arm_timeout;
-  if (arm)
-    arm_timeout = static_cast<std::int64_t>(unsigned_integer(member(value, "arm_timeout_ns")));
-  return {MotionInterruptScopeId(text(member(value, "scope_id"))),
-          InterruptPolicyId(text(member(value, "interrupt_policy_id"))),
-          parse_activation_mode(text(member(value, "activation_mode"))),
-          std::move(arm_timeout),
-          boolean(member(value, "required")),
-          fault ? std::nullopt : stop.value().participant_stop_profile,
-          category,
-          parse_structured(member(value, "metadata")),
-          std::move(stop.value()),
-          fault ? InterruptPreemptionAction::kPreemptTrajectory
-                : InterruptPreemptionAction::kCompleteMoveOnSignal,
-          entry,
-          success_through};
-}
-
 [[nodiscard]] CanonicalValue motion_payload_value(
     const PreparedMotionExecutionDTO& value, const ResolvedStopBasePlanDTO& base,
     std::span<const RuntimeResourceBindingDTO> resources,
@@ -829,65 +427,6 @@ template <class Id>
              CanonicalValue(value.contact_policy->contact_policy_revision.value())}}));
   }
   return CanonicalValue(std::move(fields));
-}
-
-[[nodiscard]] PreparedMotionExecutionDTO parse_motion_payload(
-    const CanonicalValue& value, const ResolvedStopBasePlanDTO& base,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> defaults) {
-  const bool contact = value.find_object_member("contact_policy") != nullptr;
-  if (!value.is_object() || value.as_object().size() != (contact ? 11U : 10U))
-    fail("motion_payload_fields_invalid");
-  for (const auto name :
-       {"move_id", "plan_request", "trajectory", "start_state", "planning_evidence",
-        "validation_evidence", "requested_tcp_linear_speed_mps",
-        "deployment_maximum_tcp_linear_speed_mps", "interrupt_scopes", "execution_timeout_s"})
-    static_cast<void>(member(value, name));
-  auto request =
-      DecodePreparedPlanRequest(content_identity::canonical_json(member(value, "plan_request")));
-  if (!request.ok()) fail("motion_nested_value_invalid");
-  const auto* replacement =
-      request.value().moving_replacement ? &*request.value().moving_replacement : nullptr;
-  auto trajectory = DecodePreparedTrajectory(
-      content_identity::canonical_json(member(value, "trajectory")), replacement);
-  auto state =
-      DecodePreparedControlledState(content_identity::canonical_json(member(value, "start_state")));
-  auto planning = DecodePreparedMotionPlanningEvidence(
-      content_identity::canonical_json(member(value, "planning_evidence")), replacement);
-  auto validation = DecodePreparedMotionValidationEvidence(
-      content_identity::canonical_json(member(value, "validation_evidence")));
-  if (!request.ok() || !trajectory.ok() || !state.ok() || !planning.ok() || !validation.ok())
-    fail("motion_nested_value_invalid");
-  std::optional<PreparedContactPolicyRefDTO> contact_policy;
-  if (contact) {
-    const auto& ref = member(value, "contact_policy");
-    exact(ref, {"contact_policy_id", "contact_policy_revision"});
-    contact_policy = PreparedContactPolicyRefDTO{
-        ContactPolicyId(text(member(ref, "contact_policy_id"))),
-        ContactPolicyRevision(text(member(ref, "contact_policy_revision")))};
-  }
-  std::optional<double> requested_speed;
-  const auto& requested_speed_value = member(value, "requested_tcp_linear_speed_mps");
-  if (!requested_speed_value.is_null()) {
-    requested_speed = finite_number(requested_speed_value);
-  }
-  const auto& scopes = member(value, "interrupt_scopes");
-  if (!scopes.is_array() || scopes.as_array().size() > kMaximumScopes)
-    fail("interrupt_scopes_invalid");
-  std::vector<PreparedMotionInterruptScopeDTO> parsed_scopes;
-  for (const auto& scope : scopes.as_array())
-    parsed_scopes.push_back(parse_motion_scope(scope, base, resources, defaults));
-  return {MoveId(text(member(value, "move_id"))),
-          std::move(request.value()),
-          std::move(trajectory.value()),
-          std::move(state.value()),
-          std::move(planning.value()),
-          std::move(validation.value()),
-          std::move(contact_policy),
-          requested_speed,
-          finite_number(member(value, "deployment_maximum_tcp_linear_speed_mps")),
-          std::move(parsed_scopes),
-          finite_number(member(value, "execution_timeout_s"))};
 }
 
 [[nodiscard]] CanonicalValue output_policy_value(const IoOutputCompletionPolicyDTO& policy) {
@@ -1275,11 +814,15 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const RuntimeParticipantBindingDTO& binding) {
   validate_moving_validation_join(motion);
   if (binding.motion_endpoint) {
-    const auto& frame = binding.motion_endpoint->frame;
-    const ResolvedFrameDTO selected = ResolvedComponentModelFrameDTO{
-        binding.controllable_component_id, frame.model_instance_id, frame.frame_role_id,
-        frame.compiled_frame_name, frame.model_revision};
-    if (motion.plan_request.tcp_frame != selected) fail("prepared_motion_endpoint_frame_mismatch");
+    // B7: the TCP frame is stamped with its owner (the motion component or a
+    // tool mounted on it), so the endpoint is compared by its frame key.
+    const auto* tcp = std::get_if<ResolvedComponentModelFrameDTO>(&motion.plan_request.tcp_frame);
+    if (tcp == nullptr ||
+        !same_program_frame(ProgramFrameRoleBindingDTO{tcp->frame_role_id, tcp->model_instance_id,
+                                                       tcp->model_revision,
+                                                       tcp->compiled_frame_name},
+                            binding.motion_endpoint->frame))
+      fail("prepared_motion_endpoint_frame_mismatch");
   }
   const auto* cartesian_path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
   if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
@@ -1373,7 +916,8 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
        *trajectory_metrics->peak_tcp_linear_speed_mps >
            *motion.plan_request.speed_profile.max_tcp_linear_speed_mps + 1.0e-8) ||
       motion.plan_request.retained_collision_world ||
-      motion.plan_request.retained_collision_policy) {
+      motion.plan_request.retained_collision_policy ||
+      motion.plan_request.retained_clearance_margins) {
     fail("motion_payload_join_invalid");
   }
   std::vector<PlannerRuntimeUnitBindingDTO> expected_runtime_units;
@@ -1453,137 +997,6 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
         scope.stop_plan.program_run_id != enclosing.program_run_id)
       fail("motion_interrupt_scope_invalid");
   }
-}
-
-[[nodiscard]] PreparedOperationParticipantDTO parse_participant(
-    const CanonicalValue& value, const RuntimeParticipantBindingDTO& binding,
-    const RuntimeParticipantStopReadinessDTO& readiness,
-    std::span<const HardStopResourceLimitDTO> defaults, MotionInterruptNodeCategory node_category) {
-  const bool capability_provider = value.find_object_member("capability_provider") != nullptr;
-  const bool fault_stop_plan = value.find_object_member("fault_stop_plan") != nullptr;
-  const auto* motion_endpoint = value.find_object_member("motion_endpoint");
-  const std::size_t expected_fields = 42U + static_cast<std::size_t>(capability_provider) +
-                                      static_cast<std::size_t>(fault_stop_plan) +
-                                      static_cast<std::size_t>(motion_endpoint != nullptr);
-  if (!value.is_object() || value.as_object().size() != expected_fields)
-    fail("participant_fields_invalid");
-  for (const auto name : {"api_version",
-                          "prepared_contract_digest",
-                          "operation_id",
-                          "operation_revision",
-                          "participant_id",
-                          "program_id",
-                          "program_revision",
-                          "program_binding_id",
-                          "program_run_id",
-                          "retained_bundle_id",
-                          "graph_revision",
-                          "controllable_component_id",
-                          "component_lifecycle_generation",
-                          "component_type_id",
-                          "component_type_revision",
-                          "command_target_id",
-                          "capability_id",
-                          "capability_definition_revision",
-                          "model_bindings",
-                          "frame_bindings",
-                          "control_domain_id",
-                          "control_domain_revision",
-                          "control_binding_id",
-                          "control_binding_revision",
-                          "control_interface_contract_id",
-                          "control_interface_revision",
-                          "controller_topology_id",
-                          "topology_revision",
-                          "control_route_id",
-                          "activation_set_id",
-                          "control_provider",
-                          "resources",
-                          "endpoint_contract",
-                          "claimed_command_interfaces",
-                          "claimed_state_interfaces",
-                          "active_control_configuration_id",
-                          "active_control_configuration_generation",
-                          "runtime_unit_epochs",
-                          "stop_evidence_policy_id",
-                          "stop_evidence_policy_revision",
-                          "ordinary_stop_plan",
-                          "payload"})
-    static_cast<void>(member(value, name));
-  if (text(member(value, "api_version")) != kPreparedOperationParticipantApiVersion)
-    fail("participant_api_version_invalid");
-  auto ordinary = DecodePreparedParticipantStopPlan(
-      content_identity::canonical_json(member(value, "ordinary_stop_plan")),
-      readiness.resolved_stop_base_plan, binding_resource_span(binding), defaults, node_category);
-  if (!ordinary.ok()) fail("ordinary_stop_plan_invalid");
-  std::optional<PreparedParticipantStopPlanDTO> fault;
-  if (fault_stop_plan) {
-    auto decoded = DecodePreparedParticipantStopPlan(
-        content_identity::canonical_json(member(value, "fault_stop_plan")),
-        readiness.resolved_stop_base_plan, binding_resource_span(binding), defaults, node_category);
-    if (!decoded.ok()) fail("fault_stop_plan_invalid");
-    fault = std::move(decoded.value());
-  }
-  const auto& payload = member(value, "payload");
-  if (!payload.is_object() || payload.as_object().size() != 1U) fail("payload_tag_invalid");
-  PreparedParticipantPayloadDTO parsed_payload =
-      payload.find_object_member("motion_execution") != nullptr
-          ? PreparedParticipantPayloadDTO(parse_motion_payload(
-                member(payload, "motion_execution"), readiness.resolved_stop_base_plan,
-                binding_resource_span(binding), defaults))
-          : PreparedParticipantPayloadDTO(
-                parse_capability_payload(member(payload, "capability_command")));
-  std::optional<PreparedCapabilityProviderRuntimeOccurrenceDTO> parsed_capability_provider;
-  if (capability_provider)
-    parsed_capability_provider = parse_capability_provider(member(value, "capability_provider"));
-  auto result = PreparedOperationParticipantDTO{
-      ContentDigest(text(member(value, "prepared_contract_digest"))),
-      OperationId(text(member(value, "operation_id"))),
-      OperationRevision(unsigned_integer(member(value, "operation_revision"), true)),
-      OperationParticipantId(text(member(value, "participant_id"))),
-      ProgramId(text(member(value, "program_id"))),
-      ProgramRevision(text(member(value, "program_revision"))),
-      ProgramBindingId(text(member(value, "program_binding_id"))),
-      ProgramRunId(text(member(value, "program_run_id"))),
-      RetainedBundleId(text(member(value, "retained_bundle_id"))),
-      GraphRevision(text(member(value, "graph_revision"))),
-      ControllableComponentId(text(member(value, "controllable_component_id"))),
-      ComponentLifecycleGeneration(
-          unsigned_integer(member(value, "component_lifecycle_generation"), true)),
-      ComponentTypeId(text(member(value, "component_type_id"))),
-      ComponentTypeRevision(text(member(value, "component_type_revision"))),
-      CommandTargetId(text(member(value, "command_target_id"))),
-      CapabilityId(text(member(value, "capability_id"))),
-      CapabilityDefinitionRevision(text(member(value, "capability_definition_revision"))),
-      parse_model_bindings(member(value, "model_bindings")),
-      parse_frame_bindings(member(value, "frame_bindings")),
-      ControlDomainId(text(member(value, "control_domain_id"))),
-      ControlDomainRevision(text(member(value, "control_domain_revision"))),
-      ControlBindingId(text(member(value, "control_binding_id"))),
-      ControlBindingRevision(text(member(value, "control_binding_revision"))),
-      ControlInterfaceContractId(text(member(value, "control_interface_contract_id"))),
-      ControlInterfaceRevision(text(member(value, "control_interface_revision"))),
-      ControllerTopologyId(text(member(value, "controller_topology_id"))),
-      TopologyRevision(text(member(value, "topology_revision"))),
-      ControlRouteId(text(member(value, "control_route_id"))),
-      ActivationSetId(text(member(value, "activation_set_id"))),
-      parse_provider(member(value, "control_provider")),
-      std::move(parsed_capability_provider),
-      parse_id_array<ResourceId>(member(value, "resources")),
-      parse_endpoint_contract(member(value, "endpoint_contract")),
-      parse_interfaces(member(value, "claimed_command_interfaces")),
-      parse_interfaces(member(value, "claimed_state_interfaces")),
-      ActiveControlConfigurationId(text(member(value, "active_control_configuration_id"))),
-      ActiveControlConfigurationGeneration(
-          unsigned_integer(member(value, "active_control_configuration_generation"), true)),
-      parse_epochs(member(value, "runtime_unit_epochs")),
-      StopEvidencePolicyId(text(member(value, "stop_evidence_policy_id"))),
-      StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision"))),
-      std::move(ordinary.value()),
-      std::move(parsed_payload),
-      std::move(fault)};
-  if (motion_endpoint) result.motion_endpoint = parse_motion_endpoint(*motion_endpoint);
-  return result;
 }
 
 }  // namespace
@@ -1908,31 +1321,6 @@ Result<std::string> EncodePreparedOperationParticipant(
         retained_default_limits, node_category, true)));
   } catch (const std::exception& error) {
     return rejected<std::string>(error.what());
-  }
-}
-
-Result<PreparedOperationParticipantDTO> DecodePreparedOperationParticipant(
-    std::string_view canonical_bytes, const RuntimeParticipantBinding& binding,
-    const RuntimeParticipantStopReadiness& readiness,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits,
-    MotionInterruptNodeCategory node_category) {
-  try {
-    if (canonical_bytes.size() > content_identity::kMaximumCanonicalJsonBytes)
-      fail("canonical_byte_bound_exceeded");
-    auto candidate =
-        parse_participant(content_identity::parse_canonical_json(canonical_bytes), binding.value(),
-                          readiness.value(), retained_default_limits, node_category);
-    auto verified =
-        MakePreparedOperationParticipant(std::move(candidate), binding, readiness,
-                                         retained_default_limits, node_category);
-    if (!verified.ok()) return verified;
-    const auto encoded =
-        EncodePreparedOperationParticipant(verified.value(), binding, readiness,
-                                           retained_default_limits, node_category);
-    if (!encoded.ok() || encoded.value() != canonical_bytes) fail("canonical_round_trip_mismatch");
-    return verified;
-  } catch (const std::exception& error) {
-    return rejected<PreparedOperationParticipantDTO>(error.what());
   }
 }
 

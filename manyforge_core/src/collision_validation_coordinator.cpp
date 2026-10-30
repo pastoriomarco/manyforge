@@ -784,6 +784,7 @@ CollisionQuery CollisionValidationCoordinator::make_query(
   query.required_capabilities = required_capabilities_;
   query.distance_request_mode = distance_request_mode_;
   query.selected_distance_pairs = selected_distance_pairs_;
+  query.clearance_margins = config_.clearance_margins;
   if (config_.per_state_timeout_ns > 0) {
     query.timeout_budget_ns = config_.per_state_timeout_ns;
   }

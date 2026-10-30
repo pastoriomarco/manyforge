@@ -7,6 +7,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -229,17 +230,15 @@ CREATE INDEX cclc_route_effect_attempt_transaction_order
   ON cclc_route_effect_attempts(route_selection_transaction_id, effect_sequence);
 )sql";
 
-class JournalFailure final : public std::runtime_error {
+class JournalFailure final : public TypedError {
  public:
   JournalFailure(std::string code, std::string message,
                  std::string reason = "component_lifecycle_journal_failure")
-      : std::runtime_error(std::move(message)), code_(std::move(code)), reason_(std::move(reason)) {}
+      : TypedError(std::move(code), message, {{"reason", reason}}), reason_(std::move(reason)) {}
 
-  [[nodiscard]] const std::string& code() const noexcept { return code_; }
   [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
 
  private:
-  std::string code_;
   std::string reason_;
 };
 
@@ -602,7 +601,10 @@ ALTER TABLE cclc_native_apply_plans ADD COLUMN component_bring_up BLOB;
 // request membership (owner epoch, request id), which retains its result.
 // The per-component recovery generation advances in every commit that clears
 // the driver's facts (the operator's Recover, a cancelled target); a driver
-// write based on an older one is refused (no row reads as generation 0).
+// write based on an older one is refused (no row reads as generation 0). The
+// recover attempt generation is the recovery generation under which the last
+// Recover (the operator's ordinary one or the driver's) was accepted, written
+// in that acceptance commit.
 constexpr std::string_view kLifecycleTargetSchemaUpgrade = R"sql(
 CREATE TABLE cclc_component_lifecycle_targets (
   controllable_component_id TEXT PRIMARY KEY,
@@ -613,6 +615,7 @@ CREATE TABLE cclc_component_lifecycle_targets (
   reached INTEGER NOT NULL CHECK (reached IN (0, 1)),
   recovered_cause INTEGER CHECK (recovered_cause IS NULL OR recovered_cause BETWEEN 2 AND 10),
   retirement_reason INTEGER NOT NULL CHECK (retirement_reason BETWEEN 0 AND 2),
+  incident_reenable INTEGER NOT NULL DEFAULT 0 CHECK (incident_reenable IN (0, 1)),
   CHECK ((present=1 AND retirement_reason=0) OR (present=0 AND retirement_reason IN (1,2)))
 ) STRICT;
 CREATE TABLE cclc_component_intervention_causes (
@@ -658,7 +661,10 @@ CREATE TABLE cclc_component_incident_events (
 ) STRICT;
 CREATE TABLE cclc_component_recovery_generations (
   controllable_component_id TEXT PRIMARY KEY,
-  recovery_generation INTEGER NOT NULL CHECK (recovery_generation > 0)
+  recovery_generation INTEGER NOT NULL CHECK (recovery_generation > 0),
+  recover_attempt_generation INTEGER,
+  CHECK (recover_attempt_generation IS NULL OR
+         recover_attempt_generation BETWEEN 1 AND recovery_generation)
 ) STRICT;
 )sql";
 
@@ -1049,105 +1055,21 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
   return true;
 }
 
-[[nodiscard]] bool ReconciliationEvidenceMonotonic(
-    const std::optional<LifecycleReconciliationEvidenceDTO>& previous,
-    const std::optional<LifecycleReconciliationEvidenceDTO>& next) {
-  if (!previous.has_value()) {
-    return true;
-  }
-  if (!next.has_value()) {
-    return false;
-  }
-  const bool same_source =
-      previous->provider_instance_id == next->provider_instance_id &&
-      previous->provider_manifest_id == next->provider_manifest_id &&
-      previous->provider_manifest_revision == next->provider_manifest_revision &&
-      previous->provider_runtime_unit_id == next->provider_runtime_unit_id &&
-      previous->provider_runtime_epoch == next->provider_runtime_epoch;
-  if (!same_source || previous->source_sequence > next->source_sequence ||
-      previous->observation_generation > next->observation_generation ||
-      previous->observed_at_ns > next->observed_at_ns) {
-    return false;
-  }
-  if (previous->observation_generation == next->observation_generation &&
-      (previous->observed_state != next->observed_state ||
-       previous->postcondition_result != next->postcondition_result)) {
-    return false;
-  }
-  if (previous->source_sequence == next->source_sequence &&
-      previous->observation_generation == next->observation_generation) {
-    return *previous == *next;
-  }
-  return previous->observation_generation == next->observation_generation ||
-         previous->source_sequence < next->source_sequence;
-}
-
-[[nodiscard]] bool ReconciliationEvidenceIsFresh(
-    const std::optional<LifecycleReconciliationEvidenceDTO>& previous,
-    const std::optional<LifecycleReconciliationEvidenceDTO>& next) {
-  if (!next.has_value()) {
-    return false;
-  }
-  return !previous.has_value() ||
-         (previous->provider_instance_id == next->provider_instance_id &&
-          previous->provider_manifest_id == next->provider_manifest_id &&
-          previous->provider_manifest_revision == next->provider_manifest_revision &&
-          previous->provider_runtime_unit_id == next->provider_runtime_unit_id &&
-          previous->provider_runtime_epoch == next->provider_runtime_epoch &&
-          previous->source_sequence < next->source_sequence &&
-          previous->observation_generation < next->observation_generation);
-}
-
-[[nodiscard]] bool DomainEffectMonotonic(const ComponentLifecycleDomainStatusDTO& previous,
-                                         const ComponentLifecycleDomainStatusDTO& next) {
-  using Effect = ComponentLifecycleDomainEffectDTO;
-  if (!ReconciliationEvidenceMonotonic(previous.reconciliation_evidence,
-                                       next.reconciliation_evidence)) {
-    return false;
-  }
-  switch (previous.effect) {
-    case Effect::kNone:
-      return true;
-    case Effect::kKnownNoEffect:
-      return next.effect != Effect::kNone;
-    case Effect::kEffectObserved:
-    case Effect::kPartialEffectObserved:
-      return next.effect == Effect::kEffectObserved ||
-             next.effect == Effect::kPartialEffectObserved ||
-             (next.effect == Effect::kEffectUncertain &&
-              next.primitive_attempts.size() == previous.primitive_attempts.size() + 1U &&
-              next.primitive_attempts.back().dispatch_state ==
-                  LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain);
-    case Effect::kEffectUncertain:
-      if (next.effect == Effect::kEffectUncertain) {
-        return true;
-      }
-      if (next.effect == Effect::kNone) {
-        return false;
-      }
-      return ReconciliationEvidenceIsFresh(previous.reconciliation_evidence,
-                                           next.reconciliation_evidence);
-  }
-  return false;
-}
-
 [[nodiscard]] bool DomainActionMonotonic(const ComponentLifecycleDomainStatusDTO& previous,
                                          const ComponentLifecycleDomainStatusDTO& next) {
   using Action = ComponentLifecycleDomainActionStateDTO;
   if (previous.action_state == Action::kSucceeded || previous.action_state == Action::kFailed) {
     return next.action_state == previous.action_state;
   }
-  if (previous.action_state == Action::kOutcomeUnknown ||
-      previous.action_state == Action::kReconciling) {
-    const bool resolved_by_fresh_evidence = ReconciliationEvidenceIsFresh(
-        previous.reconciliation_evidence, next.reconciliation_evidence);
-    return next.action_state == Action::kOutcomeUnknown ||
-           next.action_state == Action::kReconciling || next.action_state == Action::kSucceeded ||
-           next.action_state == Action::kFailed ||
-           (resolved_by_fresh_evidence &&
-            (next.action_state == Action::kExecuting || next.action_state == Action::kVerifying));
-  }
   return true;
+}
+
+// V-B2 feedback is append-only: a successor keeps every retained event in order.
+[[nodiscard]] bool SubstepEventsAppendOnly(const ComponentLifecycleDomainStatusDTO& previous,
+                                           const ComponentLifecycleDomainStatusDTO& next) {
+  return previous.substep_events.size() <= next.substep_events.size() &&
+         std::equal(previous.substep_events.begin(), previous.substep_events.end(),
+                    next.substep_events.begin());
 }
 
 [[nodiscard]] bool DomainEvidenceMonotonic(const ComponentLifecycleStatusDTO& previous,
@@ -1160,7 +1082,7 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
     const auto& current = next.domains[index];
     if (prior.control_domain_id != current.control_domain_id ||
         prior.resolved_provider_occurrence != current.resolved_provider_occurrence ||
-        !DomainEffectMonotonic(prior, current) || !DomainActionMonotonic(prior, current)) {
+        !SubstepEventsAppendOnly(prior, current) || !DomainActionMonotonic(prior, current)) {
       return false;
     }
   }
@@ -1173,7 +1095,6 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
     const ComponentLifecycleStatusDTO& previous, const ComponentLifecycleStatusDTO& next) {
   using Phase = ComponentLifecycleTransactionPhaseDTO;
   using Action = ComponentLifecycleDomainActionStateDTO;
-  using Effect = ComponentLifecycleDomainEffectDTO;
   if (!previous.apply_bring_up || previous.selected_bring_up ||
       previous.phase != Phase::kAccepted || next.phase != Phase::kVerifying ||
       previous.status_owner_epoch != previous.accepted_intent.request_context.request_owner_epoch ||
@@ -1189,15 +1110,15 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
         prior.expected_domain != current.expected_domain ||
         prior.requested_state != current.requested_state ||
         !prior.primitive_attempts.empty() || !current.primitive_attempts.empty() ||
-        prior.reconciliation_evidence || current.reconciliation_evidence ||
-        prior.effect != Effect::kNone ||
-        (prior.action_state != Action::kReserved && prior.action_state != Action::kNotStarted) ||
-        (current.effect != Effect::kNone && current.effect != Effect::kKnownNoEffect)) return false;
+        !prior.substep_events.empty() || !current.substep_events.empty() ||
+        (prior.action_state != Action::kReserved && prior.action_state != Action::kNotStarted))
+      return false;
+    // A retired domain is never dispatched: no attempts and no error.
     if (!current.expected_domain) {
       if (current.current_scope != prior.current_scope ||
           current.resolved_provider_occurrence != prior.resolved_provider_occurrence ||
           current.previous_state != prior.previous_state || current.current_state != prior.current_state ||
-          current.action_state != Action::kReserved || current.effect != Effect::kKnownNoEffect)
+          current.action_state != Action::kReserved || current.error)
         return false;
       continue;
     }
@@ -1216,15 +1137,19 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
   return Terminal(status) && !status.reconciliation_required;
 }
 
+// A replacement owner never re-sends. Its succeeded terminal only restates
+// retained success; a failed one may settle states from a fresh observation
+// (VB2-O1) and fails every domain that had not succeeded.
 [[nodiscard]] bool ReplacementTerminalIsSupportedByRetainedEvidence(
     const ComponentLifecycleStatusDTO& previous, const ComponentLifecycleStatusDTO& next) {
   if (!TerminalStatusIsQuiescent(next) || previous.previous_state != next.previous_state ||
-      previous.current_state != next.current_state ||
       previous.domains.size() != next.domains.size() || !next.terminal_result.has_value()) {
     return false;
   }
-
-  bool retained_observed_effect = false;
+  const bool succeeded = *next.terminal_result == ComponentLifecycleTerminalResultDTO::kSucceeded;
+  if (succeeded && previous.current_state != next.current_state) {
+    return false;
+  }
   for (std::size_t index = 0U; index < previous.domains.size(); ++index) {
     const auto& prior = previous.domains[index];
     const auto& current = next.domains[index];
@@ -1233,52 +1158,19 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
         prior.current_scope != current.current_scope ||
         prior.resolved_provider_occurrence != current.resolved_provider_occurrence ||
         prior.previous_state != current.previous_state ||
-        prior.current_state != current.current_state ||
         prior.requested_state != current.requested_state ||
-        prior.primitive_attempts != current.primitive_attempts ||
-        prior.reconciliation_evidence != current.reconciliation_evidence) {
+        prior.primitive_attempts != current.primitive_attempts) {
       return false;
     }
-
-    switch (*next.terminal_result) {
-      case ComponentLifecycleTerminalResultDTO::kSucceeded:
-        if (prior.action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded ||
-            current.action_state != prior.action_state || current.effect != prior.effect) {
-          return false;
-        }
-        break;
-      case ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect:
-        if ((prior.effect != ComponentLifecycleDomainEffectDTO::kNone &&
-             prior.effect != ComponentLifecycleDomainEffectDTO::kKnownNoEffect) ||
-            (current.effect != ComponentLifecycleDomainEffectDTO::kNone &&
-             current.effect != ComponentLifecycleDomainEffectDTO::kKnownNoEffect)) {
-          return false;
-        }
-        break;
-      case ComponentLifecycleTerminalResultDTO::kFailedPartialEffect:
-        if (prior.effect == ComponentLifecycleDomainEffectDTO::kEffectObserved ||
-            prior.effect == ComponentLifecycleDomainEffectDTO::kPartialEffectObserved) {
-          retained_observed_effect = true;
-          if (current.effect != prior.effect) {
-            return false;
-          }
-        } else if (prior.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect) {
-          if (current.effect != ComponentLifecycleDomainEffectDTO::kKnownNoEffect) {
-            return false;
-          }
-        } else if (prior.effect == ComponentLifecycleDomainEffectDTO::kNone) {
-          if (current.effect != ComponentLifecycleDomainEffectDTO::kNone &&
-              current.effect != ComponentLifecycleDomainEffectDTO::kKnownNoEffect) {
-            return false;
-          }
-        } else {
-          return false;
-        }
-        break;
+    if (succeeded ? prior.action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded ||
+                        current.action_state != prior.action_state ||
+                        prior.current_state != current.current_state
+                  : current.action_state != ComponentLifecycleDomainActionStateDTO::kSucceeded &&
+                        current.action_state != ComponentLifecycleDomainActionStateDTO::kFailed) {
+      return false;
     }
   }
-  return *next.terminal_result != ComponentLifecycleTerminalResultDTO::kFailedPartialEffect ||
-         retained_observed_effect;
+  return true;
 }
 
 [[nodiscard]] bool StatusEvidenceIsMonotonic(const ComponentLifecycleStatusDTO& previous,
@@ -1294,14 +1186,17 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
          (owner_changed || next.latest_updated_at_ns >= previous.latest_updated_at_ns);
 }
 
+// A replacement owner parks a row (outcome unknown, reconciliation required:
+// stopped or recovered bring-up, VB2-O4) or, with `failed_completion`,
+// completes the prepared attempt it found as failed.
 [[nodiscard]] bool StatusReplacementIsMonotonic(const ComponentLifecycleStatusDTO& previous,
-                                                const ComponentLifecycleStatusDTO& next) {
+                                                const ComponentLifecycleStatusDTO& next,
+                                                bool failed_completion = false) {
   const bool owner_changed = previous.status_owner_epoch != next.status_owner_epoch;
   return StatusEvidenceIsMonotonic(previous, next) &&
-         (!owner_changed ||
+         (!owner_changed || failed_completion ||
           (next.reconciliation_required &&
-           (next.phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
-            next.phase == ComponentLifecycleTransactionPhaseDTO::kReconciling)));
+           next.phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown));
 }
 
 [[nodiscard]] bool OwnerReplacementStatusIsMonotonic(const ComponentLifecycleStatusDTO& previous,
@@ -1310,8 +1205,7 @@ WHERE retained_result=1 AND target_retirement_blob IS NOT NULL
   const bool owner_changed = previous.status_owner_epoch != next.status_owner_epoch;
   const bool reconciliation_status =
       next.reconciliation_required &&
-      (next.phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
-       next.phase == ComponentLifecycleTransactionPhaseDTO::kReconciling);
+      next.phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
   const bool replacement_transition_valid =
       !owner_changed || reconciliation_status ||
       (!has_unresolved_prepared_effect &&
@@ -1522,6 +1416,7 @@ class SqliteCCLCJournal::Impl final {
       const ControllableComponentId& component);
   ComponentLifecycleTargetFactsDTO LoadLifecycleTargetFacts(
       const ControllableComponentId& component);
+  bool ActiveTargetRetiredByIncident(const ControllableComponentId& component);
   bool RecordInterventionCause(const ControllableComponentId& component,
                                const ControlDomainId& domain,
                                std::optional<LifecycleBlockingCauseClassDTO> cause_class,
@@ -1586,10 +1481,13 @@ class SqliteCCLCJournal::Impl final {
   /// mutex inside a write transaction.
   /// `reset_reached` starts the component over (startup or changed by an
   /// Apply); an operator target keeps whether it reached its target.
+  /// `keep_incident_reenable` (KeepsIncidentReenable) keeps the incident
+  /// re-enable mark; every other write ends it.
   ComponentLifecycleTargetDTO WriteLifecycleTargetLocked(const ControllableComponentId& component,
                                                          LifecycleTargetStateDTO requested_state,
                                                          LifecycleTargetOriginDTO origin,
-                                                         bool reset_reached);
+                                                         bool reset_reached,
+                                                         bool keep_incident_reenable = false);
   // Retire requested intent only: preserve target/recovery generations,
   // recovered causes, intervention causes and incident evidence.
   void RetireLifecycleTargetIntentLocked(const ControllableComponentId& component,
@@ -1597,12 +1495,20 @@ class SqliteCCLCJournal::Impl final {
   /// Cancel the target and drop the intervention causes of a component that
   /// left the adopted set; its generation watermark stays.
   void CancelLifecycleTargetLocked(const ControllableComponentId& component);
+  /// End the incident re-enable marker of a component an Apply replaced.
+  void ClearIncidentReenableLocked(const ControllableComponentId& component);
+  /// Close ends every incident re-enable mark, on present and already
+  /// retired rows, in its retirement commit (SX-656).
+  void ClearAllIncidentReenableLocked();
   /// The component's recovery generation (0 before the first); caller holds
   /// the mutex.
   std::uint64_t ReadRecoveryGenerationLocked(const ControllableComponentId& component);
   /// Advance it inside the caller's write transaction: every commit that
   /// clears the driver's facts (Recover, cancellation) calls this.
   void AdvanceRecoveryGenerationLocked(const ControllableComponentId& component);
+  /// M6 (item 35): in a Recover's acceptance commit, record the component's
+  /// current recovery generation as the one that Recover attempt ran under.
+  void RecordRecoverAttemptLocked(const ControllableComponentId& component);
   /// Refuse a driver write based on facts read before the last advance.
   void RequireRecoveryGenerationLocked(const ControllableComponentId& component,
                                        std::uint64_t expected);
@@ -1728,6 +1634,14 @@ class SqliteCCLCJournal::Impl final {
               "lifecycle journal metadata insert returned an unexpected row");
     }
     // Current-only development journal: earlier versions are not migrated.
+    // Version 24 records one transition action per domain (V-B2): three
+    // outcomes, substeps, feedback events and before/after observations, with
+    // no effect classification or reconciliation evidence.
+    // Version 23 added the incident re-enable marker on the target row: an
+    // incident retired the Active target and Active was not restored since.
+    // Version 22 added the per-component recover attempt generation (M6 item
+    // 35): the driver's once-per-recovery-generation Recover survives an
+    // owner restart.
     // Version 21 dropped the observer incident target kind and bring-up record.
     // Version 20 uses current v2 component incident diagnostic names and payloads.
     // Version 19 distinguishes ordinary cancellation from Close on the same
@@ -3307,20 +3221,25 @@ void SqliteCCLCJournal::Impl::RetainCurrentComponentLifecycleFact(
                    "component_lifecycle_state=excluded.component_lifecycle_state");
   retain.Bind(1, component_id.value());
   retain.Bind(2, static_cast<std::int64_t>(generation));
-  // A settled partial effect carries the coordinator's observed state. A
-  // reconstructed one (no fresh fault-free observation, e.g. after owner
-  // replacement) is Declared, and the predecessor never survives as Active:
-  // restart would otherwise reconstruct it as command readiness.
+  // A dispatched failure (some domain has an attempt) carries the
+  // coordinator's state settled from current status (VB2-O1), Active
+  // included when every domain was observed Active at rest. A reconstructed
+  // one (no fresh fault-free observation) is Declared. A failure before any
+  // dispatch keeps its predecessor.
   auto state = *status.current_state;
-  if (status.terminal_result == ComponentLifecycleTerminalResultDTO::kFailedPartialEffect) {
+  const bool dispatched_failure =
+      status.terminal_result &&
+      *status.terminal_result != ComponentLifecycleTerminalResultDTO::kSucceeded &&
+      std::any_of(status.domains.begin(), status.domains.end(),
+                  [](const auto& domain) { return !domain.primitive_attempts.empty(); });
+  if (dispatched_failure) {
     const auto reconstructed = [&] {
       if (!status.error) return false;
       const auto warning = status.error->details.find("component_state");
       return warning != status.error->details.end() &&
              warning->second == kComponentLifecycleStateReconstructedCode;
     };
-    if (reconstructed() || state == ComponentLifecycleStateDTO::kActive)
-      state = ComponentLifecycleStateDTO::kDeclared;
+    if (reconstructed()) state = ComponentLifecycleStateDTO::kDeclared;
   }
   retain.Bind(3, static_cast<std::int64_t>(state));
   Require(!retain.Step(), "component_lifecycle_journal_corrupt",
@@ -3834,6 +3753,11 @@ CCLCLifecycleRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayLifecycle(
 
   RetainCurrentComponentLifecycleFact(candidate_initial_status);
   if (!selected && !apply_delegated && !expected_target) RecordAcceptedOperatorRequestLocked(intent);
+  // M6 (item 35): an accepted Recover, the operator's (under the generation
+  // its acceptance just advanced to) or the driver's, is that recovery
+  // generation's one Recover attempt; the driver adds none of its own.
+  if (!selected && !apply_delegated && intent.intent == ComponentLifecycleIntentKindDTO::kRecover)
+    RecordRecoverAttemptLocked(intent.controllable_component_id);
 
   CompactTerminalResults();
   transaction.Commit();
@@ -3923,8 +3847,9 @@ void SqliteCCLCJournal::Impl::RecordAcceptedOperatorRequestLocked(
     Require(!adopted.Step(), "component_lifecycle_journal_corrupt",
             "operator target adopted component membership is duplicated");
   }
-  static_cast<void>(WriteLifecycleTargetLocked(intent.controllable_component_id, *requested,
-                                               LifecycleTargetOriginDTO::kOperator, false));
+  static_cast<void>(WriteLifecycleTargetLocked(
+      intent.controllable_component_id, *requested, LifecycleTargetOriginDTO::kOperator, false,
+      KeepsIncidentReenable(*requested, intent.request_context.source_label)));
 }
 
 std::optional<CCLCRouteSelectionRequestResultDTO>
@@ -4480,7 +4405,20 @@ std::uint64_t SqliteCCLCJournal::Impl::RecordEffectCompleted(
   const auto previous = detail::DecodeComponentLifecycleStatus(retained.Blob(1));
   Require(!retained.Step(), "component_lifecycle_journal_corrupt",
           "completed CCLC effect transaction is duplicated");
-  Require(previous_terminal == 0 && StatusReplacementIsMonotonic(previous, successor_status),
+  // A replacement owner completes the attempt it found prepared only as
+  // failed, nonterminal, on that domain (V-B2 owner recovery; nothing re-sent).
+  const auto& completed_result = *completed_attempt.lifecycle_primitive_result;
+  const bool failed_completion =
+      completed_result.outcome != LifecycleTransitionOutcomeDTO::kSucceeded &&
+      !Terminal(successor_status) &&
+      successor_status.phase == ComponentLifecycleTransactionPhaseDTO::kVerifying &&
+      std::any_of(successor_status.domains.begin(), successor_status.domains.end(),
+                  [&](const auto& domain) {
+                    return domain.control_domain_id == completed_result.control_domain_id &&
+                           domain.action_state == ComponentLifecycleDomainActionStateDTO::kFailed;
+                  });
+  Require(previous_terminal == 0 &&
+              StatusReplacementIsMonotonic(previous, successor_status, failed_completion),
           "component_lifecycle_journal_status_regressed",
           "completed effect successor status is not monotonic");
 
@@ -5978,9 +5916,7 @@ SqliteCCLCJournal::Impl::ReadNativeApplyChildrenLocked(
       Require(terminal == 0 && status.phase == ComponentLifecycleTransactionPhaseDTO::kAccepted &&
                   status.status_sequence == 1U && !status.terminal_result &&
                   std::all_of(status.domains.begin(), status.domains.end(), [](const auto& domain) {
-                    return domain.primitive_attempts.empty() && !domain.reconciliation_evidence && !domain.error &&
-                        (domain.effect == ComponentLifecycleDomainEffectDTO::kNone ||
-                         domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect) &&
+                    return domain.primitive_attempts.empty() && !domain.error &&
                         (domain.action_state == ComponentLifecycleDomainActionStateDTO::kNotStarted ||
                          domain.action_state == ComponentLifecycleDomainActionStateDTO::kReserved ||
                          domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded);
@@ -5996,7 +5932,7 @@ SqliteCCLCJournal::Impl::ReadNativeApplyChildrenLocked(
       for (const auto& domain : status.domains) {
         if (!domain.expected_domain) {
           Require(domain.action_state == ComponentLifecycleDomainActionStateDTO::kReserved &&
-                      domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
+                      domain.primitive_attempts.empty() && !domain.error,
                   "component_lifecycle_native_apply_unsettled", "native Apply retired child domain is not settled");
           continue;
         }
@@ -6781,6 +6717,7 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
     if (!plan->component_bring_up) {
       if (!retained_component(component.component_id) && has_target)
         RetireLifecycleTargetIntentLocked(component.component_id);
+      if (!retained_component(component.component_id)) ClearIncidentReenableLocked(component.component_id);
       continue;
     }
     if (retained_component(component.component_id) && has_target) continue;
@@ -6892,12 +6829,23 @@ SqliteCCLCJournal::Impl::ReadLifecycleTargetRetention(const ControllableComponen
 
 ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
     const ControllableComponentId& component, const LifecycleTargetStateDTO requested_state,
-    const LifecycleTargetOriginDTO origin, const bool reset_reached) {
+    const LifecycleTargetOriginDTO origin, const bool reset_reached,
+    const bool keep_incident_reenable) {
   const auto previous = ReadLifecycleTargetLocked(component);
   const std::uint64_t previous_generation = previous ? previous->first.target_generation : 0U;
   Require(FitsSqliteInteger(previous_generation + 1U), "component_lifecycle_journal_capacity",
           "lifecycle target generation is exhausted");
   const bool keep = !reset_reached && previous.has_value() && previous->second;
+  // The incident re-enable mark survives only Recover cell's own re-enable
+  // targets (its Prepare, and its Enable until Active is reached).
+  bool incident_reenable = false;
+  if (keep_incident_reenable && !reset_reached) {
+    Statement marker(database_,
+                     "SELECT incident_reenable FROM cclc_component_lifecycle_targets "
+                     "WHERE controllable_component_id=?");
+    marker.Bind(1, component.value());
+    incident_reenable = marker.Step() && marker.Integer(0) == 1;
+  }
   const ComponentLifecycleTargetDTO target{
       component,
       requested_state,
@@ -6910,11 +6858,13 @@ ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
   Statement write(database_,
                   "INSERT INTO cclc_component_lifecycle_targets("
                   "controllable_component_id,requested_state,origin,target_generation,present,"
-                  "reached,recovered_cause,retirement_reason) VALUES(?,?,?,?,1,?,?,0) "
+                  "reached,recovered_cause,retirement_reason,incident_reenable) "
+                  "VALUES(?,?,?,?,1,?,?,0,?) "
                   "ON CONFLICT(controllable_component_id) DO UPDATE "
                   "SET requested_state=excluded.requested_state,origin=excluded.origin,"
                   "target_generation=excluded.target_generation,present=1,"
-                  "reached=excluded.reached,recovered_cause=excluded.recovered_cause,retirement_reason=0");
+                  "reached=excluded.reached,recovered_cause=excluded.recovered_cause,retirement_reason=0,"
+                  "incident_reenable=excluded.incident_reenable");
   write.Bind(1, component.value());
   write.Bind(2, static_cast<std::int64_t>(requested_state));
   write.Bind(3, static_cast<std::int64_t>(origin));
@@ -6925,6 +6875,7 @@ ComponentLifecycleTargetDTO SqliteCCLCJournal::Impl::WriteLifecycleTargetLocked(
   } else {
     write.BindNull(6);
   }
+  write.Bind(7, static_cast<std::int64_t>(incident_reenable ? 1 : 0));
   Require(!write.Step(), "component_lifecycle_journal_corrupt",
           "lifecycle target write returned a row");
   return target;
@@ -6936,19 +6887,40 @@ void SqliteCCLCJournal::Impl::RetireLifecycleTargetIntentLocked(
               reason == LifecycleTargetRetirementReasonDTO::kClose,
           "component_lifecycle_journal_record_invalid", "target retirement reason is invalid");
   Statement retire(database_,
-                   "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,retirement_reason=? "
+                   "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,retirement_reason=?,"
+                   "incident_reenable=CASE WHEN ?=2 THEN 0 ELSE incident_reenable END "
                    "WHERE controllable_component_id=? AND present=1");
   retire.Bind(1, static_cast<std::int64_t>(reason));
-  retire.Bind(2, component.value());
+  retire.Bind(2, static_cast<std::int64_t>(reason));
+  retire.Bind(3, component.value());
   Require(!retire.Step(), "component_lifecycle_journal_corrupt",
           "lifecycle target intent retirement returned a row");
+}
+
+void SqliteCCLCJournal::Impl::ClearIncidentReenableLocked(
+    const ControllableComponentId& component) {
+  Statement clear(database_,
+                  "UPDATE cclc_component_lifecycle_targets SET incident_reenable=0 "
+                  "WHERE controllable_component_id=?");
+  clear.Bind(1, component.value());
+  Require(!clear.Step(), "component_lifecycle_journal_corrupt",
+          "incident re-enable marker clear returned a row");
+}
+
+void SqliteCCLCJournal::Impl::ClearAllIncidentReenableLocked() {
+  Statement clear(database_,
+                  "UPDATE cclc_component_lifecycle_targets SET incident_reenable=0 "
+                  "WHERE incident_reenable=1");
+  Require(!clear.Step(), "component_lifecycle_journal_corrupt",
+          "incident re-enable marker clear returned a row");
 }
 
 void SqliteCCLCJournal::Impl::CancelLifecycleTargetLocked(
     const ControllableComponentId& component) {
   Statement cancel(database_,
                    "UPDATE cclc_component_lifecycle_targets SET present=0,reached=0,"
-                   "recovered_cause=NULL,retirement_reason=CASE WHEN retirement_reason=2 THEN 2 ELSE 1 END "
+                   "recovered_cause=NULL,incident_reenable=0,"
+                   "retirement_reason=CASE WHEN retirement_reason=2 THEN 2 ELSE 1 END "
                    "WHERE controllable_component_id=?");
   cancel.Bind(1, component.value());
   Require(!cancel.Step(), "component_lifecycle_journal_corrupt",
@@ -6989,6 +6961,19 @@ void SqliteCCLCJournal::Impl::AdvanceRecoveryGenerationLocked(
   write.Bind(2, static_cast<std::int64_t>(next));
   Require(!write.Step(), "component_lifecycle_journal_corrupt",
           "component recovery generation write returned a row");
+}
+
+void SqliteCCLCJournal::Impl::RecordRecoverAttemptLocked(
+    const ControllableComponentId& component) {
+  // No row (generation 0, never recovered) records nothing: only a Recover
+  // after the operator's Recover is gated (see the driver's recovered cause).
+  Statement write(database_,
+                  "UPDATE cclc_component_recovery_generations "
+                  "SET recover_attempt_generation=recovery_generation "
+                  "WHERE controllable_component_id=?");
+  write.Bind(1, component.value());
+  Require(!write.Step(), "component_lifecycle_journal_corrupt",
+          "component recover attempt write returned a row");
 }
 
 void SqliteCCLCJournal::Impl::RequireRecoveryGenerationLocked(
@@ -7125,6 +7110,7 @@ CCLCLifecycleTargetRetirementResultDTO SqliteCCLCJournal::Impl::RetireLifecycleT
   for (const auto& target : intent.expected_targets)
     RetireLifecycleTargetIntentLocked(target.controllable_component_id,
                                      LifecycleTargetRetirementReasonDTO::kClose);
+  ClearAllIncidentReenableLocked();
   CompactTerminalResults();
   // The admission lease remains held, while Stop recognition may still
   // advance real faults. This check can roll back these purely journal writes;
@@ -7190,6 +7176,7 @@ std::vector<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::RetireLifecycl
   for (const auto& target : targets)
     RetireLifecycleTargetIntentLocked(target.controllable_component_id,
                                      LifecycleTargetRetirementReasonDTO::kClose);
+  ClearAllIncidentReenableLocked();
   transaction.Commit();
   return targets;
 }
@@ -7224,6 +7211,19 @@ std::optional<ComponentLifecycleTargetDTO> SqliteCCLCJournal::Impl::LoadLifecycl
   const auto row = ReadLifecycleTargetLocked(component);
   if (!row || !row->second) return std::nullopt;
   return row->first;
+}
+
+bool SqliteCCLCJournal::Impl::ActiveTargetRetiredByIncident(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  // An incident retired the Active target and Active was not restored since
+  // (reaching Active, an operator Disable, Close or an Apply end it).
+  Statement row(database_,
+                "SELECT incident_reenable FROM cclc_component_lifecycle_targets "
+                "WHERE controllable_component_id=?");
+  row.Bind(1, component.value());
+  return row.Step() && row.Integer(0) == 1;
 }
 
 bool SqliteCCLCJournal::Impl::RecordInterventionCause(
@@ -7291,6 +7291,14 @@ ComponentLifecycleTargetFactsDTO SqliteCCLCJournal::Impl::LoadLifecycleTargetFac
     facts.target = row->first;
   }
   facts.recovery_generation = ReadRecoveryGenerationLocked(component);
+  Statement attempt(database_,
+                    "SELECT recover_attempt_generation FROM cclc_component_recovery_generations "
+                    "WHERE controllable_component_id=? AND recover_attempt_generation IS NOT NULL");
+  attempt.Bind(1, component.value());
+  if (attempt.Step()) {
+    facts.recover_attempt_generation =
+        Positive(attempt.Integer(0), "component recover attempt generation");
+  }
   facts.intervention_causes = ReadInterventionCausesLocked(component);
   facts.open_incident = ReadOpenComponentIncidentLocked(component, false);
   transaction.Commit();
@@ -7351,7 +7359,10 @@ bool SqliteCCLCJournal::Impl::RecordLifecycleTargetReached(
   // Reaching the target again ends the recovery of the last incident.
   Statement write(database_,
                   "UPDATE cclc_component_lifecycle_targets SET reached=?,"
-                  "recovered_cause=CASE WHEN ?=1 THEN NULL ELSE recovered_cause END "
+                  "recovered_cause=CASE WHEN ?=1 THEN NULL ELSE recovered_cause END,"
+                  // Reaching Active restores what the incident retired.
+                  "incident_reenable=CASE WHEN ?2=1 AND requested_state=0 THEN 0 "
+                  "ELSE incident_reenable END "
                   "WHERE controllable_component_id=? AND present=1 "
                   "AND (? IS NULL OR target_generation=?)");
   write.Bind(1, static_cast<std::int64_t>(reached ? 1 : 0));
@@ -7603,8 +7614,15 @@ ComponentIncidentRecordDTO SqliteCCLCJournal::Impl::OpenComponentIncident(
   write.Bind(8, record.record_json);
   Require(!write.Step(), "component_lifecycle_journal_corrupt", "incident write returned a row");
   const auto target = ReadLifecycleTargetLocked(incident.controllable_component_id);
-  if (target && target->second && target->first.requested_state == LifecycleTargetStateDTO::kActive)
+  if (target && target->second && target->first.requested_state == LifecycleTargetStateDTO::kActive) {
     RetireLifecycleTargetIntentLocked(incident.controllable_component_id);
+    Statement marker(database_,
+                     "UPDATE cclc_component_lifecycle_targets SET incident_reenable=1 "
+                     "WHERE controllable_component_id=?");
+    marker.Bind(1, incident.controllable_component_id.value());
+    Require(!marker.Step(), "component_lifecycle_journal_corrupt",
+            "incident re-enable marker write returned a row");
+  }
   const auto pruned = PruneClosedIncidentsLocked();
   transaction.Commit();
   lock.unlock();
@@ -8238,13 +8256,6 @@ Result<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::AcceptOrReplaySelectedC
 }
 
 Result<std::optional<CCLCLifecycleRequestResultDTO>>
-SqliteCCLCJournal::InspectApplyComponentBringUpRequest(const RequestOwnerEpoch& owner,
-    const ComponentLifecycleIntentDTO& intent, const ContentDigest& digest) {
-  return AsResult<std::optional<CCLCLifecycleRequestResultDTO>>(
-      [&] { return impl_->InspectLifecycleRequest(owner, intent, &digest, true); });
-}
-
-Result<std::optional<CCLCLifecycleRequestResultDTO>>
 SqliteCCLCJournal::ReadApplyComponentBringUpRequestResult(
     const ComponentLifecycleIntentDTO& intent, const ContentDigest& digest) {
   return AsResult<std::optional<CCLCLifecycleRequestResultDTO>>(
@@ -8256,15 +8267,6 @@ Result<ApplyComponentGenerationSelectionDTO> SqliteCCLCJournal::ReadApplyCompone
     const std::optional<ApplyComponentQualifiedPredecessorDTO>& qualified) {
   return AsResult<ApplyComponentGenerationSelectionDTO>(
       [&] { return impl_->ReadApplyComponentGenerationSelection(owner, component, qualified); });
-}
-
-Result<CCLCLifecycleRequestResultDTO> SqliteCCLCJournal::AcceptOrReplayApplyComponentBringUp(
-    const RequestOwnerEpoch& owner, const ComponentLifecycleIntentDTO& intent,
-    const ComponentLifecycleAcceptedDTO& acceptance, const ComponentLifecycleStatusDTO& status,
-    const ContentDigest& digest) {
-  return AsResult<CCLCLifecycleRequestResultDTO>([&] {
-    return impl_->AcceptOrReplayLifecycle(owner, intent, acceptance, status, &digest, true);
-  });
 }
 
 Result<void> SqliteCCLCJournal::RecordSelectedCellClaimAttempt(
@@ -8524,6 +8526,11 @@ Result<ComponentLifecycleTargetFactsDTO> SqliteCCLCJournal::LoadLifecycleTargetF
     const ControllableComponentId& component) {
   return AsResult<ComponentLifecycleTargetFactsDTO>(
       [&]() { return impl_->LoadLifecycleTargetFacts(component); });
+}
+
+Result<bool> SqliteCCLCJournal::ActiveTargetRetiredByIncident(
+    const ControllableComponentId& component) {
+  return AsResult<bool>([&]() { return impl_->ActiveTargetRetiredByIncident(component); });
 }
 
 Result<bool> SqliteCCLCJournal::RecordInterventionCause(

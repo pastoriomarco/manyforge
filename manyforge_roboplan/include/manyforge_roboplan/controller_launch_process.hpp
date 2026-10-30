@@ -72,13 +72,20 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts);
 /// names, frame prefix and the lane's joint topics, taken from the same lane
 /// facts the generated URDF's hardware section was written from so the
 /// launch's readiness topics agree with it by construction). The user opens
-/// the Isaac scene; this process only attaches the ROS controller stack.
-/// `gripper_state_freshness_timeout_s` is the budget of the component's
-/// `gripper_feedback` stream row, passed to the launch's gripper transport
-/// adapter (one source).
+/// the Isaac scene; this process only attaches the ROS controller stack. A
+/// gripper bridge belongs to the tool component's own launch.
 [[nodiscard]] ControllerLaunchCommand isaac_controller_launch_command(
-    const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane,
-    std::optional<double> gripper_state_freshness_timeout_s = std::nullopt);
+    const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane);
+
+/// The Isaac tool (gripper-only) command: `isaac_gripper.launch.py` with the
+/// tool's description, namespace and frame prefix and, for an action
+/// transport, its bridge. `gripper_state_freshness_timeout_s` is the budget of
+/// the tool's `gripper_feedback` stream row, passed to the bridge (one source);
+/// it is required exactly when `bridge` is present.
+[[nodiscard]] ControllerLaunchCommand isaac_gripper_launch_command(
+    const ControllerLaunchArtifacts &artifacts,
+    const std::optional<IsaacGripperBridgeLane> &bridge,
+    std::optional<double> gripper_state_freshness_timeout_s);
 
 /// What one activation does with a component's launch process.
 enum class ControllerLaunchDecision {

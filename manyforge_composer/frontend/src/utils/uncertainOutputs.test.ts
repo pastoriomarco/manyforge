@@ -48,6 +48,8 @@ describe('uncertain outputs (contract 66)', () => {
     expect(message).toContain('Close never acknowledges');
     expect(message).toContain('op-a');
     expect(message).toContain(UNCERTAIN_OUTPUT_WARNING.toLowerCase());
+    // Item 37: the stuck case names the operator's way out.
+    expect(message).toContain('use Force close');
   });
 });
 

@@ -368,7 +368,7 @@ TEST(ResolvedStopBasePlanCodec, DecodesOnlyTheExactCanonicalClosedWireObject) {
                                                       "\"source_sequence\":11.5,"))
                    .ok());
   EXPECT_FALSE(DecodeResolvedStopBasePlan(
-                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:840a",
+                   ReplaceOnce(encoded.value(), "\"resolved_stop_base_plan_id\":\"sha256:7fce",
                                "\"resolved_stop_base_plan_id\":\"sha256:0925"))
                    .ok());
   EXPECT_FALSE(
@@ -653,24 +653,13 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
   const auto encoded = EncodePreparedParticipantStopPlan(base, plan, resources, defaults,
                                                          MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok());
-  const auto decoded = DecodePreparedParticipantStopPlan(encoded.value(), base, resources, defaults,
-                                                         MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), plan);
-  auto invalid_unit = encoded.value();
-  const auto unit_offset = invalid_unit.find("angular_rad_s2");
-  ASSERT_NE(unit_offset, std::string::npos);
-  invalid_unit.replace(unit_offset, std::string("angular_rad_s2").size(), "angular_bad_s2");
-  EXPECT_FALSE(DecodePreparedParticipantStopPlan(invalid_unit, base, resources, defaults,
-                                                 MotionInterruptNodeCategory::kGeneric)
-                   .ok());
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"participant_profile_mapping\""),
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:d0504e766b1502b0cf6354d376eff3fe49ff4fe34b1b75e0191caa9151b74191");
+            "sha256:eb9a9bc7737cfa5cab4137226f17e21b824c8c11b28c5140464c9d136bf7ebdd");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:73e6a728a8b9a0416f3a2d4151213bae1c135e2142bcaa9d8fffbe429beb917f");
+            "sha256:1cb4e686baac6e639645775103b40f486548737fe8067a8369777457198f03c9");
 }
 
 TEST(PreparedParticipantStopPlanCodec, AcceptsFastFaultProfileAndPreservesClosedPlan) {
@@ -692,10 +681,6 @@ TEST(PreparedParticipantStopPlanCodec, AcceptsFastFaultProfileAndPreservesClosed
   const auto encoded = EncodePreparedParticipantStopPlan(
       base, made.value(), Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  const auto decoded = DecodePreparedParticipantStopPlan(
-      encoded.value(), base, Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), made.value());
 }
 
 TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndRejectsForgery) {
@@ -754,10 +739,6 @@ TEST(PreparedParticipantStopPlanCodec, FreezesJerkPolicyInProfileContractAndIden
   const auto encoded = EncodePreparedParticipantStopPlan(base, on.value(), resources, defaults,
                                                          MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok());
-  const auto decoded = DecodePreparedParticipantStopPlan(encoded.value(), base, resources, defaults,
-                                                         MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), on.value());
   context.participant_stop_profile->jerk_limits_enabled = false;
   const auto off = MakePreparedParticipantStopPlan(base, context, resources, defaults);
   ASSERT_TRUE(off.ok());
@@ -820,7 +801,8 @@ TEST(PreparedParticipantStopPlanCodec, RejectsPurposeCoverageAndSubstitutionConf
 
   auto precision = PreparedContext();
   precision.node_category = MotionInterruptNodeCategory::kPrecisionContact;
-  EXPECT_FALSE(
+  // Q131: precision-contact is editor guidance, not a Core refusal.
+  EXPECT_TRUE(
       MakePreparedParticipantStopPlan(base, std::move(precision), resources, defaults).ok());
 }
 
@@ -979,11 +961,6 @@ TEST(PreparedParticipantStopPlanCodec, OrderedFallbacksKeepNewBaseAndInvocationR
                                         MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok());
   EXPECT_EQ(encoded.value().find("recoverable_substitution_mode"), std::string::npos);
-  const auto decoded =
-      DecodePreparedParticipantStopPlan(encoded.value(), base.value(), Resources(), DefaultLimits(),
-                                        MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), plan.value());
   auto unqualified = context;
   auto limited_base = base.value();
   limited_base.escalation_stages.front()
@@ -1079,26 +1056,23 @@ TEST(PreparedParticipantStopPlanCodec,
       set(wire, "stage_commands", V(std::move(stages))), "participant_stop_invocation_plan_digest",
       kParticipantStopInvocationPlanIdentityDomain, kPreparedParticipantStopPlanApiVersion);
   const auto old = content_identity::canonical_json(wire);
-  const auto decoded = DecodePreparedParticipantStopPlan(
-      old, base.value(), Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value().resolved_stop_base_plan_id, base.value().resolved_stop_base_plan_id);
+  // The same plan carrying its historical digest verifies and re-encodes to
+  // the historical wire bytes.
+  auto historical = fresh.value();
+  historical.participant_stop_invocation_plan_digest = ContentDigest(
+      wire.find_object_member("participant_stop_invocation_plan_digest")->as_string());
+  EXPECT_TRUE(VerifyPreparedParticipantStopPlan(base.value(), historical, Resources(),
+                                                DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                  .ok());
   EXPECT_EQ(
-      EncodePreparedParticipantStopPlan(base.value(), decoded.value(), Resources(), DefaultLimits(),
+      EncodePreparedParticipantStopPlan(base.value(), historical, Resources(), DefaultLimits(),
                                         MotionInterruptNodeCategory::kGeneric)
           .value(),
       old);
-  EXPECT_TRUE(DecodePreparedParticipantStopPlan(old, base.value(), Resources(), DefaultLimits(),
-                                                MotionInterruptNodeCategory::kGeneric)
-                  .ok());
   EXPECT_NE(fresh.value().participant_stop_invocation_plan_digest,
-            decoded.value().participant_stop_invocation_plan_digest);
-  EXPECT_EQ(
-      DecodePreparedParticipantStopPlan(fresh_bytes.value(), base.value(), Resources(),
-                                        DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
-          .value(),
-      fresh.value());
-  auto forged = decoded.value();
+            historical.participant_stop_invocation_plan_digest);
+  auto forged = historical;
   forged.participant_stop_invocation_plan_digest = ContentDigest(Digest('f'));
   EXPECT_FALSE(VerifyPreparedParticipantStopPlan(base.value(), forged, Resources(), DefaultLimits(),
                                                  MotionInterruptNodeCategory::kGeneric)

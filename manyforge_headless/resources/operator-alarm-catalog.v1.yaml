@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.8.0
-descriptor_digest: sha256:267c161200260de6c51198b872f2da7a53239847979bdf39fac0d462dabe7a68
+catalog_version: 2.9.0
+descriptor_digest: sha256:8101bde7ece439e7cbc8d8ff1c47570d2a1c09b447d642e3a31638e2589084c6
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -17,6 +17,36 @@ definitions:
     operator_response: >-
       Inspect the normalized contact pair and recovery offer, remove or repair
       the cause, acknowledge attention, then use the permitted recovery action.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_collision_condition
+    clear_authority: manyforge.kernel.runtime_collision_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.motion.runtime_monitor_observation_lost
+    version: 1
+    title: Robot position feedback lost
+    message_template: "Position feedback lost during motion on {subject_id}"
+    alarm_class: motion
+    priority: critical
+    priority_rationale: >-
+      Motion stopped because the robot's measured position stopped arriving;
+      it requires immediate awareness before recovery. Priority does not imply
+      a safety-rated annunciator.
+    consequence: >-
+      Motion remains stopped. Nothing was detected in contact, but the robot's
+      position was not confirmed while it stopped, so recovering without
+      checking the robot can repeat the stop.
+    operator_response: >-
+      Check the robot controller, its connection and the robot component's
+      status (an open component incident names its cause), acknowledge
+      attention, then use the permitted recovery action.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_collision_condition
     clear_authority: manyforge.kernel.runtime_collision_condition

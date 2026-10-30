@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/deployment_authoring.hpp>
 #include <manyforge_deployment/expression.hpp>
@@ -85,6 +86,10 @@ template <typename Callback> std::string Invoke(Callback &&callback) {
   } catch (const SourceSnapshotError &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_source_snapshot_unavailable", error.what()));
+  } catch (const manyforge::core::TypedError &error) {
+    // A typed cause keeps its code across the Python boundary.
+    return content_identity::canonical_json(
+        ErrorValue(error.code(), error.what()));
   } catch (const std::exception &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_api_internal_failure", error.what()));
@@ -522,6 +527,14 @@ public:
       }
       auto record = deployment::parse_strict_json_model_yaml(record_json).root();
       return core_->RecordProgramDiagnostic(std::move(record));
+    });
+  }
+
+  std::string RecordScenarioForceClose(const std::string& record_json) {
+    py::gil_scoped_release release;
+    return Invoke([this, &record_json]() {
+      auto record = deployment::parse_strict_json_model_yaml(record_json).root();
+      return core_->RecordScenarioForceClose(std::move(record));
     });
   }
 
@@ -1118,6 +1131,18 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
         return manyforge::headless::ReadControlSourceFileHint(path);
       },
       py::arg("path"), py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "read_viewer_scene_source",
+      [](const std::string &path, const std::string &cell_id) {
+        return manyforge::headless::ReadViewerSceneSource(path, cell_id);
+      },
+      py::arg("path"), py::arg("cell_id"), py::call_guard<py::gil_scoped_release>());
+  module.def(
+      "read_viewer_pose_sessions",
+      [](const std::string &path, const std::string &cell_id) {
+        return manyforge::headless::ReadViewerPoseSessions(path, cell_id);
+      },
+      py::arg("path"), py::arg("cell_id"), py::call_guard<py::gil_scoped_release>());
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
       .def(py::init<std::string, std::string, std::string,
                     std::string, std::string, std::string, std::string,
@@ -1218,6 +1243,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("report_json"))
       .def("record_program_diagnostic",
            &HeadlessApiBridge::RecordProgramDiagnostic, py::arg("record_json"))
+      .def("record_scenario_force_close",
+           &HeadlessApiBridge::RecordScenarioForceClose, py::arg("record_json"))
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,
            py::arg("record_json"))

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/stop_fault_recovery.hpp>
+#include <manyforge_core/types/resolved_stop_base_plan.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -263,6 +264,139 @@ TEST(StopFaultRecoveryTest, FenceFailureThenFailedUncontainedWaitsForExternalRec
   assessed = AssessStopFaultRecovery(status, Facts(status));
   ASSERT_TRUE(assessed.ok()) << assessed.error().message;
   EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+}
+
+[[nodiscard]] StopPostTerminalSurveillanceDTO MonitoringSurveillance(
+    const StopFaultLatchDTO& latch) {
+  ResolvedStopRuntimeTargetDTO runtime_target{ProviderInstanceId("provider.1"),
+                                              ProviderManifestId("provider-manifest.1"),
+                                              ProviderManifestRevision(kDigestD),
+                                              RuntimeUnitId("runtime.1"),
+                                              ProductId("product.1"),
+                                              ProductContractId("product-contract.1"),
+                                              ProductContractRevision("product-contract-revision.1"),
+                                              ContentDigest(kDigestE),
+                                              RuntimeEpoch("provider-epoch.1"),
+                                              RuntimeEpoch("runtime-epoch.1"),
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt,
+                                              std::nullopt};
+  const ResolvedStopEvidenceSourceDTO source{
+      StopEvidenceSourceKind::kBindingStateAuthority, std::move(runtime_target),
+      StateAuthorityId("state-authority.1"), StateAuthorityClass::kMeasured, std::nullopt};
+  StopPostTerminalSurveillanceDTO surveillance{
+      latch.stop_id,
+      latch.stop_generation,
+      *latch.stop_certificate,
+      latch.latch_id,
+      latch.latch_generation,
+      RequestOwnerEpoch("owner.1"),
+      7U,
+      latch.captured_resources,
+      {StopSurveillanceSourceStatusDTO{
+          StopScopeEntryKeyDTO{latch.stop_id, latch.stop_generation, ResourceId("resource.1")},
+          StopEvidenceItemId("evidence.rest"), source,
+          StopSurveillanceSourceAvailabilityDTO::kAvailable, RuntimeEpoch("state.epoch"), 7U, 0,
+          std::nullopt}},
+      StopSurveillancePolicyDTO{10, 100, 8U},
+      2U,
+      20,
+      40,
+      std::nullopt,
+      std::nullopt,
+      StopPostTerminalSurveillanceStateDTO::kMonitoring,
+      3U,
+      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
+                                     std::nullopt}};
+  EXPECT_FALSE(stop_post_terminal_surveillance_field_error(surveillance).has_value());
+  return surveillance;
+}
+
+// M6b maintainer rule: no active move and no Stop being executed proves the
+// Stop. Measured rest, a still-monitoring surveillance whose newest checkpoint
+// is not durable, a failed_uncontained trigger and a degraded persistence no
+// longer hold the latch; they stay on it as history.
+TEST(StopFaultRecoveryTest, NoActiveGoalReadiesTheLatchWhateverRestSurveillanceAndTriggerSay) {
+  auto status = Status();
+  status.fault_latch->trigger = StopFaultTriggerDTO::kFailedUncontained;
+  status.fault_latch->observed_triggers = {StopFaultTriggerDTO::kFailedUncontained};
+  status.fault_latch->persistence_degraded = true;
+  status.surveillance = MonitoringSurveillance(*status.fault_latch);
+  status.surveillance_projection = status.surveillance->checkpoint_projection;
+  ASSERT_FALSE(stop_status_field_error(status).has_value());
+  auto facts = Facts(status);
+
+  // No no-active-goal fact: the surveillance record still gates, as before.
+  auto assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
+
+  facts.external_reconciliation_facts = {facts.resource_facts.front()};
+  assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+  EXPECT_TRUE(assessed.value().persistence_degraded);
+  EXPECT_EQ(assessed.value().observed_triggers,
+            std::vector<StopFaultTriggerDTO>{StopFaultTriggerDTO::kFailedUncontained});
+
+  status.fault_latch = assessed.value();
+  const auto evaluation = EvaluateStopFaultRecovery(Intent(*status.fault_latch), status, facts);
+  ASSERT_TRUE(evaluation.ok()) << evaluation.error().message;
+  EXPECT_TRUE(evaluation.value().result.accepted);
+  EXPECT_EQ(evaluation.value().result.latch.state, StopFaultLatchStateDTO::kCleared);
+
+  // No measured-rest or fresh-sample requirement: an unsettled or
+  // unavailable joint observation (e.g. the joint state broadcaster off after
+  // a vendor fault) does not hold the latch.
+  auto unsettled = facts;
+  unsettled.resource_facts.front().state = StopFaultRecoveryResourceStateDTO::kUnsettled;
+  assessed = AssessStopFaultRecovery(status, unsettled);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+  auto unavailable = facts;
+  unavailable.resource_facts.front() =
+      StopFaultRecoveryResourceFactDTO{ResourceId("resource.1"),
+                                       StopFaultRecoveryResourceStateDTO::kUnavailable,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       ErrorDTO{"native_current_resource_state_stale", "stale", {}}};
+  assessed = AssessStopFaultRecovery(status, unavailable);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+
+  // A captured resource without a no-active-goal fact keeps the old gates.
+  auto uncovered = unavailable;
+  uncovered.external_reconciliation_facts.clear();
+  assessed = AssessStopFaultRecovery(status, uncovered);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
+
+  // It replaces only the Stop-confirmation gates: a resource the Kernel
+  // still holds reserved, dispatched or stopping waits.
+  auto blocked = facts;
+  blocked.fenced_or_orphan_resources.push_back(ResourceId("resource.1"));
+  assessed = AssessStopFaultRecovery(status, blocked);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForObservation);
+
+  // The Stop's own terminal record is still required.
+  status = Status();
+  status.terminal_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kPending, std::nullopt, std::nullopt};
+  status.fault_latch->terminal_projection = status.terminal_projection;
+  facts = Facts(status);
+  facts.external_reconciliation_facts = {facts.resource_facts.front()};
+  assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForDurableRecord);
 }
 
 TEST(StopFaultRecoveryTest, ReadyAssessmentIsStableUntilSemanticFactsChange) {

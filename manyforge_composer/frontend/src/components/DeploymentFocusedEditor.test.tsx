@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue, SourceModelProjection } from '../types/api';
 import type { ManualControlGripperDescriptor } from '../types/robotControl';
-import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
+import { DeploymentFocusedEditor, geometricContactRobotOptions } from './DeploymentFocusedEditor';
 import { statusFixture } from '../testFixtures/robotControl';
 
 const digest = `sha256:${'1'.repeat(64)}`;
@@ -106,6 +106,7 @@ function controller(
     busy: false,
     applying: false,
     error: null,
+    errorCauseCode: null,
     feedback: null,
     acceptedApply: null,
     acceptedApplyCorrelationId: null,
@@ -128,6 +129,8 @@ function controller(
     saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
+    addComponents: vi.fn(),
+    previewDraft: vi.fn(),
     confirmApply: vi.fn(),
     cancelApplyConfirmation: vi.fn(),
   };
@@ -206,6 +209,7 @@ async function mountGripper(
   outputMode: 'commanded' | 'none' = 'commanded',
   timeoutSource?: JsonValue,
   pneumaticIo?: JsonValue,
+  { scenarioTool = false, graspConfirmation }: { scenarioTool?: boolean; graspConfirmation?: JsonValue } = {},
 ) {
   const value = rosGripperController(actuationKind, outputMode);
   const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
@@ -214,10 +218,32 @@ async function mountGripper(
   const sourceRow = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
   if (timeoutSource !== undefined) sourceRow.delivery_result_timeout_s = timeoutSource;
   if (pneumaticIo !== undefined) sourceRow.pneumatic_io = pneumaticIo;
+  if (graspConfirmation !== undefined) sourceRow.grasp_confirmation = graspConfirmation;
+  if (scenarioTool) {
+    // A Scenario Draft: the gripper row sits on a tool component mounted on
+    // the robot flange, nested under runtime_configuration.
+    sourceRow.controllable_component_id = 'lite_gripper';
+    const model = { urdf: { project_path: 'model.urdf' }, package_roots: {} };
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      components: [
+        { component_id: 'lite6_robot', component_profile_id: 'lite6_v0', model_source: model, target_settings: {},
+          root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+          configuration: { runtime_kind: 'ros2_control', runtime_configuration: {} } },
+        { component_id: 'lite_gripper', component_profile_id: 'lite_gripper_v0', model_source: model, target_settings: {},
+          configuration: { runtime_kind: 'ros2_control', runtime_configuration: { gripper_target_configurations: [sourceRow] } } },
+      ],
+      attachments: [{
+        parent: { component_id: 'lite6_robot', interface: 'flange' },
+        child: { component_id: 'lite_gripper', interface: 'mount' },
+      }],
+      policies: {},
+    };
+  }
   vi.mocked(value.mutate).mockResolvedValue(value.workspace);
   const descriptor: ManualControlGripperDescriptor = {
     ...statusFixture().directControlGripper!.targetDescriptor,
-    controllableComponentId: 'robot', actuationKind, outputMode,
+    controllableComponentId: scenarioTool ? 'lite_gripper' : 'robot', actuationKind, outputMode,
     completionPolicy: actuationKind === 'pneumatic'
       ? outputMode === 'none' ? 'no_output' : 'output_delivery'
       : 'goal_fenced_target_reached',
@@ -250,7 +276,15 @@ async function mountGripper(
 }
 
 describe('DeploymentFocusedEditor', () => {
-  it('offers a retained gripper contact endpoint when arm motion endpoints are also present', async () => {
+  it('offers each motion robot once for geometric contact', () => {
+    const descriptor = statusFixture().directControl!.targetDescriptor;
+    expect(geometricContactRobotOptions([
+      descriptor,
+      { ...descriptor, commandTargetId: 'other_target' },
+    ])).toEqual([{ componentId: descriptor.controllableComponentId }]);
+  });
+
+  it('offers a motion robot for dynamic geometric contact', async () => {
     const value = controller();
     vi.mocked(value.mutate).mockResolvedValue(value.workspace);
     const document = value.workspace!.draft.document as Record<string, JsonValue>;
@@ -264,10 +298,7 @@ describe('DeploymentFocusedEditor', () => {
       transition_capability: 'sampled_only',
       freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 },
       provider: {
-        profile: 'geometric_contact', ingress_depth: 64,
-        endpoint: {
-          controllable_component_id: 'robot', command_target_id: 'arm', frame_role_id: 'tcp',
-        },
+        profile: 'geometric_contact', ingress_depth: 64, robot_component_id: 'old_robot',
         target_scene_resource_id: 'workpiece',
       },
     }];
@@ -289,20 +320,32 @@ describe('DeploymentFocusedEditor', () => {
       await act(() => root.render(<DeploymentFocusedEditor controller={value}
         sourceModel={{ status: 'ready', data: sourceModel }} motionDescriptors={[descriptor]}
         gripperDescriptors={[]} />));
-      const endpoint = find((props) => props['aria-label'] === 'contact Contact endpoint');
-      const gripperValue = JSON.stringify(['robot', 'gripper', 'tcp']);
-      expect(find((props) => props.value === gripperValue)).toBeDefined();
-      await act(() => endpoint.onChange?.({ target: { value: gripperValue } }));
+      const robot = find((props) => props['aria-label'] === 'contact Robot');
+      expect(find((props) => [props.children].flat().join('') === 'old_robot (not currently listed)')).toBeDefined();
+      expect(find((props) => props.value === 'robot')).toBeDefined();
+      await act(() => robot.onChange?.({ target: { value: 'robot' } }));
       await act(() => find((props) => props.children === 'Update I/O Draft').onClick?.());
       expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
         ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
-        [expect.objectContaining({ provider: expect.objectContaining({ endpoint: {
-          controllable_component_id: 'robot', command_target_id: 'gripper', frame_role_id: 'tcp',
-        } }) })],
+        [expect.objectContaining({ provider: expect.objectContaining({ robot_component_id: 'robot' }) })],
       );
     } finally {
       await act(() => root.unmount());
     }
+  });
+
+  it('edits the gripper row of a mounted tool in a Scenario Draft (nested runtime_configuration)', async () => {
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, { scenarioTool: true });
+    try {
+      expect(mounted.field('Program dwell')).toBeDefined();
+      await mounted.setDuration(0.25);
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith(
+        ['components', 1, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0],
+        'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+      );
+      expect(mounted.sourceRow.controllable_component_id).toBe('lite_gripper');
+    } finally { await mounted.unmount(); }
   });
 
   it.each(['commanded', 'none'] as const)(
@@ -544,6 +587,27 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await act(() => root.unmount()); }
   });
 
+  it('defaults the TCP speed check to TCP and flange and saves a change through the target limit', async () => {
+    const value = controller();
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
+    expect(markup).toContain('Check TCP speed at');
+    expect(markup).toMatch(/<option value="active_tcp_and_flange" selected="">Active TCP and flange<\/option>/);
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    try {
+      const check = find((props) => props['aria-label'] === 'robot / arm TCP speed check');
+      expect(check.value).toBe('active_tcp_and_flange');
+      await act(() => check.onChange?.({ target: { value: 'active_tcp' } }));
+      expect(value.updateMotionTargetLimit).toHaveBeenCalledExactlyOnceWith(
+        'robot', 'arm', 0.15, 'active_tcp',
+      );
+    } finally { await act(() => root.unmount()); }
+  });
+
   it('commits a Controlled Stop number only on blur or Enter with a valid value', async () => {
     const value = controller();
     const { host, find } = mountedHost();
@@ -583,6 +647,320 @@ describe('DeploymentFocusedEditor', () => {
           max_deceleration: expect.objectContaining({ value: 8 }),
         })] }),
       }));
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('edits a Real robot component Stop lead-in start (commanded by default)', async () => {
+    const deploymentDocument = (anchor?: string) => ({
+      api_version: 'manyforge.deployment_intent.v2',
+      deployment_artifact_id: 'cell-a',
+      name: 'Cell A',
+      components: [{
+        component_id: 'robot',
+        component_profile_id: 'lite6_real_measured_v0',
+        frame_prefix: 'robot/',
+        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          execution_tick_hz: 100,
+          collision_monitor_period_ms: 50,
+          planner_rng_seed: 12345,
+          initial_joint_positions_rad: [0, 1.57],
+          gripper_target_configurations: [],
+          real_profile: 'lite6_real',
+          device_address_ref: 'lite6_main',
+          ...(anchor === undefined ? {} : { stop_lead_in_anchor: anchor }),
+        },
+      }],
+      attachments: [],
+      policies: {},
+    });
+    for (const anchor of [undefined, 'measured']) {
+      const value = controller();
+      value.workspace!.draft.document = deploymentDocument(anchor);
+      value.workspace!.draft.deploymentRevision = null;
+      value.workspace!.draft.graphRevision = null;
+      const { host, find } = mountedHost();
+      const { createRoot } = await import('react-dom/client');
+      const root = createRoot(host as unknown as Element);
+      await act(() => root.render(<DeploymentFocusedEditor controller={value}
+        sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+      const select = () => find((props) => props['aria-label'] === 'Stop lead-in start');
+      try {
+        if (anchor === undefined) {
+          expect(select().value).toBe('commanded');
+          await act(() => select().onChange?.({ target: { value: 'measured' } }));
+          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+            ['components', 0, 'configuration', 'stop_lead_in_anchor'], 'set', 'measured');
+        } else {
+          expect(select().value).toBe('measured');
+          await act(() => select().onChange?.({ target: { value: 'commanded' } }));
+          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+            ['components', 0, 'configuration', 'stop_lead_in_anchor'], 'remove');
+        }
+      } finally { await act(() => root.unmount()); }
+    }
+  });
+
+  it('edits a Real robot component TCP offset sync (selected by default)', async () => {
+    const deploymentDocument = (sync?: boolean) => ({
+      api_version: 'manyforge.deployment_intent.v2',
+      deployment_artifact_id: 'cell-a',
+      name: 'Cell A',
+      components: [{
+        component_id: 'robot',
+        component_profile_id: 'lite6_real_measured_v0',
+        frame_prefix: 'robot/',
+        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          execution_tick_hz: 100,
+          collision_monitor_period_ms: 50,
+          planner_rng_seed: 12345,
+          initial_joint_positions_rad: [0, 1.57],
+          gripper_target_configurations: [],
+          real_profile: 'lite6_real',
+          device_address_ref: 'lite6_main',
+          ...(sync === undefined ? {} : { controller_tcp_offset_sync: sync }),
+        },
+      }],
+      attachments: [],
+      policies: {},
+    });
+    for (const sync of [undefined, false]) {
+      const value = controller();
+      value.workspace!.draft.document = deploymentDocument(sync);
+      value.workspace!.draft.deploymentRevision = null;
+      value.workspace!.draft.graphRevision = null;
+      const { host, find } = mountedHost();
+      const { createRoot } = await import('react-dom/client');
+      const root = createRoot(host as unknown as Element);
+      await act(() => root.render(<DeploymentFocusedEditor controller={value}
+        sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+      const checkbox = () => find((props) => props['aria-label'] === 'Send TCP offset to controller');
+      try {
+        if (sync === undefined) {
+          expect(checkbox().checked).toBe(true);
+          await act(() => checkbox().onChange?.({ target: { checked: false } }));
+          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+            ['components', 0, 'configuration', 'controller_tcp_offset_sync'], 'set', false);
+        } else {
+          expect(checkbox().checked).toBe(false);
+          await act(() => checkbox().onChange?.({ target: { checked: true } }));
+          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+            ['components', 0, 'configuration', 'controller_tcp_offset_sync'], 'remove');
+        }
+      } finally { await act(() => root.unmount()); }
+    }
+  });
+
+  it('accepts any positive collision check step up to 0.2 rad, including 0.0005', async () => {
+    const value = controller();
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2',
+      deployment_artifact_id: 'cell-a',
+      name: 'Cell A',
+      components: [{
+        component_id: 'robot',
+        component_profile_id: 'robot_ros_v1',
+        frame_prefix: 'robot/',
+        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          execution_tick_hz: 100,
+          collision_monitor_period_ms: 50,
+          planner_rng_seed: 12345,
+          initial_joint_positions_rad: [0, 1.57],
+          gripper_target_configurations: [],
+        },
+      }],
+      attachments: [],
+      policies: {},
+    };
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const stepInput = () => find((props) => props.max === 0.2);
+    const commit = async (text: string) => {
+      await act(() => stepInput().onChange?.({ target: { value: text } }));
+      await act(() => (stepInput().onBlur as () => void)());
+    };
+    try {
+      expect(stepInput().value).toBe('0.05');
+      expect(stepInput().step).toBe('any');
+      await commit('0.0005');
+      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 0, 'configuration', 'collision_check_step_rad'], 'set', 0.0005);
+      for (const refused of ['0', '-0.01', '0.2001']) await commit(refused);
+      expect(value.mutate).toHaveBeenCalledTimes(1);
+      await commit('0.2');
+      expect(value.mutate).toHaveBeenLastCalledWith(
+        ['components', 0, 'configuration', 'collision_check_step_rad'], 'set', 0.2);
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('edits the runtime settings of a Scenario robot nested under runtime_configuration', async () => {
+    const value = controller();
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      components: [{
+        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
+        model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          runtime_configuration: {
+            isaac_profile: 'lite6',
+            execution_tick_hz: 250,
+            collision_monitor_period_ms: 50,
+            planner_rng_seed: 12345,
+            initial_joint_positions_rad: [0, 1.57],
+          },
+        },
+      }],
+      attachments: [],
+      policies: {},
+    };
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    vi.mocked(value.mutate).mockResolvedValue(value.workspace);
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
+    expect(markup).toContain('Execution cadence');
+    expect(markup).toContain('Collision monitor period');
+    expect(markup).toContain('Planner seed');
+    expect(markup).toContain('Initial joint state');
+
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const cadence = () => find((props) => props.type === 'number' && props.value === '250');
+    try {
+      await act(() => cadence().onChange?.({ target: { value: '125' } }));
+      await act(() => (find((props) => props.type === 'number' && props.value === '125').onBlur as () => void)());
+      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 0, 'configuration', 'runtime_configuration', 'execution_tick_hz'], 'set', 125,
+      );
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('reads and writes a Scenario robot\'s clearance and collision step under runtime_configuration', async () => {
+    // SX-620: Scenario (intent) rows nest their runtime settings; a
+    // non-default value there is shown, and an edit writes back to it.
+    const value = controller();
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      components: [{
+        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
+        model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          runtime_configuration: {
+            isaac_profile: 'lite6',
+            collision_clearance_m: 0.004,
+            collision_check_step_rad: 0.02,
+          },
+        },
+      }],
+      attachments: [],
+      policies: {},
+    };
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    vi.mocked(value.mutate).mockResolvedValue(value.workspace);
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const clearance = () => find((props) => props.type === 'number' && props.max === 0.05);
+    const step = () => find((props) => props.type === 'number' && props.max === 0.2);
+    try {
+      expect(clearance().value).toBe('0.004');
+      expect(step().value).toBe('0.02');
+      await act(() => step().onChange?.({ target: { value: '0.03' } }));
+      await act(() => (step().onBlur as () => void)());
+      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 0, 'configuration', 'runtime_configuration', 'collision_check_step_rad'], 'set', 0.03,
+      );
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('edits a component\'s lifecycle time budget in the Draft, blank keeping the default', async () => {
+    // Per-component time budget: robots, tools, pose sources and AI models
+    // author `configuration.lifecycle_command_timeout_s`; blank removes it.
+    const value = controller();
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      components: [{
+        component_id: 'llm', component_profile_id: 'ai_model_v0', target_settings: {},
+        configuration: {
+          runtime_kind: 'ai_model',
+          runtime_configuration: { base_url: 'http://127.0.0.1:8000/v1', model: 'm' },
+        },
+      }, {
+        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
+        model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
+        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
+        configuration: {
+          runtime_kind: 'ros2_control',
+          lifecycle_command_timeout_s: 120,
+          runtime_configuration: { isaac_profile: 'lite6' },
+        },
+      }],
+      attachments: [],
+      policies: {},
+    };
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    vi.mocked(value.mutate).mockResolvedValue(value.workspace);
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const budget = (id: string) => () => find((props) => props['aria-label'] === `${id} lifecycle command time limit`);
+    const commit = async (input: () => Props, text: string) => {
+      await act(() => (input().onFocus as ((event: unknown) => void) | undefined)?.({}));
+      await act(() => input().onChange?.({ target: { value: text } }));
+      await act(() => (input().onBlur as () => void)());
+    };
+    const robot = budget('robot');
+    const model = budget('llm');
+    try {
+      expect(robot().value).toBe('120');
+      expect(model().value).toBe('');
+      expect(model().placeholder).toBe('default');
+      await commit(robot, '600');
+      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 1, 'configuration', 'lifecycle_command_timeout_s'], 'set', 600);
+      await commit(robot, '');
+      expect(value.mutate).toHaveBeenLastCalledWith(
+        ['components', 1, 'configuration', 'lifecycle_command_timeout_s'], 'remove');
+      for (const refused of ['0', '3601', 'x']) await commit(robot, refused);
+      expect(value.mutate).toHaveBeenCalledTimes(2);
+      await commit(model, '90');
+      expect(value.mutate).toHaveBeenLastCalledWith(
+        ['components', 0, 'configuration', 'lifecycle_command_timeout_s'], 'set', 90);
+      // Blank on a component without a budget writes nothing.
+      await commit(model, '');
+      expect(value.mutate).toHaveBeenCalledTimes(3);
     } finally { await act(() => root.unmount()); }
   });
 
@@ -652,6 +1030,11 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).not.toContain('Applying a change restarts this robot holding.');
     expect(markup).toContain('Execution cadence');
     expect(markup).toContain('Controlled Stop jerk limits');
+    // The target is described and has a limit, but a Scenario component's
+    // runtime has no direct-control caps: no editor whose values Apply ignores.
+    // (A compiled runtime unit still shows it; see the canonical-inputs test.)
+    expect(markup).toContain('Ordinary motion jerk');
+    expect(markup).not.toContain('Robot Control joint caps');
     const authored = value.workspace!.draft.document as unknown as {
       components: Array<{ frame_prefix: string; configuration: Record<string, unknown> }>;
     };
@@ -683,46 +1066,6 @@ describe('DeploymentFocusedEditor', () => {
       expect(invalidMarkup).toContain('with a trailing');
       expect(invalidMarkup).toContain('aria-invalid="true"');
     }
-  });
-
-  it('offers a ROS component tool payload and shows its authored mass and centre of mass', () => {
-    const value = controller();
-    const component = {
-      component_id: 'robot',
-      component_profile_id: 'lite6_real_measured_v0',
-      frame_prefix: '',
-      model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
-      root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-      target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
-      configuration: {
-        runtime_kind: 'ros2_control',
-        runtime_configuration: { real_profile: 'lite6_real', device_address_ref: 'lite6_main' },
-      },
-    };
-    value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v2',
-      deployment_artifact_id: 'cell-a',
-      name: 'Cell A',
-      components: [component],
-      attachments: [],
-      policies: {},
-    } as unknown as Record<string, JsonValue>;
-    value.workspace!.draft.deploymentRevision = null;
-    value.workspace!.draft.graphRevision = null;
-    const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
-    const absent = render();
-    expect(absent).toContain('Add tool payload');
-    expect(absent).not.toContain('Adapter mode');
-    (component.configuration.runtime_configuration as Record<string, unknown>).tool_payload = {
-      mass_kg: 0.3, center_of_mass_m: [0, 0.01, 0.05],
-    };
-    const present = render();
-    expect(present).toContain('Tool payload (applied to a real robot at Enable)');
-    expect(present).toContain('value="0.3"');
-    expect(present).toContain('Centre of mass Z');
-    expect(present).toContain('value="0.05"');
-    expect(present).toContain('Remove tool payload');
   });
 
   it.each([
@@ -851,9 +1194,12 @@ describe('DeploymentFocusedEditor', () => {
     let markup = render();
     expect(markup).toContain('robot · arm');
     expect(markup.match(/>robot · arm<\/option>/g)).toHaveLength(1);
-    // Q51: absent, the robot's own deadline is its deceleration time + 0.5 s.
+    // Q51: absent, the robot's own deadline to start braking is its
+    // deceleration time + 0.5 s; the Stop then finishes like a motion (M6).
     expect(markup).toContain('Explicit maximum Stop time');
-    expect(markup).toContain('Automatic: 1.5 s (deceleration time + 0.5 s).');
+    expect(markup).toContain(
+      'Automatic: 1.5 s (deceleration time + 0.5 s) to start braking; the Stop then finishes like a normal motion, when the controller reports it.',
+    );
     expect(markup).not.toContain('Max Stop time');
     for (const row of document.policies.stop_stage_parameters) {
       (row.default_contract_parameters as Record<string, unknown>).max_stop_time_s = 3;
@@ -922,16 +1268,18 @@ describe('DeploymentFocusedEditor', () => {
         controller={controller()}
         sourceModel={{ status: 'loading' }}
         motionDescriptors={[{
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
           ordinaryJerk: { enabled: false, presetReferenceTimeS: 1, jointLimits: [{
             sourceJointName: 'joint1', source: 'off', maximumRadS3: null,
             presetRadS3: 12, imported: null,
           }] },
           controllableComponentId: 'robot',
+          endEffectorComponentId: null,
           commandTargetId: 'arm',
           componentRoleId: 'robot',
           targetRoleId: 'arm',
           frames: [],
+          tcps: [],
           joints: [{
             sourceJointName: 'joint1', compiledJointName: 'robot__joint1', unit: 'rad',
             minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2,
@@ -981,6 +1329,26 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('No current addressed gripper descriptor is available.');
   });
 
+  it('explains a pneumatic I/O preparation refusal by its typed cause, not its text', () => {
+    const render = (error: string | null, errorCauseCode: string | null) => renderToStaticMarkup(
+      <DeploymentFocusedEditor controller={{ ...controller('pneumatic'), error, errorCauseCode }}
+        sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />,
+    );
+    const coincident = 'Open and Close presets have the same position';
+    const isaac = 'not supported by Isaac';
+    expect(render('Not applied: the candidate could not be prepared.', 'pneumatic_io_presets_coincident'))
+      .toContain(coincident);
+    expect(render('Not applied: the candidate could not be prepared.', 'pneumatic_io_unsupported_on_isaac'))
+      .toContain(isaac);
+    // The reason named only in the text explains nothing.
+    const textOnly = render('Not applied (pneumatic_io_presets_coincident: robot; '
+      + 'pneumatic_io_unsupported_on_isaac).', null);
+    expect(textOnly).not.toContain(coincident);
+    expect(textOnly).not.toContain(isaac);
+    // A cleared error hides the explanation.
+    expect(render(null, 'pneumatic_io_presets_coincident')).not.toContain(coincident);
+  });
+
   it('joins one authored gripper row to exact owner semantics', () => {
     const markup = renderToStaticMarkup(
       <DeploymentFocusedEditor
@@ -1026,5 +1394,251 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('finger_link');
     expect(markup).toContain('Gripper feedback');
     expect(markup).toContain('Default: 1000 ms · fault · ack');
+  });
+});
+
+describe('Grasp confirmation on the gripper settings', () => {
+  const rowPath = ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0];
+  const graspPath = [...rowPath, 'grasp_confirmation'];
+  type InputProps = Props & { onBlur?: () => void; onKeyDown?: (event: unknown) => void };
+  const windowInput = (mounted: Awaited<ReturnType<typeof mountGripper>>, label: string) => (
+    mounted.field(label).children as Array<{ props: InputProps }>
+  )[0].props;
+  // Types one limit, then leaves the field (blur commits, as in NumberDraft).
+  const typeLimit = async (mounted: Awaited<ReturnType<typeof mountGripper>>, label: string, value: string) => {
+    await act(() => windowInput(mounted, label).onChange?.({ target: { value } }));
+    await act(() => windowInput(mounted, label).onBlur?.());
+  };
+  const setWindow = async (mounted: Awaited<ReturnType<typeof mountGripper>>, min: string, max: string) => {
+    await typeLimit(mounted, 'Stall window min', min);
+    await typeLimit(mounted, 'Stall window max', max);
+  };
+  const setPolicy = (mounted: Awaited<ReturnType<typeof mountGripper>>, policy: string) => act(() => (
+    mounted.field('Grasp confirmation').onChange?.({ target: { value: policy } })
+  ));
+  const alert = (mounted: Awaited<ReturnType<typeof mountGripper>>) => (
+    mounted.find((props) => props.role === 'alert').children
+  );
+  const noAlert = (mounted: Awaited<ReturnType<typeof mountGripper>>) => (
+    expect(() => mounted.find((props) => props.role === 'alert')).toThrow('Mounted control not found')
+  );
+
+  it('has no Update or Discard button', async () => {
+    const mounted = await mountGripper('position_commanded');
+    try {
+      expect(() => mounted.find((props) => props.children === 'Update grasp confirmation'))
+        .toThrow('Mounted control not found');
+      expect(() => mounted.find((props) => props.children === 'Discard grasp confirmation edits'))
+        .toThrow('Mounted control not found');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes Required on a controlled gripper once its window is complete, and not before', async () => {
+    const mounted = await mountGripper('position_commanded');
+    try {
+      expect(mounted.field('Grasp confirmation').value).toBe('not_required');
+      await setPolicy(mounted, 'required');
+      // Incomplete: local validation, no Draft edit.
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(alert(mounted)).toBe('Required needs a stall window: the finished finger positions that count as a grasp.');
+      await typeLimit(mounted, 'Stall window min', '0.005');
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(alert(mounted)).toBe('Enter both stall window limits as numbers.');
+      await typeLimit(mounted, 'Stall window max', '0.03');
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(graspPath, 'set', {
+        policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 },
+      });
+      noAlert(mounted);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('commits a window limit on Enter like the other number fields', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      await act(() => windowInput(mounted, 'Stall window max').onChange?.({ target: { value: '0.02' } }));
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      const blur = vi.fn(() => windowInput(mounted, 'Stall window max').onBlur?.());
+      await act(() => windowInput(mounted, 'Stall window max').onKeyDown?.({ key: 'Enter', currentTarget: { blur } }));
+      expect(blur).toHaveBeenCalledOnce();
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(graspPath, 'set', {
+        policy: 'required', stall_window: { min_position: 0.005, max_position: 0.02 },
+      });
+    } finally { await mounted.unmount(); }
+  });
+
+  it('Escape restores the Draft window without a Draft edit', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      await act(() => windowInput(mounted, 'Stall window min').onChange?.({ target: { value: '' } }));
+      await act(() => windowInput(mounted, 'Stall window min').onKeyDown?.({ key: 'Escape', currentTarget: { blur: vi.fn() } }));
+      expect(windowInput(mounted, 'Stall window min').value).toBe('0.005');
+      await act(() => windowInput(mounted, 'Stall window min').onBlur?.());
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      noAlert(mounted);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes nothing when the value equals the Draft', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      await act(() => windowInput(mounted, 'Stall window min').onBlur?.());
+      await setPolicy(mounted, 'required');
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('turns Required off at once: keeps a window as not_required, and removes the field without one', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      expect(mounted.field('Grasp confirmation').value).toBe('required');
+      expect(windowInput(mounted, 'Stall window min').value).toBe('0.005');
+      await setPolicy(mounted, 'not_required');
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith(graspPath, 'set', {
+        policy: 'not_required', stall_window: { min_position: 0.005, max_position: 0.03 },
+      });
+      // Clearing one limit is incomplete; clearing both removes the field.
+      await typeLimit(mounted, 'Stall window min', '');
+      expect(mounted.value.mutate).toHaveBeenCalledTimes(1);
+      expect(alert(mounted)).toBe('Enter both stall window limits as numbers.');
+      await typeLimit(mounted, 'Stall window max', '');
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith(graspPath, 'remove');
+      expect(mounted.value.mutate).toHaveBeenCalledTimes(2);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('selecting Off always writes Off, dropping an incomplete or invalid window (SX-607)', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    for (const [min, max] of [['', '0.03'], ['0.04', '0.005']]) {
+      const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+        { graspConfirmation: authored });
+      try {
+        await setWindow(mounted, min, max);
+        expect(mounted.value.mutate).not.toHaveBeenCalled();
+        await setPolicy(mounted, 'not_required');
+        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(graspPath, 'remove');
+        expect(mounted.field('Grasp confirmation').value).toBe('not_required');
+        expect(windowInput(mounted, 'Stall window min').value).toBe('');
+        expect(windowInput(mounted, 'Stall window max').value).toBe('');
+        noAlert(mounted);
+      } finally { await mounted.unmount(); }
+    }
+  });
+
+  it.each([
+    ['', '', 'Required needs a stall window: the finished finger positions that count as a grasp.'],
+    ['0.01', '', 'Enter both stall window limits as numbers.'],
+    ['0.03', '0.005', 'The stall window minimum must not exceed its maximum.'],
+  ])('writes nothing for the stall window min %j max %j and shows the local validation', async (min, max, message) => {
+    const mounted = await mountGripper('position_commanded');
+    try {
+      await setPolicy(mounted, 'required');
+      await setWindow(mounted, min, max);
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      expect(alert(mounted)).toBe(message);
+      expect(windowInput(mounted, 'Stall window min')['aria-invalid']).toBe(true);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('leaves an owner refusal to the yellow Deployment notice, with no red inline repeat', async () => {
+    const mounted = await mountGripper('position_commanded');
+    try {
+      (mounted.value.mutate as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+      await setPolicy(mounted, 'required');
+      await setWindow(mounted, '0.005', '0.03');
+      expect(mounted.value.mutate).toHaveBeenCalledTimes(1);
+      noAlert(mounted);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes Required on a pneumatic gripper on the select, with the warning when no input is mapped', async () => {
+    const io: JsonValue = {
+      outputs: [{
+        signal: { controllable_component_id: 'valves', signal_name: 'open' },
+        open_value: true, close_value: false,
+      }],
+    };
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io);
+    const warning = () => mounted.find((props) => props.className === 'inline-message severity-warning');
+    try {
+      expect(() => mounted.field('Stall window min')).toThrow('Mounted control not found');
+      expect(warning).toThrow('Mounted control not found');
+      await setPolicy(mounted, 'required');
+      expect(String(warning().children)).toContain('Required needs a mapped Workpiece grasped input');
+      // A warning, not a block: the owner names the missing source.
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(graspPath, 'set', { policy: 'required' });
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes Off on a pneumatic gripper on the select, removing the field', async () => {
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, {
+      graspConfirmation: { policy: 'required' },
+    });
+    try {
+      await setPolicy(mounted, 'not_required');
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(graspPath, 'remove');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('names the mapped workpiece_grasped input and shows no warning', async () => {
+    const io: JsonValue = {
+      outputs: [{
+        signal: { controllable_component_id: 'valves', signal_name: 'open' },
+        open_value: true, close_value: false,
+      }],
+      inputs: { workpiece_grasped: { signal: { controllable_component_id: 'sensors', signal_name: 'part' } } },
+    };
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io, {
+      graspConfirmation: { policy: 'required' },
+    });
+    try {
+      expect(mounted.field('Grasp confirmation').value).toBe('required');
+      expect(() => mounted.find((props) => props.className === 'inline-message severity-warning'))
+        .toThrow('Mounted control not found');
+      const help = mounted.find((props) => props.className === 'field-help' && Array.isArray(props.children)
+        && String(props.children[0]).startsWith('Pneumatic gripper:'));
+      expect(help.children).toContain('Pneumatic gripper: the evidence is the Workpiece grasped input, sensors · part. ');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('carries the authored field through an unrelated gripper edit', async () => {
+    const authored = { policy: 'required', stall_window: { min_position: 0.005, max_position: 0.03 } };
+    const mounted = await mountGripper('position_commanded', 'commanded', undefined, undefined,
+      { graspConfirmation: authored });
+    try {
+      await mounted.setDuration(0.25);
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        rowPath, 'set', { ...mounted.sourceRow, command_duration_s: 0.25, grasp_confirmation: authored },
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('writes the nested row of a mounted tool in a Scenario Draft', async () => {
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, undefined, { scenarioTool: true });
+    try {
+      await setPolicy(mounted, 'required');
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 1, 'configuration', 'runtime_configuration', 'gripper_target_configurations', 0,
+          'grasp_confirmation'],
+        'set', { policy: 'required' },
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('offers the setting for an authored row before Robot Control addresses it', () => {
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={rosGripperController('position_commanded')}
+      scope={{ componentId: 'robot' }} sourceModel={{ status: 'loading' }} motionDescriptors={[]}
+      gripperDescriptors={[]} />);
+    expect(markup).toContain('No current addressed gripper descriptor is available.');
+    expect(markup).toContain('Grasp confirmation · robot / gripper');
+    expect(markup).toContain('Stall window min');
   });
 });

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
@@ -342,9 +343,7 @@ prepared_participant_backend_physical_binding_field_error(
   if (!unambiguous_subset(
           binding.frame_bindings, participant.frame_bindings,
           [](const auto& available, const auto& selected) {
-            return available.model_instance_id == selected.model_instance_id &&
-                   available.model_revision == selected.model_revision &&
-                   available.compiled_frame_name == selected.compiled_frame_name;
+            return same_program_frame(available, selected);
           }))
     return "prepared_participant_backend_frame_bindings_mismatch";
   if (participant.binding_identity.control_domain_id != path.control_domain_id)

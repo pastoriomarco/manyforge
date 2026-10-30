@@ -1,0 +1,156 @@
+{
+  "api_version": "manyforge.model_asset.v1",
+  "collision_body_role_bindings": [
+    {
+      "collision_body_role_id": "arm_collision",
+      "source_link_names": [
+        "link1",
+        "link2",
+        "link3",
+        "link4",
+        "link5",
+        "link6",
+        "link_base"
+      ]
+    }
+  ],
+  "expanded_source": {
+    "artifacts": [
+      {
+        "byte_size": 249384,
+        "content_digest": "sha256:4069840361c2693b5b1147da366d5ba8a49ff7ab2c52fed68e07e04e07786e3f",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link1.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 97884,
+        "content_digest": "sha256:0e736a629e6000c3c912f5aaf76937f824f510ac8894db67bd0d7f1d6210fc52",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link2.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 81184,
+        "content_digest": "sha256:f682201345117c4b021fd9db21bd9bef6824886c8324f046b7d5772d7c9fa426",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link3.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 94484,
+        "content_digest": "sha256:7bf4ab507c07a2b26e6a8528decdfe32d71efffdf1dd391406f1ce2f9ff4caa7",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link4.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 58584,
+        "content_digest": "sha256:103955f097086e0f5d46380ff89bc7ef669877bb65def38431a18fc5343e1ba0",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link5.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 51484,
+        "content_digest": "sha256:86b95b77850f38ff1437284705a1c8c616e3da21faef72e4f06751fc741de3b3",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link6.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 250984,
+        "content_digest": "sha256:871d501d23e8164440656331ee0e005d859dbdb7fab1c3725bef423adac9cf0e",
+        "logical_uri": "asset://uf850/meshes/uf850/collision/link_base.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 249384,
+        "content_digest": "sha256:4069840361c2693b5b1147da366d5ba8a49ff7ab2c52fed68e07e04e07786e3f",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link1.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 245684,
+        "content_digest": "sha256:ae2be91a991177f22dd5a12ad6533d982a9fc4f5af4749d70e2b817a312d1ed2",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link2.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 270684,
+        "content_digest": "sha256:c5a1165e86839874e12abf7acfc0b4d5f18607408c326e7d1d1c7c7fb92217c8",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link3.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 237184,
+        "content_digest": "sha256:c816f4c9fae6b038ba7f6e8c7b9804769146e71199cdfe7a1a87179a56973a61",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link4.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 147084,
+        "content_digest": "sha256:cb701fe65fd2f9fa45bbc4080ccd749bc4320ee2b8e7af0fe3e69891abb0a554",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link5.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 722484,
+        "content_digest": "sha256:d031adf90d7254b358ea922f8dfe3308cebec0852ba056e122a34353cc8ea9e3",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link6.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 541184,
+        "content_digest": "sha256:45c7cfc31975142401706ffd93c1a2ad3570fbe19694558c5ce75713ab07b5c7",
+        "logical_uri": "asset://uf850/meshes/uf850/visual/link_base.stl",
+        "media_type": "model/stl"
+      },
+      {
+        "byte_size": 1800,
+        "content_digest": "sha256:02eab99d09b1ca0d3ce7ec218af3b8ac373a2da1e010debc8018487d15311c65",
+        "logical_uri": "asset://uf850/model.srdf",
+        "media_type": "application/xml"
+      },
+      {
+        "byte_size": 7117,
+        "content_digest": "sha256:2440a7a9336006716fed1b181965dbea051c32c9cf56d5dccf933cd0ed683f09",
+        "logical_uri": "asset://uf850/model.urdf",
+        "media_type": "application/xml"
+      }
+    ],
+    "srdf_logical_uri": "asset://uf850/model.srdf",
+    "urdf_logical_uri": "asset://uf850/model.urdf"
+  },
+  "frame_role_bindings": [
+    {
+      "frame_role_id": "base",
+      "source_link_name": "link_base"
+    },
+    {
+      "frame_role_id": "flange",
+      "source_link_name": "link_eef"
+    },
+    {
+      "frame_role_id": "root",
+      "source_link_name": "world"
+    }
+  ],
+  "instance_cardinality": "multiple_per_cell",
+  "model_asset_id": "uf850",
+  "model_group_role_bindings": [
+    {
+      "model_group_role_id": "arm",
+      "source_group_name": "uf850"
+    }
+  ],
+  "model_revision": "sha256:e39fbc10adfbcc585dab7c3eab16306e369c6586080ade1a409c4b92187b6eb2",
+  "resource_role_bindings": [
+    {
+      "resource_role_id": "arm_joints",
+      "source_joint_names": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5",
+        "joint6"
+      ]
+    }
+  ],
+  "root_frame_role_id": "root"
+}

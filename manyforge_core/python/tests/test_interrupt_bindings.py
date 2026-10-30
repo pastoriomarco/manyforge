@@ -116,7 +116,8 @@ def test_profile_and_closed_structured_value_fail_closed() -> None:
         stop_mode=core.MotionInterruptStopMode.kHardDeceleration,
         fallback_stop_modes=[core.MotionInterruptStopMode.kSpringBackHold],
     )
-    assert "only soft_on_path" in core.motion_interrupt_stop_profile_field_error(
+    # Fallbacks are an ordered subsequence below the primary (Lean Stop).
+    assert "strict ordered subsequence below the primary" in core.motion_interrupt_stop_profile_field_error(
         invalid_substitution
     )
 

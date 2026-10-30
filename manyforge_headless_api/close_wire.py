@@ -11,11 +11,81 @@ from manyforge_behavior.json_scalars import MAXIMUM_SAFE_INTEGER
 
 from .models import (
     BoundedPublicRequestContext,
+    CallerAttributionRequest,
     SHA256_PATTERN,
     StrictRequest,
     _bounded_nfc,
 )
 from .native import HeadlessApiError
+
+
+# Reference note for the activation-preparation route (rendered into the REST
+# references): Close is a caller-ordered sequence and refuses an attached part.
+SCENARIO_CLOSE_REFERENCE_NOTE = (
+    "With `origin.kind: sealed_canonical_empty` this prepares Scenario Close. "
+    "Close is a sequence the caller runs in order: Reset the Program cycle; "
+    "detach every carried object (`POST /api/scene/transactions`, "
+    "`detach_carried_object_at_current_pose`); disable each component and stop "
+    "its processes; then prepare, preview and apply this canonical-empty "
+    "configuration (`scene_initialization: preserve`). Only then New or Load. "
+    "The Apply keeps the Scene, so this preparation is refused with 409 "
+    "`scenario_close_attachment_present` while any carried object remains: "
+    "`details.carried_objects` names each `scene_resource_id` with its carrier "
+    "(`controllable_component_id`, `command_target_id`). Nothing is prepared; "
+    "detach, then prepare again. Only the first preparation after a Force "
+    "close step `close_operations`, before its step `end`, keeps an attachment "
+    "(a part whose detach was refused because the robot's process is already "
+    "gone). The Composer Close runs this sequence."
+)
+
+
+# Item 37: Force close, the operator action after a refused Close.
+SCENARIO_FORCE_CLOSE_REFERENCE_NOTE = (
+    "Force close, the operator's explicit action after a Close refused for an "
+    "uncertain outcome. The caller runs it in order. Step `stop` sends a cell "
+    "Full Stop (`request_context` names the execution owner epoch; "
+    "`expected_stop_generation` is `cell_stop_action.expected_stop_generation`) "
+    "and waits briefly until the Kernel confirms it: its certificate is the "
+    "newest and succeeded. Otherwise it is refused with 409 "
+    "`scenario_force_close_stop_unconfirmed` (`details.reason`: `stop_pending`, "
+    "`stop_superseded`, `stop_not_contained`) and the caller does nothing more. "
+    "Then the caller retires the lifecycle targets (now admitted with resident "
+    "operations). Step `close_operations` then moves every resident operation "
+    "into history marked `cell_force_closed_by_operator`, frees its resources, "
+    "clears the cell-wide motion block an unresolved operation closure left "
+    "(`motion_block_cleared`; motion still needs Prepare and Enable), "
+    "and records one History row (`scenario_force_closed`) naming the "
+    "operations and outputs left in an unknown state. It is refused "
+    "`scenario_force_close_not_closing` before the retirement and "
+    "`scenario_force_close_operation_busy` while an operation is being "
+    "updated (retry); a pending I/O-rule Stop response is not waited for. "
+    "Orphan resources from an earlier restart are freed and their operations "
+    "recorded settled, which ends that motion block too. Then the caller runs "
+    "the ordinary Reset and detach while "
+    "the component processes still run (a part whose detach is refused, such "
+    "as when the robot's process is already gone, stays attached; the next "
+    "empty preparation then skips the attachment check), disables each component where "
+    "possible, stops its processes, and runs the canonical-empty Apply. On "
+    "every exit, success or failure, the caller sends step `end`, which ends "
+    "that attachment exception. Force "
+    "close never commands an output: an output's "
+    "physical state stays unknown. The cell Stop fault is kept."
+)
+
+
+class ScenarioForceCloseRequest(StrictRequest):
+    """Item 37: one step of an operator Force close; Composer runs the order."""
+
+    request_context: CallerAttributionRequest
+    # `end` (SX-616): the caller's sequence ended, success or failure.
+    step: Literal["stop", "close_operations", "end"]
+    expected_stop_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)] | None = None
+
+    @model_validator(mode="after")
+    def validate_step(self) -> ScenarioForceCloseRequest:
+        if (self.step == "stop") != (self.expected_stop_generation is not None):
+            raise ValueError("expected_stop_generation is required exactly for step stop")
+        return self
 
 
 class LifecycleTargetRetirementScope(StrictRequest):

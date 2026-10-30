@@ -8,7 +8,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
   IoSignalConfigurationSection,
-  type GeometricContactEndpointOption,
+  type GeometricContactRobotOption,
 } from './IoSignalConfigurationSection';
 
 const existing = {
@@ -31,7 +31,7 @@ afterEach(() => vi.unstubAllGlobals());
 async function mount(
   rows: JsonValue[] | undefined,
   ioProvider = true,
-  geometricContactEndpoints: GeometricContactEndpointOption[] = [],
+  geometricContactRobots: GeometricContactRobotOption[] = [],
 ) {
   const configuration: Record<string, JsonValue> = { mode: 'commanded_sim', ...(rows === undefined ? {} : { io_signals: rows }) };
   const controller = {
@@ -48,7 +48,7 @@ async function mount(
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   await act(() => root.render(<IoSignalConfigurationSection controller={controller} runtimes={runtimes}
-    geometricContactEndpoints={geometricContactEndpoints} />));
+    geometricContactRobots={geometricContactRobots} />));
   const button = (text: string) => find((props) => props.type === 'button' && props.children === text);
   const texts = () => all(() => true).map((props) => (
     Array.isArray(props.children) ? props.children.filter((item) => typeof item === 'string').join('')
@@ -199,20 +199,19 @@ describe('IoSignalConfigurationSection', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('declares a read-only geometric contact input from structural endpoint metadata', async () => {
-    const endpoints: GeometricContactEndpointOption[] = [
-      { componentId: 'arm', targetId: 'tool', frameRoleId: 'camera' },
-      { componentId: 'arm', targetId: 'tool', frameRoleId: 'tcp' },
-    ];
-    const mounted = await mount([existing], true, endpoints);
+  it('declares a dynamic geometric contact input for a selected robot', async () => {
+    const robots: GeometricContactRobotOption[] = [{ componentId: 'arm' }];
+    const mounted = await mount([existing], true, robots);
     try {
       await mounted.type('part_present Source profile', 'geometric_contact');
-      expect(mounted.all((props) => props.value === JSON.stringify(['arm', 'tool', 'camera']))).toHaveLength(1);
-      expect(mounted.all((props) => props.value === JSON.stringify(['arm', 'tool', 'tcp']))).toHaveLength(1);
-      await mounted.type('part_present Contact endpoint', JSON.stringify(['arm', 'tool', 'tcp']));
+      expect(mounted.all((props) => props.value === 'arm')).toHaveLength(1);
+      await mounted.type('part_present Robot', 'arm');
       await mounted.type('part_present Target Scene resource', 'workpiece');
       await mounted.type('part_present Maximum sample age', '75');
-      expect(mounted.texts().some((text) => text.includes("selected endpoint's existing contact-body roles"))).toBe(true);
+      expect(mounted.texts().some((text) => text.includes("selected robot's current Active TCP"))).toBe(true);
+      expect(mounted.texts().some((text) => text.includes('No Active TCP'))).toBe(true);
+      expect(mounted.texts().some((text) => text.includes('an uncarried TCP tool'))).toBe(true);
+      expect(mounted.texts().some((text) => text.includes('contact_bodies_static'))).toBe(true);
       expect(mounted.texts().some((text) => text.includes('Manual and timed Mock writes do not apply'))).toBe(true);
       await mounted.click('Update I/O Draft');
       expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
@@ -220,9 +219,7 @@ describe('IoSignalConfigurationSection', () => {
         [{ ...existing, update_mode: 'sampled',
           freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 }, provider: {
           profile: 'geometric_contact',
-          endpoint: {
-            controllable_component_id: 'arm', command_target_id: 'tool', frame_role_id: 'tcp',
-          },
+          robot_component_id: 'arm',
           target_scene_resource_id: 'workpiece',
         } }],
       );

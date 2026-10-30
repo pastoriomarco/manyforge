@@ -10,7 +10,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.routing import APIRoute
-from manyforge_behavior.program import Program
+from manyforge_behavior.program import Program, TcpEndpointAliasAmbiguous
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
@@ -36,6 +36,7 @@ from .authoring_forest import (
 from .authoring_identity import canonical_digest
 from .authoring_admission import AuthoringOperationError
 from .authoring_forest import adopt_active_catalog
+from .legacy_attach_migration import migrate_legacy_attach
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -498,9 +499,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     source_document_digest=source_digest,
                 )
 
-            # Acquire the local authoring claim before publishing the file. A
-            # stale admission generation must not leave a new Scenario behind
-            # while reporting that Save was refused. The owner installs the
+            # Acquire the local authoring claim before publishing the file. An
+            # admission refusal must not leave a new Scenario behind while
+            # reporting that Save was refused. The owner installs the
             # resulting project facts in the same composite commit.
             commit = commit_local_authoring(
                 state,
@@ -571,12 +572,19 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             program: Program | None = None
             diagnostics: list[dict[str, str]] = []
             if authoring is not None:
-                adopt_active_catalog(authoring, authoring_catalog)
                 try:
+                    selected = authoring.get("catalog")
+                    if (isinstance(selected, dict) and selected.get("content_version") == "2.8.0"
+                            and authoring_catalog.content_version == "2.9.0"):
+                        migrate_legacy_attach(authoring, deployment,
+                                              scenario_document["program_role_assignment"])
+                    adopt_active_catalog(authoring, authoring_catalog)
                     validate_invariants(authoring, authoring_catalog)
                     program, diagnostics = derive_candidate(
                         authoring, authoring_catalog
                     )
+                except TcpEndpointAliasAmbiguous as error:
+                    raise ScenarioArtifactError(error.code, str(error), status_code=400) from error
                 except AuthoringForestError as error:
                     raise ScenarioArtifactError(
                         "scenario_program_draft_invalid",
@@ -635,7 +643,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             )
             manager_status = state.headless_client.manager_status()
             _require_scenario_closed(state, manager_status)
-            bundle, graph, _epoch = state._manager_current(manager_status)
+            bundle, graph, _epoch = state._manager_current(
+                manager_status, phase="scenario_load.preview"
+            )
             activation_intent: dict[str, Any] = {
                 "scene_initialization": "initialize",
                 "scenario_id": scenario_document["scenario_id"],
@@ -746,7 +756,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 # idle admission. Manager rechecks the exact preview receipt
                 # and current publication when it accepts the operation.
                 current_bundle, current_graph, _ = state._manager_current(
-                    state.headless_client.manager_status()
+                    state.headless_client.manager_status(), phase="scenario_load.claim"
                 )
                 if activation_intent["expected_manager_current"] != {
                     "retained_bundle_id": current_bundle,
@@ -995,7 +1005,8 @@ def _require_scenario_closed(
     Load of the Scenario that is currently applied is no exception: Load
     never reapplies over a current Scenario.
     """
-    state._manager_current(manager_status)  # Existing freshness/identity checks.
+    # Existing freshness/identity checks.
+    state._manager_current(manager_status, phase="scenario_load.require_closed")
     canonical_empty = manager_status["status"]["active"].get("canonical_empty")
     if type(canonical_empty) is not bool:
         raise ScenarioArtifactError(

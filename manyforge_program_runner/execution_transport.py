@@ -33,6 +33,7 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
+    TcpEntryRequest,
     IoWatchResult,
     SHA256_PATTERN,
 )
@@ -108,6 +109,21 @@ class _ResetPositionCapabilityResponse(_ResetPositionSuccessResponse):
 
 class _ResetPositionResponse(_ResetPositionSuccessResponse):
     command: Literal["reset_robot_position"]
+
+
+class _ActiveTcpReading(StrictRequest):
+    component_id: _Identity
+    entry: TcpEntryRequest | None
+    owner_epoch: _Identity
+    registration_generation: _Revision
+    sequence: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+
+
+class _ActiveTcpResponse(StrictRequest):
+    api_version: Literal[EXECUTION_RESPONSE_VERSION]
+    command: Literal["read_active_tcp", "reset_active_tcp"]
+    ok: Literal[True]
+    robots: list[_ActiveTcpReading]
 
 
 class _ProgramNodeExecutionScope(StrictRequest):
@@ -264,11 +280,6 @@ class _MockSimulationOccurrence(StrictRequest):
             raise ValueError("node_start_index exceeds uint64")
         return value
 
-    def occurrence(self) -> dict[str, Any]:
-        return {
-            name: getattr(self, name) for name in _MockSimulationOccurrence.model_fields
-        }
-
 
 class _MockSimulationEnd(_MockSimulationOccurrence):
     """`manyforge.mock_io_node_end.v1` (decision 135): the start's exact
@@ -309,9 +320,6 @@ class _MockRunPauseOccurrence(StrictRequest):
         if value != sorted(set(value)):
             raise ValueError("held_node_instance_ids is not sorted and unique")
         return value
-
-    def occurrence(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in _MockRunPauseOccurrence.model_fields}
 
 
 class _MockRunPause(_MockRunPauseOccurrence):
@@ -460,6 +468,18 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             attribution_transport="internal",
         )
 
+    def resolve_attach_active_tcp(self, binding_id: str, target_role: str) -> str:
+        response = self.require_success(self._exchange({
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "command": "resolve_attach_active_tcp",
+            "program_binding_id": binding_id,
+            "target_role_id": target_role,
+        }))
+        frame = response.get("frame_role_id")
+        if response.get("command") != "resolve_attach_active_tcp" or not isinstance(frame, str) or not frame:
+            raise HeadlessApiError("execution_command_response_invalid", "Invalid Active TCP holder response")
+        return frame
+
     @staticmethod
     def _request(model: type[_Request], body: Mapping[str, Any]) -> _Request:
         try:
@@ -490,6 +510,32 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                                   "command": "reset_robot_position", **request.model_dump(mode="json")})
         self._reset_response(_ResetPositionResponse, response)
 
+    def _active_tcp(self, command: Literal["read_active_tcp", "reset_active_tcp"],
+                    *, ordered: bool = False) -> dict[str, Any]:
+        request = {"api_version": EXECUTION_COMMAND_VERSION, "command": command}
+        if command == "reset_active_tcp":
+            request["attribution"] = self._request_attribution(None)
+        elif ordered:
+            request["ordered"] = True
+        response = self._exchange(request)
+        try:
+            parsed = _ActiveTcpResponse.model_validate(response)
+            if parsed.command != command:
+                raise ValueError("Active TCP response names another command")
+        except (ValidationError, ValueError) as error:
+            raise HeadlessApiError(
+                "execution_command_response_invalid", "Active TCP response is invalid"
+            ) from error
+        return response
+
+    def read_active_tcp(self, *, ordered: bool = False) -> dict[str, Any]:
+        if type(ordered) is not bool:
+            raise TypeError("ordered must be boolean")
+        return self._active_tcp("read_active_tcp", ordered=ordered)
+
+    def reset_active_tcp(self) -> dict[str, Any]:
+        return self._active_tcp("reset_active_tcp")
+
     def _exchange_on(
         self, command: dict[str, Any], socket_path: Path
     ) -> dict[str, Any]:
@@ -497,6 +543,19 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         try:
             return self.require_success(response)
         except HeadlessApiError as error:
+            if command.get("command") == "submit" and error.details.get("immediate_step") == "admitted":
+                rows = response.get("active_tcp")
+                try:
+                    if type(rows) is not list:
+                        raise ValueError("Active TCP rows are missing")
+                    for row in rows:
+                        _ActiveTcpReading.model_validate(row)
+                except (ValidationError, ValueError) as invalid:
+                    raise HeadlessApiError(
+                        "execution_command_response_invalid",
+                        "admitted immediate step response has invalid Active TCP rows",
+                    ) from invalid
+                error.active_tcp = rows
             if command.get("command") in {
                 "start_program_selection",
                 "release_program_selection",
@@ -546,13 +605,11 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         )
         if (
             response.get("command") != "register_program_run_capture"
-            or response.get("program_run_id") != body.get("program_run_id")
             or type(response.get("claim_generation")) is not int
-            or response["claim_generation"] != body.get("claim_generation")
         ):
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Program capture response does not identify the registered claim",
+                "execution_command_response_invalid",
+                "Program capture response has the wrong kind or shape",
             )
         return response
 
@@ -562,7 +619,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def _io_watch_result(self, response: Mapping[str, Any], command: str) -> dict[str, Any]:
         if response.get("command") != command:
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
+                "execution_command_response_invalid",
                 f"{command} response does not name its command",
             )
         try:
@@ -591,18 +648,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             raise HeadlessApiError(
                 "execution_command_response_invalid", "I/O watch registration is invalid"
             ) from error
-        scope = registration.scope
-        if (
-            registration.owner_epoch != request.owner_epoch
-            or scope.program_runner_owner_epoch != request.program_runner_owner_epoch
-            or scope.program_run_id != request.program_run_id
-            or scope.node.node_instance_id != request.node_instance_id
-            or scope.node.node_attempt_id != request.node_attempt_id
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "I/O watch registration does not identify its node attempt",
-            )
         return {"registration": registration.model_dump(mode="json"), "result": result}
 
     def _io_watch_registration(self, registration: Mapping[str, Any]) -> dict[str, Any]:
@@ -653,13 +698,13 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         )
         if response.get("command") != "release_io_watch":
             raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
+                "execution_command_response_invalid",
                 "release_io_watch response does not name its command",
             )
 
     def start_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Start one node attempt's Mock simulation; only the exact accepted
-        reply for this same occurrence and these same rows ACKs it.
+        """Start one node attempt's Mock simulation; only a well-formed accepted
+        reply ACKs it.
 
         A host ErrorResponse keeps its code and details. Resending the same
         request is answered with the host's retained original result.
@@ -683,13 +728,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "execution_command_response_invalid",
                 "Mock simulation acknowledgement is invalid",
             ) from error
-        if ack.occurrence() != request.occurrence() or _selectors(ack.signals) != _selectors(
-            request.signals
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Mock simulation acknowledgement does not answer this node start",
-            )
         return ack.model_dump(mode="json")
 
     def _mock_exchange(
@@ -699,8 +737,8 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         ack_model: type[_Request],
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """One closed Mock lifetime command whose success echoes exactly the
-        request's occurrence; a host ErrorResponse keeps its code."""
+        """One closed Mock lifetime command; a host ErrorResponse keeps its
+        code."""
 
         request = self._request(request_model, body)
         response = self._exchange(
@@ -719,11 +757,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             raise HeadlessApiError(
                 "execution_command_response_invalid", f"{command} reply is invalid"
             ) from error
-        if ack.occurrence() != request.occurrence():
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                f"{command} reply does not answer this request",
-            )
         return ack.model_dump(mode="json")
 
     def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -741,7 +774,7 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         )
 
     def publish_program_bbkeys(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Send one ordered BB key frame; only the exact success reply ACKs it."""
+        """Send one ordered BB key frame; only a well-formed success reply ACKs it."""
 
         request = self._request(_ProgramBlackboardPublication, body)
         response = self._exchange(
@@ -762,21 +795,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "execution_command_response_invalid",
                 "BB key publication reply is invalid",
             ) from error
-        same_occurrence = (
-            ack.owner_epoch == request.owner_epoch
-            and ack.program_binding_id == request.program_binding_id
-            and ack.active_publication_generation == request.active_publication_generation
-            and ack.cycle_generation == request.cycle_generation
-            and ack.program_run_id == request.program_run_id
-        )
-        if (
-            not same_occurrence or ack.accepted_sequence != request.message_sequence
-        ) if ack.status == "accepted" else same_occurrence:
-            # A supersession must name a different (replacement) occurrence.
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "BB key publication reply does not answer this frame",
-            )
         return ack.model_dump(mode="json")
 
     def read_interrupt_rule_state_events(

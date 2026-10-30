@@ -292,6 +292,38 @@ TEST(
 }
 
 TEST(RoboPlanCandidateComputerTest,
+     StateInsideTheCollisionClearanceIsRefusedAsClearance) {
+  // A 10 m margin on every scene pair puts the collision-free start inside
+  // the clearance: the refusal names the pair and classifies it as
+  // clearance, with its positive distance (not "in collision").
+  auto fixture = make_fixture();
+  const auto pairs = fixture.scene->getCollisionModel().collisionPairs.size();
+  ASSERT_GT(pairs, 0U);
+  ASSERT_TRUE(fixture.scene
+                  ->setCollisionPairMargins(std::vector<double>(pairs, 10.0))
+                  .has_value());
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(request(fixture, joint_goal(fixture)));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "native_start_state_collision");
+  EXPECT_EQ(result.error().details.at("classification"), "clearance");
+  EXPECT_GT(std::stod(result.error().details.at("collision_signed_distance_m")), 0.0);
+  EXPECT_DOUBLE_EQ(std::stod(result.error().details.at("collision_clearance_m")), 10.0);
+  EXPECT_NE(result.error().message.find("closer than the collision clearance"),
+            std::string::npos);
+}
+
+TEST(RoboPlanCandidateComputerTest, CollisionCheckStepMustBePositive) {
+  auto fixture = make_fixture();
+  EXPECT_THROW(RoboPlanCandidateComputer(fixture.scene, fixture.binding,
+                                         {0x1234U, 65'536U, 0.01, 0.0}),
+               std::invalid_argument);
+  EXPECT_NO_THROW(RoboPlanCandidateComputer(fixture.scene, fixture.binding,
+                                            {0x1234U, 65'536U, 0.01, 0.02}));
+}
+
+TEST(RoboPlanCandidateComputerTest,
      MovingPoseGoalKeepsItsAuthoredPoseAfterTheInteriorJoin) {
   auto fixture = make_fixture();
   auto input = moving_request(fixture);

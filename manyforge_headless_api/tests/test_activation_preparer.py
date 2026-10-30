@@ -255,6 +255,42 @@ def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
     assert diagnostic not in caplog.text
 
 
+def test_typed_preparer_refusal_carries_its_cause_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SMALL3: the preparer prints a typed refusal's catalog code on stdout;
+    # the operator text on stderr is kept as it was.
+    preparer = _preparer(tmp_path)
+    diagnostic = (
+        "manyforge_prepare_activation: Activation Deployment compiler: "
+        "pneumatic_io_presets_coincident: gripper Open and Close resolve to the "
+        "same gripper coordinate"
+    )
+
+    def run(_command, **kwargs):
+        kwargs["stdout"].write(b'{"cause_code":"pneumatic_io_presets_coincident"}\n')
+        kwargs["stderr"].write(diagnostic.encode())
+        return SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(HeadlessApiError) as raised:
+        preparer.prepare(
+            source_document_digest=_DIGEST,
+            scenario_id="scenario_a",
+            project_path="/projects/scenario_a.scenario",
+            captured_input_digest=_DIGEST,
+            deployment={},
+            model_source_closure=_CLOSURE,
+            program={},
+            program_role_assignment={},
+        )
+    assert raised.value.code == "activation_preparation_failed"
+    assert raised.value.details == {
+        "preparer_detail": diagnostic,
+        "cause_code": "pneumatic_io_presets_coincident",
+    }
+
+
 def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
     tmp_path: Path,
 ) -> None:

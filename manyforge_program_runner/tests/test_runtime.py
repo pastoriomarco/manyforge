@@ -57,6 +57,7 @@ from manyforge_program_runner.persistent_keys import (
     PersistentKeyRegister,
 )
 from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.program_cycle import ProgramCycleFrameDTO
 from manyforge_headless_api.cell_admission import (
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
@@ -84,6 +85,19 @@ _ACTIVE_STATES = {
     "stopping",
     "finalizing",
 }
+
+
+def test_runner_converts_headless_producer_without_relabeling_it() -> None:
+    source = HeadlessClientError(
+        "stale_generation",
+        "owner refused",
+        producer="kernel",
+    )
+
+    translated = ProgramRuntime._headless_error(source)
+
+    assert translated.code == "stale_generation"
+    assert translated.producer == "kernel"
 
 
 def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
@@ -167,6 +181,13 @@ class _Headless:
         self.registered_captures: list[dict[str, Any]] = []
         self.cclc_reads: list[str] = []
 
+    def apply_tool_payload(self) -> None:
+        pass
+
+    def reset_active_tcp(self) -> dict[str, Any]:
+        # A selected scene reload resets Active TCPs; no robot store is bound here.
+        return {"ok": True, "robots": []}
+
     def program_applied(self) -> dict[str, Any]:
         self.applied_reads += 1
         return {
@@ -207,6 +228,16 @@ class _Headless:
                 "retained_bundle_id": _DIGEST_A,
                 "graph_revision": _DIGEST_B,
                 "active_publication_generation": 1,
+            },
+        }
+
+    def targets(self) -> dict[str, Any]:
+        """The execution owner's targets; tests set rows in ``target_components``."""
+        return {
+            "ok": True,
+            "targets": {
+                "components": deepcopy(getattr(self, "target_components", [])),
+                "schema_version": "manyforge.execution_targets.v3",
             },
         }
 
@@ -432,6 +463,13 @@ class _Snapshot:
         return deepcopy(self._value)
 
 
+class _ValueStore:
+    """The Run value store as the runtime uses it without global rules."""
+
+    def set_interrupt_notify_rule_reader(self, _reader: object) -> None:
+        return None
+
+
 class _Owner:
     def __init__(self) -> None:
         self.rows: dict[str, _Snapshot] = {}
@@ -461,6 +499,9 @@ class _Owner:
 
     def failure_pause_stop_pending(self, _program_run_id: str) -> bool:
         return False
+
+    def value_store(self, _program_run_id: str) -> "_ValueStore":
+        return _ValueStore()
 
     def read(self, program_run_id: str) -> _Snapshot:
         self.reads += 1
@@ -1716,6 +1757,8 @@ def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
 class _PreparedRunAdmission:
     def __init__(self) -> None:
         self.program = SimpleNamespace(to_dict=_timer_only_program, interrupt_condition_keys=())
+        # The run reads it for blackboard-key publication; this fixture has none.
+        self.program_binding = None
         self.project_path = "/projects/cell-pick.scenario"
 
     def port_context(self, program_run_id: str) -> object:
@@ -2121,6 +2164,29 @@ class _CarriedObjectLossStore:
             raise self.failure
         self.writes.append((key, value, dict(metadata)))
 
+    def set_interrupt_notify_rule_reader(self, _reader: object) -> None:
+        return None
+
+
+class _CarriedObjectLossMirrorFake:
+    def __init__(
+        self, snapshot: dict[str, object], catalog: RuleCatalog | None
+    ) -> None:
+        self._snapshot = snapshot
+        self._catalog = catalog
+
+    def carried_object_last_losses(self) -> object:
+        return self._snapshot["last_losses"]
+
+    def carried_object_lost_signals(self) -> object:
+        return self._snapshot["rows"]
+
+    def catalog(self) -> RuleCatalog | None:
+        return self._catalog
+
+    def poll(self) -> None:
+        return None
+
 
 def _carried_object_last_loss(
     event_id: str,
@@ -2147,11 +2213,8 @@ def _carried_object_loss_runtime(
     runtime._carried_object_lost_run_id = None  # noqa: SLF001
     runtime._carried_object_lost_seen_event_ids = set()  # noqa: SLF001
     runtime._grasp_lost_mirror_lock = Lock()  # noqa: SLF001
-    runtime._interrupt_state_mirror = SimpleNamespace(  # noqa: SLF001
-        carried_object_last_losses=lambda: snapshot["last_losses"],
-        carried_object_lost_signals=lambda: snapshot["rows"],
-        catalog=lambda: None,
-        poll=lambda: None,
+    runtime._interrupt_state_mirror = _CarriedObjectLossMirrorFake(  # noqa: SLF001
+        snapshot, catalog=None
     )
     runtime._carried_object_lost_run_active = False  # noqa: SLF001
     run_ids = tuple(stores) if isinstance(stores, Mapping) else ("run.1",)
@@ -2189,13 +2252,11 @@ def _install_startable_loss_mirror(
 ) -> dict[str, object]:
     snapshot: dict[str, object] = {"last_losses": (), "rows": ()}
     owner.value_store = lambda _program_run_id: store
-    runtime._interrupt_state_mirror = SimpleNamespace(  # noqa: SLF001
-        carried_object_last_losses=lambda: snapshot["last_losses"],
-        carried_object_lost_signals=lambda: snapshot["rows"],
-        catalog=lambda: RuleCatalog(
+    runtime._interrupt_state_mirror = _CarriedObjectLossMirrorFake(  # noqa: SLF001
+        snapshot,
+        catalog=RuleCatalog(
             "execution.epoch.1", None, 1, _DIGEST_A, _DIGEST_B, (), ()
         ),
-        poll=lambda: None,
     )
     return snapshot
 
@@ -2453,9 +2514,12 @@ def test_start_complete_request_failure_never_writes_the_key_and_retires_binding
     monkeypatch.setattr(journal, "transition", transition)
     monkeypatch.setattr(journal, "complete_request", fail_complete_request)
     try:
-        with pytest.raises((ProgramRunnerError, RuntimeError)):
+        with pytest.raises(ProgramRunnerError) as raised:
             runtime.start_run(_start_request())
 
+        assert raised.value.code == "program_run_started_then_failed"
+        assert raised.value.details["cause_code"] == "program_run_admission_failed"
+        assert raised.value.details["cause_message"] == "admission completion failed"
         assert staged == [True]
         assert bindings_at_complete[0] == "program-cycle.1"
         assert store.writes == []
@@ -2520,6 +2584,47 @@ def test_stop_won_running_cas_discards_inactive_loss_binding(
         assert store.writes == []
         assert runtime._carried_object_lost_run_id is None  # noqa: SLF001
         assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+    finally:
+        runtime.shutdown()
+
+
+def test_run_start_is_refused_before_claim_while_a_robot_has_no_end_effector_tcp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """B-run-1: the execution owner reports a robot without an End-effector
+    TCP (a null Robot Control TCP); Execute is refused, typed, before any
+    claim, and the cycle stays idle."""
+    runtime, journal, admission, _owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.no-end-effector-tcp.1",
+        finish_cycle=False,
+    )
+    motion = {
+        "command_target_id": "arm",
+        "operation_capability_id": "execution.trajectory.execute",
+        "presentation": "motion",
+        "command": {"tcp_frame_role_id": None},
+    }
+    runtime._kernel._transport.target_components = [  # noqa: SLF001
+        {"controllable_component_id": "lite6_robot", "targets": [motion]},
+    ]
+    try:
+        with pytest.raises(ProgramRunnerError) as raised:
+            runtime.start_run(_start_request())
+
+        assert raised.value.code == "program_end_effector_tcp_unavailable"
+        assert raised.value.details["controllable_component_id"] == "lite6_robot"
+        assert admission.claims == []
+        assert journal.read().state == "idle_after_reset"
+
+        # With an End-effector TCP the same Run starts.
+        motion["command"]["tcp_frame_role_id"] = "tcp"
+        runtime._kernel._transport.target_components = [  # noqa: SLF001
+            {"controllable_component_id": "lite6_robot", "targets": [motion]},
+        ]
+        result = runtime.start_run(_start_request(request_id="request.start.2"))
+        assert result["state"] == "running"
     finally:
         runtime.shutdown()
 
@@ -3156,10 +3261,13 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
             "source_label": "operator_ui",
             "correlation_id": "request.stop.start-race",
             "program_run_id": "program-cycle.1",
-            "expected_owner_epoch": runtime.owner_epoch,
+            "expected_owner_epoch": "program-runner.previous",
             "reason": "operator stop overtook start",
         }
     )
+    with pytest.raises(ProgramRunnerError) as wrong_path:
+        runtime.stop_run("program-cycle.other", stop)
+    assert wrong_path.value.code == "program_run_path_invalid"
     acceptance = runtime.stop_run("program-cycle.1", stop)
     assert acceptance["state"] == "stopping"
     assert runtime.cycle_status()["state"] == "stopping"
@@ -3177,6 +3285,8 @@ def test_stop_overtakes_start_before_claim_without_launching_tree(
         "no_effect": True,
         "needs_reset": True,
         "cause_code": "program_run_superseded_by_stop",
+        # M6 ERR: the cause's typed producer travels with it.
+        "cause_producer": "program_runner",
         "cause_message": "Program Stop was accepted before Run admission completed",
     }
     assert host.start_admissions == []
@@ -3674,10 +3784,14 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "source_label": "operator_ui",
             "correlation_id": None,
             "program_run_id": "program-cycle.1",
-            "expected_owner_epoch": runtime.owner_epoch,
+            "expected_owner_epoch": "program-runner.previous",
             "reason": "ordinary operator motion Stop",
         }
     )
+    with pytest.raises(ProgramRunnerError) as wrong_path:
+        runtime.stop_motion("program-cycle.other", motion_stop)
+    assert wrong_path.value.code == "program_run_path_invalid"
+    assert host.motion_stop_calls == []
     cycle_journal = runtime._journal  # noqa: SLF001
     assert cycle_journal is not None
     original_retain = cycle_journal.retain_run_snapshot
@@ -3751,6 +3865,10 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "reason": "ordinary operator Full Stop",
         }
     )
+    with pytest.raises(ProgramRunnerError) as wrong_path:
+        runtime.full_stop("program-cycle.other", full_stop)
+    assert wrong_path.value.code == "program_run_path_invalid"
+    assert host.full_stop_calls == []
     full_stopped = runtime.full_stop("program-cycle.1", full_stop)
     assert full_stopped["state"] == "full_stopped"
     assert host.full_stop_calls == [("program-cycle.1", "ordinary operator Full Stop")]
@@ -3848,7 +3966,66 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "settlement_evidence_digest": status["terminal_or_settlement_reference"],
         }
     )
-    reset_result = runtime.reset_cycle(reset)
+    # Hold the cycle reader just before its controls snapshot while the real
+    # Reset advances the controls revision, then inspect the emitted frame.
+    snapshot_entered, allow_snapshot = Event(), Event()
+    reset_marked, allow_reset = Event(), Event()
+    original_projection = runtime._runtime_controls_projection  # noqa: SLF001
+    controls = runtime._optional_controls("program-cycle.1")  # noqa: SLF001
+    assert controls is not None
+    original_mark_reset = controls.mark_reset
+
+    def held_projection(*args, **kwargs):
+        snapshot_entered.set()
+        assert allow_snapshot.wait(timeout=2.0)
+        return original_projection(*args, **kwargs)
+
+    def held_mark_reset(**kwargs):
+        original_mark_reset(**kwargs)
+        reset_marked.set()
+        assert allow_reset.wait(timeout=2.0)
+
+    monkeypatch.setattr(runtime, "_runtime_controls_projection", held_projection)
+    monkeypatch.setattr(controls, "mark_reset", held_mark_reset)
+    frames, reset_results, errors = [], [], []
+
+    def read_cycle():
+        try:
+            frames.append(runtime.cycle_status())
+        except Exception as error:
+            errors.append(error)
+
+    def reset_cycle():
+        try:
+            reset_results.append(runtime.reset_cycle(reset))
+        except Exception as error:
+            errors.append(error)
+
+    reader = Thread(target=read_cycle)
+    resetter = Thread(target=reset_cycle)
+    reader.start()
+    try:
+        assert snapshot_entered.wait(timeout=2.0)
+        resetter.start()
+        assert reset_marked.wait(timeout=2.0)
+        allow_snapshot.set()
+        reader.join(timeout=2.0)
+        assert not reader.is_alive()
+        assert len(frames) == 1
+        ProgramCycleFrameDTO.model_validate(frames[0])
+        assert frames[0]["runtime_control_revision"] == controls.revision
+    finally:
+        allow_snapshot.set()
+        allow_reset.set()
+        reader.join(timeout=2.0)
+        if resetter.ident is not None:
+            resetter.join(timeout=2.0)
+    assert not resetter.is_alive()
+    assert errors == []
+    assert len(reset_results) == 1
+    reset_result = reset_results[0]
+    monkeypatch.setattr(runtime, "_runtime_controls_projection", original_projection)
+    monkeypatch.setattr(controls, "mark_reset", original_mark_reset)
     with pytest.raises(ProgramRunnerError) as completed_reset:
         runtime.reset_cycle(reset)
     assert completed_reset.value.code == "program_cycle_reset_stale"
@@ -6514,7 +6691,8 @@ def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
         simulation_control=simulation,  # type: ignore[arg-type]
     )
 
-    assert runtime._ports.simulator_control is simulation  # noqa: SLF001
+    # The port is wrapped so a simulator reset also resets Active TCPs.
+    assert runtime._ports.simulator_control._port is simulation  # noqa: SLF001
     assert runtime._owner_availability["simulator_control"].available  # noqa: SLF001
     assert runtime.health()["simulation_control_available"] is True
     runtime.shutdown()
@@ -6771,6 +6949,8 @@ def test_lifecycle_failure_before_or_after_claim_is_honest_and_resettable(monkey
             assert admission.claims == []
         else:
             assert error.code == "program_run_started_then_failed"
+            assert error.producer == "program_runner"
+            assert error.details["cause_producer"] == "headless_api"
             assert error.details["program_run_id"] == cycle.program_run_id == "program-cycle.1"
             assert error.details["needs_reset"] is True
             assert cycle.state == "terminal_awaiting_reset" and cycle.claim is not None
@@ -6870,7 +7050,7 @@ def test_stop_wins_running_cas_after_last_abort_without_inventing_failure(monkey
 
 
 @pytest.mark.parametrize("not_ready", [True, False])
-def test_scene_preparation_distinguishes_not_ready_from_real_generation_change(monkeypatch, tmp_path, not_ready):
+def test_scene_preparation_refuses_not_ready_but_not_a_moved_generation(monkeypatch, tmp_path, not_ready):
     class ObservedAdmission(_Admission):
         def get(self):
             return {"admission_generation": 35 if not_ready else 37,
@@ -6880,29 +7060,36 @@ def test_scene_preparation_distinguishes_not_ready_from_real_generation_change(m
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
                              headless_client=_Headless(), execution_transport=_Headless(),
                              admission_client=admission, cycle_journal=journal)
-    def no_scene_effect(**_kwargs):
-        raise AssertionError("Refused admission must not prepare the Scene")
-    monkeypatch.setattr(runtime, "_prepare_current_applied_scene", no_scene_effect)
+    prepared: list[str] = []
+    def scene_effect(**kwargs):
+        if not_ready:
+            raise AssertionError("Refused admission must not prepare the Scene")
+        prepared.append(kwargs["context_id"])
+        return {"program_revision": "program.rev"}, {"schema_version": "manyforge.prepared_program_scene.v1"}
+    monkeypatch.setattr(runtime, "_prepare_current_applied_scene", scene_effect)
     runtime.start()
     try:
-        with pytest.raises(ProgramRunnerError) as caught:
-            if not_ready:
+        if not_ready:
+            with pytest.raises(ProgramRunnerError) as caught:
                 runtime.reset_cycle(ProgramCycleResetRequest.model_validate({
                     "request_id": "idle.reset.not-ready", "reload_initial_scene": True, "request_owner_epoch": "composer.1",
                     "source_label": "operator", "correlation_id": None,
                     "program_run_id": None, "expected_owner_epoch": "runner.1",
                     "expected_cycle_generation": 1, "expected_claim_generation": None,
                     "terminal_reference": None, "settlement_evidence_digest": None}))
-            else:
-                runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
-                    "request_id": "scene.stale", "request_owner_epoch": "composer.1",
-                    "source_label": "operator", "correlation_id": None,
-                    "expected_applied_record_digest": _DIGEST_B,
-                    "expected_admission_generation": 35}))
-        assert caught.value.code == ("authoring_not_ready" if not_ready else "stale_generation")
-        assert caught.value.details == {"admission_generation": 35 if not_ready else 37,
-                                       "authoring_allowed": not not_ready,
-                                       "expected_admission_generation": 35}
+            assert caught.value.code == "authoring_not_ready"
+            assert caught.value.details == {"admission_generation": 35,
+                                           "authoring_allowed": False,
+                                           "expected_admission_generation": 35}
+        else:
+            # The caller read generation 35; only the generation moved since.
+            result = runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
+                "request_id": "scene.older-generation", "request_owner_epoch": "composer.1",
+                "source_label": "operator", "correlation_id": None,
+                "expected_applied_record_digest": _DIGEST_B,
+                "expected_admission_generation": 35}))
+            assert result["status"] == "prepared" and result["admission_generation"] == 37
+            assert len(prepared) == 1
         cycle = journal.read()
         assert cycle.state == "idle_after_reset" and cycle.cycle_generation == 1
         assert cycle.claim is None and cycle.failure is None
@@ -6963,7 +7150,8 @@ class _SimulationLaneHeadless(_Headless):
 _SIMULATION_LANE_PROFILES = {
     "mock": {"mock_profile": "lite6_lite_gripper"},
     "isaac": {"isaac_profile": "lite6"},
-    "real": {"real_profile": "lite6_real", "device_address_ref": "lite6.address"},
+    "real": {"real_profile": "lite6_real", "device_address_ref": "lite6.address",
+             "adapter_family": "xarm"},
 }
 
 
@@ -6971,7 +7159,8 @@ def _set_simulation_lane(graph, component, lane):
     """Mirror one compiled profile and its Manager-derived simulator row."""
     profile = next(row for row in graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
                    if row["controllable_component_id"] == component)
-    for key in ("mock_profile", "isaac_profile", "real_profile", "device_address_ref"):
+    for key in ("mock_profile", "isaac_profile", "real_profile", "device_address_ref",
+                "adapter_family"):
         profile.pop(key, None)
     profile.update(_SIMULATION_LANE_PROFILES[lane])
     dependency = next(row for row in graph["component_simulator_dependencies"]
@@ -7545,6 +7734,34 @@ def test_motion_target_without_profile_still_refused_with_controller_profile_rea
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("no_output", [
+    {"output_mode": "none"},
+    {"output_mode": "commanded", "pneumatic_io": {"inputs": {}, "outputs": []}},
+])
+def test_simulation_dependency_skips_a_lane_free_pneumatic_tool(no_output):
+    # lite6_pneumatic_mock (merge 6 D4): the mounted no-output pneumatic tool
+    # has no controller profile; Run was refused before this fix.
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"))
+    graph = headless.graph
+    configuration = graph["cell_graph"]["runtime_units"][0]["configuration"]
+    configuration["controller_profiles"] = [
+        row for row in configuration["controller_profiles"] if row["controllable_component_id"] != "robot.other"]
+    graph["component_simulator_dependencies"] = [
+        row for row in graph["component_simulator_dependencies"] if row["controllable_component_id"] != "robot.other"]
+    tool = {"controllable_component_id": "robot.other", "command_target_id": "gripper",
+            "actuation_kind": "pneumatic", **no_output}
+    configuration["gripper_target_configurations"] = [tool]
+    try:
+        assert _simulation_lane_required(runtime, binding, _simulation_lane_program("arm", "other_arm")) is False
+        # A commanded (lane-bound) tool still needs its controller profile.
+        tool.pop("pneumatic_io", None)
+        tool.update(actuation_kind="position_commanded", output_mode="commanded")
+        with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
+            _simulation_lane_required(runtime, binding, _simulation_lane_program("arm", "other_arm"))
+    finally:
+        runtime.shutdown()
+
+
 @pytest.mark.parametrize(("program_kind", "reason"), [
     ("io_only", "reached Applied Program run admission"),
     ("real_motion", "reached Applied Program run admission"),
@@ -7923,6 +8140,7 @@ def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idl
             events.append(name)
         return apply
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", effect("scene"))
+    monkeypatch.setattr(runtime, "_reset_active_tcp", lambda: events.append("tcp"))
     monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", effect("position"))
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: events.append("preflight"))
     monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
@@ -7937,7 +8155,7 @@ def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idl
     })
     try:
         result = runtime.reset_cycle(request)
-        assert events == (["preflight", "preflight"] if reset_position else []) + (["scene"] if reload_scene else []) + (["position"] if reset_position else [])
+        assert events == (["preflight", "preflight"] if reset_position else []) + (["scene", "tcp"] if reload_scene else []) + (["position"] if reset_position else [])
         assert result["idle_cycle_generation"] == 2
         assert journal.read().state == "idle_after_reset"
         assert len(admission.releases) == (0 if idle and not (reload_scene or reset_position) else 1)
@@ -7973,6 +8191,70 @@ def test_position_reset_refuses_before_scene_effects(monkeypatch, tmp_path, idle
         assert journal.read() == before
         assert not journal.pending_commands()
         assert not admission.releases
+    finally:
+        runtime.shutdown()
+
+
+def test_idle_reload_without_applied_scenario_is_refused_before_any_effect(monkeypatch, tmp_path):
+    """No Applied Scenario: Reload is refused, the cycle stays idle, no claim
+    is taken, and once a Scenario is loaded the same Reset is admitted."""
+
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.options")
+
+    class Admission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+
+    class EmptyCell(_Headless):
+        loaded = False
+
+        def program_applied(self) -> dict[str, Any]:
+            if not self.loaded:
+                self.applied_reads += 1
+                raise HeadlessClientError(
+                    "program_applied_selection_not_found",
+                    "the active configuration was not installed from a Scenario", 404,
+                )
+            return super().program_applied()
+
+    admission = Admission()
+    headless = EmptyCell()
+    runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.options"),
+                             headless_client=headless, execution_transport=_Headless(),
+                             admission_client=admission, cycle_journal=journal)
+    scenes = []
+    monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: scenes.append("scene"))
+    monkeypatch.setattr(runtime, "_reset_persistent_keys_to_initial", lambda _request: scenes.append("keys"))
+    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
+    runtime.start()
+    request = ProgramCycleResetRequest.model_validate({
+        "request_id": "reset.empty", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
+        "correlation_id": None, "program_run_id": None,
+        "expected_owner_epoch": runtime.owner_epoch, "expected_cycle_generation": 1,
+        "reload_initial_scene": True,
+    })
+    before = journal.read()
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.reset_cycle(request)
+        assert refused.value.code == "program_applied_selection_not_found"
+        assert headless.applied_reads == 1
+        # Nothing changed: still idle, no Reset phase, no claim, nothing pending.
+        assert journal.read() == before
+        assert runtime.cycle_status()["state"] == "idle_after_reset"
+        assert journal.read().reset_effect_claim is None
+        assert not admission.claims and not admission.releases
+        assert not journal.pending_commands()
+        assert scenes == []
+        # Load stays admitted: the cycle is idle and no claim is held.
+        assert admission.get()["authoring_allowed"] is True
+        # After a Load, a new Reset with Reload is admitted and completes.
+        headless.loaded = True
+        result = runtime.reset_cycle(request.model_copy(update={"request_id": "reset.loaded"}))
+        assert result["idle_cycle_generation"] == 2
+        assert scenes == ["keys", "scene"]
+        assert journal.read().state == "idle_after_reset"
+        assert len(admission.claims) == 1 and len(admission.releases) == 1
     finally:
         runtime.shutdown()
 
@@ -8160,7 +8442,7 @@ def _refused_idle_reset(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("generation_advanced", [True, False])
-def test_idle_reset_retry_after_refused_acquire_targets_current_admission_generation(
+def test_idle_reset_retry_after_refused_acquire_replays_retained_intent(
     monkeypatch, tmp_path, generation_advanced,
 ):
     journal, admission, runtime, request, retained, effects, writes = _refused_idle_reset(monkeypatch, tmp_path)
@@ -8171,17 +8453,11 @@ def test_idle_reset_retry_after_refused_acquire_targets_current_admission_genera
         runtime.reset_cycle(request.model_copy(update={"request_id": "reset.retry"}))
         assert len(admission.claims) == 2
         first, retry = admission.claims
-        expected = 2 if generation_advanced else 1
-        assert retry == {**first, "expected_admission_generation": expected}
-        assert retry["request_id"] == retry["owner_transaction_id"] == first["request_id"]
-        pre_acquire = [w for w in writes if w["retained"]["claim"] is None]
-        if generation_advanced:
-            assert pre_acquire == [{"expected_generation": 1, "expected": retained,
-                                    "retained": {**retained, "intent": retry}}]
-        else:
-            assert pre_acquire == []
-            assert retry == retained["intent"]
-        assert writes[len(pre_acquire)]["expected"]["intent"] == retry
+        # The generation is evidence only: the retry never rewrites it.
+        assert retry == first == retained["intent"]
+        assert retry["expected_admission_generation"] == 1
+        assert not [w for w in writes if w["retained"]["claim"] is None]
+        assert writes[0]["expected"]["intent"] == retry
         assert effects == ["reset.refused"]
         assert journal.read().state == "idle_after_reset"
     finally:
@@ -8464,7 +8740,8 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         return owner.read(run_id)
 
     def resume_recovery(run_id, **kwargs):
-        calls.append(("resume_recovery", kwargs["node_attempt_id"], kwargs["action"]))
+        calls.append(("resume_recovery", kwargs["node_attempt_id"], kwargs["action"],
+                      kwargs.get("result")))
         return owner.read(run_id)
 
     def forbidden(*_args, **_kwargs):
@@ -8507,7 +8784,8 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         assert lookups == ["attempt.2"]
         assert calls == [
             ("continue_failure_pause", "attempt.2", "continue.2"),
-            ("resume_recovery", "attempt.2", "manual_failure"),
+            # Continue's marker (item 11: the Acknowledge of an unconfirmed Stop).
+            ("resume_recovery", "attempt.2", "manual_failure", "continue_with_failure"),
         ]
         assert result["cycle_resumed"] is True
         assert result["owner_result"] == {"accepted": True, "action": "continue_with_failure"}

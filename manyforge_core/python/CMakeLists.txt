@@ -81,6 +81,8 @@ set_target_properties(
 )
 target_link_libraries(
   manyforge_deployment_verification_core_archive INTERFACE
+  # Verification's I/O-provider domain calls Core lifecycle-plan functions.
+  "${MANYFORGE_CORE_DIR}/libmanyforge_core.a"
   manyforge_content_identity_archive
 )
 target_link_libraries(manyforge_deployment_archive INTERFACE
@@ -119,7 +121,6 @@ if(TARGET manyforge_core AND TARGET manyforge_deployment)
 else()
 # Link against the manyforge_core library
 target_link_libraries(manyforge_core_py PRIVATE
-  ${MANYFORGE_CORE_DIR}/libmanyforge_core.a
   manyforge_deployment_archive
   pybind11::module
   pybind11::headers

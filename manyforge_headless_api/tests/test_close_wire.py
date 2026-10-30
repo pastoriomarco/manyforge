@@ -214,3 +214,30 @@ def test_selection_http_preserves_actual_producer_refusals(code, status):
     with TestClient(create_app(service=service)) as client: response = client.get("/api/manager/canonical-empty-selection")
     assert response.status_code == status
     assert response.json()["detail"]["code"] == code
+
+
+def test_close_retirement_is_refused_while_recover_cell_runs(tmp_path, monkeypatch):
+    """SX-679 (maintainer): while a Recover cell press runs, Close's target
+    retirement is refused `recover_cell_in_progress` before CCLC is called;
+    once no press runs, the same retirement goes through."""
+
+    raw = _intent(); calls = []
+    class Port(CCLCOpenRequestClient):
+        def _exchange(self, command, payload):
+            calls.append(command)
+            return _result(raw)
+    pressing = {"running": True}
+    from manyforge_headless_api import app as app_module
+    class Ledger(app_module.CellRecoverLedger):
+        def running(self):
+            return pressing["running"]
+    monkeypatch.setattr(app_module, "CellRecoverLedger", Ledger)
+    service = HeadlessService(object(), object(), cell_admission=FakeAdmission())
+    with TestClient(create_app(service=service, cclc=Port(tmp_path))) as client:
+        refused = client.post("/api/cclc/targets/retire", json=raw)
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "recover_cell_in_progress"
+        assert calls == []
+        pressing["running"] = False
+        assert client.post("/api/cclc/targets/retire", json=raw).json() == _result(raw)
+    assert calls == ["lifecycle_target_retire"]

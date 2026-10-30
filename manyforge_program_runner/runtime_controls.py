@@ -17,7 +17,7 @@ import unicodedata
 import rfc8785
 
 from manyforge_behavior.failure_details import failure_wire_fields
-from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
+from manyforge_behavior.json_scalars import nonnegative_int64_value
 from manyforge_behavior.recovery import (
     OWNER_RECOVERY_ACTIONS,
     is_non_moving_recovery,
@@ -26,7 +26,7 @@ from manyforge_behavior.recovery import (
 
 
 RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v3"
-RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v4"
+RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v5"
 _MAX_AUDIT: Final = 256
 _MAX_REVISION: Final = 9_007_199_254_740_991
 # One entry per captured Program node, never per request/attempt.
@@ -99,17 +99,6 @@ def manual_result_availability(
         or owner.get("acknowledged_non_moving") is not True
     ):
         return False, "manual_result_owner_not_acknowledged"
-    try:
-        raw_deadline = owner.get("observed_state_valid_until_ns", 0)
-        valid_until_ns = nonnegative_int64(raw_deadline)
-    except ValueError:
-        return False, "manual_result_owner_observation_invalid"
-    if (
-        type(valid_until_ns) is int
-        and valid_until_ns > 0
-        and time.monotonic_ns() >= valid_until_ns
-    ):
-        return False, "manual_result_owner_observation_expired"
     return True, None
 
 
@@ -392,17 +381,9 @@ class ProgramRuntimeControls:
             # tick after the addressed owner releases an ordinary Stop. That
             # stale internal row is not another operator recovery offer.
             return None
-        try:
-            valid_until_ns = (
-                nonnegative_int64(owner.get("observed_state_valid_until_ns", 0)) or None
-                if isinstance(owner, dict)
-                else None
-            )
-        except ValueError:
-            return None
-        observation_current = (
-            valid_until_ns is None or time.monotonic_ns() < valid_until_ns
-        )
+        # Offers do not expire: freshness is checked when an action is
+        # pressed (the owner re-reads its assessment and the Kernel re-checks
+        # the start state), which refuses a stale press with a typed reason.
         operator_stop_recovery = intervention.policy_parameter == "operator_stop_policy"
         if operator_stop_recovery:
             manual_result_enabled = False
@@ -425,7 +406,7 @@ class ProgramRuntimeControls:
                 enabled_by_policy = intervention_allowed
             else:
                 enabled_by_policy = operator_stop_recovery or retry_available
-            enabled = enabled_by_policy and observation_current
+            enabled = enabled_by_policy
             actions.append(
                 {
                     "action_id": action_id,
@@ -436,20 +417,15 @@ class ProgramRuntimeControls:
                         None
                         if enabled
                         else (
-                            "recovery_owner_observation_expired"
-                            if not observation_current
-                            else (
-                                "recovery_retry_limit_reached"
-                                if intervention_allowed
-                                else "recovery_action_forbidden_by_captured_policy"
-                            )
+                            "recovery_retry_limit_reached"
+                            if intervention_allowed
+                            else "recovery_action_forbidden_by_captured_policy"
                         )
                     ),
                 }
             )
         if (
             retry_available
-            and observation_current
             and (
                 intervention.owner_task_id is None
                 or (
@@ -477,7 +453,13 @@ class ProgramRuntimeControls:
                     or owner.get("acknowledged_non_moving") is True
                 )
             )
-            continue_enabled = intervention_allowed and observation_current and closable
+            # An unconfirmed Stop holds whatever the policy, on an undecided
+            # assessment: Continue is its Acknowledge, and the node goes on
+            # with the Stop's normal outcome (it closes only if it can).
+            continue_enabled = (
+                intervention.reason_code == "program_stop_settlement_unconfirmed"
+                or (intervention_allowed and closable)
+            )
             actions.append(
                 {
                     "action_id": "continue_with_failure",
@@ -490,11 +472,7 @@ class ProgramRuntimeControls:
                         else (
                             "recovery_action_forbidden_by_captured_policy"
                             if not intervention_allowed
-                            else (
-                                "recovery_owner_observation_expired"
-                                if not observation_current
-                                else "recovery_close_not_eligible"
-                            )
+                            else "recovery_close_not_eligible"
                         )
                     ),
                 }
@@ -522,7 +500,6 @@ class ProgramRuntimeControls:
         )
         held_reset_enabled = (
             operator_stop_recovery
-            and observation_current
             and operator_stop_settled
             and (owner.get("retry_admissible") is True or stop_fault_reset_required)
         )
@@ -536,13 +513,9 @@ class ProgramRuntimeControls:
                     None
                     if held_reset_enabled
                     else (
-                        "recovery_owner_observation_expired"
-                        if operator_stop_recovery and not observation_current
-                        else (
-                            "operator_stop_not_physically_settled"
-                            if operator_stop_recovery
-                            else "cycle_not_terminal"
-                        )
+                        "operator_stop_not_physically_settled"
+                        if operator_stop_recovery
+                        else "cycle_not_terminal"
                     )
                 ),
             }
@@ -560,9 +533,9 @@ class ProgramRuntimeControls:
             "node_instance_id": identity.node_instance_id,
             "node_attempt_id": identity.node_attempt_id,
             "owner_epoch": owner_epoch,
-            # The owner's observation deadline is freshness, not offer
-            # semantics: an extension by a newer equivalent sample keeps the
-            # same offer (and its command fence); expiry changes the actions.
+            # The owner's observation deadline is Kernel freshness, not offer
+            # semantics: a newer equivalent sample keeps the same offer (and
+            # its command fence).
             "owner_assessment": (
                 {
                     key: value
@@ -590,11 +563,6 @@ class ProgramRuntimeControls:
         with self._lock:
             cached = self._offers.get(identity.node_instance_id)
             if cached is not None and cached[0] == offer_key:
-                cached[1]["valid_until_ns"] = (
-                    nonnegative_int64_value(valid_until_ns)
-                    if valid_until_ns is not None
-                    else None
-                )
                 return deepcopy(cached[1])
             if self._offer_revision >= _MAX_REVISION:
                 raise ProgramRuntimeControlError(
@@ -607,11 +575,6 @@ class ProgramRuntimeControls:
                 "offer_id": _digest(RECOVERY_OFFER_SCHEMA, material),
                 "offer_revision": self._offer_revision,
                 "generated_at_ns": nonnegative_int64_value(time.monotonic_ns()),
-                "valid_until_ns": (
-                    nonnegative_int64_value(valid_until_ns)
-                    if valid_until_ns is not None
-                    else None
-                ),
                 "kernel_assessment_revision": (
                     owner.get("assessment_revision", 0)
                     if isinstance(owner, dict)

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <optional>
 #include <string>
@@ -12,7 +13,7 @@ using namespace manyforge::core;
   MotionParticipantIntentDTO motion{
       MoveId("move.pick"),
       FrameRoleId("base"),
-      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      CurrentTcpDTO{},
       TolerancesDTO{0.01, 0.001, 0.01},
       SpeedProfileDTO{},
       TimeoutsDTO{},
@@ -68,6 +69,24 @@ TEST(OperationIntentTest, RejectsDuplicateSourceJointNames) {
   const auto result = validate_operation_intent(operation);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "motion_payload_invalid");
+}
+
+TEST(OperationIntentTest, MotionClearanceIsOptionalAndBounded) {
+  // M6 decision 16: a move's own collision clearance, in [0, 0.05] m.
+  for (const double admitted : {0.0, 0.0005, 0.05}) {
+    auto operation = valid_motion_operation();
+    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).clearance_m =
+        admitted;
+    EXPECT_TRUE(validate_operation_intent(operation).ok()) << admitted;
+  }
+  for (const double refused : {-0.001, 0.0501, std::numeric_limits<double>::quiet_NaN()}) {
+    auto operation = valid_motion_operation();
+    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).clearance_m =
+        refused;
+    const auto result = validate_operation_intent(operation);
+    ASSERT_FALSE(result.ok()) << refused;
+    EXPECT_EQ(result.error().details.at("reason"), "motion_clearance_invalid");
+  }
 }
 
 TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {
@@ -177,17 +196,46 @@ TEST(OperationIntentTest, RejectsGripperEffortWithDifferentCoordinateKind) {
   EXPECT_EQ(result.error().details.at("reason"), "gripper_command_effort_unit_mismatch");
 }
 
-TEST(OperationIntentTest, TcpEndpointRequiresOnePortableOwnerAndFrame) {
+TEST(OperationIntentTest, TcpEndpointTakesTheThreeSelectorFormsWithCompleteIdentities) {
   auto operation = valid_motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
   EXPECT_TRUE(validate_operation_intent(operation).ok());
-  motion.tcp_endpoint = MotionEndpointReferenceDTO{TargetRoleId("tool"), FrameRoleId("finger_tip")};
+  motion.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("gripper")};
   EXPECT_TRUE(validate_operation_intent(operation).ok());
-  motion.tcp_endpoint.target_role_id = TargetRoleId("");
-  EXPECT_FALSE(validate_operation_intent(operation).ok());
-  motion.tcp_endpoint.target_role_id = TargetRoleId("tool");
-  motion.tcp_endpoint.frame_role_id = FrameRoleId("");
-  EXPECT_FALSE(validate_operation_intent(operation).ok());
+  motion.tcp_endpoint = DefaultTcpOfRoleDTO{TargetRoleId("")};
+  EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),
+            "motion_tcp_endpoint_invalid");
+  const TcpEntryDTO entry{ControllableComponentId("lite_gripper"), CommandTargetId("gripper"),
+                          FrameRoleId("finger_tip")};
+  motion.tcp_endpoint = entry;
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  for (int missing = 0; missing < 3; ++missing) {
+    auto incomplete = entry;
+    if (missing == 0) incomplete.component_id = ControllableComponentId("");
+    if (missing == 1) incomplete.target_id = CommandTargetId("");
+    if (missing == 2) incomplete.frame_role_id = FrameRoleId("");
+    motion.tcp_endpoint = incomplete;
+    EXPECT_FALSE(validate_operation_intent(operation).ok()) << missing;
+  }
+}
+
+TEST(OperationIntentTest, SetTcpNamesOneRobotAndNeverCurrent) {
+  auto operation = valid_motion_operation();
+  operation.participants.front().payload = SetTcpParticipantIntentDTO{TcpEntryDTO{
+      ControllableComponentId("lite_gripper"), CommandTargetId("gripper"), FrameRoleId("tcp")}};
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  operation.participants.front().payload =
+      SetTcpParticipantIntentDTO{DefaultTcpOfRoleDTO{TargetRoleId("gripper")}};
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  operation.participants.front().payload = SetTcpParticipantIntentDTO{CurrentTcpDTO{}};
+  EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),
+            "set_tcp_current_invalid");
+  operation.participants.front().payload =
+      SetTcpParticipantIntentDTO{DefaultTcpOfRoleDTO{TargetRoleId("gripper")}};
+  operation.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  operation.participants.push_back(operation.participants.front());
+  EXPECT_EQ(validate_operation_intent(operation).error().details.at("reason"),
+            "set_tcp_shape_invalid");
 }
 
 }  // namespace

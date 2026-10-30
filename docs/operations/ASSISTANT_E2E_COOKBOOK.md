@@ -65,8 +65,8 @@ The Deployment needs an assistant profile (`assistant_profile_id`, for example
 }
 ```
 
-You can also add it in the Deployment editor: **AI models > Add AI model**
-(fields Component id, Base URL, Model, Token environment variable).
+You can also add it in Composer: **Components > Custom I/O device or AI model >
+Add AI model** (fields Component id, Base URL, Model, Token environment variable).
 
 - `base_url`: absolute `http(s)` URL of the `/v1` root.
 - `model`: the served model name.
@@ -86,8 +86,8 @@ You can also add it in the Deployment editor: **AI models > Add AI model**
 An assistant profile names one or more model aliases (for example
 `assistant_model` for the chat and `selection_model` for a Program's model
 query). With exactly one `ai_model` component, it serves every alias. With
-several, choose the component for each alias in the Deployment editor
-(**AI models > Assistant profile**), which writes the Deployment member
+several, choose the component for each alias in Composer
+(**Deployment > Cell settings > AI model aliases**), which writes the Deployment member
 `assistant_model_components`:
 
 ```json

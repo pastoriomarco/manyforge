@@ -1189,4 +1189,27 @@ TEST(ResourceSlotTableTest, SettledOwnerTransferRefusesUnsettledAndInvalidModesW
   }
 }
 
+// Item 37: Force close frees exactly the force-closed owners, whatever their
+// phase, and the unowned orphan marks; other operations keep theirs.
+TEST(ResourceSlotTableTest, ForceReleaseFreesOwnedAndOrphanSlotsOnly) {
+  ResourceSlotTable table({ResourceId("a"), ResourceId("b"), ResourceId("c")});
+  const auto closed = owner("op.closed", "part.a");
+  const auto kept = owner("op.kept", "part.b");
+  ASSERT_TRUE(table.reserve(closed, {ResourceId("a")}).ok());
+  ASSERT_TRUE(table.transition(closed, {ResourceId("a")}, ResourceSlotState::kDispatched).ok());
+  ASSERT_TRUE(table.reserve(kept, {ResourceId("b")}).ok());
+  ASSERT_TRUE(table.mark_unreconciled_external_or_orphan_goal({ResourceId("c")}).ok());
+  const auto generation = table.coherent_snapshot().operation_resource_generation;
+  EXPECT_EQ(table.force_release({OperationId("op.closed")}), std::vector<ResourceId>{ResourceId("c")});
+  const auto after = table.coherent_snapshot();
+  EXPECT_GT(after.operation_resource_generation, generation);
+  EXPECT_EQ(after.slots[0].state, ResourceSlotState::kFree);
+  EXPECT_FALSE(after.slots[0].owner.has_value());
+  EXPECT_EQ(after.slots[1].owner, kept);
+  EXPECT_EQ(after.slots[2].state, ResourceSlotState::kFree);
+  // Nothing left to free: no change and no new generation.
+  EXPECT_TRUE(table.force_release({OperationId("op.closed")}).empty());
+  EXPECT_EQ(table.coherent_snapshot().operation_resource_generation, after.operation_resource_generation);
+}
+
 }  // namespace

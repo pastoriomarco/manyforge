@@ -16,16 +16,23 @@ It does what Composer chained in the browser, with a bounded wait:
 Reads fail closed: an owner refusal or an incomplete projection is
 ``cell_state_unavailable``, never "direct control" or "no components".
 
+Every CCLC request of one press names the CCLC owner epoch read once, at the
+press's first CCLC request (M6, item 35). After a CCLC restart mid-press the
+new owner refuses the next step ``stale_request_owner_epoch`` (nothing
+started) and the press stops there; the operator presses again.
+
 Replay: a repeated request ID returns the stored result and reads nothing.
 This holds per Headless process only (bounded in-memory map, lost on restart
 or eviction); the GUI sends a fresh ID per press. There is no durable ledger.
 An unexpected error or cancellation stores ``cell_recover_outcome_unknown``
 for the ID: a step may already have run, so a replay never starts again.
 
-The client sends only a request identity. Every fence is read here, from the
-current owners. CCLC and the Kernel still decide: the latch's clearing
-conditions (rest, no uncertain operation, no open incident, configuration) are
-unchanged, and an unready latch is never cleared.
+The client sends a request identity and, optionally, the open incident IDs
+it showed (M6, item 36): an open incident outside that list refuses the press
+before any step, and each acknowledgement is pinned to the incident read.
+Every fence is read here, from the current owners. CCLC and the Kernel still
+decide: the latch's clearing conditions (rest, no uncertain operation, no open
+incident, configuration) are unchanged, and an unready latch is never cleared.
 """
 
 from __future__ import annotations
@@ -45,22 +52,32 @@ _LOGGER = logging.getLogger(__name__)
 CELL_RECOVER_RESULT_VERSION = "manyforge.cell_recover_result.v1"
 # Reference note for the Recover cell route (rendered into the REST references).
 CELL_RECOVER_REFERENCE_NOTE = (
-    "Recover cell, one server-side composite. Send only `request_context` with "
+    "Recover cell, one server-side composite. Send `request_context` with "
     "`request_id`, `source_label` and an optional `correlation_id`; every fence "
-    "is read from the current owners. It acknowledges open component incidents, "
+    "is read from the current owners. An optional `expected_incident_ids` lists "
+    "the open incident IDs the operator was shown: an open incident not listed "
+    "refuses the press `cclc_incident_changed` before any step (its details "
+    "name it), each acknowledgement is pinned to the incident read (one closed "
+    "meanwhile, with nothing else open, is an ordinary Recover), and the "
+    "press's later Recovers acknowledge none (an incident opened meanwhile "
+    "refuses them `cclc_incident_open`); absent, every open incident is "
+    "acknowledged. It acknowledges open component incidents, "
     "attempts the current cell Stop-fault latch recovery, and submits Recover "
     "for components whose previously recovered cause was still reported at the "
     "press and remains so. It then tries to enable again each component "
-    "whose Active target an incident retired (Recover, Prepare, Enable; "
+    "whose Active target an incident retired, until Active is restored or "
+    "another target replaces it (CCLC's `active_target_retired_by_incident`; "
+    "a component with an open incident but no such retirement is only "
+    "acknowledged) (Recover, Prepare, Enable; "
     "`component_rearm_*` reasons, for example the emergency stop still engaged), "
-    "listing it in `recovered_components` on success. It is also the re-arm of a "
-    "robot moved from its own interface on an idle cell: Execute and Run "
-    "(`operation_start`, `program_run`) are refused `component_rearm_required` "
-    "(no effect; `details.components`, and `details.in_motion` while it still "
-    "moves) until it is re-armed. Clients call this route, wait until the "
-    "component is `active` (`GET /api/cclc/components/{id}`, no "
-    "`moved_externally:*` reason), then re-send the command with fresh fences; "
-    "a robot still moving is refused `component_rearm_required` here too. "
+    "listing it in `recovered_components` on success. Each step waits within "
+    "that component's own lifecycle allowance (the timeout CCLC accepted it "
+    "with), so a press may outlast one HTTP call: send the same `request_id` "
+    "again to wait for its result. A robot moved from its "
+    "own interface on an idle cell is re-armed here too (Recover; the driver "
+    "re-drives Prepare and Enable), although a motion command no longer needs "
+    "it: its vendor adapter re-engages the robot at rest before the trajectory. "
+    "A robot still moving is refused `component_rearm_required` here. "
     "A refused recovery "
     "still returns a JSON result: read `outcome` (`done` or `not_recovered`), "
     "`reason.code`, `acknowledged_incidents`, `latch_cleared` and "
@@ -69,13 +86,41 @@ CELL_RECOVER_REFERENCE_NOTE = (
     "`stop_fault_recovery_closing` (Scenario Close keeps the latch; the latch "
     "recovery was refused, but incident acknowledgements earlier in the same "
     "press may already have happened), `stop_fault_latch_replaced`, "
-    "`cell_state_unavailable`, `cell_recover_in_progress` and "
+    "`cclc_incident_changed`, `cell_state_unavailable`, `stale_request_owner_epoch` "
+    "(CCLC restarted during the press; the refused step had no effect, earlier "
+    "ones are listed; press again), `cell_recover_in_progress` and "
     "`cell_recover_outcome_unknown` (a step may have reached its owner: inspect "
     "and reconcile, do not assume nothing happened). `done` does not prove that "
     "every robot is ready to move. Repeating a `request_id` returns the stored "
     "result, or `cell_recover_in_progress`, without reading state again; this "
     "replay is in memory per Headless process, bounded, and lost on restart or "
-    "eviction. Use a new `request_id` for each new press."
+    "eviction. A resend with `replay_only: true` never starts a press: an "
+    "unknown `request_id` (Headless restarted or the result was evicted) "
+    "returns `cell_recover_outcome_unknown` with `details.replay` "
+    "`request_id_unknown`. Use a new `request_id` for each new press. "
+    "While a press runs, Scenario Close's lifecycle target retirement is "
+    "refused `recover_cell_in_progress`; wait for the press or abort it "
+    "(`POST /api/execution/cell-recover/abort`)."
+)
+# SX-679: the reference note for the abort route.
+CELL_RECOVER_ABORT_REFERENCE_NOTE = (
+    "Abort the running Recover cell press, the operator's voluntary action. "
+    "Send only `request_context` with `request_id`, `source_label` and an "
+    "optional `correlation_id`. No later step of the press starts; the step in "
+    "flight is not cancelled but settles within its own limit. The press then "
+    "ends `not_recovered` with reason `cell_recover_aborted` (read it with its "
+    "own `request_id`): its details name the step it stopped before "
+    "(`before_step`), the re-enable steps done per component "
+    "(`reenable_steps`, `component:recover+prepare;...`) and the components "
+    "not enabled again (`not_reenabled`), next to `acknowledged_incidents`, "
+    "`latch_cleared` and `recovered_components` (`before_step` `none` when "
+    "the step in flight was the last and succeeded). If that step fails, its "
+    "own reason is reported, with `details.aborted` `true` and the same "
+    "lists. Abort is checked right before each owner write, so a read in "
+    "progress sends nothing after it. "
+    "Scenario Close is allowed "
+    "again once the press has ended. With no press running the abort is "
+    "refused `cell_recover_not_running`."
 )
 # How long one request waits for the latch to become recoverable.
 CELL_RECOVER_WAIT_SECONDS = 5.0
@@ -93,6 +138,10 @@ _REFUSED_BEFORE_WRITE = frozenset({"stop_fault_recovery_closing"})
 _REASON_MESSAGES = {
     "incident_open": "A component incident is open again; its cause is still present.",
     "incident_acknowledgement_refused": "CCLC refused the incident acknowledgement.",
+    "cclc_incident_changed": (
+        "An open component incident is not one this press was shown; "
+        "review it, then press Recover cell again."
+    ),
     "stop_fault_recovery_unavailable": "The cell Stop has no configuration proof to recover from.",
     "stop_fault_recovery_waiting_for_observation": (
         "Waiting for a fresh controller observation or an uncertain operation to resolve."
@@ -107,6 +156,10 @@ _REASON_MESSAGES = {
     "stop_fault_recovery_waiting_for_durable_record": "The Stop record is not saved yet.",
     "stop_fault_recovery_pending": "A recovery is already in progress.",
     "cell_state_unavailable": "A cell owner did not report its current state.",
+    "stale_request_owner_epoch": (
+        "The lifecycle owner restarted during this press; the refused step had no "
+        "effect. Press Recover cell again."
+    ),
     "stop_fault_recovery_closing": (
         "Scenario Close is in progress and keeps the cell Stop fault. "
         "Finish Close with New or Load, then press Recover cell."
@@ -125,6 +178,10 @@ _REASON_MESSAGES = {
         "A newer cell Stop latch replaced the one this press saw; press Recover cell again."
     ),
     "cell_recover_in_progress": "This Recover cell request is still running.",
+    "cell_recover_aborted": (
+        "The operator aborted Recover cell. The listed steps are done; no later "
+        "step started. Press Recover cell again to continue."
+    ),
     "cell_recover_outcome_unknown": (
         "The outcome is not confirmed: a request may have reached its owner. "
         "Listed steps are confirmed; anything else is unknown, not proven undone."
@@ -150,8 +207,22 @@ class CellRecoverPorts:
     sleep: Callable[[float], Awaitable[None]]
     # m5.5: re-arm the listed components (`component_rearm.reenable_components`):
     # Recover, Prepare and Enable; only Recover for those in the second list
-    # (moved from their own interface). Returns the re-armed ones.
-    reenable: Callable[[list[str], frozenset[str]], Awaitable[list[str]]] | None = None
+    # (moved from their own interface). The third argument is the press's
+    # CCLC owner epoch (M6, item 35); the fourth is false when the press
+    # carries the operator's incident list (item 36): its Recover then never
+    # acknowledges an incident. Returns the re-armed ones.
+    reenable: Callable[[list[str], frozenset[str], str, bool], Awaitable[list[str]]] | None = None
+
+
+class RearmAborted(HeadlessApiError):
+    """SX-679: the operator's abort stopped the re-enable before a write.
+
+    Like every error leaving ``reenable_components``, it carries
+    ``rearm_progress``: the components enabled again and the steps done.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("cell_recover_aborted", "Recover cell was aborted by the operator")
 
 
 class _NotRecovered(Exception):
@@ -159,6 +230,20 @@ class _NotRecovered(Exception):
         super().__init__(code)
         self.code = code
         self.details = {key: str(value) for key, value in (details or {}).items()}
+
+
+def _confirmed_refusal(error: CCLCOwnerRefusal) -> bool:
+    """Whether a CCLC refusal proves that this press's request did not start.
+
+    The owner says so with ``effect=not_started``. A ``stale_request_owner_epoch``
+    refusal proves it too (M6, item 35): the press pins the epoch, sends each
+    step once, and CCLC checks the epoch before anything else.
+    """
+
+    return (
+        error.details.get("effect") == "not_started"
+        or error.code == "stale_request_owner_epoch"
+    )
 
 
 def derived_request_id(request_id: str, step: str) -> str:
@@ -209,11 +294,18 @@ def incident_recover_request(
     *,
     request_context: dict[str, Any],
     admission_generation: int,
+    expected_incident_id: str | None = None,
+    acknowledge_incident: bool = True,
 ) -> dict[str, Any]:
-    """The operator's CCLC ``recover``, fenced on one current snapshot."""
+    """The operator's CCLC ``recover``, fenced on one current snapshot.
+
+    With ``expected_incident_id`` CCLC acknowledges only that open incident;
+    with ``acknowledge_incident`` false it acknowledges none (an open one
+    refuses it ``cclc_incident_open``).
+    """
 
     try:
-        return {
+        request = {
             "request_context": request_context,
             "controllable_component_id": snapshot["controllable_component_id"],
             "intent": "recover",
@@ -233,6 +325,11 @@ def incident_recover_request(
             "cclc_open_response_invalid",
             "CCLC component snapshot lacks a lifecycle fence",
         ) from error
+    if expected_incident_id is not None:
+        request["expected_incident_id"] = expected_incident_id
+    if not acknowledge_incident:
+        request["acknowledge_incident"] = False
+    return request
 
 
 def stop_fault_recovery_request(
@@ -335,18 +432,24 @@ class _CellRecovery:
         correlation_id: str | None,
         wait_seconds: float,
         poll_seconds: float,
-        pending_reenable: set[str] | None = None,
+        expected_incident_ids: frozenset[str] | None = None,
+        aborted: Callable[[], bool] | None = None,
     ) -> None:
         self._ports = ports
-        # m5.5: components whose re-enable after an incident has not
-        # succeeded yet (kept by the ledger, in memory), and this press's.
-        self._pending_reenable = pending_reenable if pending_reenable is not None else set()
+        # SX-679: the operator's abort of this press (checked before each step).
+        self._aborted = aborted or (lambda: False)
+        self.reenable_steps: dict[str, list[str]] = {}
+        # M6 (item 36): the open incidents the operator was shown, or None.
+        self._expected_incident_ids = expected_incident_ids
+        # m5.5: this press's components to enable again.
         self._reenable: list[str] = []
         self._moved: frozenset[str] = frozenset()
         self._moved_in_motion: list[str] = []
         self._request_id = request_id
         self._source_label = source_label
         self._correlation_id = correlation_id or request_id
+        # M6 (item 35): the CCLC owner epoch, read once per press.
+        self._cclc_owner_epoch: str | None = None
         self._wait_seconds = wait_seconds
         self._poll_seconds = poll_seconds
         self._component_ids: list[str] | None = None
@@ -355,6 +458,35 @@ class _CellRecovery:
         self.acknowledged: list[dict[str, str]] = []
         self.latch_cleared = False
 
+    def _progress_details(self) -> dict[str, str]:
+        """SX-679: what the re-enable did, for an aborted press's result."""
+
+        recovered = set(self.recovered_components)
+        return {
+            "reenable_steps": ";".join(
+                f"{component}:{'+'.join(steps)}"
+                for component, steps in self.reenable_steps.items()
+            ),
+            "not_reenabled": ",".join(
+                component for component in self._reenable if component not in recovered
+            ),
+        }
+
+    def _stop_if_aborted(self, step: str) -> None:
+        """SX-679/688: after the operator's abort no further owner write is sent."""
+
+        if self._aborted():
+            raise _NotRecovered(
+                "cell_recover_aborted", {"before_step": step, **self._progress_details()}
+            )
+
+    def _absorb_rearm_progress(self, error: BaseException) -> None:
+        progress = getattr(error, "rearm_progress", None)
+        if progress is not None:
+            done, steps = progress
+            self.recovered_components += [c for c in done if c not in self.recovered_components]
+            self.reenable_steps = dict(steps)
+
     def _context(self, owner_epoch: str, step: str) -> dict[str, Any]:
         return {
             "request_id": derived_request_id(self._request_id, step),
@@ -362,6 +494,11 @@ class _CellRecovery:
             "source_label": self._source_label,
             "correlation_id": self._correlation_id,
         }
+
+    async def _owner_epoch(self) -> str:
+        if self._cclc_owner_epoch is None:
+            self._cclc_owner_epoch = await self._ports.cclc_owner_epoch()
+        return self._cclc_owner_epoch
 
     async def _components(self) -> list[str]:
         """The listed components, or a typed unavailable: never assumed empty."""
@@ -408,17 +545,26 @@ class _CellRecovery:
                 rows.append((snapshot, incident))
         return rows
 
-    async def _submit_recover(self, snapshot: Mapping[str, Any], step: str, refusal: str) -> Mapping[str, Any]:
+    async def _submit_recover(
+        self,
+        snapshot: Mapping[str, Any],
+        step: str,
+        refusal: str,
+        expected_incident_id: str | None = None,
+        acknowledge_incident: bool = True,
+    ) -> Mapping[str, Any]:
         component_id = snapshot["controllable_component_id"]
         request = incident_recover_request(
             snapshot,
             request_context=self._context(
-                await self._ports.cclc_owner_epoch(), f"{step}.{component_id}"
+                await self._owner_epoch(), f"{step}.{component_id}"
             ),
             admission_generation=await self._ports.admission_generation(),
+            expected_incident_id=expected_incident_id,
+            acknowledge_incident=acknowledge_incident,
         )
         result = await self._submit(
-            self._ports.submit_lifecycle(request),
+            lambda: self._ports.submit_lifecycle(request),
             {"step": step, "controllable_component_id": component_id},
         )
         # As in the lifecycle panel: an authorization-only Recover closes
@@ -453,16 +599,18 @@ class _CellRecovery:
             if _cause_persists(snapshot)
         ]
         # m5.5: an incident retires an Active target; the operator's press
-        # tries to enable such a component again (Recover, Prepare, Enable),
-        # and again on a later press while that has not succeeded.
+        # tries to enable such a component again (Recover, Prepare, Enable).
+        # M6: only from CCLC's durable mark (an incident retired the Active
+        # target and Active was not restored), on this or a later press, also
+        # after a partial re-enable left a Prepared target. An unmarked
+        # component with an open incident (for example after an interrupted
+        # Close) is only acknowledged and recovered (maintainer, SX-668).
         self._reenable = [
             snapshot["controllable_component_id"]
             for snapshot in snapshots
-            if snapshot.get("lifecycle_target") is None
-            and (
-                _incident(snapshot) is not None
-                or snapshot["controllable_component_id"] in self._pending_reenable
-            )
+            if snapshot.get("active_target_retired_by_incident") is True
+            and (snapshot.get("lifecycle_target") or {}).get("requested_state")
+            in {None, "prepared"}
         ]
         # m5.5 FIX5: Recover cell is also the re-arm of a robot moved from its
         # own interface on an idle cell (no incident; its target is kept).
@@ -480,15 +628,37 @@ class _CellRecovery:
             snapshot["controllable_component_id"] for snapshot in moved
         ) - set(self._moved_in_motion)
         self._reenable += sorted(self._moved - set(self._reenable))
+        expected = self._expected_incident_ids
+        if expected is not None:
+            # M6 (item 36): an open incident the operator was not shown
+            # refuses the whole press before any acknowledgement.
+            for snapshot in snapshots:
+                incident = _incident(snapshot)
+                if incident is not None and incident.get("incident_id") not in expected:
+                    raise _NotRecovered(
+                        "cclc_incident_changed",
+                        {
+                            "controllable_component_id": snapshot["controllable_component_id"],
+                            "incident_id": incident.get("incident_id"),
+                            "cause_class": incident.get("cause_class"),
+                        },
+                    )
         for snapshot in snapshots:
-            if _incident(snapshot) is None:
+            incident = _incident(snapshot)
+            if incident is None:
                 continue
             component_id = snapshot["controllable_component_id"]
+            # With the operator's list, CCLC acknowledges only the incident
+            # read here; without it, the open one (today's press).
             result = await self._submit_recover(
-                snapshot, "incident", "incident_acknowledgement_refused"
+                snapshot,
+                "incident",
+                "incident_acknowledgement_refused",
+                expected_incident_id=(
+                    None if expected is None else str(incident.get("incident_id"))
+                ),
             )
-            # Report the incident CCLC actually acknowledged. A plain Recover is
-            # not pinned to the observed incident (open point, see report).
+            # Report the incident CCLC actually acknowledged.
             acknowledged = result.get("incident_recovery")
             if isinstance(acknowledged, Mapping):
                 self.acknowledged.append(
@@ -499,9 +669,8 @@ class _CellRecovery:
                     }
                 )
 
-    @staticmethod
     async def _submit(
-        submission: Awaitable[Mapping[str, Any]], details: Mapping[str, Any]
+        self, submit: Callable[[], Awaitable[Mapping[str, Any]]], details: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         """One owner write. A reply is confirmed; an error may follow a send.
 
@@ -512,14 +681,26 @@ class _CellRecovery:
         does not prove the owner refused, so its outcome is unknown.
         """
 
+        # SX-688: the one abort check, right before the write.
+        self._stop_if_aborted(str(details.get("step")))
         try:
-            return await submission
+            return await submit()
         except CCLCOwnerRefusal as error:
             # A CCLC error envelope proves no effect only with the owner's
             # existing evidence (`effect=not_started`, set where it retains
-            # the rejection); any other owner error may follow a durable claim.
-            if error.details.get("effect") == "not_started":
-                raise _NotRecovered(error.code, {**details, "message": str(error)}) from error
+            # the rejection) or a stale pinned epoch; any other owner error
+            # may follow a durable claim.
+            if _confirmed_refusal(error):
+                current = error.details.get("incident_id")
+                raise _NotRecovered(
+                    error.code,
+                    {
+                        **details,
+                        "message": str(error),
+                        # `cclc_incident_changed` names the current incident.
+                        **({"incident_id": current} if current is not None else {}),
+                    },
+                ) from error
             raise _NotRecovered(
                 "cell_recover_outcome_unknown", {**details, "code": error.code}
             ) from error
@@ -560,13 +741,29 @@ class _CellRecovery:
             )
         if not self._reenable or self._ports.reenable is None:
             return
-        self._pending_reenable.update(set(self._reenable) - self._moved)
+        owner_epoch = await self._owner_epoch()
         try:
-            reenabled = await self._ports.reenable(list(self._reenable), self._moved)
+            try:
+                # Item 36: with the operator's list only the incidents shown
+                # were acknowledged; a later Recover of this press acknowledges none.
+                reenabled = await self._ports.reenable(
+                    list(self._reenable), self._moved, owner_epoch,
+                    self._expected_incident_ids is None,
+                )
+            except Exception as error:
+                # SX-689: what the re-enable did before it stopped.
+                self._absorb_rearm_progress(error)
+                raise
+        except RearmAborted as error:
+            # SX-679/688: the abort stopped it right before a write.
+            raise _NotRecovered(
+                "cell_recover_aborted", {"before_step": "reenable", **self._progress_details()}
+            ) from error
         except CCLCOwnerRefusal as error:
             # As every other step here: a refusal proves no effect only with
-            # the owner's `effect=not_started`; otherwise the outcome is unknown.
-            if error.details.get("effect") == "not_started":
+            # the owner's `effect=not_started` or a stale pinned epoch;
+            # otherwise the outcome is unknown.
+            if _confirmed_refusal(error):
                 raise _NotRecovered(error.code, {"message": str(error)}) from error
             raise _NotRecovered(
                 "cell_recover_outcome_unknown", {"step": "reenable", "code": error.code}
@@ -578,9 +775,11 @@ class _CellRecovery:
             raise _NotRecovered(
                 "cell_recover_outcome_unknown", {"step": "reenable", "code": error.code}
             ) from error
-        for component_id in reenabled:
-            self._pending_reenable.discard(component_id)
-            self.recovered_components.append(component_id)
+        self.recovered_components += reenabled
+        self.reenable_steps.update(
+            (component, ["recover"] if component in self._moved else ["recover", "prepare", "enable"])
+            for component in reenabled
+        )
 
     async def recover_persisting_causes(self) -> None:
         """The press after a cause was released: one ordinary Recover each."""
@@ -589,8 +788,10 @@ class _CellRecovery:
             snapshot = await self._ports.component_snapshot(component_id)
             if not _cause_persists(snapshot):
                 continue  # The driver moved on; nothing for this press to do.
+            # Item 36: with the operator's list it acknowledges no incident.
             result = await self._submit_recover(
-                snapshot, "recover", "component_recover_refused"
+                snapshot, "recover", "component_recover_refused",
+                acknowledge_incident=self._expected_incident_ids is None,
             )
             if result.get("acceptance") is not None:
                 self.recovered_components.append(component_id)
@@ -649,13 +850,12 @@ class _CellRecovery:
                 owner_epoch = owner.get("owner_epoch") if isinstance(owner, Mapping) else None
                 if response.get("ok") is not True or not isinstance(owner_epoch, str) or not owner_epoch:
                     raise _unavailable("execution_identity", response)
+                recovery_request = stop_fault_recovery_request(
+                    offer,
+                    request_context=self._context(owner_epoch, f"latch.{submissions}"),
+                )
                 response = await self._submit(
-                    self._ports.submit_stop_recovery(
-                        stop_fault_recovery_request(
-                            offer,
-                            request_context=self._context(owner_epoch, f"latch.{submissions}"),
-                        )
-                    ),
+                    lambda: self._ports.submit_stop_recovery(recovery_request),
                     {"step": "latch", "latch_id": latch.get("latch_id")},
                 )
                 result = response.get("result")
@@ -727,7 +927,26 @@ class _CellRecovery:
     def outcome_unknown(cls, request_id: str) -> dict[str, Any]:
         return cls._typed(request_id, "cell_recover_outcome_unknown")
 
+    @classmethod
+    def replay_unknown(cls, request_id: str) -> dict[str, Any]:
+        """A replay-only resend of a request ID this ledger does not hold."""
+
+        result = cls._typed(request_id, "cell_recover_outcome_unknown")
+        result["reason"]["details"] = {"replay": "request_id_unknown"}
+        return result
+
     def result(self, reason: _NotRecovered | None) -> dict[str, Any]:
+        # SX-689: one result path. An accepted abort is always reported: a
+        # press that still finished is `cell_recover_aborted` with every step
+        # done; a step that failed keeps its own code, with `aborted` and the
+        # steps done before it.
+        if self._aborted():
+            if reason is None:
+                reason = _NotRecovered(
+                    "cell_recover_aborted", {"before_step": "none", **self._progress_details()}
+                )
+            elif reason.code != "cell_recover_aborted":
+                reason.details.update({"aborted": "true", **self._progress_details()})
         return {
             "schema_version": CELL_RECOVER_RESULT_VERSION,
             "request_id": self._request_id,
@@ -759,18 +978,40 @@ class CellRecoverLedger:
 
     def __init__(self, maximum: int = CELL_RECOVER_LEDGER_SIZE) -> None:
         self._maximum = maximum
-        # m5.5: components to try enabling again on the next press.
-        self.pending_reenable: set[str] = set()
         self._rows: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
+        # SX-679: running presses the operator aborted (cleared at finish).
+        self._aborted: set[str] = set()
 
-    def begin(self, request_id: str) -> dict[str, Any] | None:
-        """Claim a new request ID, or return what a repeat of it answers."""
+    def running(self) -> bool:
+        """Whether a Recover cell press is running in this Headless."""
+
+        return any(value is None for value in self._rows.values())
+
+    def abort_running(self) -> list[str]:
+        """Abort every running press; returns their request IDs."""
+
+        running = [key for key, value in self._rows.items() if value is None]
+        self._aborted.update(running)
+        return running
+
+    def aborted(self, request_id: str) -> bool:
+        return request_id in self._aborted
+
+    def begin(self, request_id: str, *, replay_only: bool = False) -> dict[str, Any] | None:
+        """Claim a new request ID, or return what a repeat of it answers.
+
+        A ``replay_only`` resend never claims: an ID this ledger does not hold
+        (a restart or an eviction lost it) answers an unknown outcome, so an
+        automatic resend can never become a new press on a newer latch.
+        """
 
         if request_id in self._rows:
             stored = self._rows[request_id]
             if stored is not None:
                 return stored
             return _CellRecovery.in_progress(request_id)
+        if replay_only:
+            return _CellRecovery.replay_unknown(request_id)
         self._rows[request_id] = None
         return None
 
@@ -785,6 +1026,7 @@ class CellRecoverLedger:
         self._rows[request_id] = (
             _CellRecovery.outcome_unknown(request_id) if result is None else result
         )
+        self._aborted.discard(request_id)
         completed = [key for key, value in self._rows.items() if value is not None]
         for key in completed[: max(0, len(completed) - self._maximum)]:
             del self._rows[key]
@@ -797,10 +1039,12 @@ async def recover_cell_once(
     request_id: str,
     source_label: str,
     correlation_id: str | None = None,
+    expected_incident_ids: frozenset[str] | None = None,
+    replay_only: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     """Run one request ID at most once; returns (result, replayed)."""
 
-    replayed = ledger.begin(request_id)
+    replayed = ledger.begin(request_id, replay_only=replay_only)
     if replayed is not None:
         return replayed, True
     recovery = _CellRecovery(
@@ -810,7 +1054,8 @@ async def recover_cell_once(
         correlation_id=correlation_id,
         wait_seconds=CELL_RECOVER_WAIT_SECONDS,
         poll_seconds=CELL_RECOVER_POLL_SECONDS,
-        pending_reenable=ledger.pending_reenable,
+        expected_incident_ids=expected_incident_ids,
+        aborted=lambda: ledger.aborted(request_id),
     )
     result = None
     try:
@@ -854,6 +1099,7 @@ async def recover_cell(
     correlation_id: str | None = None,
     wait_seconds: float = CELL_RECOVER_WAIT_SECONDS,
     poll_seconds: float = CELL_RECOVER_POLL_SECONDS,
+    expected_incident_ids: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Acknowledge incidents, then recover the current latch; one typed result."""
 
@@ -864,11 +1110,14 @@ async def recover_cell(
         correlation_id=correlation_id,
         wait_seconds=wait_seconds,
         poll_seconds=poll_seconds,
+        expected_incident_ids=expected_incident_ids,
     )
     return await _run(recovery, request_id)
 
 
 __all__ = [
+    "CELL_RECOVER_ABORT_REFERENCE_NOTE",
+    "RearmAborted",
     "CELL_RECOVER_RESULT_VERSION",
     "CELL_RECOVER_WAIT_SECONDS",
     "CellRecoverLedger",

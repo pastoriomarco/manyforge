@@ -232,7 +232,7 @@ describe('io_signals configuration', () => {
       .toBe('preserved');
   });
 
-  it('round-trips a geometric contact input through an existing endpoint reference', () => {
+  it('round-trips a geometric contact input through a robot component id', () => {
     const geometric = {
       ...mockRow,
       resource_role_id: 'part_contact',
@@ -243,11 +243,7 @@ describe('io_signals configuration', () => {
       provider: {
         profile: 'geometric_contact',
         ingress_depth: 64,
-        endpoint: {
-          controllable_component_id: 'arm',
-          command_target_id: 'tool',
-          frame_role_id: 'tcp',
-        },
+        robot_component_id: 'arm',
         target_scene_resource_id: 'workpiece',
       },
     };
@@ -256,9 +252,7 @@ describe('io_signals configuration', () => {
       kind: 'input',
       draft: {
         profile: 'geometric_contact',
-        endpointComponentId: 'arm',
-        endpointTargetId: 'tool',
-        endpointFrameRoleId: 'tcp',
+        robotComponentId: 'arm',
         targetSceneResourceId: 'workpiece',
         maximumAgeMs: '75',
         ingressDepth: '64',
@@ -268,8 +262,19 @@ describe('io_signals configuration', () => {
     expect(validateIoSignalRows(rows)).toBeNull();
     expect(ioSignalRowsValue(rows)).toEqual([geometric]);
 
+    const fixedEndpoint = { ...geometric, provider: {
+      profile: 'geometric_contact',
+      endpoint: {
+        controllable_component_id: 'arm', command_target_id: 'tool', frame_role_id: 'tcp',
+      },
+      target_scene_resource_id: 'workpiece',
+    } };
+    const legacyRows = ioSignalRows({ io_signals: [fixedEndpoint] as JsonValue[] });
+    expect(legacyRows[0].kind).toBe('preserved');
+    expect(ioSignalRowsValue(legacyRows)).toEqual([fixedEndpoint]);
+
     const omittedDepth = { ...geometric, provider: {
-      profile: 'geometric_contact', endpoint: geometric.provider.endpoint,
+      profile: 'geometric_contact', robot_component_id: geometric.provider.robot_component_id,
       target_scene_resource_id: 'workpiece',
     } };
     const omittedRows = ioSignalRows({ io_signals: [omittedDepth] as JsonValue[] });
@@ -281,7 +286,11 @@ describe('io_signals configuration', () => {
 
     for (const provider of [
       { ...geometric.provider, contact_body_role_ids: ['finger'] },
-      { ...geometric.provider, endpoint: { controllable_component_id: 'arm', command_target_id: 'tool' } },
+      {
+        profile: 'geometric_contact',
+        endpoint: { controllable_component_id: 'arm', command_target_id: 'tool', frame_role_id: 'tcp' },
+        target_scene_resource_id: 'workpiece',
+      },
     ]) {
       expect(ioSignalRows({ io_signals: [{ ...geometric, provider }] as JsonValue[] })[0].kind)
         .toBe('preserved');
@@ -378,11 +387,13 @@ describe('io_signals configuration', () => {
   it('validates geometric freshness independently and excludes it from shared-source identity', () => {
     const geometric = {
       profile: 'geometric_contact' as const,
-      endpointComponentId: 'arm', endpointTargetId: 'tool', endpointFrameRoleId: 'tcp',
+      robotComponentId: 'arm',
       targetSceneResourceId: 'workpiece', sourceId: 'contact_geometry',
     };
     expect(validateIoSignalRows([input({ ...geometric, maximumAgeMs: '' })]))
       .toContain('maximum sample age must be above 0 ms');
+    expect(validateIoSignalRows([input({ ...geometric, robotComponentId: '', maximumAgeMs: '25' })]))
+      .toContain('select a robot');
     expect(validateIoSignalRows([
       input({ ...geometric, maximumAgeMs: '25' }),
       input({ ...geometric, maximumAgeMs: '100', resourceRoleId: 'contact_b', signalName: 'contact_b' }),
@@ -447,11 +458,11 @@ describe('I/O device component', () => {
     return { ...value, signal: { ...value.signal, draft: { ...value.signal.draft, signalName: 'part_present' } } as IoDeviceDraft['signal'] };
   };
 
-  it('prefills a free id, 30 s and a Mock input on target io', () => {
+  it('prefills a free id, the 10 s default budget and a Mock input on target io', () => {
     const value = newIoDeviceDraft(['arm', 'io_device_1']);
     expect(value.componentId).toBe('io_device_2');
-    expect(value.lifecycleTimeoutS).toBe('30');
-    expect(IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S).toBe(30);
+    expect(value.lifecycleTimeoutS).toBe('10');
+    expect(IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S).toBe(10);
     expect(value.signal).toMatchObject({ kind: 'input', draft: { componentId: 'io_device_2', targetId: 'io', profile: 'mock' } });
   });
 
@@ -466,7 +477,7 @@ describe('I/O device component', () => {
       configuration: {
         runtime_kind: 'io_provider',
         runtime_configuration: {
-          io_provider_devices: [{ controllable_component_id: 'station_io', lifecycle_command_timeout_s: 30 }],
+          io_provider_devices: [{ controllable_component_id: 'station_io', lifecycle_command_timeout_s: 10 }],
           io_signals: [{ ...mockRow, controllable_component_id: 'station_io', source_id: 'station_io_source' }],
         },
       },
@@ -516,10 +527,10 @@ describe('I/O device component', () => {
     expect(ioProviderDeviceTimeout({ io_provider_devices: [{ controllable_component_id: 'd', lifecycle_command_timeout_s: 12 }] }, 'd'))
       .toEqual({ timeoutS: 12, authored: true, exact: true, outputAckTimeoutS: null });
     expect(ioProviderDeviceTimeout({ io_provider_devices: [{ controllable_component_id: 'd' }] }, 'd'))
-      .toEqual({ timeoutS: 30, authored: false, exact: true, outputAckTimeoutS: null });
-    expect(ioProviderDeviceTimeout({}, 'd')).toEqual({ timeoutS: 30, authored: false, exact: false, outputAckTimeoutS: null });
+      .toEqual({ timeoutS: 10, authored: false, exact: true, outputAckTimeoutS: null });
+    expect(ioProviderDeviceTimeout({}, 'd')).toEqual({ timeoutS: 10, authored: false, exact: false, outputAckTimeoutS: null });
     expect(ioProviderDeviceTimeout({ io_provider_devices: [{ controllable_component_id: 'other', lifecycle_command_timeout_s: 5 }] }, 'd'))
-      .toMatchObject({ timeoutS: 30, exact: false });
+      .toMatchObject({ timeoutS: 10, exact: false });
   });
 
   it('reads the output acknowledgement timeout and detects ROS SetBool outputs (contract 68)', () => {
@@ -552,6 +563,8 @@ describe('ioInputSourceText', () => {
     expect(ioInputSourceText({ ...input, profile: 'ros_bool', topic: '/cell/door' })).toBe('ROS topic /cell/door');
     expect(ioInputSourceText({ ...input, profile: 'xarm_digital', robotComponentId: 'lite6', bank: 'controller', pin: '3' }))
       .toBe('xArm lite6 controller digital input pin 3');
+    expect(ioInputSourceText({ ...input, profile: 'geometric_contact', robotComponentId: 'lite6',
+      targetSceneResourceId: 'workpiece' })).toBe('geometric contact for lite6 with workpiece');
     expect(ioInputSourceText({ ...input, profile: 'ur_io_states', topic: '/io_states', pin: '2' }))
       .toBe('ROS topic /io_states, pin 2');
     expect(ioInputSourceText(input)).toBe('Mock input');

@@ -115,7 +115,8 @@ exact_angular_group(const core::RuntimeParticipantBinding& binding) {
 RetainedRoboPlanKinematicsAdapter::RetainedRoboPlanKinematicsAdapter(
     core::RuntimeParticipantBinding binding,
     std::shared_ptr<roboplan::Scene> scene,
-    std::shared_ptr<std::mutex> scene_mutex)
+    std::shared_ptr<std::mutex> scene_mutex,
+    std::vector<std::string> mounted_frame_names)
     : binding_(std::move(binding)),
       scene_(std::move(scene)),
       scene_mutex_(std::move(scene_mutex)) {
@@ -129,6 +130,9 @@ RetainedRoboPlanKinematicsAdapter::RetainedRoboPlanKinematicsAdapter(
   for (const auto& frame : binding_.value().frame_bindings) {
     permitted_frames_.push_back(frame.compiled_frame_name);
   }
+  permitted_frames_.insert(permitted_frames_.end(),
+                           std::make_move_iterator(mounted_frame_names.begin()),
+                           std::make_move_iterator(mounted_frame_names.end()));
   std::sort(permitted_frames_.begin(), permitted_frames_.end());
   permitted_frames_.erase(
       std::unique(permitted_frames_.begin(), permitted_frames_.end()),
@@ -795,6 +799,7 @@ RoboPlanTrajectoryValidator::validate_non_collision(
   }
 
   std::optional<double> peak_tcp_linear_speed_mps;
+  std::optional<std::string> peak_tcp_linear_speed_frame;
   if (options.max_tcp_linear_speed_mps > 0.0 &&
       !options.tcp_frame.empty() && trajectory.waypoints.size() >= 2) {
     if (trajectory.joint_names.size() != model_joint_names_.size()) {
@@ -804,20 +809,29 @@ RoboPlanTrajectoryValidator::validate_non_collision(
           "trajectory_joint_group_incomplete",
           {{"group_id", group_name_}});
     }
+    // The admitted limit holds at every speed-check point: the active TCP,
+    // plus the robot flange under `tcp_speed_check: active_tcp_and_flange`.
+    // Slot k measures the k-th point of the future set and of the retained
+    // prefix's own set; a shorter set repeats its last point.
+    const auto frame_set =
+        [](const std::vector<core::SpeedCheckFrameDTO> &frames,
+           const std::string &tcp_frame) {
+          return frames.empty() ? std::vector<core::SpeedCheckFrameDTO>{
+                                      core::SpeedCheckFrameDTO{tcp_frame, {}}}
+                                : frames;
+        };
+    const auto future_frames =
+        frame_set(options.speed_frames, options.tcp_frame);
+    const auto prefix_frames =
+        options.retained_prefix
+            ? frame_set(options.retained_prefix->speed_frames,
+                        options.retained_prefix->tcp_frame)
+            : future_frames;
+    const std::size_t slot_count =
+        std::max(future_frames.size(), prefix_frames.size());
     const auto speed_started = std::chrono::steady_clock::now();
     try {
       std::lock_guard<std::mutex> lock(*scene_mutex_);
-      Eigen::Vector3d previous_position = Eigen::Vector3d::Zero();
-      bool have_previous = false;
-      double max_speed = 0.0;
-      std::size_t max_segment_index = 0;
-      double max_segment_duration_s = 0.0;
-      double prefix_max_speed = 0.0;
-      std::size_t prefix_max_segment_index = 0;
-      double prefix_max_segment_duration_s = 0.0;
-      double future_max_speed = 0.0;
-      std::size_t future_max_segment_index = 0;
-      double future_max_segment_duration_s = 0.0;
       const auto position_in_frames = [&](const Eigen::VectorXd &q,
                                           const std::string &tcp_frame,
                                           const std::string &base_frame) {
@@ -834,12 +848,21 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         return Eigen::Vector3d{tcp_transform(0, 3), tcp_transform(1, 3),
                                tcp_transform(2, 3)};
       };
-      for (std::size_t waypoint_index = 0;
-           waypoint_index < trajectory.waypoints.size(); ++waypoint_index) {
-        if (cancel.is_cancel_requested()) {
-          return cancelled();
-        }
-        const auto& waypoint = trajectory.waypoints[waypoint_index];
+      struct SpeedPeak final {
+        double speed{};
+        std::size_t segment_index{};
+        double segment_duration_s{};
+        const core::SpeedCheckFrameDTO *frame{};
+      };
+      struct SlotPeaks final {
+        SpeedPeak whole;
+        SpeedPeak prefix;
+        SpeedPeak future;
+      };
+      std::vector<SlotPeaks> slots(slot_count);
+      std::vector<Eigen::VectorXd> full_positions;
+      full_positions.reserve(trajectory.waypoints.size());
+      for (const auto &waypoint : trajectory.waypoints) {
         Eigen::VectorXd group_q(
             static_cast<Eigen::Index>(model_joint_names_.size()));
         for (std::size_t joint_index = 0;
@@ -847,122 +870,146 @@ RoboPlanTrajectoryValidator::validate_non_collision(
           group_q[static_cast<Eigen::Index>(model_index_for(joint_index))] =
               waypoint.positions_rad[joint_index];
         }
-        const Eigen::VectorXd q =
-            scene_->toFullJointPositions(group_name_, group_q);
-        const bool prefix_point =
-            options.retained_prefix &&
-            waypoint.time_from_start_s <= options.retained_prefix->end_time_s;
-        const auto &tcp_frame = prefix_point
-                                    ? options.retained_prefix->tcp_frame
-                                    : options.tcp_frame;
-        const auto &base_frame = prefix_point
-                                     ? options.retained_prefix->base_frame
-                                     : options.base_frame;
-        const Eigen::Vector3d tcp_position =
-            position_in_frames(q, tcp_frame, base_frame);
-        if (moving_metrics && !tcp_position.allFinite()) {
-          return validation_error(
-              core::ErrorCode::kInvalidRequest,
-              "Moving replacement TCP position is non-finite",
-              "tcp_speed_validation_nonfinite");
-        }
-        if (have_previous) {
-          const double duration =
-              waypoint.time_from_start_s -
-              trajectory.waypoints[waypoint_index - 1].time_from_start_s;
-          const double speed =
-              (tcp_position - previous_position).norm() / duration;
-          if (moving_metrics && !std::isfinite(speed)) {
+        full_positions.push_back(
+            scene_->toFullJointPositions(group_name_, group_q));
+      }
+      for (std::size_t slot = 0; slot < slot_count; ++slot) {
+        const auto &future_frame =
+            future_frames[std::min(slot, future_frames.size() - 1U)];
+        const auto &prefix_frame =
+            prefix_frames[std::min(slot, prefix_frames.size() - 1U)];
+        auto &peaks = slots[slot];
+        Eigen::Vector3d previous_position = Eigen::Vector3d::Zero();
+        bool have_previous = false;
+        for (std::size_t waypoint_index = 0;
+             waypoint_index < trajectory.waypoints.size(); ++waypoint_index) {
+          if (cancel.is_cancel_requested()) {
+            return cancelled();
+          }
+          const auto &waypoint = trajectory.waypoints[waypoint_index];
+          const auto &q = full_positions[waypoint_index];
+          const bool prefix_point =
+              options.retained_prefix &&
+              waypoint.time_from_start_s <= options.retained_prefix->end_time_s;
+          const auto &frame = prefix_point ? prefix_frame : future_frame;
+          const auto &base_frame = prefix_point
+                                       ? options.retained_prefix->base_frame
+                                       : options.base_frame;
+          const Eigen::Vector3d tcp_position =
+              position_in_frames(q, frame.compiled_frame, base_frame);
+          if (moving_metrics && !tcp_position.allFinite()) {
             return validation_error(
                 core::ErrorCode::kInvalidRequest,
-                "Moving replacement TCP speed is non-finite",
+                "Moving replacement TCP position is non-finite",
                 "tcp_speed_validation_nonfinite");
           }
-          if (speed > max_speed) {
-            max_speed = speed;
-            max_segment_index = waypoint_index - 1;
-            max_segment_duration_s = duration;
-          }
-          if (moving_metrics) {
-            auto &piece_speed =
-                prefix_point ? prefix_max_speed : future_max_speed;
-            auto &piece_index = prefix_point ? prefix_max_segment_index
-                                             : future_max_segment_index;
-            auto &piece_duration = prefix_point ? prefix_max_segment_duration_s
-                                                : future_max_segment_duration_s;
-            if (speed > piece_speed) {
-              piece_speed = speed;
-              piece_index = waypoint_index - 1;
-              piece_duration = duration;
+          if (have_previous) {
+            const double duration =
+                waypoint.time_from_start_s -
+                trajectory.waypoints[waypoint_index - 1].time_from_start_s;
+            const double speed =
+                (tcp_position - previous_position).norm() / duration;
+            if (moving_metrics && !std::isfinite(speed)) {
+              return validation_error(
+                  core::ErrorCode::kInvalidRequest,
+                  "Moving replacement TCP speed is non-finite",
+                  "tcp_speed_validation_nonfinite");
+            }
+            const SpeedPeak sample{speed, waypoint_index - 1, duration,
+                                   &frame};
+            if (speed > peaks.whole.speed || peaks.whole.frame == nullptr)
+              peaks.whole = sample;
+            if (moving_metrics) {
+              auto &piece = prefix_point ? peaks.prefix : peaks.future;
+              if (speed > piece.speed || piece.frame == nullptr)
+                piece = sample;
             }
           }
+          previous_position = tcp_position;
+          if (options.retained_prefix &&
+              waypoint.time_from_start_s ==
+                  options.retained_prefix->end_time_s &&
+              (prefix_frame.compiled_frame != future_frame.compiled_frame ||
+               options.retained_prefix->base_frame != options.base_frame)) {
+            // Restart only TCP position history in the successor frames at
+            // the exact shared knot. Joint secant/triple history stays intact.
+            previous_position = position_in_frames(
+                q, future_frame.compiled_frame, options.base_frame);
+            if (!previous_position.allFinite()) {
+              return validation_error(
+                  core::ErrorCode::kInvalidRequest,
+                  "Moving replacement seam TCP position is non-finite",
+                  "tcp_speed_validation_nonfinite");
+            }
+          }
+          have_previous = true;
         }
-        previous_position = tcp_position;
-        if (options.retained_prefix &&
-            waypoint.time_from_start_s == options.retained_prefix->end_time_s &&
-            (options.retained_prefix->tcp_frame != options.tcp_frame ||
-             options.retained_prefix->base_frame != options.base_frame)) {
-          // Restart only TCP position history in the successor frames at the
-          // exact shared knot. Joint secant/triple history stays intact.
-          previous_position =
-              position_in_frames(q, options.tcp_frame, options.base_frame);
-          if (!previous_position.allFinite()) {
-            return validation_error(
-                core::ErrorCode::kInvalidRequest,
-                "Moving replacement seam TCP position is non-finite",
-                "tcp_speed_validation_nonfinite");
+      }
+      const auto highest = [&](SpeedPeak SlotPeaks::*piece) {
+        SpeedPeak result;
+        for (const auto &peaks : slots)
+          if (result.frame == nullptr || (peaks.*piece).speed > result.speed)
+            result = peaks.*piece;
+        return result;
+      };
+      const auto whole = highest(&SlotPeaks::whole);
+      peak_tcp_linear_speed_mps = whole.speed;
+      if (!options.speed_frames.empty() && whole.frame != nullptr)
+        peak_tcp_linear_speed_frame = whole.frame->compiled_frame;
+      if (moving_metrics) {
+        const auto prefix = highest(&SlotPeaks::prefix);
+        const auto future = highest(&SlotPeaks::future);
+        moving_metrics->unchanged_prefix.peak_tcp_linear_speed_mps =
+            prefix.speed;
+        moving_metrics->changed_future.peak_tcp_linear_speed_mps =
+            future.speed;
+      }
+      for (const auto &peaks : slots) {
+        SpeedPeak measured = peaks.whole;
+        double speed_limit = options.max_tcp_linear_speed_mps;
+        std::string measured_tcp_frame = options.tcp_frame;
+        std::string measured_base_frame = options.base_frame;
+        if (moving_metrics) {
+          if (peaks.prefix.speed >
+              options.retained_prefix->max_tcp_linear_speed_mps +
+                  kLimitTolerance) {
+            measured = peaks.prefix;
+            speed_limit = options.retained_prefix->max_tcp_linear_speed_mps;
+            measured_tcp_frame = options.retained_prefix->tcp_frame;
+            measured_base_frame = options.retained_prefix->base_frame;
+          } else {
+            measured = peaks.future;
           }
         }
-        have_previous = true;
-      }
-      peak_tcp_linear_speed_mps = max_speed;
-      double speed_limit = options.max_tcp_linear_speed_mps;
-      std::string measured_tcp_frame = options.tcp_frame;
-      std::string measured_base_frame = options.base_frame;
-      if (moving_metrics) {
-        moving_metrics->unchanged_prefix.peak_tcp_linear_speed_mps =
-            prefix_max_speed;
-        moving_metrics->changed_future.peak_tcp_linear_speed_mps =
-            future_max_speed;
-        if (prefix_max_speed >
-            options.retained_prefix->max_tcp_linear_speed_mps +
-                kLimitTolerance) {
-          max_speed = prefix_max_speed;
-          max_segment_index = prefix_max_segment_index;
-          max_segment_duration_s = prefix_max_segment_duration_s;
-          speed_limit = options.retained_prefix->max_tcp_linear_speed_mps;
-          measured_tcp_frame = options.retained_prefix->tcp_frame;
-          measured_base_frame = options.retained_prefix->base_frame;
-        } else {
-          max_speed = future_max_speed;
-          max_segment_index = future_max_segment_index;
-          max_segment_duration_s = future_max_segment_duration_s;
-        }
-      }
-      if (max_speed > speed_limit + kLimitTolerance) {
+        if (measured.speed <= speed_limit + kLimitTolerance)
+          continue;
         const auto speed_duration_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - speed_started)
                 .count();
+        std::map<std::string, std::string> details{
+            {"limit_type", "tcp_linear_speed"},
+            {"segment_index", std::to_string(measured.segment_index)},
+            {"max_segment_index", std::to_string(measured.segment_index)},
+            {"max_segment_dt_s", std::to_string(measured.segment_duration_s)},
+            {"tcp_frame", measured_tcp_frame},
+            {"base_frame", measured_base_frame},
+            {"frame", measured.frame->compiled_frame},
+            {"measured", std::to_string(measured.speed)},
+            {"limit", std::to_string(speed_limit)},
+            {"units", "m/s"},
+            {"waypoint_count", std::to_string(trajectory.waypoints.size())},
+            {"trajectory_duration_s",
+             std::to_string(trajectory.waypoints.back().time_from_start_s)},
+            {"speed_validation_duration_ns",
+             std::to_string(speed_duration_ns)},
+            {"collision_validation_duration_ns", "0"}};
+        if (!measured.frame->frame_role_id.empty())
+          details.emplace("frame_role", measured.frame->frame_role_id);
         return validation_error(
             core::ErrorCode::kValidationLimitsViolation,
             "TCP linear speed exceeds the configured limit",
-            "tcp_linear_speed_limit_exceeded",
-            {{"limit_type", "tcp_linear_speed"},
-             {"segment_index", std::to_string(max_segment_index)},
-             {"max_segment_index", std::to_string(max_segment_index)},
-             {"max_segment_dt_s", std::to_string(max_segment_duration_s)},
-             {"tcp_frame", measured_tcp_frame},
-             {"base_frame", measured_base_frame},
-             {"measured", std::to_string(max_speed)},
-             {"limit", std::to_string(speed_limit)},
-             {"units", "m/s"},
-             {"waypoint_count", std::to_string(trajectory.waypoints.size())},
-             {"trajectory_duration_s",
-              std::to_string(trajectory.waypoints.back().time_from_start_s)},
-             {"speed_validation_duration_ns",
-              std::to_string(speed_duration_ns)},
-             {"collision_validation_duration_ns", "0"}});
+            "tcp_linear_speed_limit_exceeded", std::move(details));
       }
     } catch (const std::exception& error) {
       return validation_error(
@@ -980,6 +1027,7 @@ RoboPlanTrajectoryValidator::validate_non_collision(
                                   : std::vector<double>{},
       peak_tcp_linear_speed_mps,
       trajectory.cartesian_fidelity_metrics};
+  metrics.peak_tcp_linear_speed_frame = std::move(peak_tcp_linear_speed_frame);
   core::ValidationResultDTO result{true, std::nullopt, std::move(metrics)};
   if (moving_metrics) {
     if (!joint_acceleration_measured) {
@@ -1144,14 +1192,15 @@ make_retained_motion_model_generation(
     const core::RuntimeParticipantBinding& motion_binding,
     std::shared_ptr<roboplan::Scene> scene,
     std::shared_ptr<std::mutex> scene_mutex,
-    std::shared_ptr<RetainedKinematicStateProjector> state_projector) {
+    std::shared_ptr<RetainedKinematicStateProjector> state_projector,
+    std::vector<std::string> mounted_frame_names) {
   if (!scene || !scene_mutex || !state_projector) {
     throw std::invalid_argument(
         "retained model generation requires one scene, mutex and projector");
   }
   auto generation = std::make_shared<RetainedKinematicModelGeneration>();
   generation->kinematics = std::make_shared<RetainedRoboPlanKinematicsAdapter>(
-      motion_binding, scene, scene_mutex);
+      motion_binding, scene, scene_mutex, std::move(mounted_frame_names));
   generation->trajectory_validator =
       RoboPlanTrajectoryValidator::create(motion_binding, scene, scene_mutex);
   generation->collision_trajectory_projector =

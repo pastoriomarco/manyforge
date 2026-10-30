@@ -8,7 +8,7 @@ import {
   type ProgramSchemaValueEditorContext,
 } from './property/ProgramSchemaValueEditor';
 
-interface GraspLostPolicy {
+export interface GraspLostPolicy {
   raise_alarm: boolean;
   stop_motion: boolean;
   set_key: string | null;
@@ -22,7 +22,7 @@ const DEFAULT_POLICY: GraspLostPolicy = {
   detach: true,
 };
 
-const KEY_SCHEMA: CatalogJsonSchema = {
+export const GRASP_LOST_KEY_SCHEMA: CatalogJsonSchema = {
   type: 'string',
   'x-manyforge-semantic-type': 'blackboard_key',
 };
@@ -30,7 +30,8 @@ const KEY_SCHEMA: CatalogJsonSchema = {
 const KEY_REQUIRED_HINT = 'Choose a declared writable bool key to enable this response.';
 const KEY_INVALID_HINT = 'The selected key must be a declared writable bool key.';
 
-function policyValue(value: JsonValue | undefined): GraspLostPolicy {
+/** The authored policy with the catalog defaults for omitted fields. */
+export function graspLostPolicyValue(value: JsonValue | undefined): GraspLostPolicy {
   const row: Record<string, JsonValue> = value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value : {};
   return {
@@ -41,10 +42,26 @@ function policyValue(value: JsonValue | undefined): GraspLostPolicy {
   };
 }
 
-function writableBoolKeys(context: ProgramSchemaValueEditorContext): Set<string> {
-  return new Set(programBlackboardKeys(context.program, context.globalRuleIds)
+/** The whole policy with only `set_key` changed (a key created from the picker). */
+export function graspLostPolicyWithKey(current: JsonValue | undefined, key: string): JsonValue {
+  const policy = graspLostPolicyValue(current);
+  return {
+    raise_alarm: policy.raise_alarm,
+    stop_motion: policy.stop_motion,
+    set_key: key,
+    detach: policy.detach,
+  };
+}
+
+/** Declared writable bool keys, and their picker choices grouped by namespace. */
+export function writableBoolKeyChoices(context: ProgramSchemaValueEditorContext) {
+  const keys = new Set(programBlackboardKeys(context.program, context.globalRuleIds)
     .filter((key) => key.type === 'bool' && key.access !== 'read' && key.expression === undefined)
     .map((key) => key.key));
+  const choices = groupByNamespace([...keys], (key) => key).flatMap((group) => (
+    group.items.map((key) => ({ value: key, label: key, group: group.label }))
+  ));
+  return { keys, choices };
 }
 
 /** The literal four-choice policy attached to one carried-object attach node. */
@@ -61,16 +78,13 @@ export function GraspLostPolicyEditor({
   disabled: boolean;
   onCommit: (value: JsonValue) => void;
 }) {
-  const serializedValue = JSON.stringify(policyValue(value)) ?? '{}';
+  const serializedValue = JSON.stringify(graspLostPolicyValue(value)) ?? '{}';
   const incoming = JSON.parse(serializedValue) as GraspLostPolicy;
   const serializedKey = JSON.stringify(incoming.set_key) ?? 'null';
-  const [policy, setPolicy] = useState(() => policyValue(value));
-  const [setKeyEnabled, setSetKeyEnabled] = useState(() => policyValue(value).set_key !== null);
+  const [policy, setPolicy] = useState(() => graspLostPolicyValue(value));
+  const [setKeyEnabled, setSetKeyEnabled] = useState(() => graspLostPolicyValue(value).set_key !== null);
   const [error, setError] = useState<string | null>(null);
-  const keys = writableBoolKeys(context);
-  const keyChoices = groupByNamespace([...keys], (key) => key).flatMap((group) => (
-    group.items.map((key) => ({ value: key, label: key, group: group.label }))
-  ));
+  const { keys, choices: keyChoices } = writableBoolKeyChoices(context);
 
   useEffect(() => {
     setPolicy(JSON.parse(serializedValue) as GraspLostPolicy);
@@ -144,10 +158,18 @@ export function GraspLostPolicyEditor({
           <label className="program-grasp-lost-key-field">
             Key to set on loss
             <ProgramSchemaValueEditor
-              schema={KEY_SCHEMA}
+              schema={GRASP_LOST_KEY_SCHEMA}
               value={policy.set_key ?? undefined}
               disabled={disabled}
-              context={{ ...context, semanticChoices: keyChoices }}
+              context={{
+                ...context,
+                semanticChoices: keyChoices,
+                onCreateReference: context.onCreateReference === undefined ? undefined
+                  : (target, expectedType, expectedAccess, source) => context.onCreateReference?.(
+                    target, expectedType, expectedAccess,
+                    { ...source, parameterValue: graspLostPolicyWithKey },
+                  ),
+              }}
               path="on_grasp_lost.set_key"
               onCommit={(next) => {
                 if (typeof next === 'string') setKey(next);

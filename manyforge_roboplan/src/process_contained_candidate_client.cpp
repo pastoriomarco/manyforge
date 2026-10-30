@@ -185,10 +185,14 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
       "retained collision geometry cannot be projected into RoboPlan");
 }
 
+/// Logical collision body id to its native worker-scene names.
+using NativeBodies = std::map<core::CollisionBodyId, std::vector<std::string>>;
+
 [[nodiscard]] RoboPlanWorkerModelDTO
 project_worker_model(const RoboPlanWorkerModelDTO &base,
                      const ProcessContainedCandidateClientConfig &config,
-                     const RoboPlanCandidateProjectionDTO &projection) {
+                     const RoboPlanCandidateProjectionDTO &projection,
+                     NativeBodies &native_bodies_out) {
   if (!projection.projection_binding.valid() || !projection.world ||
       !projection.policy) {
     throw std::invalid_argument("retained RoboPlan projection is incomplete");
@@ -274,7 +278,46 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
     }
   }
   model.allowed_collision_pairs.assign(allowed.begin(), allowed.end());
+  native_bodies_out = std::move(native_bodies);
   return model;
+}
+
+/// The Kernel's logical clearance margins as native worker-scene pairs. Two
+/// logical pairs on the same native names keep the smaller margin.
+[[nodiscard]] std::vector<RoboPlanPairMarginDTO>
+native_pair_margins(const NativeBodies &native_bodies,
+                    const core::CollisionClearanceMargins *margins) {
+  if (margins == nullptr) {
+    return {};
+  }
+  std::map<std::pair<std::string, std::string>, double> native;
+  for (const auto &entry : margins->pairs) {
+    const auto left = native_bodies.find(entry.pair.body_a);
+    const auto right = native_bodies.find(entry.pair.body_b);
+    if (left == native_bodies.end() || right == native_bodies.end()) {
+      throw std::invalid_argument(
+          "retained clearance margin names an absent body");
+    }
+    for (const auto &first : left->second) {
+      for (const auto &second : right->second) {
+        if (first == second) {
+          continue;
+        }
+        const auto [found, inserted] = native.emplace(
+            std::pair{std::min(first, second), std::max(first, second)},
+            entry.margin_m);
+        if (!inserted) {
+          found->second = std::min(found->second, entry.margin_m);
+        }
+      }
+    }
+  }
+  std::vector<RoboPlanPairMarginDTO> result;
+  result.reserve(native.size());
+  for (const auto &[pair, margin] : native) {
+    result.push_back(RoboPlanPairMarginDTO{pair.first, pair.second, margin});
+  }
+  return result;
 }
 
 class UniqueFd final {
@@ -656,6 +699,9 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     core::CollisionWorldRevision world_revision;
     core::CollisionPolicyRevision policy_revision;
     std::optional<std::string> contact_policy_id;
+    /// Not part of the worker identity: the margins travel with each plan.
+    NativeBodies native_bodies;
+    std::vector<RoboPlanPairMarginDTO> pair_margins;
 
     [[nodiscard]] bool
     matches(const RoboPlanCandidateProjectionDTO &candidate) const noexcept {
@@ -755,8 +801,27 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                 "Fixed RoboPlan worker cannot select a retained projection",
                 "native_planner_projection_selection_unavailable"));
     }
+    const auto margin_failure = [](const std::exception &exception) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidRequest,
+                "Retained RoboPlan worker projection failed: " +
+                    std::string(exception.what()),
+                "native_planner_projection_selection_failed"));
+    };
     if (const auto current = selection.load(std::memory_order_acquire);
         current && current->matches(projection)) {
+      std::vector<RoboPlanPairMarginDTO> margins;
+      try {
+        margins = native_pair_margins(current->native_bodies,
+                                      projection.clearance_margins.get());
+      } catch (const std::exception &exception) {
+        return margin_failure(exception);
+      }
+      if (margins != current->pair_margins) {
+        auto updated = std::make_shared<ProjectionSelection>(*current);
+        updated->pair_margins = std::move(margins);
+        selection.store(std::move(updated), std::memory_order_release);
+      }
       return core::Result<void>::Ok();
     }
     RoboPlanWorkerModelDTO source;
@@ -767,8 +832,12 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
       source_generation = base_model_generation;
     }
     RoboPlanWorkerModelDTO projected;
+    NativeBodies native_bodies;
+    std::vector<RoboPlanPairMarginDTO> pair_margins;
     try {
-      projected = project_worker_model(source, config, projection);
+      projected = project_worker_model(source, config, projection, native_bodies);
+      pair_margins =
+          native_pair_margins(native_bodies, projection.clearance_margins.get());
     } catch (const SceneMeshContentChangedError &exception) {
       return core::Result<void>::Err(
           error(core::ErrorCode::kInvalidRequest,
@@ -776,11 +845,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                     std::string(exception.what()),
                 std::string(collision::kSceneMeshContentChangedReason)));
     } catch (const std::exception &exception) {
-      return core::Result<void>::Err(
-          error(core::ErrorCode::kInvalidRequest,
-                "Retained RoboPlan worker projection failed: " +
-                    std::string(exception.what()),
-                "native_planner_projection_selection_failed"));
+      return margin_failure(exception);
     }
     std::lock_guard lock(request_mutex);
     if (active_request.load(std::memory_order_acquire)) {
@@ -797,6 +862,9 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     }
     if (const auto current = selection.load(std::memory_order_acquire);
         current && current->matches(projection)) {
+      auto updated = std::make_shared<ProjectionSelection>(*current);
+      updated->pair_margins = std::move(pair_margins);
+      selection.store(std::move(updated), std::memory_order_release);
       return core::Result<void>::Ok();
     }
     shutdown_worker();
@@ -805,7 +873,8 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
         std::make_shared<const ProjectionSelection>(ProjectionSelection{
             projection.projection_binding.projection_revision,
             projection.world->revision, projection.policy->revision,
-            projection.contact_policy_id}),
+            projection.contact_policy_id, std::move(native_bodies),
+            std::move(pair_margins)}),
         std::memory_order_release);
     return core::Result<void>::Ok();
   }
@@ -1220,7 +1289,12 @@ ProcessContainedRoboPlanCandidateClient::binding() const noexcept {
 
 core::Result<core::TrajectoryDTO>
 ProcessContainedRoboPlanCandidateClient::compute(
-    const RoboPlanCandidateRequestDTO &request) {
+    const RoboPlanCandidateRequestDTO &selected_request) {
+  // The selected projection's clearance margins travel with this plan.
+  auto request = selected_request;
+  if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
+    request.collision_pair_margins = selected->pair_margins;
+  }
   return impl_->transact<core::TrajectoryDTO>(
       MessageType::kPlan, MessageType::kPlanResult,
       request.moving_replacement

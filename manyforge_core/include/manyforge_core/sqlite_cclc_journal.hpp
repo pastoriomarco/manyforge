@@ -15,7 +15,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 21;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 24;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -208,18 +208,11 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<void> RecordSelectedCellClaimAttempt(const RequestOwnerEpoch&,
                                                             const CellAdmissionClaimIntentDTO&,
                                                             const ContentDigest&) override;
-  [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
-  InspectApplyComponentBringUpRequest(const RequestOwnerEpoch&,
-      const ComponentLifecycleIntentDTO&, const ContentDigest&) override;
   [[nodiscard]] Result<ApplyComponentGenerationSelectionDTO> ReadApplyComponentGenerationSelection(
       const RequestOwnerEpoch&, const ControllableComponentId&,
       const std::optional<ApplyComponentQualifiedPredecessorDTO>& = std::nullopt) override;
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>>
   ReadApplyComponentBringUpRequestResult(const ComponentLifecycleIntentDTO&,
-      const ContentDigest&) override;
-  [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> AcceptOrReplayApplyComponentBringUp(
-      const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&,
-      const ComponentLifecycleAcceptedDTO&, const ComponentLifecycleStatusDTO&,
       const ContentDigest&) override;
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> RecordSelectedComponentBringUpRejection(
       const RequestOwnerEpoch&, const ComponentLifecycleIntentDTO&, const ContentDigest&,
@@ -355,6 +348,8 @@ class SqliteCCLCJournal final : public ICCLCJournal, public ICCLCLifecycleTarget
   [[nodiscard]] Result<std::optional<ComponentLifecycleTargetDTO>> LoadLifecycleTarget(
       const ControllableComponentId& component) override;
   [[nodiscard]] Result<ComponentLifecycleTargetFactsDTO> LoadLifecycleTargetFacts(
+      const ControllableComponentId& component) override;
+  [[nodiscard]] Result<bool> ActiveTargetRetiredByIncident(
       const ControllableComponentId& component) override;
   [[nodiscard]] Result<bool> RecordInterventionCause(
       const ControllableComponentId& component, const ControlDomainId& domain,

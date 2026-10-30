@@ -20,6 +20,16 @@ inline constexpr Duration kCompleteMoveOnSignalTimeoutNs = 500'000'000;
     const MotionInterruptStopProfileDTO& profile,
     Duration completion_tolerance_ns = kCompleteMoveOnSignalTimeoutNs);
 
+/// Maintainer M6: a dispatched Stop trajectory finishes like a normal motion,
+/// on the controller's report, and its no-report bound is a normal motion's
+/// (`trajectory_execution_budget_s`) for the trajectory's duration. The
+/// controlled deadline above bounds everything before that dispatch. The
+/// Kernel's watchdog of a controlled stage, from the Stop request, is the
+/// controlled deadline (the latest dispatch) plus that bound for a trajectory
+/// as long as the deadline, so it never fires before the provider's own bound.
+[[nodiscard]] Duration stop_trajectory_no_report_ns(double duration_s);
+[[nodiscard]] Duration controlled_stage_watchdog_ns(Duration controlled_deadline_ns);
+
 /// `main`'s profile check of `max_stop_time_s`: absent, or finite, positive
 /// and representable in nanoseconds.
 [[nodiscard]] bool max_stop_time_valid(const std::optional<double>& max_stop_time_s) noexcept;

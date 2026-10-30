@@ -1,10 +1,9 @@
 import { useMemo, useRef, useState } from 'react';
 
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
-import {
-  motionEndpointChoiceKey,
-  programMotionEndpointChoices,
-} from '../utils/motionEndpointAuthoring';
+import { hasUnrepresentedTcpOwner, programTcpSelectorChoices } from '../utils/motionEndpointAuthoring';
+import type { ManualControlMotionDescriptor } from '../types/robotControl';
+import type { ResolvedTargetRole } from '../utils/targetRoleResolution';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramTemplateIcon } from './programNodeGlyphs';
 
@@ -62,12 +61,16 @@ function contactPolicyIds(program: ProgramAuthoringDocument): string[] {
 
 export function ProgramAuthoringTemplate({
   program,
+  boundTargets = [],
+  motionDescriptors = [],
   busy,
   onMutate,
   collapsed,
   onCollapsedChange,
 }: {
   program: ProgramAuthoringDocument;
+  boundTargets?: readonly ResolvedTargetRole[];
+  motionDescriptors?: readonly ManualControlMotionDescriptor[];
   busy: boolean;
   onMutate: (mutation: string, args: Record<string, JsonValue>) => void;
   collapsed?: boolean;
@@ -90,12 +93,12 @@ export function ProgramAuthoringTemplate({
     [program.scene],
   );
   const policies = useMemo(() => contactPolicyIds(program), [program]);
-  const endpointChoices = useMemo(() => programMotionEndpointChoices(program), [program]);
   const [sceneId, setSceneId] = useState('');
   const [armTargetId, setArmTargetId] = useState('');
   const [toolTargetId, setToolTargetId] = useState('');
   const [baseFrame, setBaseFrame] = useState('');
   const [endpointKey, setEndpointKey] = useState('');
+  const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
   const [carrierFrame, setCarrierFrame] = useState('');
   const [touchBody, setTouchBody] = useState('');
   const [policyId, setPolicyId] = useState('');
@@ -112,15 +115,18 @@ export function ProgramAuthoringTemplate({
   const effectiveScene = scenes.includes(sceneId) ? sceneId : scenes[0] ?? '';
   const effectiveArm = arm?.id ?? '';
   const effectiveTool = tool?.id ?? '';
+  const selectedTarget = boundTargets.find((row) => row.target_role_id === effectiveArm);
+  const selectedDescriptor = selectedTarget === undefined ? undefined : motionDescriptors.find((row) => (
+    row.controllableComponentId === selectedTarget.controllable_component_id
+    && row.commandTargetId === selectedTarget.command_target_id
+  ));
+  const endpointChoices = useMemo(() => programTcpSelectorChoices(
+    program, boundTargets, selectedDescriptor, showOtherRobotTcps,
+  ), [program, boundTargets, selectedDescriptor, showOtherRobotTcps]);
   const effectiveBase = arm?.frames.includes(baseFrame)
     ? baseFrame
     : arm?.frames.find((frame) => frame === 'base') ?? arm?.frames[0] ?? '';
-  const defaultEndpointKey = arm?.frames.includes('tcp')
-    ? motionEndpointChoiceKey(effectiveArm, 'tcp')
-    : arm?.frames[0] === undefined
-      ? '' : motionEndpointChoiceKey(effectiveArm, arm.frames[0]);
   const effectiveEndpoint = endpointChoices.find((choice) => choice.key === endpointKey)
-    ?? endpointChoices.find((choice) => choice.key === defaultEndpointKey)
     ?? endpointChoices[0];
   const effectiveCarrier = tool?.frames.includes(carrierFrame)
     ? carrierFrame
@@ -156,6 +162,8 @@ export function ProgramAuthoringTemplate({
   };
   const openTemplate = (kind: 'pick' | 'place') => {
     setOperation(kind);
+    setEndpointKey('');
+    setShowOtherRobotTcps(false);
     setNamespaceId('planning');
     setBlackboardKey(`planning.${kind}_plan`);
     setInstancePrefix(`${kind}_sequence`);
@@ -223,10 +231,7 @@ export function ProgramAuthoringTemplate({
               target_role: effectiveArm,
               tool_target_role: effectiveTool,
               base_frame_role: effectiveBase,
-              tcp_endpoint: {
-                target_role: effectiveEndpoint.targetRole,
-                frame_role: effectiveEndpoint.frameRole,
-              },
+              tcp_endpoint: effectiveEndpoint.selector,
               carrier_frame_role: effectiveCarrier,
               tool_position: coordinateKind === 'linear_m'
                 ? { kind: coordinateKind, value_m: toolPosition }
@@ -269,7 +274,17 @@ export function ProgramAuthoringTemplate({
           <label><span>Tool target</span><select value={effectiveTool} onChange={(event) => setToolTargetId(event.target.value)}>{toolTargets.map((row) => <option key={row.id}>{row.id}</option>)}</select></label>
           <div className="program-template-grid">
             <label><span>Base frame</span><select value={effectiveBase} onChange={(event) => setBaseFrame(event.target.value)}>{arm?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
+            <p className="program-form-hint">{`Moves: ${effectiveArm || '—'}`}</p>
             <label><span>Motion TCP endpoint</span><select value={effectiveEndpoint?.key ?? ''} onChange={(event) => setEndpointKey(event.target.value)}>{endpointChoices.map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}</select></label>
+            <label title="Useful only once tool change is implemented: today a TCP whose tool is on another robot is refused when used.">
+              <input type="checkbox" checked={showOtherRobotTcps}
+                onChange={(event) => setShowOtherRobotTcps(event.currentTarget.checked)} />
+              Show TCPs of tools mounted on other robots
+            </label>
+            {selectedDescriptor === undefined && <p className="program-form-hint">Apply to list TCPs and current mounts.</p>}
+            {hasUnrepresentedTcpOwner(program, boundTargets, selectedDescriptor, showOtherRobotTcps) && (
+              <p className="program-form-hint">Add this tool to the Program's roles to use its TCPs.</p>
+            )}
             <label><span>Carrier frame</span><select value={effectiveCarrier} onChange={(event) => setCarrierFrame(event.target.value)}>{tool?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
             {operation === 'pick' && <label><span>Touch body</span><select value={effectiveTouch} onChange={(event) => setTouchBody(event.target.value)}>{tool?.collisionBodies.map((id) => <option key={id}>{id}</option>)}</select></label>}
           </div>

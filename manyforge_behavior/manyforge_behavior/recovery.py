@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
+import time
 from typing import Any, Final
 
 import py_trees
 
 from manyforge_behavior.failure_details import failure_origin
+from manyforge_behavior.json_scalars import nonnegative_int64
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     NodeAttemptSource,
@@ -193,10 +195,45 @@ def recovery_policy_is_actionable(policy: ProgramNodePolicy) -> bool:
     return recovery_retry_permitted(policy.recovery_policy, retries_used=0)
 
 
+def observed_state_refusal(
+    previous: Mapping[str, Any] | None,
+    current: Mapping[str, Any],
+) -> str | None:
+    """Press-time freshness of a held attempt's owner, or None when current.
+
+    Recovery offers do not expire; a manual result releases the hold without
+    another owner command, so it checks the owner's assessment freshly read
+    at the press (never a cached terminal). A hold whose owner had a robot
+    observation (or has one now) must report it available, fresh and at rest
+    now; a deadline of 0 is no exemption. A positive deadline that has
+    already elapsed is stale even when the read still says fresh (both are
+    host CLOCK_MONOTONIC); 0 is unbounded. The codes are the Kernel's own
+    recovery reason codes.
+    """
+
+    if (
+        (previous or {}).get("observed_state_available") is not True
+        and current.get("observed_state_available") is not True
+    ):
+        return None
+    if current.get("observed_state_available") is not True:
+        return "observed_state_unavailable"
+    # The Kernel's exact int64 scalar (a number, or decimal text past 2^53).
+    deadline = nonnegative_int64(current.get("observed_state_valid_until_ns", 0))
+    if current.get("observed_state_fresh") is not True or (
+        0 < deadline <= time.monotonic_ns()
+    ):
+        return "observed_state_stale"
+    if current.get("observed_state_at_rest") is not True:
+        return "observed_state_not_at_rest"
+    return None
+
+
 __all__ = [
     "OWNER_RECOVERY_ACTIONS",
     "RecoveryAwareNode",
     "is_non_moving_recovery",
+    "observed_state_refusal",
     "recovery_policy_is_actionable",
     "recovery_retry_permitted",
 ]

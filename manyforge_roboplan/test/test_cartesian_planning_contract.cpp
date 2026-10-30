@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include <Eigen/Dense>
@@ -580,6 +581,83 @@ TEST(CartesianTrajectoryContractTest,
   EXPECT_DOUBLE_EQ(linear_only.value().angular_speed_ratio, 0.0);
   EXPECT_DOUBLE_EQ(linear_only.value().linear_acceleration_ratio, 0.0);
   EXPECT_DOUBLE_EQ(linear_only.value().angular_acceleration_ratio, 0.0);
+}
+
+TEST(CartesianTrajectoryDynamicsTest,
+     SpeedCheckFramesRetimeForTheFastestPointOnly) {
+  // A wrist rotation about the TCP: the TCP stays still, the flange 7 cm
+  // behind it moves (`tcp_speed_check: active_tcp_and_flange`).
+  const std::string urdf = R"(
+<robot name="speed_check_points">
+  <link name="base"/>
+  <joint name="wrist" type="revolute">
+    <parent link="base"/><child link="tcp"/>
+    <axis xyz="0 0 1"/><limit lower="-3" upper="3" effort="1" velocity="4"/>
+  </joint>
+  <link name="tcp"/>
+  <joint name="tcp_to_flange" type="fixed">
+    <parent link="tcp"/><child link="flange"/>
+    <origin xyz="0.07 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="flange"/>
+</robot>)";
+  const std::string srdf = R"(
+<robot name="speed_check_points">
+  <group name="arm">
+    <joint name="wrist"/>
+  </group>
+</robot>)";
+  auto scene = std::make_shared<roboplan::Scene>(
+      "speed_check_points", roboplan::loadUrdfSceneDescriptionFromXml(urdf));
+  const auto imported = scene->importSrdf(srdf);
+  ASSERT_TRUE(imported.has_value()) << imported.error();
+  const auto group = scene->getJointGroupInfo("arm");
+  ASSERT_TRUE(group.has_value()) << group.error();
+
+  trajectory_detail::CartesianTrajectoryContractInput active_tcp;
+  active_tcp.compiled_group_name = "arm";
+  active_tcp.compiled_base_frame = "base";
+  active_tcp.compiled_tcp_frame = "tcp";
+  active_tcp.speed_profile.velocity_scale = 1.0;
+  active_tcp.speed_profile.acceleration_scale = 1.0;
+  active_tcp.speed_profile.max_tcp_linear_speed_mps = 0.1;
+  auto flange_only = active_tcp;
+  flange_only.compiled_tcp_frame = "flange";
+  auto with_flange = active_tcp;
+  with_flange.compiled_speed_frames = {"tcp", "flange"};
+
+  roboplan::JointTrajectory trajectory;
+  trajectory.joint_names = group->joint_names;
+  trajectory.times = {0.0, 1.0};
+  trajectory.positions = {Eigen::VectorXd::Zero(1),
+                          Eigen::VectorXd::Constant(1, 1.0)};
+  trajectory.velocities = {Eigen::VectorXd::Zero(1),
+                           Eigen::VectorXd::Zero(1)};
+  trajectory.accelerations = trajectory.velocities;
+  const CartesianPlanningControl control{[] { return false; },
+                                         [] { return false; }};
+  const auto measure = [&](const auto &request) {
+    auto envelope = trajectory_detail::measure_cartesian_frame_dynamics_envelope(
+        request, nullptr, scene, trajectory, control);
+    EXPECT_TRUE(envelope.ok()) << envelope.error().message;
+    EXPECT_TRUE(envelope.value().complete);
+    return envelope.value();
+  };
+  const auto tcp = measure(active_tcp);
+  const auto flange = measure(flange_only);
+  const auto both = measure(with_flange);
+  // Rest-to-rest unit quintic: peak 1.875 rad/s, so 0.13125 m/s at 7 cm.
+  constexpr double kFlangePeakMps = 1.875 * 1.0 * 0.07;
+  EXPECT_LT(tcp.linear_speed_ratio, 1.0);  // active_tcp: no retime
+  EXPECT_GE(both.linear_speed_ratio * 0.1, kFlangePeakMps * 0.999);
+  EXPECT_GT(both.linear_speed_ratio, 1.0);  // and_flange: stretched
+  EXPECT_DOUBLE_EQ(both.linear_speed_ratio,
+                   std::max(tcp.linear_speed_ratio, flange.linear_speed_ratio));
+  EXPECT_EQ(both.interval_checks, tcp.interval_checks + flange.interval_checks);
+  // A frame set naming only the TCP is the TCP alone.
+  auto tcp_set = active_tcp;
+  tcp_set.compiled_speed_frames = {"tcp"};
+  EXPECT_DOUBLE_EQ(measure(tcp_set).linear_speed_ratio, tcp.linear_speed_ratio);
 }
 
 TEST(CartesianBackendErrorMappingTest,

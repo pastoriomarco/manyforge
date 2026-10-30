@@ -1,6 +1,7 @@
 #include "roboplan_worker_protocol.hpp"
 
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -748,6 +749,7 @@ std::string encode_initialization(const WorkerInitializationDTO& value) {
       [](Encoder& out, std::uint32_t seed) { out.u32(seed); });
   encoder.u64(value.candidate_config.maximum_trajectory_samples);
   encoder.floating(value.candidate_config.trajectory_sample_period_s);
+  encoder.floating(value.candidate_config.collision_check_step_rad);
   return std::move(encoder).finish();
 }
 
@@ -799,6 +801,7 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
   candidate_config.maximum_trajectory_samples =
       static_cast<std::size_t>(maximum_samples);
   candidate_config.trajectory_sample_period_s = decoder.floating();
+  candidate_config.collision_check_step_rad = decoder.floating();
   decoder.require_end();
   return WorkerInitializationDTO{std::move(model), std::move(binding),
                                  std::move(candidate_config)};
@@ -832,6 +835,13 @@ std::string encode_candidate_request(
   encoder.floating(value.planning_timeout_s);
   encoder.u32(value.planning_attempt_index);
   encoder.optional(value.action_span, write_action_span);
+  encoder.vector(value.speed_check_frames, write_frame);
+  encoder.vector(value.collision_pair_margins,
+                 [](Encoder& out, const RoboPlanPairMarginDTO& margin) {
+                   out.string(margin.first);
+                   out.string(margin.second);
+                   out.floating(margin.margin_m);
+                 });
   // Omit the complete extension when absent, preserving ordinary payloads.
   if (value.moving_replacement) {
     encoder.boolean(true);
@@ -851,6 +861,7 @@ std::string encode_candidate_request(
                           moving.source_speed_profile.max_tcp_linear_speed_mps);
     write_dynamics(encoder, moving.source_per_resource_dynamics_limits);
     encoder.floating(moving.remaining_preparation_budget_s);
+    encoder.vector(moving.source_speed_check_frames, write_frame);
     // Keep legacy moving payloads byte-identical when the new cap is absent.
     if (moving.remaining_planning_budget_s) {
       encoder.boolean(true);
@@ -897,6 +908,18 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
   value.planning_attempt_index = decoder.u32();
   value.action_span =
       decoder.optional<core::ActionSpanDTO>(read_action_span);
+  value.speed_check_frames =
+      decoder.vector<core::ResolvedFrameDTO>(read_frame);
+  value.collision_pair_margins = decoder.vector<RoboPlanPairMarginDTO>(
+      [](Decoder& input) {
+        RoboPlanPairMarginDTO margin{input.string(), input.string(), 0.0};
+        margin.margin_m = input.floating();
+        if (margin.first.empty() || margin.second <= margin.first ||
+            !std::isfinite(margin.margin_m) || margin.margin_m < 0.0) {
+          fail("clearance margin pair is invalid");
+        }
+        return margin;
+      });
   if (!decoder.at_end()) {
     if (!decoder.boolean()) {
       fail("absent moving-replacement extension must be omitted");
@@ -915,6 +938,8 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
                               read_optional_double(decoder)},
         read_dynamics(decoder),
         decoder.floating()};
+    value.moving_replacement->source_speed_check_frames =
+        decoder.vector<core::ResolvedFrameDTO>(read_frame);
     if (!decoder.at_end()) {
       if (!decoder.boolean()) fail("absent moving-planning extension must be omitted");
       value.moving_replacement->remaining_planning_budget_s = decoder.floating();

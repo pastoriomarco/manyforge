@@ -57,6 +57,7 @@ inline constexpr char kTerminalPublicationInProgress[] =
 inline constexpr char kRecoveryNoneActive[] = "no_recovery_active";
 inline constexpr char kRecoveryStopNotCertified[] = "stop_not_certified";
 inline constexpr char kRecoveryStopCertified[] = "stop_certified";
+inline constexpr char kRecoveryTerminalCleanupPending[] = "terminal_cleanup_pending";
 inline constexpr char kRecoveryStopFailedEscalating[] =
     "stop_failed_escalating";
 inline constexpr char kRecoveryStopOwnerActive[] = "stop_owner_active";

@@ -1,5 +1,6 @@
 #include "manyforge_deployment/apply_component_delta.hpp"
 #include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
+#include "apply_component_delta_internal.hpp"
 
 #include <algorithm>
 #include <map>
@@ -10,6 +11,7 @@
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
@@ -115,13 +117,7 @@ template <typename Id>
 
 // -- Component relations from the typed bundle ------------------------------
 
-struct ComponentRelations final {
-  std::set<core::ModelInstanceId> model_instances;
-  std::set<core::ControlBindingId> bindings;
-  std::set<core::ControlDomainId> domains;
-  std::set<core::RuntimeUnitId> runtime_units;
-  std::set<core::CapabilityProviderBindingId> providers;
-};
+using ComponentRelations = detail::ApplyComponentRelations;
 
 [[nodiscard]] const core::ControllableComponentDTO *
 FindComponent(const core::RetainedBundleDTO &bundle,
@@ -133,13 +129,23 @@ FindComponent(const core::RetainedBundleDTO &bundle,
   return found == components.end() ? nullptr : &*found;
 }
 
+/// `index` is built from `bundle.cell_graph` (one Apply side).
 [[nodiscard]] ComponentRelations
-Relations(const core::RetainedBundleDTO &bundle,
+Relations(const core::RetainedBundleDTO &bundle, const CellKinematicIndex &index,
           const core::ControllableComponentDTO &component) {
   const auto &graph = bundle.cell_graph;
   ComponentRelations relations;
   for (const auto &role : component.model_role_bindings) {
     relations.model_instances.insert(role.model_instance_id);
+  }
+  // A component's launch description carries the static frames of the
+  // components mounted on it (the mount, and a process-less tool's frames),
+  // so their model occurrences are part of its runtime facts.
+  for (const auto &child_id : index.children_of(component.controllable_component_id)) {
+    if (const auto *child = FindComponent(bundle, child_id)) {
+      for (const auto &role : child->model_role_bindings)
+        relations.model_instances.insert(role.model_instance_id);
+    }
   }
   relations.runtime_units.insert(component.runtime_unit_ids.begin(),
                                  component.runtime_unit_ids.end());
@@ -253,14 +259,15 @@ Relations(const core::RetainedBundleDTO &bundle,
 }
 
 /// The canonical fact families one component's runtime depends on, keyed by
-/// the replacement reason each family reports.
+/// the replacement reason each family reports. `index` is built from this
+/// bundle's own graph (one Apply side).
 [[nodiscard]] std::map<std::string_view, CanonicalValue>
-RuntimeFamilies(const RetainedBundle &bundle,
+RuntimeFamilies(const RetainedBundle &bundle, const CellKinematicIndex &index,
                 const core::ControllableComponentDTO &component) {
   const auto &root = bundle.normalized_root();
   const auto &graph = MemberObject(root, "cell_graph");
   const auto &products = MemberObject(root, "compiled_products");
-  const auto relations = Relations(bundle.value(), component);
+  const auto relations = Relations(bundle.value(), index, component);
   const auto bindings = Strings(relations.bindings);
   const auto domains = Strings(relations.domains);
   const auto units = Strings(relations.runtime_units);
@@ -270,9 +277,22 @@ RuntimeFamilies(const RetainedBundle &bundle,
                    Select(MemberArray(graph, "controllable_components"),
                           "controllable_component_id",
                           {component.controllable_component_id.value()}, true));
+  // The mounts on this component (their poses are in its description).
+  Array mounts;
+  for (const auto &attachment : MemberArray(graph, "component_attachments")) {
+    const auto *parent = attachment.find_object_member("parent");
+    const auto *id = parent ? parent->find_object_member("controllable_component_id") : nullptr;
+    if (id != nullptr && id->is_string() &&
+        id->as_string() == component.controllable_component_id.value())
+      mounts.push_back(attachment);
+  }
   families.emplace(kApplyComponentReasonModelInstances,
-                   Select(MemberArray(graph, "model_instances"), "model_instance_id",
-                          Strings(relations.model_instances), true));
+                   CanonicalValue(Object{
+                       {"model_instances",
+                        Select(MemberArray(graph, "model_instances"), "model_instance_id",
+                               Strings(relations.model_instances), true)},
+                       {"component_attachments", CanonicalValue(std::move(mounts))},
+                   }));
   families.emplace(
       kApplyComponentReasonBindings,
       CanonicalValue(Object{
@@ -657,7 +677,9 @@ std::optional<core::ContentDigest> derive_component_runtime_identity(
     const RetainedBundle &bundle, const core::ControllableComponentId &controllable_component_id) {
   const auto *component = FindComponent(bundle.value(), controllable_component_id);
   if (component == nullptr) return std::nullopt;
-  return FamiliesIdentity(controllable_component_id, RuntimeFamilies(bundle, *component));
+  const CellKinematicIndex index(bundle.value().cell_graph);
+  return FamiliesIdentity(controllable_component_id,
+                          RuntimeFamilies(bundle, index, *component));
 }
 
 ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predecessor,
@@ -682,6 +704,9 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
     Fail("component delta exceeds its component bound");
   }
 
+  // One index per Apply side: the predecessor's graph and the candidate's.
+  const CellKinematicIndex old_index(old_bundle.cell_graph);
+  const CellKinematicIndex new_index(new_bundle.cell_graph);
   ApplyComponentDeltaDTO delta;
   delta.components.reserve(ids.size());
   for (const auto &id : ids) {
@@ -698,14 +723,16 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
     std::map<std::string_view, CanonicalValue> old_families;
     std::map<std::string_view, CanonicalValue> new_families;
     if (old_component != nullptr) {
-      old_families = RuntimeFamilies(predecessor, *old_component);
+      old_families = RuntimeFamilies(predecessor, old_index, *old_component);
       change.predecessor_runtime_identity = FamiliesIdentity(id, old_families);
-      change.predecessor_domains = SortedDomains(Relations(old_bundle, *old_component).domains);
+      change.predecessor_domains =
+          SortedDomains(Relations(old_bundle, old_index, *old_component).domains);
     }
     if (new_component != nullptr) {
-      new_families = RuntimeFamilies(candidate, *new_component);
+      new_families = RuntimeFamilies(candidate, new_index, *new_component);
       change.candidate_runtime_identity = FamiliesIdentity(id, new_families);
-      change.candidate_domains = SortedDomains(Relations(new_bundle, *new_component).domains);
+      change.candidate_domains =
+          SortedDomains(Relations(new_bundle, new_index, *new_component).domains);
     }
     if (old_component == nullptr) {
       change.disposition = ApplyComponentDisposition::kAdd;
@@ -730,6 +757,13 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
       AttachmentChangedComponents(old_bundle.cell_graph, new_bundle.cell_graph);
   if (!delta.valid()) Fail("derived component delta is not canonical");
   return delta;
+}
+
+detail::ApplyComponentRelations
+detail::apply_component_relations(const core::RetainedBundleDTO &bundle,
+                                  const CellKinematicIndex &index,
+                                  const core::ControllableComponentDTO &component) {
+  return Relations(bundle, index, component);
 }
 
 } // namespace manyforge::deployment

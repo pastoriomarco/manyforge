@@ -65,7 +65,8 @@ public:
   }
   /// Called once, with `ros_transport_executor_failed`, when the first
   /// executor thread fails. Set before start(); used by a transport that has
-  /// no health reader of its own (the host's generic I/O transport).
+  /// no health reader of its own (the host's generic I/O transport). Called at
+  /// most once; must not throw. The observer contains its own faults.
   using ExecutorFaultObserver = std::function<void(std::string_view reason_code)>;
   void set_executor_fault_observer(ExecutorFaultObserver observer);
   void start();

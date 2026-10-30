@@ -83,10 +83,12 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _minimal_document() -> dict[str, Any]:
-    return Program(
+    document = Program(
         _ROOT / "examples/pick_and_place_minimal.program.yaml",
         _catalog(),
     ).to_dict()
+    document["target_roles"]["arm"]["required_frame_roles"] = ["base", "tcp"]  # TCP migration: arm keeps tcp frame role in this fixture
+    return document
 
 
 def _walk(node: ProgramTreeNode) -> tuple[ProgramTreeNode, ...]:
@@ -279,6 +281,24 @@ def _ports(
     )
 
 
+def _fake_port_run(**kwargs: Any) -> ExecutableProgramRun:
+    """Bootstrap fake-port runs with synthetic per-role Active TCP entries.
+
+    The fake ports have no robot handles: role.component/role/tcp is a test-only
+    endpoint convention, not a captured deployment binding.
+    """
+    run = ExecutableProgramRun(**kwargs)
+    for key in kwargs["program"].blackboard_keys:
+        if key.startswith("active_tcp."):
+            role = key.removeprefix("active_tcp.")
+            run.value_store.write_active_tcp(role, {
+                "component_id": f"{role}.component",
+                "target_id": role,
+                "frame_role_id": "tcp",
+            })
+    return run
+
+
 def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapture:
     environment = build_node_environment()
     return ProgramRunCapture(
@@ -307,8 +327,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 49
-    assert sum(item.adapter_build_qualified for item in dispositions) == 49
+    assert len(dispositions) == len(environment.registry.rows) == 50  # TCP migration: motion.set_tcp row added
+    assert sum(item.adapter_build_qualified for item in dispositions) == 50  # TCP migration: motion.set_tcp row added
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
@@ -866,7 +886,7 @@ def test_logical_gripper_flag_wait_observes_updates_without_physical_owner(
         "children": [],
     }
     program = Program.from_dict(_identified(document), _catalog())
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -955,7 +975,7 @@ def _run(
     *,
     program_clock: ProgramClock | None = None,
 ) -> ExecutableProgramRun:
-    return ExecutableProgramRun(
+    return _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -1231,7 +1251,7 @@ def _relative_move(reference: dict[str, Any], **goal_frame: Any) -> dict[str, An
         "move",
         target_role="arm",
         base_frame_role="base",
-        tcp_endpoint={"target_role": "arm", "frame_role": "tcp"},
+        tcp_endpoint={"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
         goal={"position_m": [0.0, 0.0, 0.1], "orientation": {"rpy_deg": [0.0, 0.0, 0.0]}, **goal_frame},
         target_mode="relative",
         target_reference=reference,
@@ -1277,7 +1297,7 @@ def test_relative_goal_and_cartesian_waypoints_keep_one_owner_resolvable_frame()
         "path",
         target_role="arm",
         base_frame_role="base",
-        tcp_endpoint={"target_role": "arm", "frame_role": "tcp"},
+        tcp_endpoint={"kind": "current"},  # TCP migration: old selector without kind; missing/current = own TCP
         path=[{**pose, "frame_ref": {"kind": "cell_frame"}}, {**pose, "frame_ref": base}],
     )
     with pytest.raises(ProgramValidationError, match="waypoints must all use one frame"):
@@ -1422,7 +1442,7 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     environment = build_node_environment()
     task = _TaskPort()
     invocation = _InvocationPort()
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=environment,
         capture=_capture(program),
@@ -1434,6 +1454,9 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     assert len(task.starts) == len(task.acknowledgements) == 1
     assert task.starts[0][0] == "motion.move_to_joint_target"
     assert task.starts[0][2].parameters["target_role"] == "arm"
+    assert task.starts[0][2].blackboard["active_tcp"] == {
+        "component_id": "arm.component", "target_id": "arm", "frame_role_id": "tcp",
+    }
     assert task.starts[0][2].parameters["velocity_scale"] == 0.5
     assert invocation.invocations[0][0] == "scene.remove_object"
     assert run.availability["execution_available"] is True
@@ -1460,7 +1483,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
         program = Program(_ROOT / source, _catalog())
         task = _MaintainedProgramTaskPort()
         invocation = _InvocationPort()
-        run = ExecutableProgramRun(
+        run = _fake_port_run(
             program=program,
             environment=environment,
             capture=_capture(program),
@@ -1522,7 +1545,7 @@ def test_stopped_program_run_cannot_restart_effects() -> None:
         _catalog(),
     )
     task = _TaskPort((OwnerTaskState.ACTIVE,))
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -1557,7 +1580,7 @@ def test_retry_issues_a_fresh_attempt_identity_and_stop_cancels_active_work() ->
             "allowed_actions": [],
         }
     }
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -1573,7 +1596,7 @@ def test_retry_issues_a_fresh_attempt_identity_and_stop_cancels_active_work() ->
     assert len(task.starts) == 2
 
     active_task = _TaskPort((OwnerTaskState.ACTIVE,))
-    active_run = ExecutableProgramRun(
+    active_run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -1591,7 +1614,7 @@ def test_program_run_rejects_cross_artifact_capture_before_tree_construction() -
         _catalog(),
     )
     with pytest.raises(ProgramRuntimeError, match="Program revision"):
-        ExecutableProgramRun(
+        _fake_port_run(
             program=program,
             environment=build_node_environment(),
             capture=replace(_capture(program), program_revision=_DIGEST_C),
@@ -1854,7 +1877,7 @@ def test_stopped_program_run_presents_running_cancellable_leaves_as_interrupted(
     }
     program = Program.from_dict(_identified(document), _catalog())
     task = _TaskPort((OwnerTaskState.ACTIVE,) * 4)
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -1888,7 +1911,7 @@ def test_stopped_program_run_presents_a_refused_cancellation_as_failure() -> Non
     }
     program = Program.from_dict(_identified(document), _catalog())
     task = _RefusingCancelPort((OwnerTaskState.ACTIVE,) * 4)
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -2465,6 +2488,124 @@ def _leaf_node(run: ExecutableProgramRun, instance_id: str) -> Any:
     return node.decorated if isinstance(node, OperatorMotionStopPolicy) else node
 
 
+def _set_tcp_stop_run(*, policy: str, task: _TaskPort) -> ExecutableProgramRun:
+    document = _minimal_document()
+    document["tree"] = {
+        "node_id": "sequence", "instance_id": "root", "parameters": {},
+        "operator_stop_policy": policy,
+        "children": [
+            {
+                "node_id": "motion.set_tcp", "instance_id": instance,
+                "parameters": {
+                    "target_role": "arm",
+                    "tcp": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
+                },
+                "operator_stop_policy": policy, "children": [],
+            }
+            for instance in ("first", "second")
+        ],
+    }
+    program = Program.from_dict(_identified(document), _catalog())
+    return _fake_port_run(
+        program=program, environment=build_node_environment(),
+        capture=_capture(program), readiness=_readiness(_DIGEST_A),
+        ports=NodeAdapterPorts(kernel_operations=task),
+    )
+
+
+def test_set_tcp_pre_admission_refusal_preserves_owner_code_and_reason() -> None:
+    from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
+
+    class Refused(_TaskPort):
+        def start(self, node_id, identity, inputs):
+            raise KernelOperationAdmissionRejectedError(
+                "execution_rejected", "tool is not mounted",
+                {"reason": "tcp_tool_not_mounted"},
+            )
+
+    run = _set_tcp_stop_run(policy="continue", task=Refused())
+    assert run.tick_once() is py_trees.common.Status.FAILURE
+    leaf = _leaf_node(run, "first")
+    assert leaf.failure_reason_code == "execution_rejected"
+    assert leaf.failure_details["reason"] == "tcp_tool_not_mounted"
+    terminal = run.terminal_failure()
+    assert terminal.reason_code == "execution_rejected"
+    assert terminal.details["reason"] == "tcp_tool_not_mounted"
+
+
+def test_set_tcp_gated_refusal_preserves_owner_code_and_reason() -> None:
+    from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
+    from manyforge_behavior.orchestration_ports import OwnerInvocationGatedError
+
+    class Refused(_TaskPort):
+        def start(self, node_id, identity, inputs):
+            refusal = KernelOperationAdmissionRejectedError(
+                "execution_rejected", "rule is active",
+                {"reason": "global_interrupt_gated"},
+            )
+            raise OwnerInvocationGatedError("rule.1", refusal)
+
+    run = _set_tcp_stop_run(policy="continue", task=Refused())
+    assert run.tick_once() is py_trees.common.Status.FAILURE
+    leaf = _leaf_node(run, "first")
+    assert leaf.failure_reason_code == "execution_rejected"
+    assert leaf.failure_details["reason"] == "global_interrupt_gated"
+
+
+def test_set_tcp_admitted_failure_preserves_owner_code_and_reason() -> None:
+    class Failed(_TaskPort):
+        def start(self, node_id, identity, inputs):
+            return OwnerTaskSnapshot(
+                task_id="failed-step", state=OwnerTaskState.FAILED,
+                reason_code="execution_rejected", message="controller refused",
+                details={"reason": "tcp_offset_not_applied"},
+                settlement_proven=True,
+            )
+
+    run = _set_tcp_stop_run(policy="continue", task=Failed())
+    assert run.tick_once() is py_trees.common.Status.FAILURE
+    leaf = _leaf_node(run, "first")
+    assert leaf.failure_reason_code == "execution_rejected"
+    assert leaf.failure_details["reason"] == "tcp_offset_not_applied"
+    terminal = run.terminal_failure()
+    assert terminal.reason_code == "execution_rejected"
+    assert terminal.details["reason"] == "tcp_offset_not_applied"
+
+
+def test_set_tcp_hold_before_send_does_not_start_owner_task() -> None:
+    task = _TaskPort()
+    run = _set_tcp_stop_run(policy="hold", task=task)
+    run._operator_stop_state.publish(  # noqa: SLF001
+        OperatorMotionStopSnapshot(1, frozenset({"root", "first", "second"}))
+    )
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert task.starts == []
+    run._operator_stop_state.publish(OperatorMotionStopSnapshot(2))  # noqa: SLF001
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert [start[0] for start in task.starts] == ["motion.set_tcp", "motion.set_tcp"]
+
+
+@pytest.mark.parametrize("policy", ["hold", "continue"])
+def test_set_tcp_stop_after_send_settles_before_following_action(policy: str) -> None:
+    task = _TaskPort((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
+    run = _set_tcp_stop_run(policy=policy, task=task)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert len(task.starts) == 1
+    run._operator_stop_state.publish(  # noqa: SLF001
+        OperatorMotionStopSnapshot(1, frozenset({"root", "first", "second"}))
+    )
+    result = run.tick_once()
+    assert task.observations == ["task-1"]
+    assert task.cancellations == []
+    if policy == "hold":
+        assert result is py_trees.common.Status.RUNNING
+        assert len(task.starts) == 1
+        run._operator_stop_state.publish(OperatorMotionStopSnapshot(2))  # noqa: SLF001
+        result = run.tick_once()
+    assert result is py_trees.common.Status.SUCCESS
+    assert len(task.starts) == 2
+
+
 def test_timer_delays_for_its_duration_of_program_time_and_succeeds() -> None:
     now = [100.0]
     run = _run(
@@ -3010,7 +3151,7 @@ class _FramePort(_InvocationPort):
 
 
 def _framed_run(program: Program, frames: _FramePort | None) -> ExecutableProgramRun:
-    return ExecutableProgramRun(
+    return _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -3254,7 +3395,7 @@ def test_get_object_pose_in_another_frame_is_one_owner_transform() -> None:
     )
     frames = _FramePort()
     scene = _InvocationPort()
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -3286,7 +3427,7 @@ def test_get_object_pose_writes_the_scene_port_pose_to_a_pose_key() -> None:
     )
     invocation = _InvocationPort()
     invocation.result = OwnerInvocationResult(True, output=_cell_pose())
-    run = ExecutableProgramRun(
+    run = _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -3606,7 +3747,7 @@ def _stop_parity_run(
             ],
         }
     program = Program.from_dict(_identified(document), _catalog())
-    return ExecutableProgramRun(
+    return _fake_port_run(
         program=program,
         environment=build_node_environment(),
         capture=_capture(program),
@@ -3811,7 +3952,7 @@ def _program_dwell_run(now, *, dwell=2.0, mode=None, policy="hold", task=None):
     task = task or _TaskPort((OwnerTaskState.ACTIVE, OwnerTaskState.SUCCEEDED))
     task.metadata = {"gripper_actuation_kind": "pneumatic", "gripper_dwell_s": dwell}
     clock = ProgramClock(lambda: now[0])
-    run = ExecutableProgramRun(program=program, environment=build_node_environment(),
+    run = _fake_port_run(program=program, environment=build_node_environment(),
         capture=_capture(program), readiness=_readiness(_DIGEST_A),
         ports=NodeAdapterPorts(kernel_operations=task), program_clock=clock)
     return run, task, clock

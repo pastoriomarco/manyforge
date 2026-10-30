@@ -94,6 +94,12 @@ const Value &member(const Value &value, std::string_view name) {
         !collision_links.contains(joint.parent_link_name))
       candidates.push_back(joint.child_link_name);
   }
+  // A separately mounted tool whose gripper base is its own model root has
+  // no inner fixed parent: the root itself is the base.
+  const auto &root =
+      model.verified_asset.source_ir().semantic_index().root_link_name;
+  if (candidates.empty() && target_gripper_links.contains(root))
+    candidates.push_back(root);
   if (candidates.size() != 1U)
     return {};
   return candidates.front();

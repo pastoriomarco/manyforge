@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
@@ -130,7 +131,8 @@ public:
   ManagedProjectionRegistry(
       ManagedProjectionRegistryConfig config,
       std::unique_ptr<const IManagedProjectionAssetSource> assets,
-      RetainedPlannerSceneProjection::Clock monotonic_now_ns);
+      RetainedPlannerSceneProjection::Clock monotonic_now_ns,
+      std::function<void()> snapshot_changed = {});
   ~ManagedProjectionRegistry();
   ManagedProjectionRegistry(const ManagedProjectionRegistry &) = delete;
   ManagedProjectionRegistry &

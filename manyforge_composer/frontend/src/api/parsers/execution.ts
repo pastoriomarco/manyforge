@@ -17,13 +17,16 @@ import type {
   OperationObservation,
   OperationStateName,
   OutputEvidence,
+  Pose3Value,
   ResourceSourceKind,
   SceneRevisionValue,
   StopFaultTrigger,
+  TcpEntryIdentity,
   TargetStopResponse,
   ManualControlAvailability,
   ManualProgramHandoverContext,
 } from '../../types/robotControl';
+import { tcpEntryIdentityKey } from '../../types/robotControl';
 import type { JsonObject } from './shared';
 import { ioSignalBindingsAt, systemSignalsAt } from './ioSignals';
 import {
@@ -46,6 +49,10 @@ import {
   stringAt,
 } from './shared';
 import { parseApiErrorDto, runtimeScaleControlStatusAt } from './programRuntime';
+
+// Keep the GUI's TCP inventory bound aligned with the native program-binding
+// nested-role limit so every advertised Deployment row remains parseable.
+const MAX_DIRECT_CONTROL_TCP_ROWS = 4096;
 
 function sceneRevisionAt(value: unknown, path: string): SceneRevisionValue {
   const record = objectAt(value, path);
@@ -173,11 +180,12 @@ function manualControlMotionDescriptorAt(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'command_target_id', 'component_role_id', 'contracts',
-    'controllable_component_id', 'frames', 'joints', 'operational_joint_limits',
-    'operational_limit', 'ordinary_jerk', 'schema_version', 'target_role_id',
+    'controllable_component_id', 'end_effector_component_id', 'frames', 'joints',
+    'operational_joint_limits',
+    'operational_limit', 'ordinary_jerk', 'schema_version', 'target_role_id', 'tcps',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v5') {
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v6') {
     return fail(`${path}.schema_version`, 'the supported motion descriptor');
   }
   const operationalLimit = record.operational_limit === null
@@ -209,6 +217,62 @@ function manualControlMotionDescriptorAt(
     || new Set(frames.map((frame) => frame.frameRoleId)).size !== frames.length
   ) {
     return fail(`${path}.frames`, 'non-empty unique frame roles');
+  }
+  // TCP-C: the full Deployment TCP list, with owner identity kept separate
+  // from the display name. Rows without a legacy endpoint role remain visible
+  // to explain why the interim Robot Control action is unavailable.
+  const tcps = boundedArrayAt(record.tcps, `${path}.tcps`, MAX_DIRECT_CONTROL_TCP_ROWS).map((item, index) => {
+    const itemPath = `${path}.tcps[${index}]`;
+    const tcp = objectAt(item, itemPath);
+    allowedKeysAt(tcp, [
+      'default', 'display', 'entry', 'frame', 'mounted_elsewhere', 'mounted_here',
+    ], ['target_role_id'], itemPath);
+    const entryPath = `${itemPath}.entry`;
+    const entryRecord = objectAt(tcp.entry, entryPath);
+    exactKeysAt(entryRecord, ['component_id', 'target_id', 'frame_role_id'], entryPath);
+    const entry: TcpEntryIdentity = {
+      componentId: stringAt(entryRecord.component_id, `${entryPath}.component_id`),
+      targetId: stringAt(entryRecord.target_id, `${entryPath}.target_id`),
+      frameRoleId: stringAt(entryRecord.frame_role_id, `${entryPath}.frame_role_id`),
+    };
+    const framePath = `${itemPath}.frame`;
+    const frame = objectAt(tcp.frame, framePath);
+    allowedKeysAt(frame, [
+      'compiled_frame_name', 'frame_role_id', 'model_instance_id', 'model_revision',
+    ], ['contact_body_role_ids'], framePath);
+    const frameRoleId = stringAt(frame.frame_role_id, `${framePath}.frame_role_id`);
+    if (entry.frameRoleId !== frameRoleId) {
+      return fail(itemPath, 'a TCP entry whose frame role matches its frame');
+    }
+    const contactBodyRoleIds = frame.contact_body_role_ids === undefined
+      ? []
+      : arrayAt(frame.contact_body_role_ids, `${framePath}.contact_body_role_ids`)
+        .map((role, roleIndex) => stringAt(role, `${framePath}.contact_body_role_ids[${roleIndex}]`));
+    if (new Set(contactBodyRoleIds).size !== contactBodyRoleIds.length) {
+      return fail(`${framePath}.contact_body_role_ids`, 'unique contact-body roles');
+    }
+    return {
+      entry,
+      targetRoleId: tcp.target_role_id === undefined
+        ? null : stringAt(tcp.target_role_id, `${itemPath}.target_role_id`),
+      controllableComponentId: entry.componentId,
+      commandTargetId: entry.targetId,
+      frameRoleId: entry.frameRoleId,
+      qualifiedName: stringAt(tcp.display, `${itemPath}.display`),
+      compiledFrameName: stringAt(frame.compiled_frame_name, `${framePath}.compiled_frame_name`),
+      modelInstanceId: stringAt(frame.model_instance_id, `${framePath}.model_instance_id`),
+      modelRevision: digestAt(frame.model_revision, `${framePath}.model_revision`),
+      isDefault: booleanAt(tcp.default, `${itemPath}.default`),
+      mountedHere: booleanAt(tcp.mounted_here, `${itemPath}.mounted_here`),
+      mountedElsewhere: booleanAt(tcp.mounted_elsewhere, `${itemPath}.mounted_elsewhere`),
+      contactBodyRoleIds,
+    };
+  });
+  if (
+    tcps.slice(1).some((tcp) => tcp.isDefault)
+    || new Set(tcps.map((tcp) => tcpEntryIdentityKey(tcp.entry))).size !== tcps.length
+  ) {
+    return fail(`${path}.tcps`, 'at most one leading default and unique TCP entry triples');
   }
   const joints = boundedArrayAt(record.joints, `${path}.joints`, 1024).map((item, index) => {
     const itemPath = `${path}.joints[${index}]`;
@@ -386,10 +450,15 @@ function manualControlMotionDescriptorAt(
   return {
     schemaVersion,
     controllableComponentId: stringAt(record.controllable_component_id, `${path}.controllable_component_id`),
+    endEffectorComponentId: nullableStringAt(
+      record.end_effector_component_id,
+      `${path}.end_effector_component_id`,
+    ),
     commandTargetId: stringAt(record.command_target_id, `${path}.command_target_id`),
     componentRoleId: stringAt(record.component_role_id, `${path}.component_role_id`),
     targetRoleId: stringAt(record.target_role_id, `${path}.target_role_id`),
     frames,
+    tcps,
     joints,
     operationalJointLimits,
     ordinaryJerk,
@@ -414,7 +483,11 @@ function manualControlGripperDescriptorAt(
     'source_coordinate_name', 'source_group_name', 'source_kind',
     'state_authority_class', 'state_authority_id', 'target_role_id',
     'tcp_frame', 'touch_links', 'transport_kind', 'unit',
-  ], ['pneumatic_outputs'], path);
+  ], ['grasp_confirmation', 'pneumatic_outputs'], path);
+  // Opt-in typed grasp confirmation; present only as `required`.
+  if (record.grasp_confirmation !== undefined && record.grasp_confirmation !== 'required') {
+    return fail(`${path}.grasp_confirmation`, 'required when present');
+  }
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
   if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v3') {
     return fail(`${path}.schema_version`, 'the supported gripper descriptor');
@@ -617,6 +690,7 @@ function manualControlGripperDescriptorAt(
     stateAuthorityClass: stateAuthorityClass as ManualControlGripperDescriptor['stateAuthorityClass'],
     completionPolicy: completionPolicy as ManualControlGripperDescriptor['completionPolicy'],
     graspConfirmationPolicy: graspConfirmationPolicy as ManualControlGripperDescriptor['graspConfirmationPolicy'],
+    ...(record.grasp_confirmation === undefined ? {} : { graspConfirmation: 'required' as const }),
     sourceGroupName,
     sourceCoordinateName: stringAt(record.source_coordinate_name, `${path}.source_coordinate_name`),
     sourceKind: sourceKind as ResourceSourceKind,
@@ -784,7 +858,7 @@ export function parseExecutionControlStatus(
   const rowKey = (componentId: unknown, targetId: unknown, capabilityId: unknown) => (
     JSON.stringify([componentId, targetId, capabilityId])
   );
-  const observedByKey = new Map<string, unknown>();
+  const observedByKey = new Map<string, JsonObject>();
   boundedArrayAt(
     control.observed_targets,
     'executionControlState.control_state.observed_targets',
@@ -792,9 +866,9 @@ export function parseExecutionControlStatus(
   ).forEach((entry, index) => {
     const path = `executionControlState.control_state.observed_targets[${index}]`;
     const row = objectAt(entry, path);
-    exactKeysAt(row, [
+    allowedKeysAt(row, [
       'command_target_id', 'controllable_component_id', 'observed', 'operation_capability_id',
-    ], path);
+    ], ['active_tcp'], path);
     const key = rowKey(
       stringAt(row.controllable_component_id, `${path}.controllable_component_id`),
       stringAt(row.command_target_id, `${path}.command_target_id`),
@@ -803,7 +877,7 @@ export function parseExecutionControlStatus(
     if (observedByKey.has(key)) {
       return fail(path, 'one observation row per commandable target');
     }
-    observedByKey.set(key, row.observed);
+    observedByKey.set(key, row);
   });
   // The v6 observation for one commandable target, in the internal shape
   // (without its kind discriminator), or null when not yet authoritative.
@@ -817,7 +891,7 @@ export function parseExecutionControlStatus(
     if (!observedByKey.has(key)) {
       return fail(path, 'one observation row for the exact addressed target');
     }
-    const observed = observedByKey.get(key);
+    const observed = observedByKey.get(key)!.observed;
     observedByKey.delete(key);
     if (observed === null) return null;
     const record = objectAt(observed, `${path}.observed`);
@@ -908,8 +982,13 @@ export function parseExecutionControlStatus(
           }
           delete (addressed as JsonObject).stop_response;
           delete (addressed as JsonObject).stop_response_error;
+          const observationRow = observedByKey.get(rowKey(componentId, commandTargetId, operationCapabilityId));
+          if (observationRow === undefined || !Object.hasOwn(observationRow, 'active_tcp')) {
+            return fail(targetPath, 'an Active TCP field for the addressed motion target');
+          }
           motionRows.push({
             ...addressed,
+            active_tcp: observationRow.active_tcp,
             observed_state: observationFor(componentId, target, 'joint_positions', targetPath),
           });
         } else if (presentation === 'gripper') {
@@ -1034,6 +1113,11 @@ export function parseExecutionControlStatus(
       retained_bundle_id: identity.retainedBundleId,
     },
   });
+  if (status.directControlTargets.some((target) => (
+    target.activeTcp !== null && target.activeTcp.ownerEpoch !== identity.ownerEpoch
+  ))) {
+    return fail('executionControlState.control_state.observed_targets', 'Active TCPs of the current execution owner');
+  }
   // Null when no motion target supports scaling (for example gripper-only).
   const runtimeScaleControl = control.runtime_scale_control === null
     ? null
@@ -1121,6 +1205,7 @@ function directControlMotionAt(value: unknown): {
     'executionStatus.status.direct_control',
   );
   exactKeysAt(direct, [
+    'active_tcp',
     'base_frame_role_id',
     'command_target_id',
     'component_role_id',
@@ -1189,12 +1274,46 @@ function directControlMotionAt(value: unknown): {
     );
     exactKeysAt(observed, [
       'complete',
-      'current_tcp_pose',
+      ...(observed.current_tcp_pose === undefined ? [] : ['current_tcp_pose']),
       'positions_rad',
       'sequence',
       'source_epoch',
       'source_joint_names',
+      'tcp_poses',
     ], 'executionStatus.status.direct_control.observed_state');
+    const tcpPoseRows = boundedArrayAt(
+      observed.tcp_poses,
+      'executionStatus.observedMotion.tcp_poses',
+      MAX_DIRECT_CONTROL_TCP_ROWS,
+    );
+    const tcpPoses: Record<string, Pose3Value> = {};
+    const tcpByKey = new Map(
+      motionDescriptor.tcps.map((tcp) => [tcpEntryIdentityKey(tcp.entry), tcp]),
+    );
+    tcpPoseRows.forEach((item, index) => {
+      const rowPath = `executionStatus.observedMotion.tcp_poses[${index}]`;
+      const row = objectAt(item, rowPath);
+      exactKeysAt(row, ['entry', 'pose'], rowPath);
+      const entryPath = `${rowPath}.entry`;
+      const entryRecord = objectAt(row.entry, entryPath);
+      exactKeysAt(entryRecord, ['component_id', 'target_id', 'frame_role_id'], entryPath);
+      const entry: TcpEntryIdentity = {
+        componentId: stringAt(entryRecord.component_id, `${entryPath}.component_id`),
+        targetId: stringAt(entryRecord.target_id, `${entryPath}.target_id`),
+        frameRoleId: stringAt(entryRecord.frame_role_id, `${entryPath}.frame_role_id`),
+      };
+      const key = tcpEntryIdentityKey(entry);
+      const descriptorTcp = tcpByKey.get(key);
+      if (descriptorTcp === undefined || !descriptorTcp.mountedHere || tcpPoses[key] !== undefined) {
+        return fail(rowPath, 'one unique pose row for a carried TCP entry');
+      }
+      tcpPoses[key] = poseAt(row.pose, `${rowPath}.pose`);
+    });
+    if (motionDescriptor.tcps.some((tcp) => (
+      tcp.mountedHere && tcpPoses[tcpEntryIdentityKey(tcp.entry)] === undefined
+    ))) {
+      return fail('executionStatus.observedMotion.tcp_poses', 'a pose for every carried TCP');
+    }
     const observedNames = stringArrayAt(
       observed.source_joint_names,
       'executionStatus.observedMotion.joint_names',
@@ -1237,10 +1356,11 @@ function directControlMotionAt(value: unknown): {
         observed.complete,
         'executionStatus.observedMotion.complete',
       ),
-      currentTcpPose: poseAt(
+      currentTcpPose: observed.current_tcp_pose == null ? null : poseAt(
         observed.current_tcp_pose,
         'executionStatus.observedMotion.current_tcp_pose',
       ),
+      tcpPoses,
     };
   }
   const frameRoleIds = stringArrayAt(
@@ -1281,8 +1401,30 @@ function directControlMotionAt(value: unknown): {
   ) {
     return fail('executionStatus.status.direct_control', 'descriptors joined to the exact addressed targets');
   }
+  let activeTcp: DirectControlMotionStatus['activeTcp'] = null;
+  if (direct.active_tcp !== null) {
+    const path = 'executionStatus.status.direct_control.active_tcp';
+    const active = objectAt(direct.active_tcp, path);
+    exactKeysAt(active, ['entry', 'display', 'owner_epoch', 'registration_generation', 'sequence'], path);
+    const entry = active.entry === null ? null : objectAt(active.entry, `${path}.entry`);
+    if (entry !== null) exactKeysAt(entry, ['component_id', 'target_id', 'frame_role_id'], `${path}.entry`);
+    if ((entry === null) !== (active.display === null)) return fail(path, 'entry and display both present or both null');
+    activeTcp = {
+      entry: entry === null ? null : {
+        componentId: stringAt(entry.component_id, `${path}.entry.component_id`),
+        targetId: stringAt(entry.target_id, `${path}.entry.target_id`),
+        frameRoleId: stringAt(entry.frame_role_id, `${path}.entry.frame_role_id`),
+      },
+      display: active.display === null ? null : stringAt(active.display, `${path}.display`),
+      ownerEpoch: nonEmptyStringAt(active.owner_epoch, `${path}.owner_epoch`),
+      registrationGeneration: positiveIntegerAt(active.registration_generation, `${path}.registration_generation`),
+      sequence: integerAt(active.sequence, `${path}.sequence`),
+    };
+    if (activeTcp.sequence < 0) return fail(`${path}.sequence`, 'non-negative');
+  }
   return {
     directControl: {
+      activeTcp,
       controllableComponentId: componentId,
       commandTargetId: targetId,
       componentRoleId: stringAt(
@@ -1297,7 +1439,7 @@ function directControlMotionAt(value: unknown): {
         direct.base_frame_role_id,
         'executionStatus.status.direct_control.base_frame_role_id',
       ),
-      tcpFrameRoleId: stringAt(
+      tcpFrameRoleId: nullableStringAt(
         direct.tcp_frame_role_id,
         'executionStatus.status.direct_control.tcp_frame_role_id',
       ),

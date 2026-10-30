@@ -4,6 +4,7 @@ import type {
   CCLCComponentReadiness,
   CCLCComponentSnapshot,
   CCLCIncidentCauseClass,
+  CCLCLifecycleFactValue,
   CCLCLifecycleTargetOrigin,
   CCLCReadinessProviderOccurrence,
   CCLCTransactionStatus,
@@ -110,7 +111,7 @@ function targetFact(snapshot: CCLCComponentSnapshot): string {
 /** Preserve the actual owner ErrorDTO; this formatting adds no classification. */
 export function readinessErrorPresentation(error: CCLCTransactionStatus['error']): string | null {
   if (error === null) return null;
-  return [`[${error.code}] ${error.message}`, error.details.reason]
+  return [`[${error.code}] ${error.message}`, error.details.reason, error.details.decisive_fact]
     .filter((part): part is string => typeof part === 'string').join(' · ');
 }
 
@@ -306,4 +307,81 @@ export function componentLifecycleToneClass(tone: ComponentLifecycleTone): strin
     case 'intervention': return 'status-pill phase-intervention_required';
     default: return 'status-pill';
   }
+}
+
+const TONE_DOT: Record<ComponentLifecycleTone, string> = {
+  ready: 'status-ready',
+  waiting: 'status-waiting',
+  held: 'status-warning',
+  intervention: 'status-fault',
+};
+
+/** Existing `component-dot` status class of a tone. */
+export function componentLifecycleDotClass(tone: ComponentLifecycleTone): string {
+  return TONE_DOT[tone];
+}
+
+/** The health badge of one component row: dot, lifecycle state and verdict. */
+export function componentHealthBadge(
+  snapshot: CCLCComponentSnapshot | null,
+  readError: string | null,
+): { dotClass: string; state: string; message: string } {
+  if (snapshot === null) {
+    return {
+      dotClass: 'status-offline',
+      state: 'unknown',
+      message: readError ?? 'Current component health has not been read.',
+    };
+  }
+  const presentation = componentLifecyclePresentation(snapshot);
+  return {
+    dotClass: TONE_DOT[presentation.tone],
+    state: snapshot.lifecycleState,
+    message: presentation.message,
+  };
+}
+
+/**
+ * The device facts a vendor driver reports through CCLC (any brand that uses
+ * these fact ids), labelled for the component page. Vendor codes are copied
+ * verbatim by the driver (for example error `C2`, `mode=0`).
+ */
+const VENDOR_FACT_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ['manyforge.vendor_code.error', 'Error code'],
+  ['manyforge.vendor_code.warning', 'Warning code'],
+  ['manyforge.vendor_code.mode', 'Mode'],
+  ['manyforge.vendor_code.state', 'State'],
+  ['manyforge.vendor_code.condition', 'Condition'],
+  ['manyforge.vendor_code.power_cycle', 'Power cycle'],
+  ['device.error_present', 'Error present'],
+  ['device.warning_present', 'Warning present'],
+  ['device.motion_enabled', 'Motors enabled'],
+  ['device.accepts_commands', 'Accepts commands'],
+  ['device.moved_externally', 'Moved externally'],
+  ['device.in_motion', 'In motion'],
+];
+
+function vendorFactValue(value: CCLCLifecycleFactValue): string {
+  switch (value.kind) {
+    case 'unknown': return 'unknown';
+    case 'boolean': return value.booleanValue ? 'yes' : 'no';
+    case 'integer': return String(value.integerValue);
+    default: return value.tokenValue.replaceAll('_', ' ');
+  }
+}
+
+/**
+ * Vendor status of one component, in a fixed order: the reported vendor and
+ * device facts, then the owner's blocking reason (for example
+ * `moved_externally:rearm_at_next_motion`). Empty when nothing is reported.
+ */
+export function vendorStatusFacts(snapshot: CCLCComponentSnapshot): Array<{ label: string; value: string }> {
+  const facts = snapshot.readiness.providerOccurrences.flatMap((domain) => domain.health?.facts ?? []);
+  const rows = VENDOR_FACT_LABELS.flatMap(([factId, label]) => {
+    const fact = facts.find((candidate) => candidate.lifecycleFactId === factId);
+    return fact === undefined ? [] : [{ label, value: vendorFactValue(fact.value) }];
+  });
+  const reason = snapshot.lifecycleProgress?.blockingReason ?? null;
+  return reason === null || reason === '' ? rows
+    : [...rows, { label: 'Blocking reason', value: reason.replace(':', ' · ').replaceAll('_', ' ') }];
 }

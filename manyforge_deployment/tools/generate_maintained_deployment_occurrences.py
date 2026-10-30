@@ -37,6 +37,9 @@ from check_maintained_deployment_sources import (
 
 
 ZERO_DIGEST: Final = "sha256:" + "0" * 64
+# Mirrors core::kDefaultLifecycleBudgetNs (component_lifecycle_budget.hpp):
+# every component's default lifecycle step budget, used by every plan.
+DEFAULT_LIFECYCLE_BUDGET_NS: Final = 10_000_000_000
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
 SCENARIO_PROJECT_API: Final = "manyforge.scenario.project.v2"
@@ -47,13 +50,13 @@ NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
 )
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48"
+    "sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274"
+    "sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -71,7 +74,7 @@ LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v
 # R7 D12: the xArm-family arm and gripper lifecycle providers.
 XARM_LIFECYCLE_PROVIDER_ID: Final = "xarm_arm_provider"
 XARM_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "xarm_gripper_provider"
-LITE6_NATIVE_MODEL_FAMILY_ID: Final = "lite6_lite_gripper"
+LITE6_NATIVE_MODEL_FAMILY_ID: Final = "lite6"
 LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover")
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 # R7 package 4: a Real xArm-family arm's ros2_control provider. Same offers as
@@ -79,6 +82,13 @@ ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 XARM_ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control.xarm"
 XARM_ROS2_CONTROL_GRIPPER_PROVIDER_ID: Final = (
     "manyforge.provider.ros2_control.xarm.gripper"
+)
+# V-A (A7): the Real xArm-family arm's plans, owned by the xArm package.
+XARM_ROS2_CONTROL_LIFECYCLE_PLANS: Final = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_xarm_control"
+    / "resources"
+    / "xarm_ros2_control_lifecycle_plans.json"
 )
 
 CAPABILITIES: Final = {
@@ -618,12 +628,18 @@ def component_type_document(
     ``arm_only`` (fixed-scale only) drops the gripper target and tag: the
     model's gripper geometry stays passive, as for a Real component in CP8
     step 1 that controls its arm only.
+
+    Merge 6: a family without arm joints is a tool (its `gripper` target
+    only, mounted through its root interface `mount`); a robot without
+    gripper geometry offers its `flange` to one tool.
     """
 
     if arm_only and runtime_scaling:
         raise GenerationError("the arm-only component type is fixed-scale only")
     family_id = family["model_family_id"]
     semantics = family["semantics"]
+    if not source_joint_names(family, "arm_joints"):
+        return tool_component_type_document(family, runtime_scaling=runtime_scaling)
     group_roles = {
         row["model_group_role_id"] for row in semantics["model_group_role_bindings"]
     }
@@ -634,9 +650,13 @@ def component_type_document(
         row["collision_body_role_id"]
         for row in semantics["collision_body_role_bindings"]
     }
+    frame_roles = {row["frame_role_id"] for row in semantics["frame_role_bindings"]}
     physical_gripper = (
         not arm_only and "gripper" in group_roles and "fingers" in resource_roles
     )
+    # A robot whose model carries no gripper geometry mounts its tool as a
+    # separate component on `flange`; its `tcp` is then the tool's (D1).
+    offers_flange = "gripper_collision" not in collision_roles
     arm_collision_roles = [
         {
             "collision_body_role_id": role,
@@ -694,15 +714,14 @@ def component_type_document(
                 ],
                 "frame_roles": [
                     {
-                        "frame_role_id": "base",
+                        "frame_role_id": role,
                         "model_role_id": "arm_model",
-                        "asset_frame_role_id": "base",
-                    },
-                    {
-                        "frame_role_id": "tcp",
-                        "model_role_id": "arm_model",
-                        "asset_frame_role_id": "tcp",
-                    },
+                        "asset_frame_role_id": role,
+                    }
+                    for role in (
+                        ("base", "flange", "tcp") if offers_flange else ("base", "tcp")
+                    )
+                    if role in frame_roles
                 ],
                 "collision_body_roles": arm_collision_roles,
                 "capabilities": [
@@ -743,16 +762,202 @@ def component_type_document(
                 ],
             },
         ],
-        "attachment_interfaces": [],
+        "attachment_interfaces": (
+            [
+                {
+                    "attachment_interface_id": "flange",
+                    "model_role_id": "arm_model",
+                    "frame_role_id": "flange",
+                    "accepts_tags": ["tool"],
+                    "max_attachments": 1,
+                }
+            ]
+            if offers_flange
+            else []
+        ),
     }
     if not physical_gripper:
         value["command_targets"] = value["command_targets"][:1]
+    with_tcps(value, family)
     return revisioned_document(
         value,
         domain="catalog-record-revision/component_type",
         api_version="manyforge.component_type.v1",
         revision_field="component_type_revision",
     )
+
+
+def tool_component_type_document(
+    family: dict[str, Any], *, runtime_scaling: bool = True
+) -> dict[str, Any]:
+    """Return the component type of a tool family (merge 6).
+
+    One `gripper` target on model role `tool_model`; the component root and
+    the `mount` interface are the tool's root frame, the robot flange plane.
+    The target exposes each TCP of the family (``tcp_frame_role_ids``, else
+    ``tcp``) under its own name; the first is the default.
+    """
+
+    family_id = family["model_family_id"]
+    semantics = family["semantics"]
+    collision_roles = {
+        row["collision_body_role_id"]
+        for row in semantics["collision_body_role_bindings"]
+    }
+    root = semantics["root_frame_role_id"]
+    contact = (
+        {"contact_body_role_ids": ["gripper_fingers"]}
+        if "gripper_fingers" in collision_roles
+        else {}
+    )
+    value = {
+        "api_version": "manyforge.component_type.v1",
+        "component_type_id": (
+            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component"
+        ),
+        "tags": ["gripper", "tool"],
+        "model_roles": [{"model_role_id": "tool_model", "cardinality": "exactly_one"}],
+        "component_root": {"model_role_id": "tool_model", "frame_role_id": root},
+        "model_mounts": [],
+        "command_targets": [
+            {
+                "command_target_id": "gripper",
+                "model_group_roles": [
+                    {
+                        "model_group_role_id": "planning_group",
+                        "model_role_id": "tool_model",
+                        "asset_model_group_role_id": "gripper",
+                    }
+                ],
+                "resource_roles": [
+                    {
+                        "resource_role_id": "fingers",
+                        "source_kind": "model_role",
+                        "model_role_id": "tool_model",
+                        "asset_resource_role_id": "fingers",
+                    }
+                ],
+                "frame_roles": [
+                    {
+                        "frame_role_id": role,
+                        "model_role_id": "tool_model",
+                        "asset_frame_role_id": role,
+                        **contact,
+                    }
+                    # A registered tool records its TCPs; a maintained one has `tcp`.
+                    for role in family.get("tcp_frame_role_ids", ["tcp"])
+                ],
+                "collision_body_roles": [
+                    {
+                        "collision_body_role_id": role,
+                        "model_role_id": "tool_model",
+                        "asset_collision_body_role_id": role,
+                    }
+                    for role in ("gripper_collision", "gripper_fingers")
+                    if role in collision_roles
+                ],
+                "capabilities": [
+                    capability_selector(capability_id)
+                    for capability_id in GRIPPER_CAPABILITIES
+                ],
+            }
+        ],
+        "attachment_interfaces": [
+            {
+                "attachment_interface_id": "mount",
+                "model_role_id": "tool_model",
+                "frame_role_id": root,
+                "accepts_tags": ["articulated-arm"],
+                "max_attachments": 1,
+            }
+        ],
+    }
+    # TCP-A (merge 6): tag the tool's TCPs and its default.
+    with_tcps(value, family)
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/component_type",
+        api_version="manyforge.component_type.v1",
+        revision_field="component_type_revision",
+    )
+
+
+def with_tcps(value: dict[str, Any], family: dict[str, Any]) -> None:
+    """Tag the TCPs of one component type (merge 6, TCP-A).
+
+    The rows are rules over the family's frame roles:
+
+    - ``arm`` (the motion target) exposes the asset's ``flange`` and tags it
+      and its ``tcp`` (when exposed) as TCPs; the default is ``tcp``, else
+      ``flange``. With a tool mounted, D1 still resolves ``{arm, tcp}`` to the
+      tool's default TCP.
+    - ``gripper`` tags its ``tcp``, its default.
+    - An asset offset frame role (``pose_in_source_link``) is a TCP of the
+      family's first target (``arm`` on a robot, ``gripper`` on a tool).
+    - A family that records its TCPs (``tcp_frame_role_ids``, from a component
+      descriptor's ``tcps``) exposes and tags each of them on its first target
+      under its own name; the first is the default.
+    """
+
+    semantics = family["semantics"]
+    declared = family.get("tcp_frame_role_ids")
+    asset_roles = {row["frame_role_id"] for row in semantics["frame_role_bindings"]}
+    offsets = sorted(
+        row["frame_role_id"]
+        for row in semantics["frame_role_bindings"]
+        if "pose_in_source_link" in row
+    )
+    for index, target in enumerate(value["command_targets"]):
+        rows = target["frame_roles"]
+        model_role = (
+            rows[0]["model_role_id"] if rows else value["model_roles"][0]["model_role_id"]
+        )
+        exposed = {row["frame_role_id"] for row in rows}
+        wanted = set(offsets) if index == 0 else set()
+        if index == 0 and declared is not None:
+            wanted.update(declared)
+        if target["command_target_id"] == "arm" and "flange" in asset_roles:
+            wanted.add("flange")
+        for role in sorted(wanted - exposed):
+            rows.append(
+                {"frame_role_id": role, "model_role_id": model_role, "asset_frame_role_id": role}
+            )
+        tagged = wanted | ({"tcp"} & {row["frame_role_id"] for row in rows})
+        for row in rows:
+            if row["frame_role_id"] in tagged:
+                row["tcp"] = True
+        rows.sort(key=lambda row: row["frame_role_id"])
+        if tagged:
+            first = (declared[0],) if index == 0 and declared is not None else ()
+            target["default_tcp_frame_role_id"] = next(
+                role
+                for role in (*first, "tcp", "flange", *sorted(tagged))
+                if role in tagged
+            )
+
+
+def default_tcp(component_type: dict[str, Any]) -> dict[str, str] | None:
+    """B5: the default TCP a component's graph row carries.
+
+    As the activation compiler (``compiled_default_tcp``): the one target that
+    declares a default. Maintained occurrences author no ``default_tcp``, so
+    TCPs on several targets are refused.
+    """
+
+    declared = [
+        {
+            "command_target_id": target["command_target_id"],
+            "frame_role_id": target["default_tcp_frame_role_id"],
+        }
+        for target in component_type["command_targets"]
+        if "default_tcp_frame_role_id" in target
+    ]
+    if len(declared) > 1:
+        raise GenerationError(
+            f"component_default_tcp_required: {component_type['component_type_id']} "
+            f"has TCPs on {len(declared)} targets"
+        )
+    return declared[0] if declared else None
 
 
 def control_contract(target: str, runtime_kind: str = "native") -> dict[str, Any]:
@@ -1032,8 +1237,9 @@ def lifecycle_transition(
 def xarm_lifecycle_plans() -> list[dict[str, Any]]:
     """The xArm arm catalog after R7 package 5: the operator's Recover clears
     the vendor error, then the warning, through the unmodified driver's
-    `clean_error`/`clean_warn` (`xarm.clear_*`). The vendor plugin's own
-    activation does the rest of the ready sequence (R7 D1)."""
+    `clean_error`/`clean_warn` (`device.clear_error`, `xarm.clear_warning`).
+    The vendor plugin's own activation does the rest of the ready sequence
+    (R7 D1)."""
     boolean = lifecycle_boolean
     recovered = lifecycle_predicate(
         ["disabled"],
@@ -1050,10 +1256,10 @@ def xarm_lifecycle_plans() -> list[dict[str, Any]]:
                 ["disabled", "faulted"], {}
             ),
             "requested_postcondition": recovered,
-            "timeout_duration_ns": 30_000_000_000,
+            "timeout_duration_ns": DEFAULT_LIFECYCLE_BUDGET_NS,
             "transitions": [
                 lifecycle_transition(
-                    "xarm.clear_error",
+                    "device.clear_error",
                     lifecycle_predicate(
                         ["disabled", "faulted"],
                         {"device.error_present": boolean(True)},
@@ -1241,7 +1447,7 @@ def lite6_gripper_lifecycle_predicate(
 
 
 def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
-    timeout_ns = 30_000_000_000
+    timeout_ns = DEFAULT_LIFECYCLE_BUDGET_NS
     prepare_eligible = lite6_gripper_lifecycle_predicate("declared", False, False)
     prepare_eligible["allowed_states"].append("disabled")
     prepared = lite6_gripper_lifecycle_predicate("prepared", False, False)
@@ -1371,7 +1577,7 @@ def ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
         ["disabled"],
         {ready: boolean(False), fault: boolean(False), transport: boolean(True)},
     )
-    timeout_ns = 30_000_000_000
+    timeout_ns = DEFAULT_LIFECYCLE_BUDGET_NS
     return [
         {
             "intent": "prepare",
@@ -1474,7 +1680,7 @@ def xarm_ros2_control_gripper_lifecycle_plans() -> list[dict[str, Any]]:
             "requested_state": "disabled",
             "recover_target_eligibility": healthy,
             "requested_postcondition": healthy,
-            "timeout_duration_ns": 30_000_000_000,
+            "timeout_duration_ns": DEFAULT_LIFECYCLE_BUDGET_NS,
             "transitions": [],
         },
     ]
@@ -1482,336 +1688,12 @@ def xarm_ros2_control_gripper_lifecycle_plans() -> list[dict[str, Any]]:
 
 def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
     """Real xArm-family arm on stock ros2_control plus the driver's
-    `clean_error`/`clean_warn` (R7 package 4; mirrors
-    `manyforge_xarm_control::make_xarm_ros2_control_lifecycle_plans`).
-
-    Prepare clears a vendor error left on the unarmed robot (m5.5), arms
-    through the hardware activation (D1), absorbs the plugin's
-    reactivate-all, switches the joint state broadcaster back on when that
-    reactivation left it off, and marks the arm prepared; Enable activates the trajectory
-    controller; Disable switches off the controller, then the hardware (D4
-    option B); Recover switches both off and clears the vendor error, then the
-    warning (D10)."""
-    boolean = lifecycle_boolean
-    ready_for_commands = "device.accepts_commands"
-    error = "device.error_present"
-    warning = "device.warning_present"
-    broadcaster = "external.broadcaster_active"
-    controller_active = "external.controller_active"
-    ready = "external.controller_configuration_ready"
-    loaded = "external.controller_loaded"
-    spawned = "external.controller_spawned"
-    fault = "external.fault_present"
-    hardware = "external.hardware_active"
-    measured = "external.measured_joints_valid"
-    transport = "external.transport_ready"
-    unarmed = ["declared", "disabled"]
-    any_state = ["declared", "prepared", "active", "degraded", "faulted", "disabled"]
-    prepared = lifecycle_predicate(
-        ["prepared"],
-        {
-            ready_for_commands: boolean(True),
-            broadcaster: boolean(True),
-            controller_active: boolean(False),
-            loaded: boolean(True),
-            fault: boolean(False),
-            hardware: boolean(True),
-            measured: boolean(True),
-            transport: boolean(True),
-        },
-    )
-    armed = lifecycle_predicate(
-        unarmed,
-        {
-            ready_for_commands: boolean(True),
-            fault: boolean(False),
-            hardware: boolean(True),
-            transport: boolean(True),
-        },
-    )
-    active = lifecycle_predicate(
-        ["active"],
-        {
-            ready_for_commands: boolean(True),
-            ready: boolean(True),
-            loaded: boolean(True),
-            fault: boolean(False),
-            transport: boolean(True),
-        },
-    )
-    disabled = lifecycle_predicate(
-        ["disabled"],
-        {
-            ready: boolean(False),
-            controller_active: boolean(False),
-            fault: boolean(False),
-            hardware: boolean(False),
-            transport: boolean(True),
-        },
-    )
-    recovered = lifecycle_predicate(
-        unarmed,
-        {
-            error: boolean(False),
-            warning: boolean(False),
-            controller_active: boolean(False),
-            fault: boolean(False),
-            hardware: boolean(False),
-            transport: boolean(True),
-        },
-    )
-    # m5.5: every Real xArm arm lifecycle step is bounded at 10 s.
-    timeout_ns = 10_000_000_000
-    return [
-        {
-            "intent": "prepare",
-            "requested_state": "prepared",
-            "requested_postcondition": prepared,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                # m5.5: clear a vendor error left on the unarmed robot first.
-                lifecycle_transition(
-                    "xarm.clear_error",
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            error: boolean(True),
-                            controller_active: boolean(False),
-                            fault: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            error: boolean(False),
-                            controller_active: boolean(False),
-                            fault: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-                lifecycle_transition(
-                    "ros2_control.hardware.activate",
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            error: boolean(False),
-                            spawned: boolean(True),
-                            fault: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                    armed,
-                ),
-                lifecycle_transition(
-                    "ros2_control.controller.deactivate",
-                    lifecycle_predicate(
-                        ["declared", "prepared", "disabled"],
-                        {
-                            controller_active: boolean(True),
-                            fault: boolean(False),
-                            hardware: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        ["disabled"],
-                        {
-                            controller_active: boolean(False),
-                            fault: boolean(False),
-                            hardware: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-                lifecycle_transition(
-                    "ros2_control.broadcaster.activate",
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            broadcaster: boolean(False),
-                            controller_active: boolean(False),
-                            fault: boolean(False),
-                            hardware: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            broadcaster: boolean(True),
-                            fault: boolean(False),
-                            hardware: boolean(True),
-                            measured: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-                lifecycle_transition(
-                    "ros2_control.controller.prepare",
-                    lifecycle_predicate(
-                        unarmed,
-                        {
-                            ready_for_commands: boolean(True),
-                            broadcaster: boolean(True),
-                            controller_active: boolean(False),
-                            loaded: boolean(True),
-                            fault: boolean(False),
-                            hardware: boolean(True),
-                            measured: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    prepared,
-                ),
-            ],
-        },
-        {
-            "intent": "enable",
-            "requested_state": "active",
-            "requested_postcondition": active,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "ros2_control.controller.activate",
-                    lifecycle_predicate(
-                        ["prepared"],
-                        {
-                            ready_for_commands: boolean(True),
-                            broadcaster: boolean(True),
-                            ready: boolean(False),
-                            controller_active: boolean(False),
-                            loaded: boolean(True),
-                            fault: boolean(False),
-                            measured: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    active,
-                )
-            ],
-        },
-        {
-            "intent": "disable",
-            "requested_state": "disabled",
-            "requested_postcondition": disabled,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "ros2_control.controller.deactivate",
-                    lifecycle_predicate(
-                        ["prepared", "active", "degraded"],
-                        {controller_active: boolean(True), transport: boolean(True)},
-                    ),
-                    lifecycle_predicate(
-                        ["disabled"],
-                        {controller_active: boolean(False), transport: boolean(True)},
-                    ),
-                ),
-                lifecycle_transition(
-                    "ros2_control.hardware.deactivate",
-                    lifecycle_predicate(
-                        ["declared", "prepared", "degraded", "disabled"],
-                        {
-                            controller_active: boolean(False),
-                            hardware: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    disabled,
-                ),
-            ],
-        },
-        {
-            "intent": "recover",
-            "requested_state": "disabled",
-            "recover_target_eligibility": lifecycle_predicate(
-                ["degraded", "faulted"], {transport: boolean(True)}
-            ),
-            "requested_postcondition": recovered,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "ros2_control.controller.deactivate",
-                    lifecycle_predicate(
-                        any_state,
-                        {controller_active: boolean(True), transport: boolean(True)},
-                    ),
-                    lifecycle_predicate(
-                        any_state,
-                        {controller_active: boolean(False), transport: boolean(True)},
-                    ),
-                ),
-                lifecycle_transition(
-                    "ros2_control.hardware.deactivate",
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            controller_active: boolean(False),
-                            hardware: boolean(True),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            controller_active: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-                lifecycle_transition(
-                    "xarm.clear_error",
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            error: boolean(True),
-                            controller_active: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            error: boolean(False),
-                            controller_active: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-                lifecycle_transition(
-                    "xarm.clear_warning",
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            error: boolean(False),
-                            warning: boolean(True),
-                            controller_active: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                    lifecycle_predicate(
-                        any_state,
-                        {
-                            error: boolean(False),
-                            warning: boolean(False),
-                            controller_active: boolean(False),
-                            hardware: boolean(False),
-                            transport: boolean(True),
-                        },
-                    ),
-                ),
-            ],
-        },
-    ]
+    `clean_error`/`clean_warn` (R7 package 4). V-A (A7): the plans are xArm
+    data (`XARM_ROS2_CONTROL_LIFECYCLE_PLANS`, mirroring
+    `manyforge_xarm_control::make_xarm_ros2_control_lifecycle_plans`)."""
+    return read_yaml(
+        XARM_ROS2_CONTROL_LIFECYCLE_PLANS, "the xArm Real arm lifecycle plans"
+    )["plans"]
 
 
 def ros2_control_provider_manifest(
@@ -2427,18 +2309,23 @@ def catalog_sources(
     component_references: dict[str, dict[str, str]] = {}
     # Every family with a ROS controller profile (Isaac or offline mock, also
     # those only composed by generated multi-robot cells) has the fixed-scale
-    # ROS component type.
+    # ROS component type. Merge 6: every family has one, including the
+    # combined arm+gripper families kept as test fixtures (D2) that no
+    # profile selects any more.
     fixed_scale_families = {
-        profile["model_family_id"]
-        for profile in description["runtime_restoration_profiles"]
-        if "ros2_control_runtime" in profile
+        family["model_family_id"] for family in description["model_families"]
     }
-    # CP8 step 1: a family with a Real controller profile also has the
-    # fixed-scale arm-only type a Real component selects (no gripper target).
+    # CP8 step 1: a combined family (arm and fingers) with a Real controller
+    # profile also has the fixed-scale arm-only type a Real component selects
+    # (no gripper target). A split arm has no fingers and needs none.
     arm_only_families = {
         profile["model_family_id"]
         for profile in description["runtime_restoration_profiles"]
         if "real_profile" in profile.get("ros2_control_runtime", {})
+    } & {
+        family["model_family_id"]
+        for family in description["model_families"]
+        if source_joint_names(family, "fingers")
     }
     for family in description["model_families"]:
         document = component_type_document(family)
@@ -2638,31 +2525,42 @@ def gripper_stop_policy_key(
     raise GenerationError("maintained gripper has an unsupported actuation kind")
 
 
+def is_tool_family(family: dict[str, Any]) -> bool:
+    """Merge 6: a tool model has fingers and no arm joints."""
+    return not source_joint_names(family, "arm_joints")
+
+
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
     runtime_restoration_profile: dict[str, Any],
     refs: dict[str, dict[str, str]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """One component's graph rows. A tool family yields only its `gripper`
+    target, no root pose and no cell-wide provider bindings (its robot's)."""
     occurrence = deployment["component_occurrence_id"]
     family_id = family["model_family_id"]
+    tool = is_tool_family(family)
     ros2_control = "ros2_control_runtime" in runtime_restoration_profile
     runtime_configuration = copy.deepcopy(runtime_restoration_profile[
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ])
+    # D4: a pneumatic tool profile selects no controller lane.
+    lane_free = False
     if ros2_control:
         # The source cap is explicit demo policy; bind it to this occurrence.
-        for limit in runtime_configuration["motion_target_limits"]:
+        for limit in runtime_configuration.get("motion_target_limits", []):
             limit["controllable_component_id"] = occurrence
         # Q37: the authored fault Stop profile is read directly, as main.
-        runtime_configuration["default_fault_stop_profiles"] = [
-            fault_stop_profile_row(
-                occurrence,
-                runtime_restoration_profile["stop_profiles"][
-                    "default_fault_stop_profile"
-                ],
-            )
-        ]
+        if not tool:
+            runtime_configuration["default_fault_stop_profiles"] = [
+                fault_stop_profile_row(
+                    occurrence,
+                    runtime_restoration_profile["stop_profiles"][
+                        "default_fault_stop_profile"
+                    ],
+                )
+            ]
         # Q68: the runtime unit carries each component's own controller
         # profile (Isaac or offline mock), as the activation compiler emits.
         selectors = [
@@ -2670,7 +2568,8 @@ def graph_and_applicability(
             for name in ("isaac_profile", "mock_profile")
             if name in runtime_configuration
         ]
-        if len(selectors) != 1:
+        lane_free = tool and not selectors
+        if len(selectors) != 1 and not lane_free:
             raise GenerationError(
                 "maintained ROS profile must select exactly one controller profile"
             )
@@ -2678,8 +2577,9 @@ def graph_and_applicability(
             {
                 "controllable_component_id": occurrence,
                 "frame_prefix": "",
-                selectors[0]: runtime_configuration.pop(selectors[0]),
+                selector: runtime_configuration.pop(selector),
             }
+            for selector in selectors
         ]
         for row in (
             *runtime_configuration.get("gripper_target_configurations", []),
@@ -2716,7 +2616,9 @@ def graph_and_applicability(
         for index, _ in enumerate(source_joint_names(family, "arm_joints"))
     ]
     finger_joints = source_joint_names(family, "fingers")
-    targets = ("arm", "gripper") if finger_joints else ("arm",)
+    targets = (
+        ("gripper",) if tool else ("arm", "gripper") if finger_joints else ("arm",)
+    )
     gripper_stop_ref = (
         refs[gripper_stop_policy_key(family, runtime_restoration_profile)]
         if finger_joints
@@ -2776,7 +2678,9 @@ def graph_and_applicability(
                 "provider_manifest_id": target_control_ref["record_id"],
                 "provider_manifest_revision": target_control_ref["record_revision"],
                 "state_authority_id": (
-                    f"{occurrence}.{target}.commanded_sim_state"
+                    f"{occurrence}.{target}.commanded_state"
+                    if lane_free
+                    else f"{occurrence}.{target}.commanded_sim_state"
                     if ros2_control
                     else f"{occurrence}.{target}.predicted_state"
                 ),
@@ -2807,6 +2711,32 @@ def graph_and_applicability(
             bindings.append(binding)
     bindings.sort(key=lambda row: row["control_binding_id"])
 
+    component: dict[str, Any] = {
+        "controllable_component_id": occurrence,
+        "component_type_id": component_ref["record_id"],
+        "component_type_revision": component_ref["record_revision"],
+        "model_role_bindings": [
+            {
+                "model_role_id": "tool_model" if tool else "arm_model",
+                "model_instance_id": model_instance_id,
+            }
+        ],
+        "runtime_unit_ids": [runtime_unit_id],
+    }
+    tcp = default_tcp(component_type_document(family, runtime_scaling=not ros2_control))
+    if tcp is not None:
+        component["default_tcp"] = tcp
+    # A mounted tool is placed by its attachment, never by a root pose.
+    if not tool:
+        component["root_pose_in_cell"] = copy.deepcopy(
+            deployment.get(
+                "root_pose_in_cell",
+                {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+            )
+        )
     graph = {
         "runtime_units": [
             {
@@ -2824,29 +2754,7 @@ def graph_and_applicability(
                 "model_revision": model_ref["record_revision"],
             }
         ],
-        "controllable_components": [
-            {
-                "controllable_component_id": occurrence,
-                "component_type_id": component_ref["record_id"],
-                "component_type_revision": component_ref["record_revision"],
-                "model_role_bindings": [
-                    {
-                        "model_role_id": "arm_model",
-                        "model_instance_id": model_instance_id,
-                    }
-                ],
-                "runtime_unit_ids": [runtime_unit_id],
-                "root_pose_in_cell": copy.deepcopy(
-                    deployment.get(
-                        "root_pose_in_cell",
-                        {
-                            "position_m": [0.0, 0.0, 0.0],
-                            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-                        },
-                    )
-                ),
-            }
-        ],
+        "controllable_components": [component],
         "control_domains": [
             {
                 "control_domain_id": domain_id(occurrence, target),
@@ -2941,7 +2849,7 @@ def graph_and_applicability(
                     ],
                 }
             )
-    for capability_id in CELL_CAPABILITIES:
+    for capability_id in () if tool else CELL_CAPABILITIES:
         provider_bindings.append(
             {
                 "capability_provider_binding_id": (
@@ -3290,6 +3198,86 @@ def assistant_projection(
     )
 
 
+# Graph collections and their row ids (canonical sort order).
+GRAPH_ID_FIELDS: Final = {
+    "runtime_units": "runtime_unit_id",
+    "model_instances": "model_instance_id",
+    "controllable_components": "controllable_component_id",
+    "control_domains": "control_domain_id",
+    "control_bindings": "control_binding_id",
+    "component_attachments": "component_attachment_id",
+}
+# Runtime-unit rows each component contributes (Q63-Q68 per-component rows).
+COMPONENT_RUNTIME_ROWS: Final = (
+    "motion_target_limits",
+    "default_fault_stop_profiles",
+    "gripper_target_configurations",
+    "controller_profiles",
+    "component_streams",
+)
+
+
+def runtime_row_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        row["controllable_component_id"],
+        row.get("command_target_id", ""),
+        row.get("source_joint_name", ""),
+        row.get("stream_id", ""),
+    )
+
+
+def mount_tool(
+    graph: dict[str, Any],
+    desired: list[dict[str, Any]],
+    provider_bindings: list[dict[str, Any]],
+    robot_occurrence: str,
+    tool: tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]],
+) -> None:
+    """Merge 6: add a tool's rows and its flange->mount attachment.
+
+    Both share the robot's one runtime unit; cell-wide runtime fields stay the
+    robot's, the tool adds only its own per-component rows.
+    """
+    tool_graph, tool_desired, tool_providers = tool
+    (unit,) = graph["runtime_units"]
+    (tool_unit,) = tool_graph["runtime_units"]
+    if tool_unit["runtime_unit_id"] != unit["runtime_unit_id"]:
+        raise GenerationError("a mounted tool must share its robot's runtime unit")
+    configuration = unit["configuration"]
+    for field in COMPONENT_RUNTIME_ROWS:
+        rows = configuration.get(field, []) + tool_unit["configuration"].get(field, [])
+        if rows:
+            configuration[field] = sorted(rows, key=runtime_row_key)
+    (tool_component,) = tool_graph["controllable_components"]
+    for collection in GRAPH_ID_FIELDS:
+        if collection != "runtime_units":
+            graph[collection].extend(copy.deepcopy(tool_graph[collection]))
+    graph["component_attachments"].append(
+        {
+            "component_attachment_id": tool_component["controllable_component_id"],
+            "component_attachment_revision": ZERO_DIGEST,
+            "parent": {
+                "controllable_component_id": robot_occurrence,
+                "attachment_interface_id": "flange",
+            },
+            "child": {
+                "controllable_component_id": tool_component["controllable_component_id"],
+                "attachment_interface_id": "mount",
+            },
+            "child_interface_pose_in_parent_interface": {
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    )
+    for collection, id_field in GRAPH_ID_FIELDS.items():
+        graph[collection].sort(key=lambda row: row[id_field])
+    desired.extend(tool_desired)
+    desired.sort(key=lambda row: row["control_domain_id"])
+    provider_bindings.extend(tool_providers)
+    provider_bindings.sort(key=lambda row: row["capability_provider_binding_id"])
+
+
 def deployment_candidate(
     deployment: dict[str, Any],
     family: dict[str, Any],
@@ -3299,7 +3287,9 @@ def deployment_candidate(
     refs: dict[str, dict[str, str]],
     overlay_ref: dict[str, str],
     catalog_source_rows: dict[str, tuple[Path, bytes, dict[str, str]]],
+    tool_family: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """One maintained occurrence; with ``tool_family`` its mounted tool too."""
     runtime_restoration_profile = runtime_profiles_by_id[
         deployment["runtime_restoration_profile_id"]
     ]
@@ -3313,6 +3303,30 @@ def deployment_candidate(
     )
     family_id = family["model_family_id"]
     has_gripper = bool(source_joint_names(family, "fingers"))
+    # The gripper (and its Stop policy) comes from the robot's own combined
+    # model, or from its mounted tool.
+    gripper_family, gripper_profile = family, runtime_restoration_profile
+    tool = deployment.get("tool")
+    if (tool is None) != (tool_family is None):
+        raise GenerationError("a maintained tool needs exactly its model family")
+    if tool is not None:
+        if has_gripper or not is_tool_family(tool_family):
+            raise GenerationError("a mounted tool needs an arm-only robot and a tool model")
+        gripper_family = tool_family
+        gripper_profile = runtime_profiles_by_id[tool["runtime_restoration_profile_id"]]
+        mount_tool(
+            graph,
+            desired,
+            provider_bindings,
+            deployment["component_occurrence_id"],
+            graph_and_applicability(
+                {**deployment, "component_occurrence_id": tool["component_occurrence_id"]},
+                tool_family,
+                gripper_profile,
+                refs,
+            ),
+        )
+        has_gripper = True
     catalog_keys = {
         *(
             f"capability:{capability_id}"
@@ -3337,6 +3351,14 @@ def deployment_candidate(
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}",
         f"contract:{key_prefix}arm",
         f"model:{family_id}",
+        *(
+            (
+                f"component:fixed_scale:{tool_family['model_family_id']}",
+                f"model:{tool_family['model_family_id']}",
+            )
+            if tool_family is not None
+            else ()
+        ),
         "provider:logical_scene",
         ("provider:ros2_control" if ros2_control else "provider:control"),
         *([] if ros2_control else ["provider:planning"]),
@@ -3346,7 +3368,7 @@ def deployment_candidate(
         *(
             (
                 f"contract:{key_prefix}gripper",
-                gripper_stop_policy_key(family, runtime_restoration_profile),
+                gripper_stop_policy_key(gripper_family, gripper_profile),
                 f"topology:{key_prefix}gripper",
             )
             if has_gripper
@@ -3535,21 +3557,10 @@ def _project_reference(
     return {"project_path": os.path.relpath(target, project_root).replace(os.sep, "/")}
 
 
-def _deployment_intent(
-    *,
-    root: Path,
-    project_root: Path,
-    deployment: dict[str, Any],
-    family: dict[str, Any],
-    runtime_profile: dict[str, Any],
+def _model_source(
+    *, root: Path, project_root: Path, family: dict[str, Any]
 ) -> dict[str, Any]:
-    """Project the maintained source description into editable intent.
-
-    The generated Deployment graph remains an offline qualification product.
-    Scenario projects retain only source references and the settings a user can
-    meaningfully author; preparation derives graph/provider/binding identities.
-    """
-
+    """A model family's URDF/SRDF and package root, relative to the project."""
     source = family["source"]
     accepted_prefix = source["accepted_package_uri_prefix"]
     if not accepted_prefix.startswith("package://"):
@@ -3581,6 +3592,41 @@ def _deployment_intent(
         raise GenerationError(
             f"maintained package root is unavailable: {package_root}"
         )
+    model_source: dict[str, Any] = {
+        "urdf": _project_reference(root, project_root, source["urdf_path"]),
+        "package_roots": {
+            package_name: {
+                "project_path": os.path.relpath(package_root, project_root).replace(
+                    os.sep, "/"
+                )
+            }
+        },
+    }
+    if source.get("srdf_path"):
+        model_source["srdf"] = _project_reference(
+            root, project_root, source["srdf_path"]
+        )
+    return model_source
+
+
+def _deployment_intent(
+    *,
+    root: Path,
+    project_root: Path,
+    deployment: dict[str, Any],
+    family: dict[str, Any],
+    runtime_profile: dict[str, Any],
+    tool_family: dict[str, Any] | None = None,
+    tool_runtime_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Project the maintained source description into editable intent.
+
+    The generated Deployment graph remains an offline qualification product.
+    Scenario projects retain only source references and the settings a user can
+    meaningfully author; preparation derives graph/provider/binding identities.
+    A maintained ``tool`` becomes its own component, mounted on the robot's
+    ``flange`` by an ``attachments`` row (merge 6).
+    """
 
     runtime_kind = (
         "ros2_control" if "ros2_control_runtime" in runtime_profile else "native"
@@ -3629,20 +3675,7 @@ def _deployment_intent(
         ],
     }
 
-    model_source: dict[str, Any] = {
-        "urdf": _project_reference(root, project_root, source["urdf_path"]),
-        "package_roots": {
-            package_name: {
-                "project_path": os.path.relpath(package_root, project_root).replace(
-                    os.sep, "/"
-                )
-            }
-        },
-    }
-    if source.get("srdf_path"):
-        model_source["srdf"] = _project_reference(
-            root, project_root, source["srdf_path"]
-        )
+    model_source = _model_source(root=root, project_root=project_root, family=family)
 
     root_pose = deployment.get("root_pose_in_cell")
     if root_pose is None:
@@ -3688,6 +3721,46 @@ def _deployment_intent(
         "assistant_profile_id": deployment["assistant_profile_id"],
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
+    tool = deployment.get("tool")
+    if (tool is None) != (tool_family is None) or (tool is None) != (
+        tool_runtime_profile is None
+    ):
+        raise GenerationError("a maintained tool needs its model family and profile")
+    if tool is not None:
+        # The tool carries its own gripper row and streams; it has no root
+        # pose, no motion limits and no fault Stop profile of its own.
+        tool_id = tool["component_occurrence_id"]
+        tool_configuration = copy.deepcopy(tool_runtime_profile["ros2_control_runtime"])
+        for row in (
+            *tool_configuration.get("gripper_target_configurations", []),
+            *tool_configuration.get("component_streams", []),
+        ):
+            row["controllable_component_id"] = tool_id
+        result["components"].append(
+            {
+                "component_id": tool_id,
+                "frame_prefix": "",
+                "component_profile_id": tool["runtime_restoration_profile_id"],
+                "model_source": _model_source(
+                    root=root, project_root=project_root, family=tool_family
+                ),
+                "target_settings": {},
+                "configuration": {
+                    "runtime_kind": "ros2_control",
+                    "runtime_configuration": tool_configuration,
+                },
+            }
+        )
+        result["components"].sort(key=lambda row: row["component_id"])
+        result["attachments"] = [
+            {
+                "parent": {
+                    "component_id": deployment["component_occurrence_id"],
+                    "interface": "flange",
+                },
+                "child": {"component_id": tool_id, "interface": "mount"},
+            }
+        ]
     pose_source = deployment.get("pose_source")
     if pose_source is not None:
         # Model-free pose-source component (Isaac object observer).
@@ -3874,6 +3947,7 @@ def scenario_documents(
                 root / assignment["program_source"], "maintained Program"
             )
             project_root = root / "examples" / f"{assignment['scenario_id']}.scenario"
+            tool = deployment.get("tool")
             intent = _deployment_intent(
                 root=root,
                 project_root=project_root,
@@ -3882,6 +3956,12 @@ def scenario_documents(
                 runtime_profile=runtime_profiles[
                     deployment["runtime_restoration_profile_id"]
                 ],
+                tool_family=None if tool is None else families[tool["model_family_id"]],
+                tool_runtime_profile=(
+                    None
+                    if tool is None
+                    else runtime_profiles[tool["runtime_restoration_profile_id"]]
+                ),
             )
             outputs.extend(
                 _scenario_project_outputs(
@@ -3903,9 +3983,15 @@ def historical_capability_closure() -> dict[str, Any]:
     active_ids = sorted(
         set(ARM_CAPABILITIES + GRIPPER_CAPABILITIES + CELL_CAPABILITIES)
     )
-    if len(active_ids) != 34:
+    missing = [
+        capability_id
+        for capability_id in active_ids
+        if capability_id not in CAPABILITIES
+    ]
+    if missing:
         raise GenerationError(
-            "historical capability closure must contain exactly 34 active IDs"
+            "historical capability closure has no definition for: "
+            + ", ".join(missing)
         )
     rows: list[dict[str, Any]] = []
     for capability_id in active_ids:
@@ -4008,6 +4094,7 @@ def generate(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix="manyforge-n6-deployments-") as temporary:
         temporary_root = Path(temporary)
         for deployment in description["deployments"]:
+            tool = deployment.get("tool")
             candidate = deployment_candidate(
                 deployment,
                 family_by_id[deployment["model_family_id"]],
@@ -4017,6 +4104,9 @@ def generate(args: argparse.Namespace) -> None:
                 refs,
                 overlay_ref,
                 source_rows,
+                tool_family=(
+                    None if tool is None else family_by_id[tool["model_family_id"]]
+                ),
             )
             expected = sealed_deployment_bytes(
                 args.revision_tool.resolve(), candidate, temporary_root
@@ -4050,6 +4140,9 @@ def generate(args: argparse.Namespace) -> None:
         # R7 D12 (2026-10-25): renamed to xarm_arm_provider/xarm_gripper_provider.
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_arm_provider.json",
         "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_gripper_provider.json",
+        # Merge 6: the Real Lite 6 profile now selects the split `lite6` arm,
+        # which needs no arm-only variant.
+        "manyforge_deployment/resources/maintained/catalog/component_type/lite6_lite_gripper.fixed_scale.arm_only.component.json",
     ):
         require_obsolete_output_absent(root / relative, update=args.update)
     for deployment in description["deployments"]:

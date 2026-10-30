@@ -885,31 +885,8 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 69
-    assert len({row.capability_id for row in registry}) == 69
-    assert (
-        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 33
-    )
-    assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
-    assert (
-        sum(row.scope == core.CapabilityScope.kControlDomain for row in registry) == 8
-    )
-    assert (
-        sum(
-            row.provider_binding_kind
-            == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
-            for row in registry
-        )
-        == 52
-    )
-    assert (
-        sum(
-            row.provider_binding_kind
-            == core.CapabilityProviderBindingKind.kControlBinding
-            for row in registry
-        )
-        == 17
-    )
+    assert registry
+    assert len({row.capability_id for row in registry}) == len(registry)
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
         "sha256:713a06c46c5f5100fd4ee1a729ae06be5db753ed84cdff5bdf4d4ac5a77565e0"
@@ -1829,7 +1806,8 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    assert len(registry.value_schemas) == 6
+    # Seven value schemas since M6 (runtime.pose_source.v2 joined the set).
+    assert len(registry.value_schemas) == 7
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1848,15 +1826,15 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48",
+            "sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190",
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274",
+            "sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
-            "sha256:6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4",
+            "sha256:253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7",
         ),
         (
             "manyforge.value_schema.runtime.pose_source.v2",

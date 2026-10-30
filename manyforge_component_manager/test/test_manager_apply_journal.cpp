@@ -38,6 +38,12 @@
 #include "runtime_only_retention_fixture.hpp"
 
 namespace manyforge::component_manager {
+
+// Defined by the journal implementation; deliberately omitted from the public API.
+core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnlyForTesting(
+    const std::filesystem::path &, const core::CellId &,
+    const core::NamedApplyPublicationTransactionDTO &, std::uint64_t *);
+
 namespace {
 
 using core::ActiveBundlePublicationGeneration;
@@ -577,10 +583,7 @@ BringUpChildStatus(const ManagerApplyBringUpIntentWriteResult &parent,
         requested,
         accepted ? core::ComponentLifecycleDomainActionStateDTO::kReserved
                  : core::ComponentLifecycleDomainActionStateDTO::kSucceeded,
-        accepted ? core::ComponentLifecycleDomainEffectDTO::kNone
-                 : core::ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
         {},
-        std::nullopt,
         std::nullopt}},
       false,
       terminal ? std::optional<core::ComponentLifecycleTerminalResultDTO>(
@@ -905,7 +908,9 @@ NativeParentReadFixture WriteNativeParent(
     const ManagerApplyPhase phase = ManagerApplyPhase::kRuntimeConverged,
     const bool materialized = false,
     const deployment::RetainedBundle *predecessor = nullptr,
-    const bool linked = false, const bool holding = false) {
+    const bool linked = false, const bool holding = false,
+    // A known `failed` terminal with this cause code instead of unknown_effect.
+    const std::optional<std::string> &known_cause_code = std::nullopt) {
   const auto &original = predecessor == nullptr ? candidate : *predecessor;
   auto intent = authoring ? ParentClaimIntent() : Intent();
   intent.cell_id = candidate.value().cell_graph.cell_id;
@@ -1098,10 +1103,7 @@ NativeParentReadFixture WriteNativeParent(
              installed
                  ? core::ComponentLifecycleDomainActionStateDTO::kSucceeded
                  : core::ComponentLifecycleDomainActionStateDTO::kReserved,
-             installed ? core::ComponentLifecycleDomainEffectDTO::kKnownNoEffect
-                       : core::ComponentLifecycleDomainEffectDTO::kNone,
              {},
-             std::nullopt,
              std::nullopt});
       }
       if (!proof.result.locally_valid())
@@ -1122,11 +1124,17 @@ NativeParentReadFixture WriteNativeParent(
     static_cast<void>(journal.EnsureTerminalOutcome(
         {intent.apply_id, intent.apply_generation, std::nullopt, std::nullopt,
          std::nullopt, std::nullopt,
-         ManagerApplyTerminalOutcomeState::kUnknownEffect,
+         known_cause_code ? ManagerApplyTerminalOutcomeState::kFailed
+                          : ManagerApplyTerminalOutcomeState::kUnknownEffect,
          ManagerApplyFailureEvidenceDTO{
              persisted.intent_digest, phase, failure_code,
              "original retained preparation exception",
-             ManagerApplyEffectDisposition::kUnknown}}));
+             known_cause_code ? ManagerApplyEffectDisposition::kKnown
+                              : ManagerApplyEffectDisposition::kUnknown,
+             known_cause_code.value_or("typed_cause_code"),
+             {},
+             "component_manager",
+             ManagerApplyEffectBoundary::kUnknown}}));
   core::NativeApplyPlanDTO plan{{intent.apply_id, intent.apply_generation},
                                 candidate.retained_bundle_id(),
                                 intent.candidate_graph_revision,
@@ -1441,6 +1449,10 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
       "runtime_initialization_failed",
       "replacement initialization failed after teardown",
       ManagerApplyEffectDisposition::kKnown,
+      "typed_cause_code",
+      {},
+      "component_manager",
+      ManagerApplyEffectBoundary::kUnknown,
   };
   EXPECT_TRUE(failure.valid());
 
@@ -1555,6 +1567,98 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
       "unknown_effect");
 }
 
+TEST(ManagerApplyJournal, RetainsTheTypedCauseOfATerminalFailure) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "terminal-typed-cause.sqlite3";
+  std::optional<ManagerApplyTerminalOutcomeDTO> expected;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    // The phase code names the failed Apply step; the cause keeps the Kernel's
+    // own code, details (separator bytes included) and producer.
+    const ManagerApplyTerminalOutcomeDTO outcome{
+        ApplyId("apply-1"),
+        ApplyGeneration(1U),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        ManagerApplyTerminalOutcomeState::kFailed,
+        ManagerApplyFailureEvidenceDTO{
+            intent.intent_digest,
+            ManagerApplyPhase::kAccepted,
+            "apply_admission_failed",
+            "Kernel rejected Manager Apply admission: stale_generation: moved",
+            ManagerApplyEffectDisposition::kKnown,
+            "stale_generation",
+            {{"reason", "expected_generation_stale"},
+             {"odd=key:", "value\nwith=separators:9"}},
+            "kernel",
+            ManagerApplyEffectBoundary::kBeforeEffect},
+    };
+    EXPECT_TRUE(journal.EnsureTerminalOutcome(outcome).inserted);
+    expected = outcome;
+    auto other_cause = outcome;
+    other_cause.failure->cause_details.erase("reason");
+    EXPECT_THROW(static_cast<void>(journal.EnsureTerminalOutcome(other_cause)),
+                 ManagerApplyJournalConflictError);
+  }
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto stored =
+      reopened.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(stored.has_value() && expected.has_value());
+  EXPECT_EQ(stored->terminal_outcome, *expected);
+  EXPECT_EQ(stored->terminal_outcome.failure->cause_code, "stale_generation");
+  EXPECT_EQ(stored->terminal_outcome.failure->producer, "kernel");
+  EXPECT_EQ(stored->terminal_outcome.failure->effect_boundary,
+            ManagerApplyEffectBoundary::kBeforeEffect);
+  EXPECT_EQ(stored->terminal_outcome.failure->cause_details.at("odd=key:"),
+            "value\nwith=separators:9");
+}
+
+TEST(ManagerApplyTerminalOutcome, TypedCauseIsBounded) {
+  const auto valid = ManagerApplyFailureEvidenceDTO{
+      ContentDigest(std::string(kDigestThree)),
+      ManagerApplyPhase::kAccepted,
+      "apply_admission_failed",
+      "refused",
+      ManagerApplyEffectDisposition::kKnown,
+      "stale_generation",
+      {{"reason", "expected_generation_stale"}},
+      "kernel",
+      ManagerApplyEffectBoundary::kUnknown,
+  };
+  EXPECT_TRUE(valid.valid());
+  auto invalid = valid;
+  invalid.cause_code.clear();
+  EXPECT_FALSE(invalid.valid());
+  invalid = valid;
+  invalid.producer.clear();
+  EXPECT_FALSE(invalid.valid());
+  invalid = valid;
+  invalid.producer = std::string(kMaximumManagerApplyFailureProducerBytes + 1U, 'p');
+  EXPECT_FALSE(invalid.valid());
+  invalid = valid;
+  invalid.cause_details.emplace("", "empty key");
+  EXPECT_FALSE(invalid.valid());
+  invalid = valid;
+  invalid.cause_details["long"] =
+      std::string(kMaximumManagerApplyFailureCauseDetailValueBytes + 1U, 'v');
+  EXPECT_FALSE(invalid.valid());
+  invalid = valid;
+  for (std::size_t index = 0; index < kMaximumManagerApplyFailureCauseDetails; ++index)
+    invalid.cause_details["key" + std::to_string(index)] = "value";
+  EXPECT_FALSE(invalid.valid());
+  // A failure before any effect is a known one; an unknown effect cannot be.
+  invalid = valid;
+  invalid.effect_boundary = ManagerApplyEffectBoundary::kBeforeEffect;
+  EXPECT_TRUE(invalid.valid());
+  invalid.effect_disposition = ManagerApplyEffectDisposition::kUnknown;
+  EXPECT_FALSE(invalid.valid());
+  EXPECT_STREQ(ToString(ManagerApplyEffectBoundary::kBeforeEffect), "before_effect");
+  EXPECT_STREQ(ToString(ManagerApplyEffectBoundary::kUnknown), "unknown");
+}
+
 TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "terminal-failure.sqlite3";
@@ -1569,6 +1673,10 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
       "runtime_initialization_failed",
       "replacement initialization failed after teardown",
       ManagerApplyEffectDisposition::kUnknown,
+      "typed_cause_code",
+      {},
+      "component_manager",
+      ManagerApplyEffectBoundary::kUnknown,
   };
   const auto retained = journal.EnsureTerminalOutcome({
       ApplyId("apply-1"),
@@ -1670,7 +1778,11 @@ TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) 
                              : ManagerApplyTerminalOutcomeState::kUnknownEffect,
                          ManagerApplyFailureEvidenceDTO{
                              intent.intent_digest, phase, "refused",
-                             "refused by the test", disposition},
+                             "refused by the test", disposition,
+                             "typed_cause_code",
+                             {},
+                             "component_manager",
+                             ManagerApplyEffectBoundary::kUnknown},
                      })
                      .record.terminal_outcome_digest;
     }
@@ -1757,7 +1869,11 @@ TEST(ManagerApplyJournal,
                      : ManagerApplyTerminalOutcomeState::kUnknownEffect,
                  ManagerApplyFailureEvidenceDTO{
                      intent.intent_digest, ManagerApplyPhase::kAccepted,
-                     "refused", "test refusal", disposition}})
+                     "refused", "test refusal", disposition,
+                     "typed_cause_code",
+                     {},
+                     "component_manager",
+                     ManagerApplyEffectBoundary::kUnknown}})
             .record;
     EXPECT_TRUE(ValidateTerminalManagerApplyClaimsReadOnly(
                     path, CellId("cell-1"), claims)
@@ -1865,6 +1981,10 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                        "preflight_refused",
                        "candidate validation failed before any effect",
                        ManagerApplyEffectDisposition::kKnown,
+                       "typed_cause_code",
+                       {},
+                       "component_manager",
+                       ManagerApplyEffectBoundary::kUnknown,
                    },
                }),
                ManagerApplyJournalConflictError);
@@ -1884,6 +2004,10 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                        "preflight_refused",
                        "candidate validation failed before any effect",
                        ManagerApplyEffectDisposition::kKnown,
+                       "typed_cause_code",
+                       {},
+                       "component_manager",
+                       ManagerApplyEffectBoundary::kUnknown,
                    },
                }),
                ManagerApplyJournalConflictError);
@@ -1903,6 +2027,10 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                        "preflight_refused",
                        "candidate validation failed before any effect",
                        ManagerApplyEffectDisposition::kUnknown,
+                       "typed_cause_code",
+                       {},
+                       "component_manager",
+                       ManagerApplyEffectBoundary::kUnknown,
                    },
                }),
                std::invalid_argument);
@@ -1922,6 +2050,10 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                        "",
                        "candidate validation failed before any effect",
                        ManagerApplyEffectDisposition::kKnown,
+                       "typed_cause_code",
+                       {},
+                       "component_manager",
+                       ManagerApplyEffectBoundary::kUnknown,
                    },
                }),
                std::invalid_argument);
@@ -1939,6 +2071,10 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                        std::string(kMaximumManagerApplyFailureCodeBytes + 1U, 'c'),
                        "candidate validation failed before any effect",
                        ManagerApplyEffectDisposition::kKnown,
+                       "typed_cause_code",
+                       {},
+                       "component_manager",
+                       ManagerApplyEffectBoundary::kUnknown,
                    },
                }),
                std::invalid_argument);
@@ -2380,7 +2516,11 @@ TEST(ManagerApplyJournal,
           ManagerApplyPhase::kAccepted,
           "maintenance_preflight_refused",
           "maintenance was refused before any runtime effect",
-          ManagerApplyEffectDisposition::kKnown},
+          ManagerApplyEffectDisposition::kKnown,
+          "typed_cause_code",
+          {},
+          "component_manager",
+          ManagerApplyEffectBoundary::kUnknown},
   }));
   const auto refused_before_effect =
       ValidateManagerAuthoringOwnerReconciliationReadOnly(
@@ -2405,7 +2545,11 @@ TEST(ManagerApplyJournal,
           ManagerApplyPhase::kRuntimeConverged,
           "runtime_initialization_failed",
           "replacement initialization failed after teardown",
-          ManagerApplyEffectDisposition::kKnown},
+          ManagerApplyEffectDisposition::kKnown,
+          "typed_cause_code",
+          {},
+          "component_manager",
+          ManagerApplyEffectBoundary::kUnknown},
   }));
   const auto destructive_failure =
       ValidateManagerAuthoringOwnerReconciliationReadOnly(
@@ -2932,6 +3076,174 @@ TEST(ManagerApplyFenceJournal,
   EXPECT_EQ(report.fence_acceptance_count, 1);
 }
 
+TEST(ManagerApplyJournalReadOnly, ProofLookupsDoNotGrowWithUnrelatedHistory) {
+  const auto measure = [](const int unrelated_count) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "apply.sqlite3";
+    const auto target = Intent();
+    SqliteManagerApplyJournal journal(path, target.cell_id);
+    const auto accepted = journal.EnsureIntent(target).record;
+    for (int i = 0; i < unrelated_count; ++i) {
+      const auto suffix = std::to_string(i);
+      static_cast<void>(journal.EnsureIntent(
+          Intent("other-" + suffix, 1U, "other-request-" + suffix)));
+    }
+    const core::NamedApplyPublicationTransactionDTO apply{
+        target.apply_id, target.apply_generation};
+    std::uint64_t lookups = 0U;
+    const auto proof = ReadManagerApplyStatusReadOnlyForTesting(
+        path, target.cell_id, apply, &lookups);
+    EXPECT_TRUE(proof.ok());
+    if (proof.ok()) {
+      EXPECT_EQ(proof.value().intent, accepted);
+    }
+    return lookups;
+  };
+  const auto short_history = measure(0);
+  const auto long_history = measure(32);
+  EXPECT_GT(short_history, 0U);
+  EXPECT_EQ(long_history, short_history);
+}
+
+TEST(ManagerApplyJournal, TouchedWriteAndReadDecodeBoundedHistory) {
+  const auto measure = [](const int unrelated_count) {
+    TemporaryDirectory directory;
+    SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
+                                      CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    for (int i = 0; i < unrelated_count; ++i) {
+      const auto suffix = std::to_string(i);
+      static_cast<void>(journal.EnsureIntent(
+          Intent("other-" + suffix, 1U, "other-request-" + suffix)));
+    }
+    const auto before_write = journal.record_verification_count();
+    const auto scope = journal.EnsureAffectedScope(intent.intent_digest,
+                                                    AffectedScope());
+    EXPECT_TRUE(scope.inserted);
+    const auto after_write = journal.record_verification_count();
+    const auto status = journal.ReadStatus(intent.intent.apply_id,
+                                           intent.intent.apply_generation);
+    EXPECT_TRUE(status.has_value());
+    if (status.has_value()) {
+      EXPECT_TRUE(status->affected_scope.has_value());
+    }
+    const auto after_read = journal.record_verification_count();
+    return std::pair{after_write - before_write, after_read - after_write};
+  };
+  const auto short_history = measure(0);
+  const auto long_history = measure(32);
+  EXPECT_GT(short_history.first, 0U);
+  EXPECT_GT(short_history.second, 0U);
+  EXPECT_EQ(long_history.first, short_history.first);
+  EXPECT_EQ(long_history.second, short_history.second);
+}
+
+TEST(ManagerApplyJournal, TamperedTouchedIntentRefusesScopeAndRollsBack) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+  const auto rewrite = [&](const std::string &source) {
+    ExecSql(path,
+            "DROP TRIGGER manager_apply_intents_no_update;"
+            "UPDATE manager_apply_intents SET source_label='" + source +
+                "' WHERE apply_id='apply-1';"
+                "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
+                "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
+                "'manager_apply_intents is immutable'); END;");
+  };
+  rewrite("tampered-source");
+  EXPECT_THROW(static_cast<void>(journal.EnsureAffectedScope(
+                   intent.intent_digest, AffectedScope())),
+               ManagerApplyJournalIntegrityError);
+  rewrite(Intent().request_context.source_label);
+  EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 0U);
+  EXPECT_TRUE(journal.EnsureAffectedScope(intent.intent_digest, AffectedScope())
+                  .inserted);
+}
+
+TEST(ManagerApplyJournal, CorruptPreviousGenerationRefusesChildWrite) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  static_cast<void>(journal.EnsureIntent(Intent()));
+  const auto current = journal.EnsureIntent(
+      Intent("apply-1", 2U, "request-2", "owner-epoch-1",
+             "candidate-bundle-2")).record;
+  auto scope = AffectedScope();
+  scope.apply_generation = ApplyGeneration(2U);
+  const auto rewrite = [&](const std::string &source) {
+    ExecSql(path,
+            "DROP TRIGGER manager_apply_intents_no_update;"
+            "UPDATE manager_apply_intents SET source_label='" + source +
+                "' WHERE apply_id='apply-1' AND apply_generation=1;"
+                "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
+                "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
+                "'manager_apply_intents is immutable'); END;");
+  };
+  rewrite("tampered-source");
+  // Ordinary reads keep their existing exact-record behavior.
+  EXPECT_EQ(journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(2U)),
+            current);
+  EXPECT_THROW(static_cast<void>(journal.EnsureAffectedScope(
+                   current.intent_digest, scope)),
+               ManagerApplyJournalIntegrityError);
+  rewrite(Intent().request_context.source_label);
+  EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 0U);
+  EXPECT_TRUE(journal.EnsureAffectedScope(current.intent_digest, scope).inserted);
+}
+
+TEST(ManagerApplyJournal, ChildWriteChecksOnlyImmediateApplyPredecessor) {
+  const auto measure = [](const std::uint64_t generations) {
+    TemporaryDirectory directory;
+    SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
+                                      CellId("cell-1"));
+    for (std::uint64_t generation = 1; generation < generations;
+         ++generation) {
+      const auto suffix = std::to_string(generation);
+      static_cast<void>(journal.EnsureIntent(
+          Intent("apply-1", generation, "request-" + suffix)));
+    }
+    const auto suffix = std::to_string(generations);
+    const auto current = journal.EnsureIntent(
+        Intent("apply-1", generations, "request-" + suffix)).record;
+    auto scope = AffectedScope();
+    scope.apply_generation = ApplyGeneration(generations);
+    const auto before = journal.record_verification_count();
+    EXPECT_TRUE(journal.EnsureAffectedScope(current.intent_digest, scope).inserted);
+    return journal.record_verification_count() - before;
+  };
+  const auto short_history = measure(2U);
+  EXPECT_GT(short_history, 0U);
+  EXPECT_EQ(measure(32U), short_history);
+}
+
+TEST(ManagerApplyJournal, UnrelatedCorruptionIsDetectedOnReopen) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  const auto target = Intent();
+  const core::NamedApplyPublicationTransactionDTO apply{
+      target.apply_id, target.apply_generation};
+  {
+    SqliteManagerApplyJournal journal(path, target.cell_id);
+    const auto intent = journal.EnsureIntent(target).record;
+    static_cast<void>(journal.EnsureIntent(
+        Intent("other", 1U, "other-request")));
+    ExecSql(path,
+            "DROP TRIGGER manager_apply_intents_no_update;"
+            "UPDATE manager_apply_intents SET source_label='tampered' "
+            "WHERE apply_id='other';"
+            "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
+            "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
+            "'manager_apply_intents is immutable'); END;");
+    EXPECT_TRUE(journal.EnsureAffectedScope(intent.intent_digest,
+                                            AffectedScope()).inserted);
+    EXPECT_TRUE(ReadManagerApplyStatusReadOnly(path, target.cell_id, apply).ok());
+  }
+  EXPECT_THROW((SqliteManagerApplyJournal(path, target.cell_id)),
+               ManagerApplyJournalIntegrityError);
+}
+
 TEST(ManagerApplyFenceJournal,
      AffectedScopeIsImmutableAndRequiredBeforeFenceAttempt) {
   TemporaryDirectory directory;
@@ -3393,6 +3705,42 @@ TEST(ManagerApplyRuntimeJournal,
             static_cast<std::int64_t>(kMaximumRuntimeStagedReadySetsPerApply));
 }
 
+TEST(ManagerApplyRuntimeJournal, CorruptStagedPredecessorRefusesLaterWrite) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "runtime.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto accepted = EnsureAcceptedApply(journal);
+  const auto runtime = journal.EnsureRuntimeConvergenceIntent(
+      accepted.intent.intent_digest,
+      RuntimeIntent(accepted.acceptance.acceptance_digest));
+  const auto digest = runtime.record.runtime_convergence_intent_digest;
+  ASSERT_TRUE(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(digest, 1U))
+                  .inserted);
+  ExecSql(path,
+          "DROP TRIGGER manager_apply_runtime_staged_ready_sets_no_update;"
+          "UPDATE manager_apply_runtime_staged_ready_sets "
+          "SET runtime_evidence_encoding='0;' WHERE staged_ready_generation=1;"
+          "CREATE TRIGGER manager_apply_runtime_staged_ready_sets_no_update "
+          "BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is "
+          "immutable'); END;");
+  EXPECT_THROW(static_cast<void>(journal.EnsureRuntimeStagedReady(
+                   RuntimeStagedReady(digest, 2U))),
+               ManagerApplyJournalIntegrityError);
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database,
+                            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                            nullptr), SQLITE_OK);
+  sqlite3_stmt *statement = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(database,
+      "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets "
+      "WHERE staged_ready_generation=2", -1, &statement, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+  EXPECT_EQ(sqlite3_column_int64(statement, 0), 0);
+  EXPECT_EQ(sqlite3_finalize(statement), SQLITE_OK);
+  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
 TEST(ManagerApplyRuntimeJournal,
      DetectsConvergenceAndStagedReadyPayloadCorruptionOnRestart) {
   TemporaryDirectory directory;
@@ -3754,6 +4102,37 @@ TEST(ManagerNativeApplyParentRead,
 }
 
 TEST(ManagerNativeApplyParentRead,
+     ScenarioCompositionRefusalIsTheSameEarlyPreparationFailure) {
+  TemporaryDirectory package;
+  const auto candidate = NativeParentCandidate(package.path(), false);
+  ASSERT_TRUE(candidate);
+  // Only the host's typed refusal makes a known `failed` Prepare early.
+  for (const auto &[cause, classified] :
+       std::vector<std::pair<std::string, bool>>{
+           {std::string(kScenarioCompositionRefusedCode), true},
+           {"typed_cause_code", false}}) {
+    SCOPED_TRACE(cause);
+    TemporaryDirectory state;
+    const auto path = state.path() / "refused-parent.sqlite3";
+    const auto fixture = WriteNativeParent(
+        path, package.path(), *candidate, false,
+        "runtime_composition_preparation_failed",
+        ManagerApplyPhase::kRuntimeConverged, false, nullptr, false, false,
+        cause);
+    const auto cell = candidate->value().cell_graph.cell_id;
+    const auto early = ReadNativeApplyPreparationFailureReadOnly(
+        path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
+        fixture.receipt);
+    ASSERT_TRUE(early.ok()) << early.error().message;
+    ASSERT_EQ(early.value().has_value(), classified);
+    if (classified) {
+      EXPECT_EQ(early.value()->terminal_outcome->terminal_outcome.state,
+                ManagerApplyTerminalOutcomeState::kFailed);
+    }
+  }
+}
+
+TEST(ManagerNativeApplyParentRead,
      RejectsForeignPlanClaimAndNonExactRecoveryEvidence) {
   TemporaryDirectory package;
   TemporaryDirectory state;
@@ -3999,7 +4378,7 @@ TEST(ManagerNativeApplyParentRead,
 }
 
 TEST(ManagerNativeApplyParentRead,
-     VerifiesWholeInventoryAndFailureIntentDigestInFreshSnapshot) {
+     VerifiesTouchedChainAndFailureIntentDigestInFreshSnapshot) {
   TemporaryDirectory package;
   TemporaryDirectory state;
   const auto candidate = NativeParentCandidate(package.path(), false);
@@ -4024,7 +4403,7 @@ TEST(ManagerNativeApplyParentRead,
       "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
       "manager_apply_intents "
       "BEGIN SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  EXPECT_FALSE(
+  EXPECT_TRUE(
       ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan, *candidate)
           .ok());
   ExecSql(
@@ -4379,6 +4758,83 @@ TEST(ManagerApplyBringUpJournal,
 }
 
 TEST(ManagerApplyBringUpJournal,
+     RetiredDomainHoldingRequiresNoAttemptOrError) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "retired.sqlite3",
+                                    CellId("cell-1"));
+  const auto parent = journal.EnsureBringUpIntent(Intent(), BringUpPlan());
+  auto intent = FenceIntent();
+  intent.scope.domains.push_back({ControlDomainId("retired"),
+                                  ControlDomainRevision("retired-r1"), std::nullopt});
+  intent.scope.bindings.push_back({ControlBindingId("retired-jtc"),
+                                   ControlBindingRevision("retired-binding-r1"), std::nullopt});
+  intent.scope.resources.push_back(ResourceId("joint-3"));
+  // A controller domain with a predecessor names its active configuration.
+  intent.expected_active_control_configurations.push_back(
+      {ControlDomainId("retired"), core::ActiveControlConfigurationId("retired-mode"),
+       core::ActiveControlConfigurationGeneration(1U)});
+  const auto attempt = EnsureAttempt(journal, parent.intent.intent_digest, intent);
+  auto accepted_fence = AcceptedFence();
+  accepted_fence.captured_scope = intent.scope;
+  const auto fence = journal.EnsureFenceAcceptance(
+      parent.intent.intent.apply_id, parent.intent.intent.apply_generation,
+      attempt.record.fence_attempt_digest, accepted_fence).record;
+  const auto proof_with_retired = [&](ManagerApplyBringUpChildPhase phase) {
+    auto proof = BringUpChildProof(parent, fence, phase);
+    auto &status = *proof.result.status;
+    const core::ResolvedLifecycleControlDomainScopeDTO scope{
+        ControlDomainId("retired"), ControlDomainRevision("retired-r1"),
+        core::ControllerTopologyId("topology-1"), core::TopologyRevision("topology-revision-1"),
+        std::nullopt,
+        {{ControlBindingId("retired-jtc"), ControlBindingRevision("retired-binding-r1"),
+          core::ControlRouteId("route-1")}},
+        {ResourceId("joint-3")}};
+    const auto &child = parent.plan.plan.children.front();
+    const core::ResolvedLifecycleProviderOccurrenceDTO provider{
+        scope.control_domain_id, scope.control_domain_revision,
+        core::ProviderInstanceId("provider-1"), core::ProviderManifestId("manifest-1"),
+        core::ProviderManifestRevision("manifest-r1"), child.runtime_unit_id,
+        child.runtime_epoch, ContentDigest(std::string(kDigestThree))};
+    status.domains.push_back({scope.control_domain_id, std::nullopt, scope, provider,
+        core::ComponentLifecycleStateDTO::kDeclared,
+        core::ComponentLifecycleStateDTO::kDeclared, status.requested_state,
+        core::ComponentLifecycleDomainActionStateDTO::kNotStarted, {}, std::nullopt});
+    return proof;
+  };
+  const auto accepted = proof_with_retired(ManagerApplyBringUpChildPhase::kAccepted);
+  const auto holding = proof_with_retired(ManagerApplyBringUpChildPhase::kHolding);
+  ASSERT_TRUE(accepted.result.locally_valid());
+  ASSERT_TRUE(holding.result.locally_valid());
+  static_cast<void>(journal.EnsureBringUpChildProof(accepted));
+
+  auto attempted = holding;
+  auto &attempted_status = *attempted.result.status;
+  auto &retired = attempted_status.domains.back();
+  const auto &provider = *retired.resolved_provider_occurrence;
+  retired.primitive_attempts.push_back({
+      attempted_status.acceptance.lifecycle_transaction_id,
+      attempted_status.acceptance.lifecycle_transaction_generation,
+      attempted_status.accepted_intent.controllable_component_id,
+      retired.control_domain_id, provider.control_domain_revision,
+      provider.provider_instance_id, provider.provider_manifest_id,
+      provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+      provider.provider_runtime_epoch, core::LifecyclePrimitiveId("transition.prepare"),
+      core::LifecyclePrimitiveAttemptId("retired-attempt"), 1U,
+      core::LifecycleTransitionOutcomeDTO::kSucceeded, std::nullopt});
+  ASSERT_TRUE(attempted.result.locally_valid());
+  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(attempted)),
+               ManagerApplyJournalIntegrityError);
+
+  auto failed = holding;
+  failed.result.status->domains.back().action_state = core::ComponentLifecycleDomainActionStateDTO::kFailed;
+  failed.result.status->domains.back().error = core::ErrorDTO{"retired_error", "retired domain failed", {}};
+  ASSERT_TRUE(failed.result.locally_valid());
+  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(failed)),
+               ManagerApplyJournalIntegrityError);
+  EXPECT_TRUE(journal.EnsureBringUpChildProof(holding).inserted);
+}
+
+TEST(ManagerApplyBringUpJournal,
      RetainsExactNoAdmissionRejectionAndRefusesForeignChild) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "rejection.sqlite3",
@@ -4537,14 +4993,14 @@ TEST(ManagerApplyBringUpJournal,
 }
 
 TEST(ManagerApplyJournalIntegrity,
-     RefusesV18InterruptedIntentWithActionablePreservationMessage) {
+     RefusesV19InterruptedIntentWithActionablePreservationMessage) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "interrupted-v18.sqlite3";
+  const auto path = directory.path() / "interrupted-v19.sqlite3";
   {
     SqliteManagerApplyJournal owner(path, CellId("cell-1"));
     static_cast<void>(owner.EnsureIntent(Intent()));
   }
-  ExecSql(path, "PRAGMA user_version=18;");
+  ExecSql(path, "PRAGMA user_version=19;");
   const auto before = ReadFileBytes(path);
   try {
     SqliteManagerApplyJournal refused(path, CellId("cell-1"));
@@ -4552,8 +5008,8 @@ TEST(ManagerApplyJournalIntegrity,
   } catch (const ManagerApplyJournalIntegrityError &error) {
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
-    EXPECT_NE(message.find("version 18"), std::string::npos);
-    EXPECT_NE(message.find("v19"), std::string::npos);
+    EXPECT_NE(message.find("version 19"), std::string::npos);
+    EXPECT_NE(message.find("v20"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);

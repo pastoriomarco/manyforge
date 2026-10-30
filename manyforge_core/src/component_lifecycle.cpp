@@ -68,40 +68,11 @@ template <typename Value, typename Less>
   return false;
 }
 
-[[nodiscard]] bool known(LifecyclePrimitiveDispatchStateDTO value) noexcept {
+[[nodiscard]] bool known(LifecycleTransitionOutcomeDTO value) noexcept {
   switch (value) {
-    case LifecyclePrimitiveDispatchStateDTO::kNotDispatched:
-    case LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown:
-    case LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(LifecyclePrimitiveKnownResultDTO value) noexcept {
-  switch (value) {
-    case LifecyclePrimitiveKnownResultDTO::kSucceeded:
-    case LifecyclePrimitiveKnownResultDTO::kFailed:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(LifecyclePrimitiveEffectDTO value) noexcept {
-  switch (value) {
-    case LifecyclePrimitiveEffectDTO::kNone:
-    case LifecyclePrimitiveEffectDTO::kPossible:
-    case LifecyclePrimitiveEffectDTO::kObserved:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(LifecyclePostconditionResultDTO value) noexcept {
-  switch (value) {
-    case LifecyclePostconditionResultDTO::kSatisfied:
-    case LifecyclePostconditionResultDTO::kNotSatisfied:
-    case LifecyclePostconditionResultDTO::kInconclusive:
+    case LifecycleTransitionOutcomeDTO::kSucceeded:
+    case LifecycleTransitionOutcomeDTO::kFailed:
+    case LifecycleTransitionOutcomeDTO::kConnectionLost:
       return true;
   }
   return false;
@@ -113,22 +84,8 @@ template <typename Value, typename Less>
     case ComponentLifecycleDomainActionStateDTO::kNotStarted:
     case ComponentLifecycleDomainActionStateDTO::kExecuting:
     case ComponentLifecycleDomainActionStateDTO::kVerifying:
-    case ComponentLifecycleDomainActionStateDTO::kReconciling:
     case ComponentLifecycleDomainActionStateDTO::kSucceeded:
     case ComponentLifecycleDomainActionStateDTO::kFailed:
-    case ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown:
-      return true;
-  }
-  return false;
-}
-
-[[nodiscard]] bool known(ComponentLifecycleDomainEffectDTO value) noexcept {
-  switch (value) {
-    case ComponentLifecycleDomainEffectDTO::kNone:
-    case ComponentLifecycleDomainEffectDTO::kKnownNoEffect:
-    case ComponentLifecycleDomainEffectDTO::kEffectObserved:
-    case ComponentLifecycleDomainEffectDTO::kPartialEffectObserved:
-    case ComponentLifecycleDomainEffectDTO::kEffectUncertain:
       return true;
   }
   return false;
@@ -142,7 +99,6 @@ template <typename Value, typename Less>
     case ComponentLifecycleTransactionPhaseDTO::kExecuting:
     case ComponentLifecycleTransactionPhaseDTO::kVerifying:
     case ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown:
-    case ComponentLifecycleTransactionPhaseDTO::kReconciling:
     case ComponentLifecycleTransactionPhaseDTO::kSucceeded:
     case ComponentLifecycleTransactionPhaseDTO::kFailed:
       return true;
@@ -153,8 +109,8 @@ template <typename Value, typename Less>
 [[nodiscard]] bool known(ComponentLifecycleTerminalResultDTO value) noexcept {
   switch (value) {
     case ComponentLifecycleTerminalResultDTO::kSucceeded:
-    case ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect:
-    case ComponentLifecycleTerminalResultDTO::kFailedPartialEffect:
+    case ComponentLifecycleTerminalResultDTO::kFailed:
+    case ComponentLifecycleTerminalResultDTO::kConnectionLost:
       return true;
   }
   return false;
@@ -245,8 +201,8 @@ template <typename Value, typename Less>
 }
 
 // The fault-free states a Recover domain may settle in. Its plan
-// postcondition decides which (the Real xArm arm: declared or disabled; a
-// healthy Real xArm gripper: declared, prepared, active or disabled).
+// postcondition decides which (e.g. a Real arm: declared or disabled; a
+// healthy Real gripper: declared, prepared, active or disabled).
 [[nodiscard]] constexpr bool recover_settled_state(ComponentLifecycleStateDTO state) noexcept {
   return state == ComponentLifecycleStateDTO::kDeclared ||
          state == ComponentLifecycleStateDTO::kPrepared ||
@@ -256,22 +212,17 @@ template <typename Value, typename Less>
 
 // A succeeded domain carries its observed state. It is the requested state,
 // except after a Recover whose plan postcondition admits another settled
-// state; the status check below allows that difference for Recover alone.
+// state, or a Prepare that found the domain Active; the status check below
+// allows that difference for these two alone.
 // The coordinator's plan evaluation, not this check, establishes that the
 // observed state satisfies the provider's plan.
 [[nodiscard]] bool domain_requested_postcondition_satisfied(
     const ComponentLifecycleDomainStatusDTO& domain) noexcept {
-  if (domain.requested_state.presence != ComponentLifecycleRequestedStatePresenceDTO::kResolved ||
-      !domain.requested_state.state.has_value() || !domain.current_state.has_value() ||
-      (*domain.current_state != *domain.requested_state.state &&
-       !(recover_settled_state(*domain.requested_state.state) &&
-         recover_settled_state(*domain.current_state)))) {
-    return false;
-  }
-  return !domain.reconciliation_evidence.has_value() ||
-         (domain.reconciliation_evidence->observed_state == *domain.current_state &&
-          domain.reconciliation_evidence->postcondition_result ==
-              LifecyclePostconditionResultDTO::kSatisfied);
+  return domain.requested_state.presence == ComponentLifecycleRequestedStatePresenceDTO::kResolved &&
+         domain.requested_state.state.has_value() && domain.current_state.has_value() &&
+         (*domain.current_state == *domain.requested_state.state ||
+          (recover_settled_state(*domain.requested_state.state) &&
+           recover_settled_state(*domain.current_state)));
 }
 
 // These joins establish durable data consistency only. The original live
@@ -1227,7 +1178,36 @@ bool BrandLifecyclePrimitiveIntentDTO::locally_valid() const noexcept {
          bounded_identity(lifecycle_primitive_id) &&
          bounded_identity(lifecycle_primitive_attempt_id) &&
          expected_observation_generation != 0U && remaining_duration_ns > 0 &&
-         remaining_duration_ns <= kMaxLifecycleTransactionTimeoutNs;
+         remaining_duration_ns <= kMaxLifecycleTransactionTimeoutNs && known(requested_state);
+}
+
+bool LifecycleSubstepResultDTO::locally_valid() const noexcept {
+  return bounded_identity(substep_id) && (!within || bounded_identity(*within)) &&
+         known(outcome) && started_at_ns >= 0 && finished_at_ns >= started_at_ns &&
+         error_valid(error) && (outcome == LifecycleTransitionOutcomeDTO::kSucceeded) != error.has_value();
+}
+
+bool LifecycleSubstepEventDTO::locally_valid() const noexcept {
+  const bool finished = phase == Phase::kFinished;
+  return bounded_identity(attempt_id) && bounded_identity(substep_id) &&
+         (!within || bounded_identity(*within)) &&
+         (phase == Phase::kStarted || finished) && at_ns >= 0 &&
+         outcome.has_value() == finished && (!outcome || known(*outcome)) &&
+         (!error_code || (finished && !error_code->empty() &&
+                          error_code->size() <= kMaxLifecycleErrorCodeBytes));
+}
+
+bool LifecycleTransitionObservationDTO::locally_valid() const noexcept {
+  return known(observed_state) && facts.size() <= kMaxLifecycleFacts &&
+         std::all_of(facts.begin(), facts.end(),
+                     [](const LifecycleFactDTO& fact) { return fact.locally_valid(); }) &&
+         observation_generation != 0U && source_sequence != 0U && at_ns >= 0;
+}
+
+LifecycleTransitionObservationDTO RecordLifecycleTransitionObservation(
+    const BrandLifecycleObservationDTO& observation) {
+  return {observation.observed_state, observation.facts, observation.observation_generation,
+          observation.source_sequence, observation.received_timestamp_ns};
 }
 
 bool BrandLifecyclePrimitiveResultDTO::locally_valid() const noexcept {
@@ -1238,21 +1218,11 @@ bool BrandLifecyclePrimitiveResultDTO::locally_valid() const noexcept {
       bounded_identity(provider_runtime_unit_id) && bounded_identity(provider_runtime_epoch) &&
       bounded_identity(lifecycle_primitive_id) &&
       bounded_identity(lifecycle_primitive_attempt_id) && expected_observation_generation != 0U &&
-      known(dispatch_state) && known(effect) && error_valid(error) &&
-      (!known_result.has_value() || known(*known_result))) {
-    switch (dispatch_state) {
-      case LifecyclePrimitiveDispatchStateDTO::kNotDispatched:
-        return effect == LifecyclePrimitiveEffectDTO::kNone && !known_result.has_value() &&
-               error.has_value();
-      case LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown:
-        return known_result.has_value() &&
-               ((*known_result == LifecyclePrimitiveKnownResultDTO::kSucceeded &&
-                 !error.has_value()) ||
-                (*known_result == LifecyclePrimitiveKnownResultDTO::kFailed && error.has_value()));
-      case LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain:
-        return effect != LifecyclePrimitiveEffectDTO::kNone && !known_result.has_value() &&
-               error.has_value();
-    }
+      known(outcome) && error_valid(error) &&
+      (outcome == LifecycleTransitionOutcomeDTO::kSucceeded) != error.has_value() &&
+      substeps.size() <= kMaxLifecycleSubsteps) {
+    return std::all_of(substeps.begin(), substeps.end(),
+                       [](const LifecycleSubstepResultDTO& substep) { return substep.locally_valid(); });
   }
   return false;
 }
@@ -1273,14 +1243,6 @@ bool BrandLifecyclePrimitiveResultDTO::matches(
          lifecycle_primitive_id == intent.lifecycle_primitive_id &&
          lifecycle_primitive_attempt_id == intent.lifecycle_primitive_attempt_id &&
          expected_observation_generation == intent.expected_observation_generation;
-}
-
-bool LifecycleReconciliationEvidenceDTO::locally_valid() const noexcept {
-  return bounded_identity(provider_instance_id) && bounded_identity(provider_manifest_id) &&
-         bounded_identity(provider_manifest_revision) &&
-         bounded_identity(provider_runtime_unit_id) && bounded_identity(provider_runtime_epoch) &&
-         source_sequence != 0U && observation_generation != 0U && known(observed_state) &&
-         known(postcondition_result) && observed_at_ns >= 0;
 }
 
 bool ResolvedLifecycleControlDomainScopeDTO::locally_valid() const noexcept {
@@ -1502,8 +1464,12 @@ bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
       current_scope.has_value() != current_state.has_value() ||
       (previous_state.has_value() && !known(*previous_state)) ||
       (current_state.has_value() && !known(*current_state)) || !requested_state.locally_valid() ||
-      !known(action_state) || !known(effect) ||
-      primitive_attempts.size() > kMaxLifecycleAttemptsPerDomain || !error_valid(error)) {
+      !known(action_state) || primitive_attempts.size() > kMaxLifecycleAttemptsPerDomain ||
+      !error_valid(error) || substep_events.size() > kMaxLifecycleSubstepEvents ||
+      !std::all_of(substep_events.begin(), substep_events.end(),
+                   [](const LifecycleSubstepEventDTO& event) { return event.locally_valid(); }) ||
+      (observed_before && !observed_before->locally_valid()) ||
+      (observed_after && !observed_after->locally_valid())) {
     return false;
   }
   if (current_scope && current_scope->provider()) {
@@ -1514,8 +1480,6 @@ bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
       return false;
   }
   std::set<LifecyclePrimitiveAttemptId> attempts;
-  bool any_possible_effect = false;
-  bool any_observed_effect = false;
   for (const auto& attempt : primitive_attempts) {
     if (!attempt.locally_valid() || attempt.control_domain_id != control_domain_id ||
         !resolved_provider_occurrence.has_value() ||
@@ -1530,47 +1494,12 @@ bool ComponentLifecycleDomainStatusDTO::locally_valid() const noexcept {
         !attempts.insert(attempt.lifecycle_primitive_attempt_id).second) {
       return false;
     }
-    any_possible_effect = any_possible_effect ||
-                          attempt.effect == LifecyclePrimitiveEffectDTO::kPossible ||
-                          attempt.effect == LifecyclePrimitiveEffectDTO::kObserved;
-    any_observed_effect =
-        any_observed_effect || attempt.effect == LifecyclePrimitiveEffectDTO::kObserved;
-  }
-  if (reconciliation_evidence.has_value()) {
-    if (!reconciliation_evidence->locally_valid() || !resolved_provider_occurrence.has_value() ||
-        reconciliation_evidence->provider_instance_id !=
-            resolved_provider_occurrence->provider_instance_id ||
-        reconciliation_evidence->provider_manifest_id !=
-            resolved_provider_occurrence->provider_manifest_id ||
-        reconciliation_evidence->provider_manifest_revision !=
-            resolved_provider_occurrence->provider_manifest_revision ||
-        reconciliation_evidence->provider_runtime_unit_id !=
-            resolved_provider_occurrence->provider_runtime_unit_id ||
-        reconciliation_evidence->provider_runtime_epoch !=
-            resolved_provider_occurrence->provider_runtime_epoch) {
-      return false;
-    }
-  }
-  if ((any_possible_effect && effect == ComponentLifecycleDomainEffectDTO::kNone) ||
-      (any_observed_effect && effect != ComponentLifecycleDomainEffectDTO::kEffectObserved &&
-       effect != ComponentLifecycleDomainEffectDTO::kPartialEffectObserved &&
-       effect != ComponentLifecycleDomainEffectDTO::kEffectUncertain) ||
-      (any_possible_effect && !any_observed_effect &&
-       effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect &&
-       !reconciliation_evidence.has_value())) {
-    return false;
   }
   switch (action_state) {
     case ComponentLifecycleDomainActionStateDTO::kSucceeded:
-      return !error.has_value() && domain_requested_postcondition_satisfied(*this) &&
-             (effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect ||
-              effect == ComponentLifecycleDomainEffectDTO::kEffectObserved);
+      return !error.has_value() && domain_requested_postcondition_satisfied(*this);
     case ComponentLifecycleDomainActionStateDTO::kFailed:
-      return error.has_value() && effect != ComponentLifecycleDomainEffectDTO::kEffectUncertain;
-    case ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown:
-      return error.has_value() && effect == ComponentLifecycleDomainEffectDTO::kEffectUncertain;
-    case ComponentLifecycleDomainActionStateDTO::kReconciling:
-      return reconciliation_evidence.has_value();
+      return error.has_value();
     case ComponentLifecycleDomainActionStateDTO::kReserved:
     case ComponentLifecycleDomainActionStateDTO::kNotStarted:
     case ComponentLifecycleDomainActionStateDTO::kExecuting:
@@ -1648,19 +1577,20 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
   std::size_t attempt_count = 0U;
   std::size_t kinematic_projection_count = 0U;
   std::size_t kinematic_contributing_binding_count = 0U;
-  bool any_uncertain = false;
-  bool any_observed_or_partial = false;
-  bool all_known_no_effect = true;
   bool all_succeeded = true;
 
   for (const auto& domain : domains) {
     if (!domain.locally_valid() || domain.requested_state != requested_state) {
       return false;
     }
-    // Only a Recover may succeed at a settled state other than the requested one.
+    // Only a Recover may succeed at a settled state other than the requested
+    // one, and an ordinary Prepare at Active (above Prepared, fault-free by
+    // its plan postcondition).
     if (accepted_intent.intent != ComponentLifecycleIntentKindDTO::kRecover &&
         domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
-        domain.current_state != requested_state.state) {
+        domain.current_state != requested_state.state &&
+        !(accepted_intent.intent == ComponentLifecycleIntentKindDTO::kPrepare && !delegated &&
+          domain.current_state == ComponentLifecycleStateDTO::kActive)) {
       return false;
     }
     if (domain.current_scope.has_value()) {
@@ -1730,18 +1660,10 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       return false;
     }
 
-    any_uncertain =
-        any_uncertain || domain.effect == ComponentLifecycleDomainEffectDTO::kEffectUncertain;
-    any_observed_or_partial =
-        any_observed_or_partial ||
-        domain.effect == ComponentLifecycleDomainEffectDTO::kEffectObserved ||
-        domain.effect == ComponentLifecycleDomainEffectDTO::kPartialEffectObserved;
-    all_known_no_effect =
-        all_known_no_effect && (domain.effect == ComponentLifecycleDomainEffectDTO::kNone ||
-                                domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect);
+    // A retired domain is never dispatched: no attempts and no error.
     const bool retired_selected_domain =
         (selected || delegated) && !domain.expected_domain.has_value() && !domain.error.has_value() &&
-        domain.effect == ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
+        domain.primitive_attempts.empty();
     all_succeeded = all_succeeded &&
                     (retired_selected_domain ||
                      (domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
@@ -1777,13 +1699,6 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
       ((phase == ComponentLifecycleTransactionPhaseDTO::kFailed ||
         phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown) &&
        !error.has_value()) ||
-      (terminal_result == ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect &&
-       !all_known_no_effect) ||
-      (terminal_result == ComponentLifecycleTerminalResultDTO::kFailedPartialEffect &&
-       (!any_observed_or_partial || any_uncertain)) ||
-      (any_uncertain && (phase != ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown &&
-                         phase != ComponentLifecycleTransactionPhaseDTO::kReconciling)) ||
-      (any_uncertain && terminal_result.has_value()) ||
       (terminal_phase && remaining_duration_ns != 0)) {
     return false;
   }

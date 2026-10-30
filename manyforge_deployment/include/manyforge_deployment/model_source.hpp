@@ -3,12 +3,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/model_asset.hpp>
+#include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -764,6 +768,50 @@ class SourceVerifiedModelAsset final {
     const UrdfDocumentIr& document);
 [[nodiscard]] std::string emit_canonical_srdf_document(
     const SrdfDocumentIr& document);
+
+/// One offset frame of a model occurrence: a generated massless link
+/// `link_name` (no inertial, visual or collision) fixed to `parent_link_name`
+/// at `pose` (T_parent_link). A descriptor offset frame (`custom == false`)
+/// hangs off a source link; a Deployment custom TCP also off a descriptor
+/// offset frame, never off another custom TCP.
+struct OffsetFrameLinkIr final {
+  std::string link_name;
+  std::string parent_link_name;
+  core::PlacementPoseDTO pose;
+  bool custom = false;
+
+  friend bool operator==(const OffsetFrameLinkIr&,
+                         const OffsetFrameLinkIr&) = default;
+};
+
+/// The URDF origin of a placement pose (quaternion to roll-pitch-yaw).
+[[nodiscard]] UrdfOriginIr urdf_origin_from_pose(
+    const core::PlacementPoseDTO& pose);
+
+/// The source-local name of an offset frame's generated fixed joint.
+[[nodiscard]] std::string offset_frame_joint_name(std::string_view link_name);
+
+/// A model occurrence's offset frames: the asset's offset frame roles, then
+/// the occurrence's custom TCPs.
+[[nodiscard]] std::vector<OffsetFrameLinkIr> occurrence_offset_frames(
+    std::span<const core::ModelFrameRoleBindingDTO> asset_bindings,
+    std::span<const core::ModelCustomTcpDTO> custom_tcps);
+
+/// `urdf` plus one generated link and fixed joint per offset frame, in
+/// canonical order. Throws ModelSourceError (`tcp_parent_unknown`,
+/// `custom_tcp_parent_unknown`, `tcp_name_duplicate`,
+/// `custom_tcp_name_collision`).
+[[nodiscard]] UrdfDocumentIr with_offset_frame_links(
+    UrdfDocumentIr urdf, std::span<const OffsetFrameLinkIr> frames);
+
+/// The generated fixed joint of one offset frame.
+[[nodiscard]] UrdfJointIr offset_frame_joint(const OffsetFrameLinkIr& frame);
+
+/// `urdf_bytes` with one empty (massless) link per fixed joint's child and
+/// the joint itself inserted before the final `</robot>`; every other byte
+/// is kept. robot_state_publisher publishes such joints on /tf_static.
+[[nodiscard]] std::string append_fixed_links(
+    std::string_view urdf_bytes, std::span<const UrdfJointIr> joints);
 
 [[nodiscard]] ParsedModelDocuments parse_model_documents_for_projection(
     std::string_view urdf_bytes, std::optional<std::string_view> srdf_bytes);

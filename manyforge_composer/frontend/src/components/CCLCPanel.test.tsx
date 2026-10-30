@@ -79,7 +79,7 @@ function failedLifecycleController(details: Record<string, string>): CCLCControl
     remaining_duration_ns: 0,
     status_owner_epoch: 'cclc.epoch.1',
     status_sequence: 2,
-    terminal_result: 'failed_known_no_effect',
+    terminal_result: 'failed',
   } }, 'lifecycle');
   return current;
 }
@@ -289,7 +289,7 @@ describe('CCLC presentation', () => {
     failed.pendingTransaction = { kind: 'lifecycle', id: 'lifecycle.7' };
     failed.transaction = {
       kind: 'lifecycle', transactionId: 'lifecycle.7', phase: 'failed',
-      terminalResult: 'failed_known_no_effect', reconciliationRequired: false,
+      terminalResult: 'failed', reconciliationRequired: false,
       error: {
         code: 'native_lifecycle_route_unavailable',
         message: 'The native route did not become ready',
@@ -350,3 +350,63 @@ it('renders an identical intervention plan error and health diagnostic once', ()
   const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true, mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
   expect(html.split('[actual_vendor_fault] Actual arm transport fault · actual_fault_bit')).toHaveLength(2);
 });
+
+
+it('names each domain with its own readiness error and decisive fact', () => {
+  const current = controller();
+  const occurrence = (controlDomainId: string) => ({ controlDomainId, controlDomainRevision: 'revision.1',
+    lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: `provider.${controlDomainId}`,
+    providerManifestId: 'manifest.1', providerManifestRevision: 'revision.1',
+    providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' });
+  const missing = (decisive: string) => ({ code: 'component_lifecycle_transition_missing',
+    message: 'No transition satisfied', details: { reason: 'no_transition_satisfied', decisive_fact: decisive } });
+  const domains: CCLCReadinessProviderOccurrence[] = [
+    { hasActivationStep: true, providerOccurrence: occurrence('domain.arm'), decisionKind: null,
+      health: { observedState: 'declared', facts: [], diagnostic: null }, error: missing('external.measured_joints_valid=false') },
+    { hasActivationStep: true, providerOccurrence: occurrence('domain.gripper'), decisionKind: null,
+      health: { observedState: 'active', facts: [], diagnostic: null }, error: missing('state=active') }];
+  current.snapshot!.readiness = { ...current.snapshot!.readiness, ready: false, providerOccurrences: domains };
+  const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true, mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
+  expect(html).toContain('domain.arm: [component_lifecycle_transition_missing] No transition satisfied · no_transition_satisfied · external.measured_joints_valid=false');
+  expect(html).toContain('domain.gripper: [component_lifecycle_transition_missing] No transition satisfied · no_transition_satisfied · state=active');
+});
+
+describe('CCLC surface split for the Components section', () => {
+  const render = (part: 'all' | 'cell' | 'component', current = controller()) => renderToStaticMarkup(
+    createElement(CCLCPanelView, { enabled: true, mutationAvailable: true, mutationUnavailableReason: null,
+      controller: current, componentIds: ['component.arm', 'component.io'], part }));
+
+  it('keeps the whole surface by default', () => {
+    const html = render('all');
+    expect(html).toContain('Activate all');
+    expect(html).toContain('aria-label="Configured component health"');
+    expect(html).toContain('aria-label="Component lifecycle status"');
+  });
+
+  it('shows only Activate all and the sequence progress above the list', () => {
+    const current = controller();
+    current.activationProgress = 'Activating component.io (2 of 2)';
+    current.pendingTransaction = { kind: 'lifecycle', id: 'lifecycle.7' };
+    const html = render('cell', current);
+    expect(html).toContain('Activate all');
+    expect(html).toContain('Activating component.io (2 of 2)');
+    expect(html).not.toContain('aria-label="Configured component health"');
+    expect(html).not.toContain('aria-label="Component lifecycle status"');
+    expect(html).not.toContain('aria-label="Lifecycle requests"');
+    // A component's request in flight is shown on its page, not above the list.
+    expect(html).not.toContain('class="cclc-transaction"');
+  });
+
+  it('shows only the selected component\'s state and requests on its page', () => {
+    const current = controller();
+    current.pendingTransaction = { kind: 'lifecycle', id: 'lifecycle.7' };
+    const html = render('component', current);
+    expect(html).toContain('aria-label="Component lifecycle status"');
+    expect(html).toContain('aria-label="Lifecycle requests"');
+    expect(html).toContain('class="cclc-transaction"');
+    expect(html).toContain('id="cclc-panel-title-component"');
+    expect(html).not.toContain('Activate all');
+    expect(html).not.toContain('aria-label="Configured component health"');
+  });
+});
+

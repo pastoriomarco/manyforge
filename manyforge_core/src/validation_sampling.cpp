@@ -30,10 +30,11 @@ double max_step(const std::array<double, N>& control) {
   return step;
 }
 
-// Bound on |dp/ds| over s in [0, 1] for every joint of one segment. The
-// degree selection mirrors trajectory_sampler's endpoint classification.
-// A Bezier curve's derivative is bounded by degree x the largest difference
-// of adjacent control points (hodograph convex hull).
+// Bound on |dp/ds| over s in [0, 1] for one segment: every joint's bound,
+// combined as a Euclidean norm (RoboPlan's configuration distance). The
+// degree selection mirrors trajectory_sampler's endpoint classification. A
+// Bezier curve's derivative is bounded by degree x the largest difference of
+// adjacent control points (hodograph convex hull).
 double segment_speed_bound(const TrajectoryWaypointDTO& a, const TrajectoryWaypointDTO& b,
                            std::size_t joints) {
   const double T = b.time_from_start_s - a.time_from_start_s;
@@ -44,29 +45,31 @@ double segment_speed_bound(const TrajectoryWaypointDTO& a, const TrajectoryWaypo
   for (std::size_t j = 0; j < joints; ++j) {
     const double pa = a.positions_rad[j];
     const double pb = b.positions_rad[j];
+    double joint = 0.0;
     if (acceleration) {
       const double da = T * a.velocities_rad_s[j];
       const double db = T * b.velocities_rad_s[j];
       const double aa = T * T * a.accelerations_rad_s2[j];
       const double ab = T * T * b.accelerations_rad_s2[j];
-      bound = std::max(bound, 5.0 * max_step(std::array<double, 6>{
-                                        pa, pa + da / 5.0, pa + 2.0 * da / 5.0 + aa / 20.0,
-                                        pb - 2.0 * db / 5.0 + ab / 20.0, pb - db / 5.0, pb}));
+      joint = 5.0 * max_step(std::array<double, 6>{
+                        pa, pa + da / 5.0, pa + 2.0 * da / 5.0 + aa / 20.0,
+                        pb - 2.0 * db / 5.0 + ab / 20.0, pb - db / 5.0, pb});
     } else if (velocity) {
-      bound = std::max(bound, 3.0 * max_step(std::array<double, 4>{
-                                        pa, pa + T * a.velocities_rad_s[j] / 3.0,
-                                        pb - T * b.velocities_rad_s[j] / 3.0, pb}));
+      joint = 3.0 * max_step(std::array<double, 4>{
+                        pa, pa + T * a.velocities_rad_s[j] / 3.0,
+                        pb - T * b.velocities_rad_s[j] / 3.0, pb});
     } else {
-      bound = std::max(bound, std::abs(pb - pa));
+      joint = std::abs(pb - pa);
     }
+    bound += joint * joint;
   }
-  return bound;
+  return std::sqrt(bound);
 }
 
 }  // namespace
 
 Result<CollisionValidationSamples> sample_for_collision_validation(
-    const TrajectoryDTO& trajectory, const double max_joint_step_rad, const std::size_t max_states,
+    const TrajectoryDTO& trajectory, const double max_step_rad, const std::size_t max_states,
     const ValidationSamplingStopCheck& stop) {
   if (auto valid = validate_trajectory_for_sampling(trajectory); !valid.ok()) {
     return refuse("collision_validation_trajectory_unsampleable",
@@ -111,7 +114,7 @@ Result<CollisionValidationSamples> sample_for_collision_validation(
     const auto& from = waypoints[index];
     const auto& to = waypoints[index + 1];
     const double wanted =
-        segment_speed_bound(from, to, trajectory.joint_names.size()) / max_joint_step_rad;
+        segment_speed_bound(from, to, trajectory.joint_names.size()) / max_step_rad;
     const std::size_t remaining = max_states - out.trajectory.waypoints.size();
     if (!std::isfinite(wanted) || wanted > static_cast<double>(remaining)) {
       return refuse("collision_validation_sample_budget_exceeded",

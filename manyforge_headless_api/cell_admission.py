@@ -118,11 +118,13 @@ class CellAdmissionError(RuntimeError):
         details: Mapping[str, Any] | None = None,
         *,
         outcome_unknown: bool = False,
+        producer: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.details = dict(details or {})
         self.outcome_unknown = outcome_unknown
+        self.producer = producer
 
 
 class CellAdmissionClient:
@@ -300,13 +302,21 @@ class CellAdmissionClient:
                     outcome_unknown=True,
                 )
             error = response.get("error")
+            producer = (
+                error.get("producer", "kernel")
+                if isinstance(error, dict)
+                else None
+            )
             if (
                 not isinstance(error, dict)
-                or set(error) != _ERROR_KEYS
+                or frozenset(error)
+                not in {_ERROR_KEYS, _ERROR_KEYS | {"producer"}}
                 or not isinstance(error.get("code"), str)
                 or not error["code"]
                 or not isinstance(error.get("message"), str)
                 or not isinstance(error.get("details"), dict)
+                or not isinstance(producer, str)
+                or not producer
             ):
                 raise CellAdmissionError(
                     "execution_command_response_invalid",
@@ -314,7 +324,8 @@ class CellAdmissionClient:
                     outcome_unknown=True,
                 )
             raise CellAdmissionError(
-                error["code"], error["message"], error["details"]
+                error["code"], error["message"], error["details"],
+                producer=producer,
             )
         result_key = {
             "cell_admission_acquire": "claim",

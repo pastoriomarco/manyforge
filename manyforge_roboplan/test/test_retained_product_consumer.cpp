@@ -19,7 +19,6 @@
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
-#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
@@ -73,6 +72,8 @@
 #include "io_provider_lifecycle_product.hpp"
 #include "maintained_activation_fixture.hpp"
 #include "pneumatic_program_fixture.hpp"
+#include "program_root_fixture.hpp"
+#include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/io_signal_ingress.hpp>
@@ -1024,6 +1025,24 @@ make_candidate_binding(const core::RuntimeParticipantBinding &runtime) {
       std::move(joint_names),          std::move(frames)};
 }
 
+// Active TCP (M7): a fixture robot's runtime owner whose TCP list is its own
+// `tcp` frame, its End-effector TCP and so its Active TCP.
+[[nodiscard]] RobotTcpReader
+fixture_robot_tcps(const core::RuntimeParticipantBinding &binding) {
+  const auto &value = binding.value();
+  std::vector<RobotTcp> rows;
+  for (const auto &frame : value.frame_bindings)
+    if (frame.frame_role_id == core::FrameRoleId("tcp"))
+      rows.push_back(RobotTcp{{value.controllable_component_id, value.command_target_id,
+                               frame.frame_role_id},
+                              frame, true, false});
+  return [robot = value.controllable_component_id, state = ActiveTcp(std::move(rows))](
+             const core::ControllableComponentId &component) -> std::optional<ActiveTcp> {
+    if (component != robot) return std::nullopt;
+    return state;
+  };
+}
+
 [[nodiscard]] core::OperationIntentDTO
 make_motion_operation(const core::RuntimeParticipantBinding &binding,
                       const core::RequestOwnerEpoch &owner_epoch,
@@ -1061,8 +1080,9 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
           core::MotionParticipantIntentDTO{
               core::MoveId("move.native.retained-projection"),
               core::FrameRoleId("base"),
-              core::MotionEndpointReferenceDTO{value.target_role_id,
-                                               core::FrameRoleId("tcp")},
+              core::TcpSelectorDTO(core::TcpEntryDTO{value.controllable_component_id,
+                                                     value.command_target_id,
+                                                     core::FrameRoleId("tcp")}),
               core::TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
               core::SpeedProfileDTO{0.5, 0.5, std::nullopt},
               core::TimeoutsDTO{3.0, 5.0},
@@ -2396,9 +2416,7 @@ TEST(RetainedProductCrossConsumer,
     const auto &query() const { return verified.query(); }
     const auto &cell_frame() const { return verified.cell_frame(); }
     const auto &targets() const { return verified.targets(); }
-    const auto &kinematic_frame_paths() const {
-      return verified.kinematic_frame_paths();
-    }
+    const auto &kinematic_index() const { return verified.kinematic_index(); }
     const auto &control_bindings() const { return rows; }
     void require_same_bundle_as(
         const deployment::VerifiedRetainedPlanningModel &planning) const {
@@ -2514,7 +2532,41 @@ TEST(RetainedProductCrossConsumer,
                        bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
                        model_map.cell_frame().cell_id,
                        model_map.cell_frame().compiled_frame_name,
-                       model_map.kinematic_frame_paths(), {}, {}, {absence}, 10'000'000})),
+                       model_map.kinematic_index().frame_paths(), {}, {}, {}, {},
+                       {absence}, 10'000'000})),
+               std::invalid_argument);
+
+  // B2: no target row names a frame of another component (the LOADFIX12
+  // foreign `tcp` row and its exception are gone): such a row is refused.
+  ASSERT_NE(arm_target, nullptr);
+  const auto arm_tcp = std::find_if(
+      arm_target->frames.begin(), arm_target->frames.end(),
+      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; });
+  ASSERT_NE(arm_tcp, arm_target->frames.end());
+  const auto *arm_tcp_frame =
+      std::get_if<deployment::CompositionComponentModelFrame>(&arm_tcp->frame);
+  ASSERT_NE(arm_tcp_frame, nullptr);
+  const auto target_row = [&](const core::ControllableComponentId &stamp) {
+    return RetainedTargetSceneFrameInput{
+        component_id, arm_target_id, core::FrameRoleId("tcp"),
+        core::ResolvedComponentModelFrameDTO{
+            stamp, arm_tcp_frame->model_instance_id,
+            arm_tcp_frame->frame_role_id, arm_tcp_frame->compiled_frame_name,
+            arm_tcp_frame->model_revision}};
+  };
+  const auto with_target_row = [&](RetainedTargetSceneFrameInput row) {
+    return RetainedSceneFrameResolver::create(
+        collision_model,
+        RetainedSceneFrameResolverInput{
+            bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
+            model_map.cell_frame().cell_id,
+            model_map.cell_frame().compiled_frame_name,
+            model_map.kinematic_index().frame_paths(), {}, {std::move(row)}, {},
+            {}, {arm_source}, 10'000'000});
+  };
+  EXPECT_NE(with_target_row(target_row(component_id)), nullptr);
+  EXPECT_THROW(static_cast<void>(with_target_row(
+                   target_row(core::ControllableComponentId("lite_gripper")))),
                std::invalid_argument);
 }
 
@@ -3966,7 +4018,8 @@ enum class Lite6AggregateCheck {
   kPneumaticCollisionProjection,
 #endif
   kMeasuredOptionalDomainRace,
-  kMeasuredNullOptionalDomainRace
+  kMeasuredNullOptionalDomainRace,
+  kSoleRuntimeJoin
 };
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
@@ -3982,6 +4035,7 @@ void select_geometric_contact_station(
   std::erase_if(rows, [](const auto &row) {
     const auto *id = row.find_object_member("component_id");
     return id == nullptr || (id->as_string() != "lite6_robot" &&
+                             id->as_string() != "lite_gripper" &&
                              id->as_string() != "station_io");
   });
   const auto station =
@@ -4008,8 +4062,7 @@ void select_geometric_contact_station(
     "direction":"input",
     "freshness":{"mode":"sample_age","maximum_age_ns":5000000000},
     "provider":{"profile":"geometric_contact","ingress_depth":4,
-      "endpoint":{"controllable_component_id":"lite6_robot",
-        "command_target_id":"gripper","frame_role_id":"tcp"},
+      "robot_component_id":"lite6_robot",
       "target_scene_resource_id":"geometric_target"},
     "resource_role_id":"probe_contact","signal_name":"probe_contact",
     "source_id":"station_io.probe_contact",
@@ -4365,11 +4418,22 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       core::CommandSchemaRevision(
           std::string(core::kGripperPositionCommandSchemaRevision))};
   auto gripper_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map, component_id, gripper_target_id,
-      state_authority, command_schema, local_runtime_epoch,
+      *materialized.bundle, model_map,
+      maintained_product_check ? core::ControllableComponentId("lite_gripper")
+                               : component_id,
+      gripper_target_id, state_authority, command_schema,
+      maintained_product_check ? std::nullopt : std::optional(local_runtime_epoch),
       maintained_product_check
           ? std::optional(core::CapabilityId("tool.gripper.command"))
           : std::nullopt);
+  if (maintained_product_check) {
+    EXPECT_EQ(arm_binding.value().controllable_component_id,
+              core::ControllableComponentId("lite6_robot"));
+    EXPECT_EQ(gripper_binding.value().controllable_component_id,
+              core::ControllableComponentId("lite_gripper"));
+    EXPECT_NE(arm_binding.value().control_path->control_domain_id,
+              gripper_binding.value().control_path->control_domain_id);
+  }
   if (geometric_host_check) {
     deployment::FilesystemCatalogArtifactStore artifacts(package_root);
     const auto direct =
@@ -4383,7 +4447,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                      binding->value().target_role_bindings.begin(),
                      binding->value().target_role_bindings.end(),
                      [&](const auto &target) {
-                       return target.controllable_component_id == component_id &&
+                       return target.controllable_component_id == core::ControllableComponentId("lite_gripper") &&
                               target.command_target_id == gripper_target_id;
                      });
         },
@@ -4401,6 +4465,13 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const auto full_legacy = retained_motion_planner_frames(arm_binding);
     EXPECT_EQ(retained_motion_planner_frames(arm_binding, &model_map),
               full_legacy);
+    // LOADFIX9 oracle: the shared helper equals the M6b loop over the frames.
+    std::vector<std::string> m6b_frame_names;
+    for (const auto &frame :
+         retained_motion_planner_frames(arm_binding, &model_map))
+      m6b_frame_names.push_back(core::compiled_frame_name(frame));
+    EXPECT_EQ(retained_motion_planner_frame_names(arm_binding, &model_map),
+              m6b_frame_names);
 
     // Compile an actual Program whose arm declares only its base while its
     // sibling tool declares the TCP. The selected arm inventory is produced by
@@ -4604,7 +4675,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ManagedKernelAdmissionGate admission_gate;
   auto runtime_input = RetainedNativeRuntimeInput{
       arm_binding,
-      gripper_binding,
+      maintained_product_check ? std::nullopt : std::optional(gripper_binding),
       {},
       {},
       {},
@@ -4627,7 +4698,9 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         return RetainedSceneFrameResolver::create_verified(
             shared_collision_model, *materialized.bundle, model_map, retained,
             local_runtime.runtime_unit_id, local_runtime.runtime_epoch,
-            std::move(state_sources));
+            std::move(state_sources),
+            // The split product's gripper is local: select the component like the host.
+            maintained_product_check ? std::optional(component_id) : std::nullopt);
       },
       {},
       {},
@@ -4636,17 +4709,14 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       {},
       {},
       {}};
-  if (mixed_output_check) {
-    // Include every actual control-facing route, including shared feedback,
-    // reset and Stop capabilities of the same physical backend owner.
+  if (maintained_product_check) {
+    // Include every actual robot route. The mounted gripper is a separate
+    // component and does not belong to the robot's backend owner.
     for (const auto& control : graph.control_bindings) {
       if (control.controllable_component_id != component_id) continue;
-      ASSERT_TRUE(control.command_target_id == arm_target_id ||
-                  control.command_target_id == gripper_target_id);
+      ASSERT_EQ(control.command_target_id, arm_target_id);
       if (control.control_binding_id == arm_binding.value().control_path->control_binding_id) {
         runtime_input.control_binding_representatives.push_back(arm_binding);
-      } else if (control.control_binding_id == gripper_binding.value().control_path->control_binding_id) {
-        runtime_input.control_binding_representatives.push_back(gripper_binding);
       } else {
         runtime_input.control_binding_representatives.push_back(make_fixture_runtime_participant(
             *materialized.bundle, model_map, component_id, control.command_target_id,
@@ -4797,12 +4867,12 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   // All constructor cases select the existing Core execution-port seam.
   core::ExecutionPortParticipant *port_participant = nullptr;
   runtime_input.motion_state_channel_config = selected_core_test_state_config(arm_binding);
-  runtime_input.gripper_state_channel_config = selected_core_test_state_config(gripper_binding);
+  if (!maintained_product_check)
+    runtime_input.gripper_state_channel_config = selected_core_test_state_config(gripper_binding);
   if (authored_fault_check) {
-    // These constructor checks need the same independently loaded/reloaded
-    // Stop authority as the existing measured-publication fixture below.
+    // These constructor checks need the same resolved Stop authority as the
+    // existing measured-publication fixture below.
     deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
-    core::FilesystemResolvedStopBasePlanRepository plans(temporary.path());
     const auto &path = *arm_binding.value().control_path;
     const auto desired = std::find_if(
         materialized.bundle->value().desired_control_configurations.begin(),
@@ -4836,9 +4906,9 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         configuration.source_runtime_unit_id, configuration.source_runtime_epoch);
     const auto plan = deployment::resolve_verified_stop_base_plan(
         *materialized.bundle, artifacts, expected, configuration, arm_binding);
-    auto readiness = deployment::store_and_verify_runtime_participant_stop_readiness(
+    auto readiness = deployment::seal_runtime_participant_stop_readiness(
         *materialized.bundle, plan, core::ComponentLifecycleGeneration(1U),
-        expected, arm_binding, plans);
+        expected, arm_binding);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
     runtime_input.motion_stop_readiness = std::move(readiness.value());
   }
@@ -4854,7 +4924,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_EQ(port_participant, nullptr);
     return;
   }
-  runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, true);
+  runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, !maintained_product_check);
   if (check == Lite6AggregateCheck::kCompose ||
       check == Lite6AggregateCheck::kRefreshCellModel)
     runtime_input.participant_resolver_factory =
@@ -4881,12 +4951,30 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       runtime_config.kernel.collision_monitor_period_ns;
   const auto configured_immediate_query_budget_ns =
       runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
+  const bool sole_runtime_join_check =
+      check == Lite6AggregateCheck::kSoleRuntimeJoin;
   auto runtime =
-      (moving_budget_check || mixed_output_check || geometric_host_check)
+      (moving_budget_check || mixed_output_check || geometric_host_check ||
+       sole_runtime_join_check)
           ? create_retained_native_runtime_participants(
                 std::move(runtime_input), std::move(runtime_config))
           : create_retained_native_runtime(std::move(runtime_input),
                                            std::move(runtime_config));
+  if (sole_runtime_join_check) {
+    // lite6_pick_and_place (merge 6 tool split): the robot is the cell's only
+    // runtime; its mounted tool is a gripper-only owner, not a peer. Load
+    // failed here with exit 70. The joined robot still roots the cell once.
+    ASSERT_NO_THROW(join_retained_native_runtime_participants(
+        runtime, {}, fixture_tcp_endpoint_resolver_factory()));
+    EXPECT_EQ(runtime->cell_runtime_root, runtime.get());
+    EXPECT_TRUE(runtime->participant_peers.empty());
+    EXPECT_NE(runtime->stop_surveillance_owner, nullptr);
+    EXPECT_TRUE(static_cast<bool>(runtime->participant_resolver));
+    EXPECT_THROW(join_retained_native_runtime_participants(
+                     runtime, {}, fixture_tcp_endpoint_resolver_factory()),
+                 std::invalid_argument);
+    return;
+  }
   if (geometric_host_check) {
     runtime->collision_monitor_period_ns =
         configured_collision_monitor_period_ns;
@@ -4961,12 +5049,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     ASSERT_EQ(catalog.size(), 1U);
     const auto &signal = catalog.front();
     EXPECT_EQ(signal.provider.profile, "geometric_contact");
-    ASSERT_TRUE(signal.provider.endpoint);
-    EXPECT_EQ(signal.provider.endpoint->controllable_component_id,
-              component_id);
-    EXPECT_EQ(signal.provider.endpoint->command_target_id, gripper_target_id);
-    EXPECT_EQ(signal.provider.endpoint->frame_role_id,
-              core::FrameRoleId("tcp"));
+    ASSERT_TRUE(signal.provider.robot_component_id);
+    EXPECT_EQ(*signal.provider.robot_component_id, component_id);
     const auto &domain = require_fixture_one(
         graph.control_domains,
         [&](const auto &row) {
@@ -4989,7 +5073,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
          provider.provider_instance_id, provider.provider_manifest_id,
          provider.provider_manifest_revision, provider.provider_runtime_unit_id,
          station_epoch, provider.lifecycle_plan_catalog_digest},
-        manifest->value(), runtime->clock, 1'000'000'000LL));
+        manifest->value(), runtime->clock, 1'000'000'000LL, 10'000'000LL));
     auto drivers = std::make_shared<const host_detail::IoProviderDriverGroup>(
         host_detail::IoProviderDriverGroup{driver});
 
@@ -4997,26 +5081,68 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         materialized.bundle->retained_bundle_id(), graph.graph_revision,
         initial_scene.shared()->revision};
     constexpr std::uint64_t kPublicationGeneration = 1U;
+    // Use the maintained split ownership: the arm has no gripper runtime;
+    // the mounted tool has an independent scalar owner and channel.
+    ASSERT_FALSE(runtime->gripper_binding.has_value());
+    ASSERT_EQ(runtime->gripper_state_channel, nullptr);
+    auto tool_channel = std::make_shared<RetainedObservedStateChannel>(
+        gripper_binding, state_projector, selected_core_test_state_config(gripper_binding));
+    ASSERT_TRUE(tool_channel->initialize_from_projection(runtime->clock->now()).applied());
+    auto tool_backend = std::make_shared<UnusedSelectedGripperBackend>(gripper_binding, tool_channel);
+    auto tool_runtime = std::make_shared<RetainedNativeGripperRuntime>(
+        RetainedNativeGripperRuntimeInput{gripper_binding, tool_backend, runtime->clock,
+                                         tool_channel, tool_backend.get(), std::nullopt,
+                                         false, {}, runtime->scheduler, std::nullopt});
+
+    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
+    const auto direct = deployment::compile_direct_control_program_binding_inventory(
+        *materialized.bundle, model_map, artifacts);
+    ASSERT_EQ(direct.motion.size(), 1U);
+    const auto &robot_target = require_fixture_one(
+        direct.motion.front()->value().target_role_bindings,
+        [&](const auto &target) {
+          return target.controllable_component_id == component_id &&
+                 target.command_target_id == arm_target_id;
+        }, "actual direct motion TCP inventory");
+    ASSERT_TRUE(robot_target.robot_tcps);
+    auto handle = RetainedRos2ControlRuntimeHandle::Create();
+    handle->InstallActiveTcp(component_id, *robot_target.robot_tcps, false,
+                             direct.motion.front()->program_binding_id());
+    const auto gripper_tcp = require_fixture_one(
+        *robot_target.robot_tcps,
+        [&](const auto &row) {
+          return row.entry.component_id == core::ControllableComponentId("lite_gripper") &&
+                 row.entry.target_id == gripper_target_id;
+        }, "mounted gripper TCP");
+    ASSERT_TRUE(handle->SetActiveTcp(gripper_tcp.entry,
+                                     core::ActiveTcpChangeSource::kRobotControl).ok());
+
     auto composition = std::make_unique<host_detail::Composition>(
-        component_id, materialized.bundle, nullptr, nullptr, nullptr, nullptr,
-        runtime->motion_binding, runtime->gripper_binding, std::nullopt,
+        component_id, materialized.bundle, nullptr, nullptr, direct.motion.front(), nullptr,
+        runtime->motion_binding, std::nullopt, std::nullopt,
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
         nullptr, runtime, product_projection,
         core::ActiveBundlePublicationGeneration(kPublicationGeneration),
         std::nullopt, std::nullopt);
     composition->cell_runtime = budget_cell.get();
+    composition->ros2_control_runtime_handle = handle;
     composition->target_resolver =
         std::make_shared<ProductBackedRuntimeParticipantResolver>(
             package_root, materialized.bundle, model_map,
-            std::vector<core::RuntimeParticipantBinding>{
-                runtime->motion_binding, *runtime->gripper_binding},
+            std::vector<core::RuntimeParticipantBinding>{runtime->motion_binding, gripper_binding},
             std::vector<core::ProgramBindingId>{});
-    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
-    composition->direct_control_io_program_bindings =
-        deployment::compile_direct_control_program_binding_inventory(
-            *materialized.bundle, model_map, artifacts)
-            .io;
+    composition->direct_control_io_program_bindings = direct.io;
+    auto tool_view = std::make_unique<host_detail::Composition>(
+        core::ControllableComponentId("lite_gripper"), materialized.bundle,
+        nullptr, nullptr, nullptr, nullptr, std::nullopt, gripper_binding, std::nullopt,
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}), nullptr, nullptr,
+        product_projection, core::ActiveBundlePublicationGeneration(kPublicationGeneration),
+        std::nullopt, std::nullopt);
+    tool_view->cell_runtime = budget_cell.get();
+    tool_view->gripper_runtime = tool_runtime;
+    composition->participant_compositions.push_back(std::move(tool_view));
     auto station_view = std::make_unique<host_detail::Composition>(
         station, materialized.bundle, nullptr, nullptr, nullptr, nullptr,
         std::nullopt, std::nullopt, std::nullopt,
@@ -5032,6 +5158,38 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
             host_detail::ComponentRuntimePins{nullptr, nullptr, drivers});
     composition->participant_compositions.push_back(std::move(station_view));
 
+    // This fixture invokes the lower-level I/O installer directly. Supply
+    // its cell sources from the actual arm and split-tool channels; the host
+    // wrapper normally obtains the same sources from its cell collector.
+    const auto add_cell_source = [&](const auto &channel) {
+      const auto *publication = channel->addressed_publication();
+      composition->cell_frame_state_sources.push_back({
+          {channel->query_context(), channel->source_kind(),
+           std::shared_ptr<const core::IObservedStateProvider>(channel, publication),
+           RetainedSceneFrameCoordinateAuthority::kRequiredPublication},
+          std::shared_ptr<const core::ObservedRobotStatePublication>(
+              channel, &publication->numeric_publication())});
+    };
+    add_cell_source(runtime->motion_state_channel);
+    // A missing model coordinate is an installation error, not a synthetic
+    // neutral value or a runtime-unavailable sample (DX-3080).
+    const auto arm_names = runtime->motion_state_channel->addressed_publication()
+                               ->numeric_publication().canonical_joint_names();
+    ASSERT_FALSE(arm_names.empty());
+    const auto missing_source = host_detail::PrepareCompositionIoProviderResources(
+        *composition, *budget_cell, {}, {});
+    ASSERT_FALSE(missing_source.ok());
+    EXPECT_EQ(missing_source.error().code, "io_provider_installation_failed");
+    EXPECT_EQ(missing_source.error().message,
+              "a joint in the cell model has no state source (robot lite6_robot)");
+    const auto known = missing_source.error().details.find("known_source_joint_names");
+    ASSERT_NE(known, missing_source.error().details.end());
+    EXPECT_EQ(missing_source.error().details.at("known_source_joint_names_truncated"), "false");
+    for (const auto &name : arm_names)
+      EXPECT_NE(known->second.find(name), std::string::npos);
+    EXPECT_EQ(composition->io_signal_runtime, nullptr);
+    add_cell_source(tool_channel);
+
     const auto prepared = host_detail::PrepareCompositionIoProviderResources(
         *composition, *budget_cell, {}, {});
     ASSERT_TRUE(prepared.ok()) << prepared.error().message;
@@ -5043,12 +5201,25 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const auto &geometric =
         installations.begin()->second.front().geometric_contact;
     ASSERT_TRUE(geometric);
-    EXPECT_EQ(geometric->endpoint.command_target_id, gripper_target_id);
-    ASSERT_EQ(geometric->endpoint.contact_body_bindings.size(), 1U);
-    EXPECT_EQ(geometric->endpoint.contact_body_bindings.front()
-                  .collision_body_role_id,
-              core::CollisionBodyRoleId("gripper_fingers"));
-    EXPECT_EQ(geometric->observed_states.size(), 2U);
+    const auto no_tcp = composition->target_resolver->ActiveTcpContactBodies(
+        runtime->motion_binding, std::nullopt);
+    ASSERT_FALSE(no_tcp.ok());
+    EXPECT_EQ(no_tcp.error().code, "io_source_unavailable");
+    EXPECT_EQ(no_tcp.error().details.at("reason"), "active_tcp_unavailable");
+    const auto tool_bodies = geometric->read_contact_bodies();
+    ASSERT_TRUE(tool_bodies.ok()) << tool_bodies.error().message;
+    ASSERT_FALSE(tool_bodies.value().empty());
+    EXPECT_TRUE(std::all_of(tool_bodies.value().begin(), tool_bodies.value().end(),
+                            [](const auto &body) { return body.find("lite_gripper") != std::string::npos; }));
+    ASSERT_EQ(geometric->observed_states.size(), 2U);
+    const auto *arm_publication =
+        &runtime->motion_state_channel->addressed_publication()->numeric_publication();
+    const auto *tool_publication =
+        &tool_runtime->state_channel()->addressed_publication()->numeric_publication();
+    EXPECT_TRUE(std::any_of(geometric->observed_states.begin(), geometric->observed_states.end(),
+                            [&](const auto &row) { return row.get() == arm_publication; }));
+    EXPECT_TRUE(std::any_of(geometric->observed_states.begin(), geometric->observed_states.end(),
+                            [&](const auto &row) { return row.get() == tool_publication; }));
     const auto query =
         std::dynamic_pointer_cast<collision::ManyForgeCollisionEngine>(
             geometric->collision_engine);
@@ -5081,10 +5252,10 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                                             std::string(primitive) + "." +
                                             std::to_string(sequence)),
           snapshot.source_generation,
-          1'000'000'000LL};
+          1'000'000'000LL,
+          core::ComponentLifecycleStateDTO::kUndeclared};
       const auto outcome = driver->Dispatch(intent, {});
-      ASSERT_EQ(outcome.known,
-                core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+      ASSERT_EQ(outcome.outcome, RetainedRos2ControlSwitchOutcome::kSucceeded)
           << (outcome.error ? outcome.error->message : "missing result");
     };
     const core::IoSignalId signal_id{station, "probe_contact"};
@@ -5101,6 +5272,49 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     // Compare the contained level; bool conversion only tests optional presence.
     EXPECT_EQ(contact.latest_sample->publication.value,
               std::optional<bool>(true));
+    const auto prepared_world = geometric->collision_publisher
+                                    ->published_runtime_collision_query_bundle();
+    ASSERT_TRUE(prepared_world);
+    ASSERT_TRUE(prepared_world->world);
+    for (const auto &body : tool_bodies.value())
+      EXPECT_EQ(geometric->body_static_wrt_group(*prepared_world->world, body),
+                std::optional<bool>(false));
+    // Keep the provider enabled while changing the live robot-owned TCP.
+    // This maintained Lite6 flange declares no contact bodies, so it must
+    // publish unavailable instead of retaining the gripper's true level.
+    const auto robot_tcp = require_fixture_one(
+        *robot_target.robot_tcps,
+        [&](const auto &row) {
+          return row.entry.component_id == component_id &&
+                 row.entry.frame_role_id == core::FrameRoleId("flange");
+        }, "robot flange TCP");
+    ASSERT_TRUE(robot_tcp.frame.contact_body_role_ids.empty());
+    ASSERT_TRUE(handle->SetActiveTcp(robot_tcp.entry,
+                                     core::ActiveTcpChangeSource::kRobotControl).ok());
+    const auto robot_bodies = geometric->read_contact_bodies();
+    ASSERT_TRUE(robot_bodies.ok()) << robot_bodies.error().message;
+    EXPECT_TRUE(robot_bodies.value().empty());
+    bool saw_unavailable = false;
+    for (const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         !saw_unavailable && std::chrono::steady_clock::now() < deadline;) {
+      ASSERT_TRUE(composition->io_signal_runtime->DrainPending().ok());
+      const auto current = take(composition->io_signal_service->ReadSignal(signal_id));
+      if (current.latest_sample &&
+          current.availability == core::IoSignalAvailability::kUnavailable) {
+        EXPECT_FALSE(current.latest_sample->publication.value.has_value());
+        ASSERT_TRUE(current.latest_sample->publication.error);
+        EXPECT_EQ(current.latest_sample->publication.error->code, "io_source_unavailable");
+        EXPECT_EQ(current.latest_sample->publication.error->details.at("reason"),
+                  "active_tcp_contact_bodies_unavailable");
+        saw_unavailable = true;
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    ASSERT_TRUE(saw_unavailable);
+    ASSERT_TRUE(handle->SetActiveTcp(gripper_tcp.entry,
+                                     core::ActiveTcpChangeSource::kRobotControl).ok());
+
     const auto initial_bundle =
         geometric->collision_publisher
             ->published_runtime_collision_query_bundle();
@@ -5255,7 +5469,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     mixed_driver = take(host_detail::IoProviderDriverRecord::Create(
         {domain.control_domain_id, domain.control_domain_revision,
          core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}, resources}},
-        occurrence, manifest->value(), runtime->clock, 1'000'000'000LL));
+        occurrence, manifest->value(), runtime->clock, 1'000'000'000LL, 10'000'000LL));
 
     component_manager::SqliteActiveBundlePublicationStore publications(
         temporary.path() / "mixed-active.sqlite3", graph.cell_id);
@@ -5356,10 +5570,11 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
           selected.provider_manifest_revision, selected.provider_runtime_unit_id,
           selected.provider_runtime_epoch, core::LifecyclePrimitiveId("io.provider." + std::string(primitive)),
           core::LifecyclePrimitiveAttemptId("mixed.attempt." + std::string(primitive)),
-          before.source_generation, 1'000'000'000LL};
+          before.source_generation, 1'000'000'000LL,
+          core::ComponentLifecycleStateDTO::kUndeclared};
       ASSERT_TRUE(intent.locally_valid());
       const auto outcome = mixed_driver->Dispatch(intent, {});
-      ASSERT_EQ(outcome.known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+      ASSERT_EQ(outcome.outcome, RetainedRos2ControlSwitchOutcome::kSucceeded)
           << (outcome.error ? outcome.error->code + ": " + outcome.error->message
                             : "no lifecycle error returned");
     }
@@ -5401,12 +5616,20 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     RetainedRuntimeParticipantResolverFactory current_factory =
         [package_root, bundle = materialized.bundle, model_map, direct_id = binding->program_binding_id()]
         (auto composed) {
+          // Active TCP (M7): Robot control resolves through the robot's owner.
+          std::vector<RobotTcpReader> owners;
+          for (const auto &row : composed) owners.push_back(fixture_robot_tcps(row));
+          const RobotTcpReader robot_tcps = [owners](const core::ControllableComponentId &robot) {
+            for (const auto &owner : owners)
+              if (auto state = owner(robot)) return state;
+            return std::optional<ActiveTcp>{};
+          };
           auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
               package_root, bundle, model_map, std::move(composed),
               std::vector<core::ProgramBindingId>{direct_id});
           return RetainedRuntimeParticipantResolver{
-              [resolver](const auto& operation, auto index) {
-                return resolver->ResolveExecutionParticipant(operation, index);
+              [resolver, robot_tcps](const auto& operation, auto index) {
+                return resolver->ResolveExecutionParticipant(operation, index, robot_tcps);
               }};
         };
     std::vector<core::RuntimeParticipantBinding> all_bindings;
@@ -5493,7 +5716,10 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_NE(runtime, nullptr);
   ASSERT_NE(runtime->active_addressed_kernel(), nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
-  ASSERT_TRUE(runtime->gripper_binding.has_value());
+  if (mixed_output_check)
+    EXPECT_FALSE(runtime->gripper_binding.has_value());
+  else
+    ASSERT_TRUE(runtime->gripper_binding.has_value());
   if (check == Lite6AggregateCheck::kMeasuredPublication ||
       check == Lite6AggregateCheck::kResolverRebuildFailures ||
       check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind ||
@@ -5502,9 +5728,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
       check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
     // Use the verified ROS product and actual Kernel with the focused Core port.
-    // Stop readiness is produced by the existing sealed repository boundary.
+    // Stop readiness is produced by the existing sealed readiness boundary.
     deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
-    core::FilesystemResolvedStopBasePlanRepository plans(temporary.path());
     const auto make_configuration = [&](const core::RuntimeParticipantBinding &binding,
                                         core::ActiveControlConfigurationGeneration generation) {
       const auto &path = *binding.value().control_path;
@@ -5582,8 +5807,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
               : core::ComponentLifecycleGeneration(1U), mixed_output_check
               ? core::ComponentLifecycleStateDTO::kDeclared
               : core::ComponentLifecycleStateDTO::kPrepared}};
-      return deployment::resolve_store_and_verify_route_readiness_batch(
-          *materialized.bundle, artifacts, expected, configuration, components, bindings, plans);
+      return deployment::resolve_and_verify_route_readiness_batch(
+          *materialized.bundle, artifacts, expected, configuration, components, bindings);
     };
     const auto assert_budget = [&]() {
       if (!moving_budget_check)
@@ -6719,6 +6944,51 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(measured_metrics.peak_tcp_linear_speed_mps.has_value());
   EXPECT_GT(*measured_metrics.peak_tcp_linear_speed_mps, 0.0);
   EXPECT_LE(*measured_metrics.peak_tcp_linear_speed_mps, 0.15);
+  EXPECT_FALSE(measured_metrics.peak_tcp_linear_speed_frame);
+  if (check == Lite6AggregateCheck::kMovingValidation) {
+    // tcp_speed_check over a frame set. The base link stands in for an
+    // active TCP that does not move; the moving TCP link stands in for the
+    // robot flange, so only the flange can exceed the limit.
+    const core::SpeedCheckFrameDTO still_tcp{base_frame.compiled_frame_name,
+                                             "tcp"};
+    const core::SpeedCheckFrameDTO moving_flange{tcp_frame.compiled_frame_name,
+                                                 "flange"};
+    const double flange_peak = *measured_metrics.peak_tcp_linear_speed_mps;
+    core::ValidationOptionsDTO tcp_only{flange_peak * 0.5,
+                                        base_frame.compiled_frame_name,
+                                        base_frame.compiled_frame_name, false};
+    tcp_only.speed_frames = {still_tcp};
+    const auto active_tcp = runtime->kinematic_model->validate_non_collision(
+        measured_trajectory, tcp_only, cancellation);
+    ASSERT_TRUE(active_tcp.valid)
+        << (active_tcp.error ? active_tcp.error->message : "");
+    EXPECT_DOUBLE_EQ(*active_tcp.trajectory_metrics->peak_tcp_linear_speed_mps,
+                     0.0);
+    EXPECT_EQ(active_tcp.trajectory_metrics->peak_tcp_linear_speed_frame,
+              base_frame.compiled_frame_name);
+    auto with_flange = tcp_only;
+    with_flange.speed_frames = {still_tcp, moving_flange};
+    const auto refused = runtime->kinematic_model->validate_non_collision(
+        measured_trajectory, with_flange, cancellation);
+    ASSERT_FALSE(refused.valid);
+    ASSERT_TRUE(refused.error);
+    EXPECT_EQ(refused.error->details.at("reason"),
+              "tcp_linear_speed_limit_exceeded");
+    EXPECT_EQ(refused.error->details.at("frame"),
+              tcp_frame.compiled_frame_name);
+    EXPECT_EQ(refused.error->details.at("frame_role"), "flange");
+    EXPECT_EQ(refused.error->details.at("tcp_frame"),
+              base_frame.compiled_frame_name);
+    with_flange.max_tcp_linear_speed_mps = flange_peak * 2.0;
+    const auto accepted = runtime->kinematic_model->validate_non_collision(
+        measured_trajectory, with_flange, cancellation);
+    ASSERT_TRUE(accepted.valid)
+        << (accepted.error ? accepted.error->message : "");
+    EXPECT_DOUBLE_EQ(*accepted.trajectory_metrics->peak_tcp_linear_speed_mps,
+                     flange_peak);
+    EXPECT_EQ(accepted.trajectory_metrics->peak_tcp_linear_speed_frame,
+              tcp_frame.compiled_frame_name);
+  }
   if (check == Lite6AggregateCheck::kMovingValidation) {
     core::ValidationOptionsDTO moving_options{
         1.0, tcp_frame.compiled_frame_name, base_frame.compiled_frame_name,
@@ -6805,6 +7075,24 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_EQ(refused_source.error->details.at("reason"),
               "tcp_linear_speed_limit_exceeded");
     EXPECT_EQ(refused_source.error->details.at("tcp_frame"),
+              tcp_frame.compiled_frame_name);
+    // The retained prefix keeps its own frame set: a one-point source
+    // prefix, then a two-point future whose flange alone moves.
+    auto future_set = moving_options;
+    future_set.tcp_frame = base_frame.compiled_frame_name;
+    future_set.speed_frames = {
+        core::SpeedCheckFrameDTO{base_frame.compiled_frame_name, "tcp"}};
+    future_set.max_tcp_linear_speed_mps = 1e-6;
+    const auto still_future = validate(seam_trajectory, future_set);
+    ASSERT_TRUE(still_future.valid && still_future.moving_replacement)
+        << (still_future.error ? still_future.error->message : "");
+    future_set.speed_frames.push_back(
+        core::SpeedCheckFrameDTO{tcp_frame.compiled_frame_name, "flange"});
+    const auto refused_future_flange = validate(seam_trajectory, future_set);
+    ASSERT_FALSE(refused_future_flange.valid);
+    ASSERT_TRUE(refused_future_flange.error);
+    EXPECT_EQ(refused_future_flange.error->details.at("frame_role"), "flange");
+    EXPECT_EQ(refused_future_flange.error->details.at("frame"),
               tcp_frame.compiled_frame_name);
     auto future_too_slow = moving_options;
     future_too_slow.max_tcp_linear_speed_mps = 1e-6;
@@ -6961,7 +7249,8 @@ void check_refreshed_cell_model(
   const auto make_candidate =
       [&](const std::string &urdf,
           std::vector<RoboPlanJointLimitInput> limits,
-          std::vector<core::RuntimeParticipantBinding> projected) {
+          std::vector<core::RuntimeParticipantBinding> projected,
+          std::vector<std::string> mounted_frame_names = {}) {
         auto scene = make_roboplan_scene(RoboPlanSceneInput{
             "retained_lite6_candidate_cell", urdf, srdf, stage.package_paths(),
             std::move(limits)});
@@ -6972,7 +7261,7 @@ void check_refreshed_cell_model(
                 std::move(projected), 0));
         return make_retained_motion_model_generation(
             arm_binding, std::move(scene), std::move(scene_mutex),
-            std::move(projector));
+            std::move(projector), std::move(mounted_frame_names));
       };
   const auto candidate_urdf = with_peer(moved_root(predecessor_urdf));
   // Limits are read from the closure-local retained URDF, edited identically.
@@ -7003,6 +7292,21 @@ void check_refreshed_cell_model(
   const auto world_tcp_before = runtime.kinematic_model->forward_kinematics(
       core::FkRequestDTO{zero_state, tcp_frame, ""});
   ASSERT_TRUE(world_tcp_before.ok()) << world_tcp_before.error().message;
+
+  // ur5e_lite6_wall_grouped (TCP-C): a mounted tool's second TCP is an
+  // owner-issued planner frame outside the arm binding. FK of it failed the
+  // whole control-state read until the owner passes it to the kinematics.
+  {
+    const core::FkRequestDTO tool_frame{zero_state, "peer_link", ""};
+    const auto refused = candidate->kinematics->forward_kinematics(tool_frame);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "retained_fk_binding_mismatch");
+    const auto permitted =
+        make_candidate(candidate_urdf, candidate_limits, both, {"peer_link"});
+    const auto allowed = permitted->kinematics->forward_kinematics(tool_frame);
+    EXPECT_TRUE(allowed.ok()) << allowed.error().message;
+  }
 
   const core::ConfigurationFenceId fence_id("cell-model.refresh.apply");
   const core::ConfigurationFenceScopeDTO scope{};
@@ -7131,6 +7435,11 @@ TEST(RetainedProductCrossConsumer,
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kCompose);
 }
 
+TEST(RetainedProductCrossConsumer,
+     SoleMotionRuntimeWithOnlyToolComponentsJoinsWithoutPeers) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kSoleRuntimeJoin);
+}
+
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
 TEST(RetainedProductCrossConsumer,
      NoFeedbackPneumaticCloseReachesNextCollisionExpansion) {
@@ -7167,8 +7476,45 @@ TEST(RetainedNativeMeasuredRoutePublication,
       Lite6AggregateCheck::kMixedOutputPublication);
 }
 
+// TCPUNMOUNTED-REBASE supplies this genuine retained product; it must be
+// integrated first. Exercise the real resolver and mount index, not a made-up
+// uncarried TCP row or a fake combined runtime.
+TEST(RetainedProductCrossConsumer, GeometricContactRefusesARealUnmountedToolTcp) {
+  ScopedTemporaryRoot temporary;
+  const auto product = deployment::test::MaterializeMaintainedLite6WithUnmountedTool(
+      temporary.path());
+  ASSERT_TRUE(product.bundle);
+  ASSERT_TRUE(product.model_map);
+  const core::ControllableComponentId robot("lite6_robot");
+  const core::ControllableComponentId tool("lite_gripper");
+  const core::CommandTargetId arm("arm");
+  const auto physical = make_fixture_runtime_participant(
+      *product.bundle, *product.model_map, robot, arm, std::nullopt, std::nullopt,
+      std::nullopt, core::CapabilityId("execution.trajectory.execute"));
+  deployment::FilesystemCatalogArtifactStore catalog(temporary.path());
+  const auto binding = deployment::compile_direct_control_motion_program_binding(
+      robot, arm, *product.bundle, *product.model_map, catalog);
+  ASSERT_TRUE(binding);
+  const auto &target = require_fixture_one(
+      binding->value().target_role_bindings,
+      [&](const auto &row) { return row.controllable_component_id == robot && row.command_target_id == arm; },
+      "unmounted fixture robot target");
+  ASSERT_TRUE(target.robot_tcps);
+  const auto &tcp = require_fixture_one(
+      *target.robot_tcps,
+      [&](const auto &row) { return row.entry.component_id == tool &&
+                                     row.entry.frame_role_id == core::FrameRoleId("tcp"); },
+      "unmounted fixture tool TCP");
+  ProductBackedRuntimeParticipantResolver resolver(
+      temporary.path(), product.bundle, *product.model_map,
+      std::vector<core::RuntimeParticipantBinding>{physical}, std::vector<core::ProgramBindingId>{});
+  const auto bodies = resolver.ActiveTcpContactBodies(physical, tcp);
+  ASSERT_FALSE(bodies.ok());
+  EXPECT_EQ(bodies.error().details.at("reason"), "tcp_tool_not_mounted");
+}
+
 TEST(RetainedProductCrossConsumer,
-     ActualGeometricContactInstallsMaintainedGripperEndpointThroughHostIo) {
+     ActualGeometricContactInstallsSplitGripperThroughHostIo) {
   check_selected_core_lite6_aggregate(
       Lite6AggregateCheck::kGeometricHostInstallation);
 }
@@ -8492,6 +8838,8 @@ TEST(RetainedProductCrossConsumer,
       });
   ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
   auto projection = projection_result.value();
+  ASSERT_NE(projection->logical_snapshot(), nullptr);
+  EXPECT_EQ(*projection->logical_snapshot(), initial_scene);
   ASSERT_TRUE(
       projection->ProjectionHealth().healthy_for_target(initial_revision));
   const auto publication_inventory =
@@ -8724,6 +9072,7 @@ TEST(RetainedProductCrossConsumer,
   // next consumer, and a failed build desynchronizes the projection.
   const auto uncertain = projection->ApplyTransaction(uncertain_transaction);
   EXPECT_EQ(uncertain.result, core::ProjectionCommitResultStateDTO::kCommitted);
+  EXPECT_EQ(*projection->logical_snapshot(), uncertain_scene);
   fail_clock = true;
   EXPECT_EQ(projection->snapshot(), nullptr);
   fail_clock = false;
@@ -8748,6 +9097,8 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(recovered.presence_valid());
   EXPECT_TRUE(
       recovered.resulting_health.healthy_for_target(candidate_revision));
+  ASSERT_NE(projection->logical_snapshot(), nullptr);
+  EXPECT_EQ(*projection->logical_snapshot(), candidate_scene);
   std::optional<core::SceneTransactionDTO> oldest_retained_transaction;
   for (std::uint64_t sequence = 3U; sequence <= 5U; ++sequence) {
     const core::SceneTransactionDTO no_op{
@@ -9282,7 +9633,7 @@ TEST(RetainedProductCrossConsumer,
   const auto operation = make_motion_operation(
       physical, core::RequestOwnerEpoch("kernel.endpoint"),
       scene.shared()->revision);
-  const auto resolved = resolver.Resolve(operation, 0U);
+  const auto resolved = resolver.Resolve(operation, 0U, fixture_robot_tcps(physical));
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   const auto &endpoint = resolved.value().value().motion_endpoint;
   ASSERT_TRUE(endpoint);
@@ -9436,7 +9787,10 @@ TEST(RetainedProductCrossConsumer,
     forged.program_id = core::ProgramId("forged-direct-program");
     EXPECT_FALSE(resolver.ValidateExecutionOrigin(forged).ok());
     EXPECT_FALSE(resolver.Resolve(forged, 0U).ok());
-    const auto resolved = resolver.Resolve(operation, 0U);
+    const auto robot_tcps = fixture_robot_tcps(physical_bindings[index]);
+    // Robot control needs the robot's runtime owner (its list).
+    EXPECT_FALSE(resolver.Resolve(operation, 0U).ok());
+    const auto resolved = resolver.Resolve(operation, 0U, robot_tcps);
     ASSERT_TRUE(resolved.ok()) << resolved.error().message;
     EXPECT_EQ(resolved.value().value().program_binding_id,
               physical_bindings[index].value().program_binding_id);
@@ -9451,18 +9805,56 @@ TEST(RetainedProductCrossConsumer,
     EXPECT_EQ(endpoint->command_target_id,
               physical_bindings[index].value().command_target_id);
     EXPECT_EQ(endpoint->frame.frame_role_id, core::FrameRoleId("tcp"));
+    // Robot control's Current is the robot's Active TCP.
+    auto current = operation;
+    std::get<core::MotionParticipantIntentDTO>(current.participants.front().payload)
+        .tcp_endpoint = core::CurrentTcpDTO{};
+    const auto at_current = resolver.Resolve(current, 0U, robot_tcps);
+    ASSERT_TRUE(at_current.ok()) << at_current.error().message;
+    EXPECT_EQ(at_current.value().value().motion_endpoint, endpoint);
+    // B-run-1: with no End-effector TCP (no Active TCP) a joint goal at
+    // Current runs at the robot's own flange; a Cartesian goal is refused.
+    {
+      const auto &value = physical_bindings[index].value();
+      auto flange_frame = endpoint->frame;
+      flange_frame.frame_role_id = core::FrameRoleId("flange");
+      flange_frame.contact_body_role_ids.clear();
+      const RobotTcp flange{{value.controllable_component_id, value.command_target_id,
+                             core::FrameRoleId("flange")},
+                            flange_frame, false, false};
+      const RobotTcpReader no_tcp = [robot = value.controllable_component_id,
+                                     state = ActiveTcp({flange})](
+                                        const core::ControllableComponentId &component)
+          -> std::optional<ActiveTcp> {
+        if (component != robot) return std::nullopt;
+        return state;
+      };
+      const auto jog = resolver.Resolve(current, 0U, no_tcp);
+      ASSERT_TRUE(jog.ok()) << jog.error().message;
+      EXPECT_EQ(jog.value().value().motion_endpoint->frame.frame_role_id,
+                core::FrameRoleId("flange"));
+      auto cartesian = current;
+      std::get<core::MotionParticipantIntentDTO>(cartesian.participants.front().payload).motion =
+          core::PoseGoalDTO{};
+      const auto refused = resolver.Resolve(cartesian, 0U, no_tcp);
+      ASSERT_FALSE(refused.ok());
+      EXPECT_EQ(refused.error().details.at("reason"), "end_effector_tcp_unavailable");
+    }
+    // A1-1: an entry outside the robot's list is a typed refusal.
     auto crossed_endpoint = operation;
-    std::get<core::MotionParticipantIntentDTO>(
-        crossed_endpoint.participants.front().payload)
-        .tcp_endpoint.target_role_id =
-        core::TargetRoleId("missing.endpoint.owner");
-    EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U).ok());
+    std::get<core::TcpEntryDTO>(std::get<core::MotionParticipantIntentDTO>(
+                                    crossed_endpoint.participants.front().payload)
+                                    .tcp_endpoint)
+        .component_id = core::ControllableComponentId("missing.endpoint.owner");
+    const auto crossed = resolver.Resolve(crossed_endpoint, 0U, robot_tcps);
+    ASSERT_FALSE(crossed.ok());
+    EXPECT_EQ(crossed.error().details.at("reason"), "active_tcp_unknown");
     crossed_endpoint = operation;
-    std::get<core::MotionParticipantIntentDTO>(
-        crossed_endpoint.participants.front().payload)
-        .tcp_endpoint.frame_role_id =
-        core::FrameRoleId("missing.endpoint.frame");
-    EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U).ok());
+    std::get<core::TcpEntryDTO>(std::get<core::MotionParticipantIntentDTO>(
+                                    crossed_endpoint.participants.front().payload)
+                                    .tcp_endpoint)
+        .frame_role_id = core::FrameRoleId("missing.endpoint.frame");
+    EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U, robot_tcps).ok());
     const auto &physical = physical_bindings[index];
     const auto &control = *physical.value().control_path;
     const auto context = core::make_observed_state_query_context(physical, 100);
@@ -10452,6 +10844,180 @@ TEST(RetainedProductConsumerTest, PneumaticCaptureAndOutputResolverUseTheBoundIo
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   EXPECT_EQ(resolved.value().binding.value().controllable_component_id.value(), "gripper_io");
   EXPECT_EQ(resolved.value().binding.value().io_output_binding->signal.signal_id.name, "valve");
+}
+
+// B7 [C-QB7]: a frame's component is always its owner. On the maintained
+// lite6 + lite_gripper product the real planner's inventory holds the
+// gripper's TCP once, gripper-stamped; a Program move at that TCP resolves
+// with the gripper as its endpoint owner (which stamps the Kernel request,
+// test_resource_addressed_execution_kernel); the real RoboPlan worker plans
+// it; the arm-stamped spelling and a frame outside the inventory are refused
+// before transport.
+TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner) {
+  namespace fixture = deployment::test::maintained_activation_fixture_detail;
+  ScopedTemporaryRoot package, artifacts, stages;
+  const auto product = deployment::test::MaterializeMaintainedInterruptDeployment(
+      package.path(),
+      deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root());
+  ASSERT_TRUE(product.model_map);
+  const auto &bundle = *product.bundle;
+  const auto &model_map = *product.model_map;
+  const core::ControllableComponentId arm_id("lite6_robot");
+  const core::ControllableComponentId tool_id("lite_gripper");
+
+  // An actual Program over the maintained components: the arm moves, its TCP
+  // endpoint is the gripper's own `tcp` (one name per frame since B2).
+  deployment::test::ProgramOptions options;
+  options.catalog_content_version =
+      bundle.value().catalogs.node_environment.content_version;
+  auto authored = deployment::test::make_program_root(options);
+  authored = fixture::With(std::move(authored), "component_roles",
+                           deployment::parse_strict_json_model_yaml(
+                               R"({"robot":{},"tool":{}})")
+                               .root());
+  authored = fixture::With(std::move(authored), "target_roles",
+                           deployment::parse_strict_json_model_yaml(R"({
+    "arm":{"component_role":"robot",
+      "required_capabilities":[
+        {"capability_id":"execution.trajectory.execute","parameters":{},"disposition":"required"},
+        {"capability_id":"planning.motion.joint_goal","parameters":{},"disposition":"required"}],
+      "required_frame_roles":["base"],"required_resource_roles":["arm_joints"],
+      "required_collision_body_roles":[],"required_model_roles":["arm_model"]},
+    "gripper":{"component_role":"tool",
+      "required_capabilities":[
+        {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"}],
+      "required_frame_roles":["tcp"],"required_resource_roles":["fingers"],
+      "required_collision_body_roles":[],"required_model_roles":[]}})")
+                               .root());
+  const auto program = deployment::verify_program_binding_contract(
+      deployment::canonical_json(deployment::test::with_program_revision(
+          deployment::normalize_program_authoring(authored))),
+      bundle);
+  deployment::FilesystemCatalogArtifactStore catalogs(package.path());
+  const auto compiled = deployment::compile_program_binding(
+      *program,
+      {{{core::ComponentRoleId("robot"), arm_id}, {core::ComponentRoleId("tool"), tool_id}},
+       {{core::TargetRoleId("arm"), core::CommandTargetId("arm")},
+        {core::TargetRoleId("gripper"), core::CommandTargetId("gripper")}}},
+      bundle, model_map, catalogs);
+  ASSERT_NE(compiled, nullptr);
+  deployment::FilesystemProgramRepository programs(artifacts.path());
+  deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
+  ASSERT_TRUE(programs.put_if_absent(program, bundle));
+  ASSERT_TRUE(bindings.put_if_absent(compiled, bundle, model_map));
+
+  const auto physical = make_fixture_runtime_participant(
+      bundle, model_map, arm_id, core::CommandTargetId("arm"), std::nullopt, std::nullopt,
+      std::nullopt, core::CapabilityId("execution.trajectory.execute"));
+  ProductBackedRuntimeParticipantResolver resolver(package.path(), product.bundle, model_map,
+                                                   {physical}, {}, artifacts.path());
+  const auto scene = make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id);
+  auto operation =
+      make_motion_operation(physical, core::RequestOwnerEpoch("kernel.b7"), scene.shared()->revision);
+  operation.program_id = compiled->value().program_id;
+  operation.program_revision = compiled->value().program_revision;
+  operation.program_binding_id = compiled->value().program_binding_id;
+  auto &participant = operation.participants.front();
+  participant.component_role_id = core::ComponentRoleId("robot");
+  participant.target_role_id = core::TargetRoleId("arm");
+  // TCP-A1: the arm role's list carries the mounted gripper's TCP.
+  std::get<core::MotionParticipantIntentDTO>(participant.payload).tcp_endpoint =
+      core::TcpEntryDTO{tool_id, core::CommandTargetId("gripper"), core::FrameRoleId("tcp")};
+  const auto resolved = resolver.ResolveExecutionParticipant(operation, 0U);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  const auto &selected = resolved.value().binding.value();
+  EXPECT_EQ(selected.controllable_component_id, arm_id);
+  ASSERT_TRUE(selected.motion_endpoint);
+  EXPECT_EQ(resolved.value().motion_endpoint_owner, std::optional(tool_id));
+  const auto &endpoint = selected.motion_endpoint->frame;
+  // The Kernel's TCP stamp: the endpoint frame under its owner.
+  const core::ResolvedFrameDTO tool_tcp = core::ResolvedComponentModelFrameDTO{
+      tool_id, endpoint.model_instance_id, endpoint.frame_role_id, endpoint.compiled_frame_name,
+      endpoint.model_revision};
+
+  // The owner-issued inventory: every frame stamped with its owner, the
+  // gripper's TCP exactly once.
+  const auto frames = retained_motion_planner_frames(physical, &model_map);
+  EXPECT_EQ(std::count(frames.begin(), frames.end(), tool_tcp), 1);
+  for (const auto &frame : frames) {
+    const auto *row = std::get_if<core::ResolvedComponentModelFrameDTO>(&frame);
+    ASSERT_NE(row, nullptr);
+    const auto *owner = model_map.kinematic_index().owner_of(row->model_instance_id);
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(row->controllable_component_id, *owner);
+  }
+  const auto base = std::find_if(frames.begin(), frames.end(), [&](const auto &frame) {
+    const auto *row = std::get_if<core::ResolvedComponentModelFrameDTO>(&frame);
+    return row != nullptr && row->controllable_component_id == arm_id &&
+           row->frame_role_id == core::FrameRoleId("base");
+  });
+  ASSERT_NE(base, frames.end());
+
+  // The real planner accepts the inventory and plans the tool-TCP move.
+  auto candidate = make_candidate_binding(physical);
+  candidate.permitted_frames = frames;
+  const auto &products = bundle.value().compiled_products;
+  const auto retained = load_lite6_planning_model(
+      package.path(), deployment::RetainedPlanningModelQuery{
+                          bundle.retained_bundle_id(), products.planning_collision_model.product_id});
+  auto stage = RetainedPlanningModelStage::create_verified(retained, stages.path());
+  ProcessContainedCandidateClientConfig candidate_config;
+  candidate_config.worker_executable = MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH;
+  std::unique_ptr<RoboPlanPlannerBackend> planner;
+  ASSERT_NO_THROW(planner = std::make_unique<RoboPlanPlannerBackend>(
+                      core::testing::make_test_projection_binding(), candidate,
+                      std::make_unique<ProcessContainedRoboPlanCandidateClient>(
+                          RoboPlanWorkerModelDTO{"b7_owner_stamped_worker",
+                                                 stage.loader_urdf_path(),
+                                                 stage.srdf_path(),
+                                                 stage.package_paths(),
+                                                 retained_joint_limit_rows(retained),
+                                                 {},
+                                                 {}},
+                          candidate, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
+                          std::move(candidate_config))));
+  const auto request = [&](const core::ResolvedFrameDTO &tcp_frame) {
+    const auto &joints = candidate.compiled_joint_names;
+    std::vector<double> start(joints.size(), 0.0);
+    start.at(2) = 1.57;
+    auto goal = start;
+    goal.front() += 0.05;
+    auto value = core::testing::make_test_plan_request(
+        "move:b7-tool-tcp",
+        core::ResolvedMotionSpecDTO{core::ResolvedJointGoalDTO{candidate.resources, joints, goal}},
+        joints, start);
+    value.controllable_component_id = candidate.controllable_component_id;
+    value.command_target_id = candidate.command_target_id;
+    value.model_bindings = {{candidate.model_instance_id, candidate.model_revision}};
+    value.model_group_binding.model_instance_id = candidate.model_instance_id;
+    value.model_group_binding.model_revision = candidate.model_revision;
+    value.model_group_binding.compiled_group_name = candidate.compiled_group_name;
+    value.resources = candidate.resources;
+    value.start_state.controllable_component_id = candidate.controllable_component_id;
+    value.start_state.command_target_id = candidate.command_target_id;
+    value.start_state.resources = candidate.resources;
+    value.base_frame = *base;
+    value.tcp_frame = tcp_frame;
+    return value;
+  };
+  const auto planned = planner->plan(request(tool_tcp));
+  ASSERT_TRUE(planned.trajectory) << (planned.error ? planned.error->message : "");
+  EXPECT_FALSE(planned.trajectory->waypoints.empty());
+
+  // The moving arm's spelling of the gripper's TCP, and a frame outside the
+  // inventory, are refused before transport.
+  const core::ResolvedFrameDTO arm_spelled = core::ResolvedComponentModelFrameDTO{
+      arm_id, endpoint.model_instance_id, endpoint.frame_role_id, endpoint.compiled_frame_name,
+      endpoint.model_revision};
+  const core::ResolvedFrameDTO outside = core::ResolvedComponentModelFrameDTO{
+      tool_id, endpoint.model_instance_id, core::FrameRoleId("b7_not_in_inventory"),
+      endpoint.compiled_frame_name, endpoint.model_revision};
+  for (const auto &frame : {arm_spelled, outside}) {
+    const auto refused = planner->plan(request(frame));
+    EXPECT_FALSE(refused.trajectory);
+    ASSERT_TRUE(refused.error.has_value());
+    EXPECT_EQ(refused.error->details.at("reason"), "native_planner_participant_binding_mismatch");
+  }
 }
 #endif
 

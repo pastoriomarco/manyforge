@@ -65,9 +65,11 @@ import {
 import { valueSourceMenuModel } from '../utils/valueSourceMenu';
 import {
   buildMotionEndpointMutation,
+  hasUnrepresentedTcpOwner,
   motionEndpointKeyOfNode,
-  programMotionEndpointChoices,
+  programTcpSelectorChoices,
 } from '../utils/motionEndpointAuthoring';
+import { customTcpsOf } from '../utils/customTcps';
 import {
   hasSourcesWithin,
   setValueAtPath,
@@ -88,6 +90,7 @@ import {
   type ProgramSchemaValueEditorContext,
 } from './property/ProgramSchemaValueEditor';
 import {
+  SourceableValue,
   ValueSourceContext,
   valueSourceMenuEntries,
   type ValueSourceController,
@@ -102,6 +105,7 @@ import { resolvedTargetRoles } from '../utils/targetRoleResolution';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { StopStagePicker } from './StopStagePicker';
 import { GraspLostPolicyEditor } from './GraspLostPolicyEditor';
+import { TripPresetEditor } from './TripPresetEditor';
 
 interface ProgramPropertyEditorProps {
   embedded?: boolean;
@@ -228,6 +232,10 @@ export function typeValuesTransition(
   /** The typed value of a map entry a source supplied without a literal. */
   entryDefault?: JsonValue,
 ): { transition: ProgramParameterTransition } | { error: string } {
+  if (node.node_id === 'motion.set_tcp' && path === 'tcp'
+      && !Object.prototype.hasOwnProperty.call(node.parameters, 'tcp')) {
+    return { transition: { kind: 'type_values', literal: { kind: 'current' } } };
+  }
   if (path !== field.id) {
     return {
       transition: valueAtPath(node.parameters, path) === undefined && entryDefault !== undefined
@@ -320,6 +328,7 @@ export function ProgramPropertyEditor({
     });
   }, []);
   const [discardEpoch, setDiscardEpoch] = useState(0);
+  const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
   const [sourceMenu, setSourceMenu] = useState<{
     path: string;
     schema: CatalogJsonSchema;
@@ -402,12 +411,22 @@ export function ProgramPropertyEditor({
       sourceModel,
       sourceModelUnavailableReason,
     ]);
-  const motionEndpointChoices = useMemo(
-    () => programMotionEndpointChoices(program),
-    [program],
-  );
+  const selectedMotionDescriptor = useMemo(() => {
+    const role = selected?.parameters.target_role;
+    const target = draftTargetRoles.find((row) => row.target_role_id === role);
+    return target === undefined ? undefined : motionDescriptors.find((candidate) => (
+      candidate.controllableComponentId === target.controllable_component_id
+      && candidate.commandTargetId === target.command_target_id
+    ));
+  }, [draftTargetRoles, motionDescriptors, selected]);
+  const motionEndpointChoices = useMemo(() => programTcpSelectorChoices(
+    program, draftTargetRoles, selectedMotionDescriptor, showOtherRobotTcps,
+    (componentId) => customTcpsOf(deploymentDocument as Record<string, JsonValue> | null, componentId)
+      .map((tcp) => tcp.tcpId),
+  ), [deploymentDocument, draftTargetRoles, program, selectedMotionDescriptor, showOtherRobotTcps]);
   useEffect(() => {
     setErrors({});
+    setShowOtherRobotTcps(false);
     setDiscardEpoch((current) => current + 1);
     setSourceMenu(null);
     setFormula(null);
@@ -450,6 +469,33 @@ export function ProgramPropertyEditor({
     ? motionBindings?.[parameterId] ?? null
     : null;
 
+  // These keys are portable declarations for roles selected by a motion or
+  // planner, or requiring trajectory execution. Keep them local to Set TCP's
+  // key menu; scalar expressions and conditions must not gain tcp_entry.
+  const tcpSourceKeys = [...blackboardKeys];
+  const tcpRoles = new Set<string>();
+  for (const [role, value] of Object.entries(program.target_roles)) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+    const capabilities = value.required_capabilities;
+    if (Array.isArray(capabilities) && capabilities.some((item) => (
+      item !== null && typeof item === 'object' && !Array.isArray(item)
+      && item.capability_id === 'execution.trajectory.execute'
+    ))) tcpRoles.add(role);
+  }
+  for (const { node } of flattenProgramForest(roots)) {
+    if ((node.node_id === 'motion.move_to_joint_target' || node.node_id === 'motion.move_to_pose'
+        || node.node_id === 'motion.move_until_signal' || node.node_id === 'motion.follow_cartesian_path'
+        || node.node_id === 'motion.probe_search' || node.node_id === 'planning.plan_pick_sequence'
+        || node.node_id === 'planning.plan_place_sequence')
+        && typeof node.parameters.target_role === 'string'
+        && node.parameters.target_role in program.target_roles) tcpRoles.add(node.parameters.target_role);
+  }
+  for (const role of tcpRoles) {
+    const key = `active_tcp.${role}`;
+    if (!tcpSourceKeys.some((row) => row.key === key)) {
+      tcpSourceKeys.push({ key, type: 'tcp_entry', access: 'read', persistence: 'run' });
+    }
+  }
   const valueSourceModel = (path: string, schema: CatalogJsonSchema) => valueSourceMenuModel({
     entry,
     path,
@@ -457,7 +503,7 @@ export function ProgramPropertyEditor({
     sources: selected.value_sources,
     literals: { ...catalogDefaultParameters(entry), ...selected.parameters },
     parameters: programParameters,
-    keys: blackboardKeys,
+    keys: entry.id === 'motion.set_tcp' && path === 'tcp' ? tcpSourceKeys : blackboardKeys,
     preferredParameter: motionBindingOf(valuePathParameter(path)),
   });
 
@@ -524,7 +570,8 @@ export function ProgramPropertyEditor({
           title: `Field ${source.field} of key ${source.reference}; written while the Program runs.`,
         };
       }
-      const row = blackboardKeys.find((candidate) => candidate.key === source.reference);
+      const row = (selected.node_id === 'motion.set_tcp' ? tcpSourceKeys : blackboardKeys)
+        .find((candidate) => candidate.key === source.reference);
       return {
         label: `key.${source.reference}`,
         title: row === undefined
@@ -716,6 +763,22 @@ export function ProgramPropertyEditor({
           </details>
         )}
       </section>
+      <TripPresetEditor
+        key={`${selected.instance_id}:${discardEpoch}`}
+        node={selected}
+        keyContext={{
+          entry, node: selected, parameterId: 'on_grasp_lost', program, globalRuleIds: ruleIds, onCreateReference,
+        }}
+        disabled={busy}
+        invalidEdit={hasInvalidEdit}
+        onReplace={(replacement) => {
+          // The preset's parameter and recovery policy change in one Draft edit.
+          void onMutate('tree_draft_replace_subtree', {
+            instance_id: selected.instance_id,
+            subtree: replacement as unknown as JsonValue,
+          });
+        }}
+      />
       <ValueSourceContext.Provider value={sourceController}>
       <section className="dcard" aria-label="Parameters">
         <h4>Parameters</h4>
@@ -723,7 +786,8 @@ export function ProgramPropertyEditor({
           <p className="muted">This node has no authored parameters.</p>
         )}
         {entry.parameters.map((parameter) => {
-          const hasMotionTcpEndpoint = entry.parameters.some((field) => field.id === 'tcp_endpoint');
+          const hasMotionTcpEndpoint = parameter.id === 'tcp_endpoint'
+            || (selected.node_id === 'motion.set_tcp' && parameter.id === 'tcp');
           const source = selected.value_sources?.[parameter.id];
           const rule = keyValueParameterRule(entry, selected, blackboardKeys, parameter.id);
           const hasLiteral = Object.prototype.hasOwnProperty.call(
@@ -807,6 +871,8 @@ export function ProgramPropertyEditor({
                     ? 'Motion TCP endpoint'
                     : parameter.id === 'max_tcp_linear_speed_mps'
                     ? 'TCP speed ceiling (m/s)'
+                    : parameter.id === 'clearance_m'
+                    ? 'Collision clearance (m)'
                     : parameter.id}
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
@@ -816,6 +882,11 @@ export function ProgramPropertyEditor({
                   {selectedDeploymentSpeed === null
                     ? 'Optional speed ceiling; the backend uses the lower of this value and the applied Deployment target maximum.'
                     : `Currently applied Deployment maximum for ${selectedDeploymentSpeed.target}: ${selectedDeploymentSpeed.maximum} m/s. ${typeof displayedSpeed === 'number' && Number.isFinite(displayedSpeed) && displayedSpeed > 0 ? `With ${source === undefined ? 'request' : 'parameter default'} ${displayedSpeed} m/s, the effective ceiling is ${Math.min(displayedSpeed, selectedDeploymentSpeed.maximum)} m/s. ` : 'The backend resolves the effective ceiling when the request is known. '}The authored value is unchanged.`}
+                </p>
+              )}
+              {parameter.id === 'clearance_m' && (
+                <p className="muted">
+                  Optional. Omitted, the move keeps the Deployment clearance (0, off, unless the Deployment sets one); 0 turns the clearance off for this move.
                 </p>
               )}
               {rule.inapplicable !== undefined && (
@@ -967,8 +1038,9 @@ export function ProgramPropertyEditor({
                     }}
                   />
                 </>
-              ) : hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint' ? (
-                <div id={`property-${selected.instance_id}-tcp_endpoint`}>
+              ) : hasMotionTcpEndpoint ? (
+                <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  <SourceableValue path={parameter.id} schema={schema}>
                   {source !== undefined ? (
                     <>
                       <p className="program-form-error inline-message severity-error" role="alert">
@@ -979,19 +1051,22 @@ export function ProgramPropertyEditor({
                         className="text-button"
                         disabled={busy || rule.locked !== undefined}
                         onClick={() => {
-                          const request = buildMotionEndpointMutation(selected, null);
+                          const request = buildMotionEndpointMutation(selected, null, parameter.id);
                           void onMutate(request.mutation, request.args);
                         }}
                       >Remove dynamic endpoint value</button>
                     </>
                   ) : (() => {
-                    const currentKey = motionEndpointKeyOfNode(selected) ?? '';
+                    const currentKey = motionEndpointKeyOfNode(selected, parameter.id) ?? '';
                     const currentIsDeclared = motionEndpointChoices.some(
                       (choice) => choice.key === currentKey,
                     );
                     const currentLabel = 'Current endpoint is not declared';
                     return (
                       <>
+                        {parameter.id === 'tcp_endpoint' && (
+                          <p className="program-form-hint">{`Moves: ${typeof selected.parameters.target_role === 'string' ? selected.parameters.target_role : '—'}`}</p>
+                        )}
                         <select
                           value={currentKey}
                           disabled={busy || rule.locked !== undefined}
@@ -1001,16 +1076,12 @@ export function ProgramPropertyEditor({
                               (candidate) => candidate.key === event.currentTarget.value,
                             );
                             const request = buildMotionEndpointMutation(
-                              selected,
-                              choice === undefined ? null : {
-                                target_role: choice.targetRole,
-                                frame_role: choice.frameRole,
-                              },
+                              selected, choice?.selector ?? null, parameter.id,
                             );
                             void onMutate(request.mutation, request.args);
                           }}
                         >
-                          <option value="">Select a declared endpoint</option>
+                          {currentKey === '' && <option value="">Select a TCP</option>}
                           {currentKey !== '' && !currentIsDeclared && (
                             <option value={currentKey}>{currentLabel}</option>
                           )}
@@ -1018,12 +1089,29 @@ export function ProgramPropertyEditor({
                             <option key={choice.key} value={choice.key}>{choice.label}</option>
                           ))}
                         </select>
+                        {selected.node_id === 'motion.set_tcp' && (
+                          <button type="button" disabled={busy} onClick={(event) => (
+                            sourceController.openMenu(parameter.id, schema, event.currentTarget, null)
+                          )}>Use a TCP key…</button>
+                        )}
+                        <label title="Useful only once tool change is implemented: today a TCP whose tool is on another robot is refused when used.">
+                          <input type="checkbox" checked={showOtherRobotTcps}
+                            onChange={(event) => setShowOtherRobotTcps(event.currentTarget.checked)} />
+                          Show TCPs of tools mounted on other robots
+                        </label>
+                        {selectedMotionDescriptor === undefined && (
+                          <p className="program-form-hint">Apply to list TCPs and current mounts.</p>
+                        )}
+                        {hasUnrepresentedTcpOwner(program, draftTargetRoles, selectedMotionDescriptor, showOtherRobotTcps) && (
+                          <p className="program-form-hint">Add this tool to the Program's roles to use its TCPs.</p>
+                        )}
                         <p className="program-form-hint">
-                          Choose a frame declared on a target role. The selected endpoint must be on the same physical component as the motion target; this is checked when the motion starts. Current-pose capture is available when the selected endpoint matches the robot’s current TCP.
+                          Current uses the robot's Active TCP. A role default or an entry sets the Active TCP to that TCP.
                         </p>
                       </>
                     );
                   })()}
+                  </SourceableValue>
                 </div>
               ) : (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
@@ -1059,7 +1147,7 @@ export function ProgramPropertyEditor({
                       + `${String(targetRole)} into this goal`
                       + (pose ? '. Replaces the goal frame with this robot’s base frame' : '')
                       + (pose && selected.parameters.tcp_endpoint !== undefined
-                        ? '. Capture requires the selected target and frame roles to match the robot’s current TCP'
+                        ? '. The pose is the selected TCP’s, which must be one of the robot’s Applied TCPs'
                         : '')
                       + (relative ? '. This switches the move to absolute.' : '.')
                     )}

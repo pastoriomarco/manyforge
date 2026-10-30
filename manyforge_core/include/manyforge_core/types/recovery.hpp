@@ -49,6 +49,11 @@ enum class RecoveryClass {
   kFailedValidation,
   kOrdinaryOperatorStop,
   kUnknownFault,
+  /// A Stop the Program's own configuration requested (interrupt rule trip,
+  /// carried object lost), settled at its first stage: the Program's
+  /// ordinary failure, never an operator hold. Published by the addressed
+  /// Kernel only; a participant engine never derives it.
+  kOrdinaryProgramStop,
 };
 
 /// Shared recovery and motion-free closure action identifiers. `reset_cycle`

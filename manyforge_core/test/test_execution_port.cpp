@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/ports/iexecution_port.hpp>
+#include <manyforge_core/robot_at_target.hpp>
 #include <manyforge_core/testing/fake_execution_port.hpp>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -276,6 +278,37 @@ TEST(ExecutionPortTest, ReadinessTimingAndLaneFactsAreScripted) {
 
   ASSERT_EQ(port.Submit(Key(1U), Trajectory(1.0)).dispatch, ExecutionPortDispatch::kDispatched);
   EXPECT_EQ(port.ReadGoal(Key(1U))->binding_epoch, ExecutionBindingEpoch{4U});
+}
+
+// Merge 6 arrival: the one "robot at target" rule needs both facts.
+TEST(RobotAtTarget, FinishedButOutOfToleranceIsNotArrived) {
+  const std::vector<double> target{1.0, 2.0};
+  const auto result = robot_at_target(true, std::vector<double>{1.0, 2.03}, target, 0.02);
+  EXPECT_FALSE(result.arrived);
+  EXPECT_NEAR(result.max_error_rad, 0.03, 1e-12);
+  EXPECT_EQ(result.joint_index, 1U);
+}
+
+TEST(RobotAtTarget, WithinToleranceButNotFinishedIsNotArrived) {
+  const std::vector<double> target{1.0, 2.0};
+  const auto result = robot_at_target(false, std::vector<double>{1.0, 2.0}, target, 0.02);
+  EXPECT_FALSE(result.arrived);
+  EXPECT_DOUBLE_EQ(result.max_error_rad, 0.0);
+}
+
+TEST(RobotAtTarget, FinishedAndWithinToleranceIsArrived) {
+  const std::vector<double> target{1.0, 2.0};
+  EXPECT_TRUE(robot_at_target(true, std::vector<double>{1.005, 1.99}, target, 0.02).arrived);
+  // The bound is inclusive, as the former terminal gate.
+  EXPECT_TRUE(robot_at_target(true, std::vector<double>{1.5, 2.0}, target, 0.5).arrived);
+}
+
+TEST(RobotAtTarget, UnusablePositionsAreNotArrived) {
+  const std::vector<double> target{1.0, 2.0};
+  EXPECT_FALSE(robot_at_target(true, std::vector<double>{1.0}, target, 0.02).arrived);
+  EXPECT_FALSE(robot_at_target(true, std::vector<double>{}, std::vector<double>{}, 0.02).arrived);
+  EXPECT_FALSE(
+      robot_at_target(true, std::vector<double>{1.0, std::nan("")}, target, 0.02).arrived);
 }
 
 }  // namespace

@@ -153,18 +153,24 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.transport-unique-icons \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   });
 
-  it('locates lifecycle control under Deployment and binds selection to Manager graph identities', () => {
+  it('locates lifecycle control under Components and binds selection to Manager Applied identities', () => {
     const app = source('../App.tsx');
     const deployment = source('./DeploymentCompositionPanel.tsx');
+    const components = source('./ComponentsWorkspace.tsx');
     const lifecycle = source('./CCLCPanel.tsx');
 
     expect(app).not.toContain('<CCLCPanel');
-    expect(deployment).toContain('<CCLCPanel');
+    expect(deployment).not.toContain('<CCLCPanel');
+    // Activate all above the list; the selected component's lifecycle on its page.
+    expect(components).toContain('<CCLCPanelView part="cell"');
+    expect(components).toContain('<CCLCPanelView part="component"');
     // The panel uses App's shared CCLC controller; App binds it to the admission generation.
-    expect(deployment).toContain('controller={cclc}');
-    expect(app).toContain('headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, configuredComponentIds');
-    expect(deployment).toContain('candidate.controllable_component_id');
-    // Components are selected from the list rows (pressed state), bound to Manager graph identities.
+    expect(components).toContain('controller={cclc}');
+    expect(app).toContain('headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, appliedDeploymentIdentity?.componentIds');
+    expect(app).toContain('lifecycleIds={configuredComponentIds}');
+    // The page selects its component in CCLC, never while a request is in flight.
+    expect(components).toContain('setControllableComponentId(selectedId)');
+    expect(components).toContain('!cclcBusy');
     expect(lifecycle).toContain('aria-pressed={selected}');
     expect(lifecycle).toContain('setControllableComponentId(id)');
     expect(lifecycle).not.toContain('placeholder="lite6-arm"');

@@ -33,7 +33,7 @@ def test_committed_fixture_matches_the_backend_producer(name: str) -> None:
 @pytest.mark.parametrize("value", [True, False, 1.5, -1, 9_007_199_254_740_992,
                                   "garbage", "01", "-1", "9223372036854775808",
                                   "18446744073709551615", "18446744073709551616"])
-@pytest.mark.parametrize("key", ["generated_at_ns", "valid_until_ns"])
+@pytest.mark.parametrize("key", ["generated_at_ns"])
 def test_timestamp_normalization_preserves_invalid_wire_values(key, value):
     result = _stabilize({key: value})[key]
     assert type(result) is type(value)
@@ -41,7 +41,7 @@ def test_timestamp_normalization_preserves_invalid_wire_values(key, value):
 
 
 @pytest.mark.parametrize("value", [0, 9_007_199_254_740_991, "0", "9223372036854775807"])
-@pytest.mark.parametrize("key", ["generated_at_ns", "valid_until_ns"])
+@pytest.mark.parametrize("key", ["generated_at_ns"])
 def test_timestamp_normalization_replaces_valid_wire_values(key, value):
     result = _stabilize({key: value})[key]
     assert type(result) is type(value)

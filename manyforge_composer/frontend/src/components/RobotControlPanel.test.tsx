@@ -6,11 +6,13 @@ import { RobotControlPanel, RobotControlPanelView } from './RobotControlPanel';
 import { useRobotControl } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { LogicalSceneProjection } from '../types/api';
-import { buildGripperCommandIntent, initialRobotControlState, robotControlReducer } from '../state/robotControl';
+import { buildGripperCommandIntent, initialRobotControlState, robotControlReducer, selectedStatusForState } from '../state/robotControl';
 import { gripperReceiptFixture, statusFixture } from '../testFixtures/robotControl';
+import { tcpEntryIdentityKey } from '../types/robotControl';
 
 const controller = vi.hoisted(() => ({
   state: {
+    mountedToolByRobot: {},
     status: {
       ownerEpoch: 'owner-1',
       cellId: 'cell-1',
@@ -24,6 +26,8 @@ const controller = vi.hoisted(() => ({
         targetRoleId: 'command_target',
         baseFrameRoleId: 'base',
         tcpFrameRoleId: 'tcp',
+        activeTcp: { entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' }, display: 'robot-1.tcp',
+          ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 },
         operationCapabilityId: 'execution.trajectory.execute',
         planningCapabilityIds: ['planning.motion.joint_goal'],
         frameRoleIds: ['base', 'tcp'],
@@ -39,14 +43,22 @@ const controller = vi.hoisted(() => ({
           maxAccelerationRadS2: 3,
         }],
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
           ordinaryJerk: null,
           controllableComponentId: 'robot-1', commandTargetId: 'arm',
+          endEffectorComponentId: null,
           componentRoleId: 'controlled_component', targetRoleId: 'command_target',
           frames: [
             { frameRoleId: 'base', compiledFrameName: 'base_link', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
             { frameRoleId: 'tcp', compiledFrameName: 'tool0', modelInstanceId: 'robot-model', modelRevision: 'sha256:model' },
           ],
+          tcps: [{
+            entry: { componentId: 'robot-1', targetId: 'arm', frameRoleId: 'tcp' },
+            targetRoleId: 'command_target', controllableComponentId: 'robot-1', commandTargetId: 'arm',
+            frameRoleId: 'tcp', qualifiedName: 'robot-1.tcp', compiledFrameName: 'tool0',
+            modelInstanceId: 'robot-model', modelRevision: 'sha256:model', isDefault: true,
+            mountedHere: true, mountedElsewhere: false, contactBodyRoleIds: [],
+          }],
           joints: [{ sourceJointName: 'joint_1', compiledJointName: 'robot__joint_1', unit: 'rad', minPositionRad: -1, maxPositionRad: 1, maxVelocityRadS: 2, maxAccelerationRadS2: 3 }],
           operationalJointLimits: [{
             sourceJointName: 'joint_1', modelMaxVelocityRadS: 2,
@@ -113,6 +125,12 @@ const controller = vi.hoisted(() => ({
           position_m: { x_m: 0, y_m: 0, z_m: 0.2 },
           orientation: { x: 0, y: 0, z: 0, w: 1 },
         },
+        tcpPoses: {
+          '["robot-1","arm","tcp"]': {
+            position_m: { x_m: 0, y_m: 0, z_m: 0.2 },
+            orientation: { x: 0, y: 0, z: 0, w: 1 },
+          },
+        },
       },
       observedGripper: {
         sequence: 1,
@@ -141,7 +159,7 @@ const controller = vi.hoisted(() => ({
     motionSettings: { velocityScale: 1, accelerationScale: 1, tcpLinearSpeedMps: 0.1,
       tcpAngularSpeedRadS: 0.5, tcpLinearAccelerationMps2: 0.5, tcpAngularAccelerationRadS2: 2.5,
       cartesianTranslationToleranceM: 0.005, cartesianRotationToleranceRad: 0.05,
-      cartesianMaxBlendDeviationRad: 0.01, jointLimits: {} },
+      cartesianMaxBlendDeviationRad: 0.01, clearanceM: null, jointLimits: {} },
     generation: 1,
     intent: {},
     preview: {
@@ -162,6 +180,10 @@ const controller = vi.hoisted(() => ({
   runtimeScalePending: false,
   runtimeScaleError: null,
   stopFaultRecoveryPending: false,
+  stopFaultRecoveryInProgress: false,
+  stopFaultRecoveryAbortPending: false,
+  cellRecoverBlockedReason: null,
+  setCellRecoverBlockedReason: vi.fn(),
   stopFaultRecoveryError: null,
   componentIncidents: [],
   componentIncidentsUnavailableReason: null,
@@ -169,6 +191,9 @@ const controller = vi.hoisted(() => ({
   gripperTargets: [] as Array<Record<string, unknown>>,
   selectRobot: vi.fn(),
   selectTool: vi.fn(),
+  selectTcp: vi.fn(),
+  tcpApplying: false,
+  tcpError: null,
   selectMode: vi.fn(),
   editJoint: vi.fn(),
   editPose: vi.fn(),
@@ -179,6 +204,7 @@ const controller = vi.hoisted(() => ({
   stop: vi.fn(),
   fullStop: vi.fn(),
   recoverStopFault: vi.fn(),
+  abortRecoverStopFault: vi.fn(),
   reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
@@ -195,6 +221,180 @@ vi.mock('../hooks/useRobotControl', () => ({
 }));
 
 describe('RobotControlPanel layout', () => {
+  it('TCP-C: lists the robot\'s and the mounted tool\'s TCPs, the default selected', () => {
+    const status = statusFixture();
+    const row = status.directControl!.targetDescriptor.tcps[0];
+    status.directControl!.targetDescriptor.tcps = [
+      { ...row, qualifiedName: 'lite_gripper.tcp' },
+      { ...row, entry: { ...row.entry, frameRoleId: 'flange' }, frameRoleId: 'flange',
+        qualifiedName: 'robot-a.flange', compiledFrameName: 'link_eef', isDefault: false },
+      { ...row, entry: { componentId: 'lite_gripper', targetId: 'gripper', frameRoleId: 'cup_edge' },
+        targetRoleId: 'mounted_tool_target', controllableComponentId: 'lite_gripper',
+        commandTargetId: 'gripper', frameRoleId: 'cup_edge', qualifiedName: 'lite_gripper.cup_edge',
+        compiledFrameName: 'cup_edge_link', isDefault: false, mountedHere: true,
+        mountedElsewhere: false },
+      { ...row, entry: { componentId: 'workbench_tool', targetId: 'tool', frameRoleId: 'tcp' },
+        targetRoleId: null, controllableComponentId: 'workbench_tool', commandTargetId: 'tool',
+        frameRoleId: 'tcp', qualifiedName: 'workbench_tool.tcp', isDefault: false,
+        mountedHere: false, mountedElsewhere: true },
+      { ...row, entry: { componentId: 'second_target', targetId: 'tool', frameRoleId: 'tcp' },
+        targetRoleId: null, controllableComponentId: 'second_target', commandTargetId: 'tool',
+        frameRoleId: 'tcp', qualifiedName: 'second_target.tcp', isDefault: false,
+        mountedHere: true, mountedElsewhere: false },
+    ];
+    status.observedMotion!.tcpPoses = {
+      [tcpEntryIdentityKey(status.directControl!.targetDescriptor.tcps[0].entry)]: status.observedMotion!.currentTcpPose!,
+      [tcpEntryIdentityKey(status.directControl!.targetDescriptor.tcps[1].entry)]: status.observedMotion!.currentTcpPose!,
+      [tcpEntryIdentityKey(status.directControl!.targetDescriptor.tcps[2].entry)]: status.observedMotion!.currentTcpPose!,
+    };
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state,
+      selectedStatus: selectedStatusForState(state), motionTargets: [status.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null };
+    const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    expect(markup).toContain('aria-label="Robot Control TCP"');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;tcp&quot;]" selected="">lite_gripper.tcp (default)</option>');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;flange&quot;]">robot-a.flange</option>');
+    expect(markup).toContain('<option value="[&quot;lite_gripper&quot;,&quot;gripper&quot;,&quot;cup_edge&quot;]">lite_gripper.cup_edge</option>');
+    expect(markup).toContain('Show TCPs of tools mounted on other robots');
+    expect(markup).not.toContain('workbench_tool.tcp');
+  });
+
+  it.each(['approving', 'executing', 'stopping'] as const)(
+    'disables the TCP picker while a manual operation is %s', (phase) => {
+      const status = statusFixture();
+      const row = status.directControl!.targetDescriptor.tcps[0];
+      status.directControl!.targetDescriptor.tcps.push({ ...row,
+        entry: { ...row.entry, frameRoleId: 'flange' }, frameRoleId: 'flange',
+        qualifiedName: 'robot-a.flange', isDefault: false });
+      const state = { ...robotControlReducer(initialRobotControlState, { type: 'status_resolved', status }), phase };
+      const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state,
+        selectedStatus: selectedStatusForState(state), motionTargets: [status.directControl!],
+        manualControlAllowed: true, manualControlUnavailableReason: null };
+      const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+      expect(markup).toMatch(/aria-label="Robot Control TCP"[^>]*disabled=""/);
+      expect(markup).toContain('Sets this robot&#x27;s Active TCP. TCPs of tools on other robots are listed with the reason they can&#x27;t be used here.');
+    },
+  );
+
+  it('keeps an existing TCP pick visible without a pose after it becomes unmounted', () => {
+    const status = statusFixture();
+    const baseTcp = status.directControl!.targetDescriptor.tcps[0];
+    const toolTcp = {
+      ...baseTcp,
+      entry: { componentId: 'lite_gripper', targetId: 'gripper', frameRoleId: 'cup_edge' },
+      targetRoleId: 'mounted_tool_target',
+      controllableComponentId: 'lite_gripper', commandTargetId: 'gripper',
+      frameRoleId: 'cup_edge', qualifiedName: 'lite_gripper.cup_edge',
+      compiledFrameName: 'cup_edge_link', isDefault: false,
+    };
+    status.directControl!.targetDescriptor.tcps.push(toolTcp);
+    const key = tcpEntryIdentityKey(toolTcp.entry);
+    status.observedMotion!.tcpPoses[key] = status.observedMotion!.currentTcpPose!;
+    status.directControl!.activeTcp = { entry: toolTcp.entry, display: toolTcp.qualifiedName,
+      ownerEpoch: status.ownerEpoch, registrationGeneration: 1, sequence: 1 };
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+
+    const unmounted = structuredClone(status);
+    const changedRow = unmounted.directControl!.targetDescriptor.tcps.find((tcp) => (
+      tcpEntryIdentityKey(tcp.entry) === key
+    ))!;
+    changedRow.mountedHere = false;
+    changedRow.mountedElsewhere = true;
+    changedRow.targetRoleId = null;
+    delete unmounted.observedMotion!.tcpPoses[key];
+    state = robotControlReducer(state, { type: 'status_refreshed', status: unmounted });
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'cartesian_path' });
+
+    expect(state.mode).toBe('cartesian_path');
+    const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state,
+      selectedStatus: selectedStatusForState(state), motionTargets: [unmounted.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null };
+    const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    expect(markup).toContain('TCP pose');
+    expect(markup).toContain('<code>—</code>');
+    expect(markup).toContain('Tool not mounted on this robot.');
+    expect(markup).toContain('The current TCP pose is unavailable. Select a TCP with a reported pose to preview a Cartesian path.');
+    expect(markup).not.toContain('The current owner-issued TCP pose is the explicit first waypoint.');
+    expect(markup).toMatch(/class="approve-button"[^>]*disabled=""/);
+
+    const withoutObservation = structuredClone(unmounted);
+    withoutObservation.observedMotion = null;
+    // The selected status is derived from the per-target list.
+    withoutObservation.observedMotions = [];
+    state = robotControlReducer(state, { type: 'status_refreshed', status: withoutObservation });
+    const withoutObservationController: ReturnType<typeof useRobotControl> = {
+      ...useRobotControl(true), state,
+      selectedStatus: selectedStatusForState(state), motionTargets: [withoutObservation.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null,
+    };
+    const withoutObservationMarkup = renderToStaticMarkup(
+      <RobotControlPanelView enabled controller={withoutObservationController} />,
+    );
+    expect(withoutObservationMarkup).not.toContain('aria-label="Selected TCP pose"');
+  });
+
+  it('keeps a joint Move To approval available when the selected TCP is unmounted', () => {
+    const status = statusFixture();
+    const row = status.directControl!.targetDescriptor.tcps[0];
+    row.mountedHere = false;
+    row.mountedElsewhere = true;
+    row.targetRoleId = null;
+    status.directControl!.selectedTcpEntryKey = tcpEntryIdentityKey(row.entry);
+    status.observedMotion!.currentTcpPose = null;
+    status.observedMotion!.tcpPoses = {};
+    const ready = useRobotControl(true).state;
+    const state = { ...ready, status, mode: 'move_to' as const, moveToKind: 'joint' as const };
+    const panelController: ReturnType<typeof useRobotControl> = {
+      ...useRobotControl(true), state, selectedStatus: status, motionTargets: [status.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null,
+    };
+    const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    expect(markup).toMatch(/class="approve-button"(?![^>]*disabled)[^>]*>/);
+  });
+
+  it('B1: without an end-effector TCP offers joint jog only, with a plain note', () => {
+    const status = statusFixture();
+    status.directControl!.tcpFrameRoleId = null;
+    status.directControl!.activeTcp = { entry: null, display: null, ownerEpoch: status.ownerEpoch,
+      registrationGeneration: 1, sequence: 0 };
+    status.observedMotion!.currentTcpPose = null;
+    const row = status.directControl!.targetDescriptor.tcps[0];
+    status.directControl!.targetDescriptor.tcps = [
+      { ...row, entry: { ...row.entry, frameRoleId: 'flange' },
+        frameRoleId: 'flange', qualifiedName: 'robot-a.flange', compiledFrameName: 'link_eef', isDefault: false },
+    ];
+    status.observedMotion!.tcpPoses = {
+      [tcpEntryIdentityKey(status.directControl!.targetDescriptor.tcps[0].entry)]:
+        status.observedMotion!.tcpPoses[tcpEntryIdentityKey(row.entry)],
+    };
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state,
+      selectedStatus: selectedStatusForState(state), motionTargets: [status.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null };
+    const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    expect(markup).toMatch(/<button type="button" title="Joint" aria-pressed="true">Joint<\/button>/);
+    for (const label of ['Pose plan', 'Cartesian', 'Move To']) {
+      expect(markup).toMatch(new RegExp(`disabled="">${label}</button>`));
+    }
+    expect(markup).toContain('No TCP: joint jog only. Choose a TCP for Cartesian moves.');
+    expect(markup).toContain('<option value="" disabled="" selected="">No End-effector TCP; choose one</option>');
+    expect(markup).toContain('<option value="[&quot;robot-a&quot;,&quot;arm&quot;,&quot;flange&quot;]">robot-a.flange</option>');
+  });
+
+  it('does not offer Set TCP when the robot has no owner status', () => {
+    const status = statusFixture();
+    status.directControl!.activeTcp = null;
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const panelController: ReturnType<typeof useRobotControl> = { ...useRobotControl(true), state,
+      selectedStatus: selectedStatusForState(state), motionTargets: [status.directControl!],
+      manualControlAllowed: true, manualControlUnavailableReason: null };
+    const markup = renderToStaticMarkup(<RobotControlPanelView enabled controller={panelController} />);
+    expect(markup).not.toContain('aria-label="Robot Control TCP"');
+    expect(markup).not.toContain('No TCP: joint jog only.');
+    expect(markup).toContain('Robot status unavailable.');
+  });
+
   it.each(['commanded', 'none'] as const)(
     'keeps pneumatic %s authoring and exact preview approval behind owner eligibility during Stop', (outputMode) => {
       const status = statusFixture();
@@ -349,6 +549,25 @@ describe('RobotControlPanel layout', () => {
     }
     expect(renderToStaticMarkup(<RobotControlPanel enabled />))
       .not.toContain('aria-label="Robot target"');
+  });
+
+  it('offers a tool component (mounted on the robot flange) next to the robot', () => {
+    const tool = structuredClone(controller.state.status.directControlGripper) as unknown as Record<string, unknown>;
+    tool.controllableComponentId = 'lite_gripper';
+    controller.gripperTargets.push(
+      controller.state.status.directControlGripper as unknown as Record<string, unknown>,
+      tool,
+    );
+    try {
+      const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+      expect(markup).toContain('aria-label="Robot target"');
+      expect(markup).toContain('robot-1 · arm');
+      expect(markup).toContain('lite_gripper · gripper');
+      // The robot's own gripper is not offered as a separate component.
+      expect(markup).not.toContain('>robot-1 · gripper</option>');
+    } finally {
+      controller.gripperTargets.length = 0;
+    }
   });
 
   it('presents an expected target rejection locally without calling the robot blocked', () => {

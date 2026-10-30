@@ -87,6 +87,35 @@ def _fixture() -> dict[str, Any]:
     return value
 
 
+def _robot_tcp_fixture(*, duplicate_display_identity: bool = False) -> dict[str, Any]:
+    value = _native_fixture()
+    target = value["target_role_bindings"][0]
+    component_id = target["controllable_component_id"]
+    frame = copy.deepcopy(target["frame_role_bindings"][0])
+    entry = {
+        "component_id": component_id,
+        "target_id": target["command_target_id"],
+        "frame_role_id": frame["frame_role_id"],
+    }
+    row = {
+        "entry": entry,
+        "frame": frame,
+        "end_effector": False,
+        "component_default": False,
+    }
+    rows = [row]
+    if duplicate_display_identity:
+        # B-dep-1: two targets of one component can each declare `tcp`.
+        # Their entry triples differ even when the display role and resolved
+        # compiled frame name are the same.
+        second = copy.deepcopy(row)
+        second["entry"]["target_id"] = target["command_target_id"] + "_secondary"
+        rows.append(second)
+    target["robot_tcps"] = rows
+    _rehash(value)
+    return value
+
+
 def _node_policy(*, instance_id: str = "root") -> dict[str, Any]:
     return {
         "instance_id": instance_id,
@@ -341,6 +370,65 @@ CASES = (
 def test_native_binding_fixture_is_accepted_without_copy() -> None:
     document = _native_fixture()
     assert validate_program_binding(document) is document
+
+
+def test_robot_tcp_rows_preserve_list_without_a_default() -> None:
+    document = _robot_tcp_fixture()
+    target = document["target_role_bindings"][0]
+    assert "default_tcp" not in target
+    assert target["robot_tcps"][0]["end_effector"] is False
+    assert validate_program_binding(document) is document
+
+
+def test_robot_tcp_presence_distinguishes_empty_from_absent() -> None:
+    document = _native_fixture()
+    target = document["target_role_bindings"][0]
+    target.pop("robot_tcps", None)
+    _rehash(document)
+    assert validate_program_binding(document) is document
+    assert "robot_tcps" not in target
+    target["robot_tcps"] = []
+    _rehash(document)
+    assert validate_program_binding(document) is document
+    assert target["robot_tcps"] == []
+    target["robot_tcps"] = None
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)
+
+
+def test_robot_tcp_identity_is_the_full_entry_triple() -> None:
+    document = _robot_tcp_fixture(duplicate_display_identity=True)
+    rows = document["target_role_bindings"][0]["robot_tcps"]
+    assert rows[0]["entry"]["component_id"] == rows[1]["entry"]["component_id"]
+    assert rows[0]["entry"]["frame_role_id"] == rows[1]["entry"]["frame_role_id"]
+    assert rows[0]["frame"]["compiled_frame_name"] == rows[1]["frame"]["compiled_frame_name"]
+    assert rows[0]["entry"]["target_id"] != rows[1]["entry"]["target_id"]
+    assert validate_program_binding(document) is document
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda row: row["frame"].__setitem__("frame_role_id", "another_frame"),
+        lambda row: row.__setitem__("end_effector", 1),
+    ],
+)
+def test_robot_tcp_rows_reject_malformed_frame_and_marks(mutation) -> None:
+    document = _robot_tcp_fixture()
+    mutation(document["target_role_bindings"][0]["robot_tcps"][0])
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)
+
+
+def test_robot_tcp_rows_reject_duplicate_entry_triples() -> None:
+    document = _robot_tcp_fixture()
+    rows = document["target_role_bindings"][0]["robot_tcps"]
+    rows.append(copy.deepcopy(rows[0]))
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError, match="canonical sorted unique"):
+        validate_program_binding(document)
 
 
 def test_generated_parser_accepts_a_nonempty_sparse_node_policy() -> None:

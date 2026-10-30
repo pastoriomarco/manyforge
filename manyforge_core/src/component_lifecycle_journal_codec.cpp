@@ -643,6 +643,88 @@ void PutResolvedProviderOccurrence(Writer& writer,
           reader.Identity<ContentDigest>()};
 }
 
+void PutSubstepResult(Writer& writer, const LifecycleSubstepResultDTO& value) {
+  writer.Identity(value.substep_id);
+  writer.Optional<LifecyclePrimitiveId>(value.within,
+                                        [&](const auto& item) { writer.Identity(item); });
+  writer.EnumValue(value.outcome);
+  writer.I64(value.started_at_ns);
+  writer.I64(value.finished_at_ns);
+  writer.Optional<ErrorDTO>(value.error, [&](const auto& item) { PutError(writer, item); });
+}
+
+[[nodiscard]] LifecycleSubstepResultDTO GetSubstepResult(Reader& reader) {
+  return LifecycleSubstepResultDTO{
+      reader.Identity<LifecyclePrimitiveId>(),
+      reader.Optional<LifecyclePrimitiveId>(
+          [&]() { return reader.Identity<LifecyclePrimitiveId>(); }),
+      reader.EnumValue<LifecycleTransitionOutcomeDTO>(),
+      reader.I64(),
+      reader.I64(),
+      reader.Optional<ErrorDTO>([&]() { return GetError(reader); })};
+}
+
+void PutSubstepEvent(Writer& writer, const LifecycleSubstepEventDTO& value) {
+  writer.Identity(value.attempt_id);
+  writer.Identity(value.substep_id);
+  writer.Optional<LifecyclePrimitiveId>(value.within,
+                                        [&](const auto& item) { writer.Identity(item); });
+  writer.EnumValue(value.phase);
+  writer.I64(value.at_ns);
+  writer.Optional<LifecycleTransitionOutcomeDTO>(value.outcome,
+                                                 [&](const auto item) { writer.EnumValue(item); });
+  writer.Optional<std::string>(value.error_code, [&](const auto& item) { writer.String(item); });
+}
+
+[[nodiscard]] LifecycleSubstepEventDTO GetSubstepEvent(Reader& reader) {
+  return LifecycleSubstepEventDTO{
+      reader.Identity<LifecyclePrimitiveAttemptId>(),
+      reader.Identity<LifecyclePrimitiveId>(),
+      reader.Optional<LifecyclePrimitiveId>(
+          [&]() { return reader.Identity<LifecyclePrimitiveId>(); }),
+      reader.EnumValue<LifecycleSubstepEventDTO::Phase>(),
+      reader.I64(),
+      reader.Optional<LifecycleTransitionOutcomeDTO>(
+          [&]() { return reader.EnumValue<LifecycleTransitionOutcomeDTO>(); }),
+      reader.Optional<std::string>([&]() { return reader.String(); })};
+}
+
+void PutFact(Writer& writer, const LifecycleFactDTO& value) {
+  writer.Identity(value.lifecycle_fact_id);
+  writer.EnumValue(value.value.kind);
+  writer.Optional<bool>(value.value.boolean_value, [&](const auto item) { writer.Bool(item); });
+  writer.Optional<std::int64_t>(value.value.integer_value,
+                                [&](const auto item) { writer.I64(item); });
+  writer.Optional<std::string>(value.value.token_value,
+                               [&](const auto& item) { writer.String(item); });
+}
+
+[[nodiscard]] LifecycleFactDTO GetFact(Reader& reader) {
+  return LifecycleFactDTO{
+      reader.Identity<LifecycleFactId>(),
+      LifecycleFactValueDTO{reader.EnumValue<LifecycleFactValueKindDTO>(),
+                            reader.Optional<bool>([&]() { return reader.Bool(); }),
+                            reader.Optional<std::int64_t>([&]() { return reader.I64(); }),
+                            reader.Optional<std::string>([&]() { return reader.String(); })}};
+}
+
+void PutTransitionObservation(Writer& writer, const LifecycleTransitionObservationDTO& value) {
+  writer.EnumValue(value.observed_state);
+  writer.Vector(value.facts, [&](const auto& item) { PutFact(writer, item); });
+  writer.U64(value.observation_generation);
+  writer.U64(value.source_sequence);
+  writer.I64(value.at_ns);
+}
+
+[[nodiscard]] LifecycleTransitionObservationDTO GetTransitionObservation(Reader& reader) {
+  return LifecycleTransitionObservationDTO{
+      reader.EnumValue<ComponentLifecycleStateDTO>(),
+      reader.Vector<LifecycleFactDTO>([&]() { return GetFact(reader); }),
+      reader.U64(),
+      reader.U64(),
+      reader.I64()};
+}
+
 void PutPrimitiveResult(Writer& writer, const BrandLifecyclePrimitiveResultDTO& value) {
   writer.Identity(value.lifecycle_transaction_id);
   writer.Counter(value.lifecycle_transaction_generation);
@@ -657,11 +739,9 @@ void PutPrimitiveResult(Writer& writer, const BrandLifecyclePrimitiveResultDTO& 
   writer.Identity(value.lifecycle_primitive_id);
   writer.Identity(value.lifecycle_primitive_attempt_id);
   writer.U64(value.expected_observation_generation);
-  writer.EnumValue(value.dispatch_state);
-  writer.EnumValue(value.effect);
-  writer.Optional<LifecyclePrimitiveKnownResultDTO>(
-      value.known_result, [&](const auto item) { writer.EnumValue(item); });
+  writer.EnumValue(value.outcome);
   writer.Optional<ErrorDTO>(value.error, [&](const auto& item) { PutError(writer, item); });
+  writer.Vector(value.substeps, [&](const auto& item) { PutSubstepResult(writer, item); });
 }
 
 void PutPrimitiveIntent(Writer& writer, const BrandLifecyclePrimitiveIntentDTO& value) {
@@ -679,6 +759,7 @@ void PutPrimitiveIntent(Writer& writer, const BrandLifecyclePrimitiveIntentDTO& 
   writer.Identity(value.lifecycle_primitive_attempt_id);
   writer.U64(value.expected_observation_generation);
   writer.I64(value.remaining_duration_ns);
+  writer.EnumValue(value.requested_state);
 }
 
 [[nodiscard]] BrandLifecyclePrimitiveIntentDTO GetPrimitiveIntent(Reader& reader) {
@@ -695,7 +776,8 @@ void PutPrimitiveIntent(Writer& writer, const BrandLifecyclePrimitiveIntentDTO& 
                                           reader.Identity<LifecyclePrimitiveId>(),
                                           reader.Identity<LifecyclePrimitiveAttemptId>(),
                                           reader.U64(),
-                                          reader.I64()};
+                                          reader.I64(),
+                                          reader.EnumValue<ComponentLifecycleStateDTO>()};
 }
 
 [[nodiscard]] BrandLifecyclePrimitiveResultDTO GetPrimitiveResult(Reader& reader) {
@@ -713,37 +795,9 @@ void PutPrimitiveIntent(Writer& writer, const BrandLifecyclePrimitiveIntentDTO& 
       reader.Identity<LifecyclePrimitiveId>(),
       reader.Identity<LifecyclePrimitiveAttemptId>(),
       reader.U64(),
-      reader.EnumValue<LifecyclePrimitiveDispatchStateDTO>(),
-      reader.EnumValue<LifecyclePrimitiveEffectDTO>(),
-      reader.Optional<LifecyclePrimitiveKnownResultDTO>(
-          [&]() { return reader.EnumValue<LifecyclePrimitiveKnownResultDTO>(); }),
-      reader.Optional<ErrorDTO>([&]() { return GetError(reader); })};
-}
-
-void PutReconciliation(Writer& writer, const LifecycleReconciliationEvidenceDTO& value) {
-  writer.Identity(value.provider_instance_id);
-  writer.Identity(value.provider_manifest_id);
-  writer.Identity(value.provider_manifest_revision);
-  writer.Identity(value.provider_runtime_unit_id);
-  writer.Identity(value.provider_runtime_epoch);
-  writer.U64(value.source_sequence);
-  writer.U64(value.observation_generation);
-  writer.EnumValue(value.observed_state);
-  writer.EnumValue(value.postcondition_result);
-  writer.I64(value.observed_at_ns);
-}
-
-[[nodiscard]] LifecycleReconciliationEvidenceDTO GetReconciliation(Reader& reader) {
-  return LifecycleReconciliationEvidenceDTO{reader.Identity<ProviderInstanceId>(),
-                                            reader.Identity<ProviderManifestId>(),
-                                            reader.Identity<ProviderManifestRevision>(),
-                                            reader.Identity<RuntimeUnitId>(),
-                                            reader.Identity<RuntimeEpoch>(),
-                                            reader.U64(),
-                                            reader.U64(),
-                                            reader.EnumValue<ComponentLifecycleStateDTO>(),
-                                            reader.EnumValue<LifecyclePostconditionResultDTO>(),
-                                            reader.I64()};
+      reader.EnumValue<LifecycleTransitionOutcomeDTO>(),
+      reader.Optional<ErrorDTO>([&]() { return GetError(reader); }),
+      reader.Vector<LifecycleSubstepResultDTO>([&]() { return GetSubstepResult(reader); })};
 }
 
 void PutProviderFenceOccurrence(Writer& writer,
@@ -1688,12 +1742,14 @@ void PutDomainStatus(Writer& writer, const ComponentLifecycleDomainStatusDTO& va
                                               [&](const auto item) { writer.EnumValue(item); });
   PutRequestedState(writer, value.requested_state);
   writer.EnumValue(value.action_state);
-  writer.EnumValue(value.effect);
   writer.Vector(value.primitive_attempts,
                 [&](const auto& item) { PutPrimitiveResult(writer, item); });
-  writer.Optional<LifecycleReconciliationEvidenceDTO>(
-      value.reconciliation_evidence, [&](const auto& item) { PutReconciliation(writer, item); });
   writer.Optional<ErrorDTO>(value.error, [&](const auto& item) { PutError(writer, item); });
+  writer.Vector(value.substep_events, [&](const auto& item) { PutSubstepEvent(writer, item); });
+  writer.Optional<LifecycleTransitionObservationDTO>(
+      value.observed_before, [&](const auto& item) { PutTransitionObservation(writer, item); });
+  writer.Optional<LifecycleTransitionObservationDTO>(
+      value.observed_after, [&](const auto& item) { PutTransitionObservation(writer, item); });
 }
 
 [[nodiscard]] ComponentLifecycleDomainStatusDTO GetDomainStatus(Reader& reader) {
@@ -1711,11 +1767,13 @@ void PutDomainStatus(Writer& writer, const ComponentLifecycleDomainStatusDTO& va
           [&]() { return reader.EnumValue<ComponentLifecycleStateDTO>(); }),
       GetRequestedState(reader),
       reader.EnumValue<ComponentLifecycleDomainActionStateDTO>(),
-      reader.EnumValue<ComponentLifecycleDomainEffectDTO>(),
       reader.Vector<BrandLifecyclePrimitiveResultDTO>([&]() { return GetPrimitiveResult(reader); }),
-      reader.Optional<LifecycleReconciliationEvidenceDTO>(
-          [&]() { return GetReconciliation(reader); }),
-      reader.Optional<ErrorDTO>([&]() { return GetError(reader); })};
+      reader.Optional<ErrorDTO>([&]() { return GetError(reader); }),
+      reader.Vector<LifecycleSubstepEventDTO>([&]() { return GetSubstepEvent(reader); }),
+      reader.Optional<LifecycleTransitionObservationDTO>(
+          [&]() { return GetTransitionObservation(reader); }),
+      reader.Optional<LifecycleTransitionObservationDTO>(
+          [&]() { return GetTransitionObservation(reader); })};
 }
 
 void PutProgramNode(Writer& writer, const ProgramNodeAdmissionEvidenceDTO& value) {

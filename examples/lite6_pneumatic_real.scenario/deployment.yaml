@@ -1,7 +1,18 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
   "assistant_profile_id": null,
-  "attachments": [],
+  "attachments": [
+    {
+      "child": {
+        "component_id": "lite_gripper",
+        "interface": "mount"
+      },
+      "parent": {
+        "component_id": "lite6_robot",
+        "interface": "flange"
+      }
+    }
+  ],
   "compatibility": {
     "lane": "manyforge-only",
     "provides": [
@@ -22,8 +33,7 @@
         "runtime_configuration": {
           "io_provider_devices": [
             {
-              "controllable_component_id": "gripper_io",
-              "lifecycle_command_timeout_s": 30
+              "controllable_component_id": "gripper_io"
             }
           ],
           "io_signals": [
@@ -74,6 +84,7 @@
           "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
+          "adapter_family": "xarm",
           "collision_monitor_period_ms": 50.0,
           "component_streams": [
             {
@@ -86,50 +97,6 @@
           ],
           "device_address_ref": "lite6_main",
           "execution_tick_hz": 100,
-          "gripper_target_configurations": [
-            {
-              "actuation_kind": "pneumatic",
-              "attach_frame": "link_tcp",
-              "auxiliary_frames": [
-                "lite_gripper_base_link"
-              ],
-              "closed_state_ref": "closed",
-              "command_duration_s": 0.8,
-              "command_target_id": "gripper",
-              "controllable_component_id": "lite6_robot",
-              "delivery_result_timeout_s": 1.0,
-              "description": "Commanded pneumatic gripper driven through configured I/O signals.",
-              "mount_frame": "link_eef",
-              "open_state_ref": "open",
-              "output_mode": "commanded",
-              "pneumatic_io": {
-                "inputs": {
-                  "workpiece_grasped": {
-                    "signal": {
-                      "controllable_component_id": "gripper_io",
-                      "signal_name": "workpiece_grasped"
-                    }
-                  }
-                },
-                "outputs": [
-                  {
-                    "close_value": true,
-                    "open_value": false,
-                    "signal": {
-                      "controllable_component_id": "valve_io",
-                      "signal_name": "valve"
-                    }
-                  }
-                ]
-              },
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
-            }
-          ],
           "initial_joint_positions_rad": [
             0.0,
             0.0,
@@ -151,10 +118,10 @@
           }
         },
         "srdf": {
-          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf"
+          "project_path": "../../manyforge_example_models/models/lite6/lite6.srdf"
         },
         "urdf": {
-          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+          "project_path": "../../manyforge_example_models/models/lite6/lite6.urdf"
         }
       },
       "root_pose_in_cell": {
@@ -215,6 +182,75 @@
       }
     },
     {
+      "component_id": "lite_gripper",
+      "component_profile_id": "lite_gripper_pneumatic_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "component_streams": [],
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "pneumatic",
+              "attach_frame": "link_tcp",
+              "auxiliary_frames": [
+                "lite_gripper_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "lite_gripper",
+              "delivery_result_timeout_s": 1.0,
+              "description": "Commanded pneumatic gripper driven through configured I/O signals.",
+              "mount_frame": "lite_gripper_mount",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "pneumatic_io": {
+                "inputs": {
+                  "workpiece_grasped": {
+                    "signal": {
+                      "controllable_component_id": "gripper_io",
+                      "signal_name": "workpiece_grasped"
+                    }
+                  }
+                },
+                "outputs": [
+                  {
+                    "close_value": true,
+                    "open_value": false,
+                    "signal": {
+                      "controllable_component_id": "valve_io",
+                      "signal_name": "valve"
+                    }
+                  }
+                ]
+              },
+              "tcp_frame": "link_tcp",
+              "touch_links": [
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger"
+              ]
+            }
+          ]
+        },
+        "runtime_kind": "ros2_control"
+      },
+      "frame_prefix": "",
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.urdf"
+        }
+      },
+      "target_settings": {}
+    },
+    {
       "component_id": "valve_io",
       "component_profile_id": "io_device_v0",
       "configuration": {
@@ -222,7 +258,6 @@
           "io_provider_devices": [
             {
               "controllable_component_id": "valve_io",
-              "lifecycle_command_timeout_s": 30,
               "output_source_ack_timeout_s": 0.5
             }
           ],

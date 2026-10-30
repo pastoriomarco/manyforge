@@ -154,6 +154,40 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
       );
       const component = componentByRole.get(target.component_role_id);
       if (!component || component.controllable_component_id !== target.controllable_component_id) bad(tp, 'target/component correspondence');
+      if ('default_tcp' in target) {
+        const dp = `${tp}.default_tcp`;
+        const entry = record(target.default_tcp, FIELDS.tcp_entry, dp);
+        ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${dp}.${field}`));
+      }
+      if ('robot_tcps' in target) {
+        const tcpPath = `${tp}.robot_tcps`;
+        const robotTcps = array(target.robot_tcps, tcpPath).map((item2, j) => {
+          const rp = `${tcpPath}[${j}]`;
+          const tcp = record(item2, FIELDS.robot_tcp, rp);
+          const entryPath = `${rp}.entry`;
+          const entry = record(tcp.entry, FIELDS.tcp_entry, entryPath);
+          ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${entryPath}.${field}`));
+          const framePath = `${rp}.frame`;
+          const frame = record(tcp.frame, FIELDS.frame, framePath, OPTIONAL_FIELDS.frame);
+          identity(frame.frame_role_id, `${framePath}.frame_role_id`);
+          identity(frame.model_instance_id, `${framePath}.model_instance_id`);
+          digest(frame.model_revision, `${framePath}.model_revision`);
+          text(frame.compiled_frame_name, `${framePath}.compiled_frame_name`);
+          if (frame.frame_role_id !== entry.frame_role_id) bad(rp, 'TCP entry/frame role correspondence');
+          if ('contact_body_role_ids' in frame) {
+            const bodyRoles = array(frame.contact_body_role_ids, `${framePath}.contact_body_role_ids`)
+              .map((role) => identity(role, `${framePath}.contact_body_role_ids`));
+            sorted(bodyRoles, (role) => role, `${framePath}.contact_body_role_ids`);
+          }
+          if (typeof tcp.end_effector !== 'boolean' || typeof tcp.component_default !== 'boolean') {
+            bad(rp, 'TCP marks must be boolean');
+          }
+          return tcp;
+        });
+        sorted(robotTcps,
+          (row) => `${(row.entry as Row).component_id}\u0000${(row.entry as Row).target_id}\u0000${(row.entry as Row).frame_role_id}`,
+          tcpPath);
+      }
       const frames = array(target.frame_role_bindings, `${tp}.frame_role_bindings`).map((item2, j) => {
         const fp = `${tp}.frame_role_bindings[${j}]`;
         const frame = record(item2, FIELDS.frame, fp, OPTIONAL_FIELDS.frame);

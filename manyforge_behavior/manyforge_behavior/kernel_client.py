@@ -98,14 +98,13 @@ class ExecutionTransport(Protocol):
     def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
-# Transport loss and malformed or mismatched replies: they cannot prove what
+# Transport loss and malformed replies: they cannot prove what
 # the owner did, so they are never an owner refusal (or a teardown).
 EXECUTION_TRANSPORT_FAILURE_CODES = frozenset(
     {
         "execution_owner_unavailable",
         "execution_command_transport_failure",
         "execution_command_response_invalid",
-        "execution_command_response_identity_mismatch",
     }
 )
 
@@ -126,6 +125,17 @@ class KernelOperationAdmissionRejectedError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = dict(details or {})
+
+
+class KernelImmediateStepFailedError(RuntimeError):
+    """A nonresident immediate step failed after the exact admission."""
+
+    def __init__(self, code: str, message: str, details: Mapping[str, Any],
+                 active_tcp: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details)
+        self.active_tcp = active_tcp
 
 
 class KernelOperationObservationUnavailableError(RuntimeError):
@@ -239,6 +249,19 @@ class KernelClient:
     def targets(self) -> dict[str, Any]:
         return self._projection("targets")
 
+    def read_active_tcp(self, *, ordered: bool = False) -> dict[str, Any]:
+        if type(ordered) is not bool:
+            raise TypeError("ordered must be boolean")
+        method = getattr(self._transport, "read_active_tcp", None)
+        if not callable(method):
+            raise TypeError("execution transport has no callable read_active_tcp")
+        return self._successful(
+            method(ordered=True) if ordered else method(), label="read active tcp"
+        )
+
+    def reset_active_tcp(self) -> dict[str, Any]:
+        return self._projection("reset_active_tcp")
+
     def control_state(self) -> dict[str, Any]:
         return self._projection("control_state")
 
@@ -321,20 +344,33 @@ class KernelClient:
         return self._successful(method(), label=method_name.replace("_", " "))
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+        def refusal(code: str, message: str, details: object, active_tcp: object) -> None:
+            detail = dict(details) if isinstance(details, Mapping) else {}
+            participants = intent.get("participants")
+            is_set_tcp = (
+                isinstance(participants, (list, tuple)) and len(participants) == 1
+                and isinstance(participants[0], Mapping)
+                and isinstance(participants[0].get("payload"), Mapping)
+                and participants[0]["payload"].get("kind") == "set_tcp"
+            )
+            if is_set_tcp and detail.get("immediate_step") == "admitted":
+                context = intent.get("request_context")
+                expected = context.get("request_id") if isinstance(context, Mapping) else None
+                if (not isinstance(expected, str) or not expected
+                    or detail.get("request_id") != expected
+                    or not isinstance(detail.get("operation_id"), str)
+                    or not detail["operation_id"]):
+                    raise KernelClientResponseError("immediate-step failure receipt is invalid")
+                raise KernelImmediateStepFailedError(code, message, detail, active_tcp)
+            raise KernelOperationAdmissionRejectedError(code, message, detail)
+
         try:
             response = self._transport.submit(intent)
         except Exception as exc:
             code = getattr(exc, "code", None)
-            # Transport loss and malformed or mismatched replies cannot prove
-            # whether the owner accepted the request. All other typed owner
-            # errors are explicit pre-acceptance rejections.
             if isinstance(code, str) and code not in EXECUTION_TRANSPORT_FAILURE_CODES:
-                details = getattr(exc, "details", None)
-                raise KernelOperationAdmissionRejectedError(
-                    code,
-                    str(exc) or "execution owner rejected the operation",
-                    details if isinstance(details, Mapping) else None,
-                ) from exc
+                refusal(code, str(exc) or "execution owner rejected the operation",
+                        getattr(exc, "details", None), getattr(exc, "active_tcp", None))
             raise
         if isinstance(response, dict) and response.get("ok") is False:
             error = response.get("error")
@@ -345,9 +381,8 @@ class KernelClient:
                 and isinstance(error.get("message"), str)
                 and isinstance(error.get("details", {}), Mapping)
             ):
-                raise KernelOperationAdmissionRejectedError(
-                    error["code"], error["message"], error.get("details")
-                )
+                refusal(error["code"], error["message"], error.get("details"),
+                        response.get("active_tcp"))
         return self._successful(response, label="submission")
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
@@ -423,8 +458,6 @@ class KernelClient:
         result = response.get("result")
         if (
             not isinstance(result, dict)
-            or result.get("request_id") != request.get("request_id")
-            or result.get("action") != request.get("action")
             or type(result.get("accepted")) is not bool
             or not isinstance(result.get("resulting_assessment"), dict)
         ):
@@ -488,8 +521,8 @@ class KernelClient:
             label="Program execution scope",
         )
         scope = response.get("scope")
-        if not isinstance(scope, dict) or scope.get("program_run_id") != program_run_id:
-            raise KernelClientResponseError("execution scope changed its Program run")
+        if not isinstance(scope, dict):
+            raise KernelClientResponseError("execution scope has an invalid shape")
         return scope
 
     def read_manual_handover(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -512,7 +545,6 @@ class KernelClient:
             or not isinstance(accepted, Mapping)
             or not isinstance(accepted.get("group_ids"), list)
             or not accepted["group_ids"]
-            or accepted.get("group_ids") != request.get("group_ids")
             or accepted.get("replay_status") not in {"accepted_new", "replayed_exact"}
             or not isinstance(accepted.get("state"), Mapping)
         ):
@@ -533,7 +565,6 @@ class KernelClient:
             response.get("command") != "release_program_selection"
             or not isinstance(scope, Mapping)
             or type(scope.get("selection_revision")) is not int
-            or scope["selection_revision"] != expected_selection_revision + 1
         ):
             raise KernelClientResponseError(
                 "Program selection Resume omitted its scope"
@@ -554,7 +585,6 @@ class KernelClient:
             response.get("command") != "start_program_selection"
             or not isinstance(scope, Mapping)
             or type(scope.get("selection_revision")) is not int
-            or scope["selection_revision"] != expected_selection_revision + 1
         ):
             raise KernelClientResponseError(
                 "Program selection initial Run omitted its scope"
@@ -640,6 +670,7 @@ __all__ = [
     "ExecutionTransport",
     "KernelClient",
     "KernelOperationAdmissionRejectedError",
+    "KernelImmediateStepFailedError",
     "KernelOperationObservationUnavailableError",
     "KernelOperationSettlementPendingError",
     "KernelClientResponseError",

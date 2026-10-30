@@ -2,15 +2,23 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentStreamsSection } from './ComponentStreamsSection';
 import { PoseSourceComponentSection } from './PoseSourceComponentForm';
 import { AiModelComponentSection } from './AiModelComponentForm';
+import { LifecycleBudgetField } from './LifecycleBudgetField';
 import { PneumaticIoEditor, pneumaticIoProblem } from './PneumaticIoEditor';
 import { pneumaticGripperDrafts, type PneumaticGripperDraft } from '../utils/pneumaticGripperAuthoring';
+import {
+  graspConfirmationForm,
+  graspConfirmationProblem,
+  graspConfirmationValue,
+  workpieceGraspedSignal,
+  type GraspConfirmationForm,
+} from '../utils/graspConfirmation';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import {
   IoSignalConfigurationSection,
   IoSignalInputFields,
   IoSignalOutputFields,
-  type GeometricContactEndpointOption,
+  type GeometricContactRobotOption,
 } from './IoSignalConfigurationSection';
 import {
   IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S,
@@ -22,6 +30,7 @@ import {
   ioDeviceHasGpioOutput,
   ioProviderDeviceTimeout,
   ioProviderDeviceValue,
+  ioSignalsConfiguration,
   isIoProviderComponent,
   lifecycleTimeoutProblem,
   newIoDeviceDraft,
@@ -58,15 +67,28 @@ import type {
   DeploymentControlledStopProfile,
   JsonValue,
   SourceModelProjection,
+  TcpSpeedCheck,
 } from '../types/api';
 import type {
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
 } from '../types/robotControl';
 import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
+import {
+  onOpenGlobalRulesRequest,
+  takeOpenGlobalRulesRequest,
+} from '../state/globalRulesNavigation';
+
+/**
+ * Which part of the editor renders: everything (the default), one
+ * component's own settings (its Components page), or the cell-level settings
+ * that belong to no single component (Deployment, Cell settings).
+ */
+export type FocusedEditorScope = 'all' | 'cell' | { componentId: string };
 
 interface DeploymentFocusedEditorProps {
   controller: DeploymentWorkspaceController;
+  scope?: FocusedEditorScope;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
   gripperDescriptors: ManualControlGripperDescriptor[];
@@ -109,6 +131,7 @@ interface MotionTargetLimit {
   componentId: string;
   targetId: string;
   value: number;
+  tcpSpeedCheck: TcpSpeedCheck;
   settingsPath: Array<string | number>;
 }
 
@@ -134,6 +157,8 @@ interface GripperTargetConfigurationDraft {
   commandDurationS: number;
   deliveryResultTimeoutS?: number;
   pneumaticIo?: JsonValue;
+  // Opt-in grasp confirmation, kept verbatim; the owner validates it.
+  graspConfirmation?: JsonValue;
   touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
@@ -211,6 +236,29 @@ function runtimeConfigurations(
   });
 }
 
+/**
+ * An intent row is the component itself; a compiled runtime unit holds the
+ * components its target rows name.
+ */
+function runtimeHoldsComponent(runtime: RuntimeConfiguration, componentId: string): boolean {
+  if (runtime.intentTargetSettings !== null) return runtime.runtimeUnitId === componentId;
+  return ['motion_target_limits', 'gripper_target_configurations', 'direct_control_joint_limits', 'io_signals']
+    .some((key) => {
+      const rows = runtime.configuration[key];
+      return Array.isArray(rows) && rows.some((row) => objectValue(row)?.controllable_component_id === componentId);
+    });
+}
+
+/** Motion robots offered to geometric-contact I/O authoring. */
+export function geometricContactRobotOptions(
+  motionDescriptors: readonly ManualControlMotionDescriptor[],
+): GeometricContactRobotOption[] {
+  return [...new Map(motionDescriptors.map((descriptor) => [
+    descriptor.controllableComponentId,
+    { componentId: descriptor.controllableComponentId },
+  ])).values()].sort((left, right) => left.componentId.localeCompare(right.componentId));
+}
+
 function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit[] {
   return runtimes.flatMap((runtime) => {
     const rows = runtime.configuration.motion_target_limits;
@@ -229,6 +277,7 @@ function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit
           componentId,
           targetId,
           value: limit,
+          tcpSpeedCheck: row?.tcp_speed_check === 'active_tcp' ? 'active_tcp' : 'active_tcp_and_flange',
           settingsPath: runtime.intentTargetSettings === null
             ? [...runtime.configurationPath, 'motion_target_limits', rowIndex]
             : ['components', runtime.index, 'target_settings', targetId],
@@ -264,11 +313,35 @@ function directControlJointLimits(
   });
 }
 
+/**
+ * Where a runtime's settings live: a Scenario (intent) component nests them
+ * under `runtime_configuration`, a compiled runtime unit holds them directly.
+ * Returns the settings object and its document path.
+ */
+function runtimeSettingsAt(runtime: RuntimeConfiguration): {
+  settings: Record<string, JsonValue>;
+  path: Array<string | number>;
+} {
+  const nested = objectValue(runtime.configuration.runtime_configuration);
+  return nested !== null
+    ? { settings: nested, path: [...runtime.configurationPath, 'runtime_configuration'] }
+    : { settings: runtime.configuration, path: runtime.configurationPath };
+}
+
+/** Where a runtime's gripper rows live, and their document path. */
+function gripperRowsAt(runtime: RuntimeConfiguration): {
+  rows: JsonValue | undefined;
+  path: Array<string | number>;
+} {
+  const { settings, path } = runtimeSettingsAt(runtime);
+  return { rows: settings.gripper_target_configurations, path: [...path, 'gripper_target_configurations'] };
+}
+
 function gripperTargetConfigurations(
   runtimes: RuntimeConfiguration[],
 ): GripperTargetConfigurationDraft[] {
   return runtimes.flatMap((runtime) => {
-    const rows = runtime.configuration.gripper_target_configurations;
+    const { rows } = gripperRowsAt(runtime);
     if (!Array.isArray(rows)) return [];
     return rows.flatMap((value, rowIndex) => {
       const row = objectValue(value);
@@ -282,6 +355,7 @@ function gripperTargetConfigurations(
       const commandDurationS = numberValue(row?.command_duration_s);
       const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
       const pneumaticIo = row?.pneumatic_io;
+      const graspConfirmation = row?.grasp_confirmation;
       const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
@@ -322,6 +396,7 @@ function gripperTargetConfigurations(
         commandDurationS,
         ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
         ...(pneumaticIo === undefined ? {} : { pneumaticIo }),
+        ...(graspConfirmation === undefined ? {} : { graspConfirmation }),
         touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
@@ -347,6 +422,7 @@ function gripperConfigurationValue(
     ...(draft.actuationKind === 'pneumatic' && draft.deliveryResultTimeoutS !== undefined
       ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
     ...(draft.pneumaticIo === undefined ? {} : { pneumatic_io: draft.pneumaticIo }),
+    ...(draft.graspConfirmation === undefined ? {} : { grasp_confirmation: draft.graspConfirmation }),
     touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
@@ -573,29 +649,27 @@ function FramePrefixDraft({ value, disabled, onCommit }: {
   onCommit: (value: string) => Promise<unknown> | unknown;
 }) {
   const [draft, setDraft] = useState(value);
-  const [invalid, setInvalid] = useState(false);
-  useEffect(() => { setDraft(value); setInvalid(false); }, [value]);
+  useEffect(() => { setDraft(value); }, [value]);
   const formatInvalid = draft !== '' && (draft.startsWith('/') || !draft.endsWith('/')
     || /[^A-Za-z0-9_/]/.test(draft));
+  // An owner refusal shows in the yellow Deployment notice row, not here.
   const commit = async () => {
     if (draft === value || formatInvalid) return;
-    setInvalid(await onCommit(draft) === null);
+    await onCommit(draft);
   };
   return (
-    <label className={`deployment-focused-field${formatInvalid || invalid ? ' invalid' : ''}`}>
+    <label className={`deployment-focused-field${formatInvalid ? ' invalid' : ''}`}>
       <span>TF frame prefix</span>
-      <input value={draft} disabled={disabled} aria-invalid={formatInvalid || invalid}
-        onChange={(event) => { setDraft(event.target.value); setInvalid(false); }}
+      <input value={draft} disabled={disabled} aria-invalid={formatInvalid}
+        onChange={(event) => { setDraft(event.target.value); }}
         onBlur={() => { void commit(); }}
         onKeyDown={(event) => {
           if (event.key === 'Enter') event.currentTarget.blur();
           if (event.key === 'Escape') setDraft(value);
         }} />
       <small>Empty keeps unprefixed frames. Applying a change restarts this robot holding.</small>
-      {(formatInvalid || invalid) && <small className="deployment-field-error inline-message severity-error">
-        {formatInvalid
-          ? "Frame prefix must be empty or use only ASCII letters, digits, '_' and '/', without a leading '/' and with a trailing '/'."
-          : 'Value was rejected.'}
+      {formatInvalid && <small className="deployment-field-error inline-message severity-error">
+        {"Frame prefix must be empty or use only ASCII letters, digits, '_' and '/', without a leading '/' and with a trailing '/'."}
       </small>}
     </label>
   );
@@ -607,6 +681,7 @@ function NumberDraft({
   value,
   unit,
   min,
+  exclusiveMin,
   max,
   step,
   disabled,
@@ -617,6 +692,8 @@ function NumberDraft({
   value: number;
   unit?: string;
   min?: number;
+  /** The value must be greater than this (the backend's exclusive minimum). */
+  exclusiveMin?: number;
   max?: number;
   step?: number;
   disabled: boolean;
@@ -633,14 +710,15 @@ function NumberDraft({
     if (
       !Number.isFinite(parsed)
       || (min !== undefined && parsed < min)
+      || (exclusiveMin !== undefined && !(parsed > exclusiveMin))
       || (max !== undefined && parsed > max)
     ) {
       setInvalid(true);
       return;
     }
     if (parsed === value) return;
-    const result = await onCommit(parsed);
-    setInvalid(result === null);
+    // An owner refusal shows in the yellow Deployment notice row, not here.
+    await onCommit(parsed);
   };
   return (
     <label className={`deployment-focused-field${invalid ? ' invalid' : ''}`} title={title}>
@@ -649,7 +727,7 @@ function NumberDraft({
         <input
           type="number"
           value={draft}
-          min={min}
+          min={min ?? exclusiveMin}
           max={max}
           step={step ?? 'any'}
           disabled={disabled}
@@ -669,7 +747,7 @@ function NumberDraft({
         />
         {unit && <small>{unit}</small>}
       </span>
-      {invalid && <small className="deployment-field-error inline-message severity-error">Value was rejected.</small>}
+      {invalid && <small className="deployment-field-error inline-message severity-error">Enter a number within the allowed range.</small>}
     </label>
   );
 }
@@ -702,8 +780,8 @@ function CommitNumberInput({
       return;
     }
     if (parsed === value) return;
-    const result = await onCommit(parsed);
-    setInvalid(result === null);
+    // An owner refusal shows in the yellow Deployment notice row, not here.
+    await onCommit(parsed);
   };
   return (
     <input
@@ -715,7 +793,7 @@ function CommitNumberInput({
       disabled={disabled}
       aria-label={ariaLabel}
       aria-invalid={invalid || undefined}
-      title={invalid ? 'Value was rejected.' : undefined}
+      title={invalid ? 'Enter a number within the allowed range.' : undefined}
       onChange={(event) => {
         setDraft(event.target.value);
         setInvalid(false);
@@ -756,15 +834,12 @@ function OptionalNumberDraft({
 }) {
   const [draft, setDraft] = useState(value === null ? '' : String(value));
   const [invalid, setInvalid] = useState(false);
-  const [rejected, setRejected] = useState(false);
   useEffect(() => {
     setDraft(value === null ? '' : String(value));
     setInvalid(false);
-    setRejected(false);
   }, [value]);
   const commit = async () => {
     const parsed = draft.trim() === '' ? null : Number(draft);
-    setRejected(false);
     if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0
       || (maximum !== undefined && parsed > maximum)
       || (minimum !== undefined && parsed < minimum))) {
@@ -772,13 +847,13 @@ function OptionalNumberDraft({
       return;
     }
     if (parsed === value) return;
-    const result = await onCommit(parsed);
-    // A well-formed value the owner refused is not an input-format error.
+    // A well-formed value the owner refused is not an input-format error: the
+    // refusal shows in the yellow Deployment notice row, not here.
     setInvalid(false);
-    setRejected(result === null);
+    await onCommit(parsed);
   };
   return (
-    <label className={`deployment-focused-field${invalid || rejected ? ' invalid' : ''}`}>
+    <label className={`deployment-focused-field${invalid ? ' invalid' : ''}`}>
       <span>{label}</span>
       <span className="deployment-number-with-unit">
         <input
@@ -793,7 +868,6 @@ function OptionalNumberDraft({
           onChange={(event) => {
             setDraft(event.target.value);
             setInvalid(false);
-            setRejected(false);
           }}
           onBlur={() => { void commit(); }}
           onKeyDown={(event) => {
@@ -801,14 +875,12 @@ function OptionalNumberDraft({
             if (event.key === 'Escape') {
               setDraft(value === null ? '' : String(value));
               setInvalid(false);
-              setRejected(false);
               event.currentTarget.blur();
             }
           }}
         />
         <small>{unit}</small>
       </span>
-      {rejected && <small className="deployment-field-error inline-message severity-error">Value was rejected.</small>}
       {invalid && <small className="deployment-field-error inline-message severity-error">
         {maximum === 0 ? 'Enable ordinary jerk shaping first, or leave blank.'
           : minimum !== undefined ? `Use at least ${minimum}${maximum === undefined ? '' : ` and at most ${maximum}`}, or clear the manual jerk cap first.`
@@ -1152,6 +1224,21 @@ function ModelAndTargetSection({
                   Individual motion nodes and manual commands may request a
                   slower speed.
                 </p>
+                <label className="deployment-focused-field"
+                  title="The flange is the point the robot's own TCP speed limit refers to.">
+                  <span>Check TCP speed at</span>
+                  <select aria-label={`${limit.componentId} / ${limit.targetId} TCP speed check`}
+                    disabled={editingDisabled} value={limit.tcpSpeedCheck}
+                    onChange={(event) => { void controller.updateMotionTargetLimit(
+                      limit.componentId,
+                      limit.targetId,
+                      limit.value,
+                      event.target.value as TcpSpeedCheck,
+                    ); }}>
+                    <option value="active_tcp_and_flange">Active TCP and flange</option>
+                    <option value="active_tcp">Active TCP only</option>
+                  </select>
+                </label>
                 {matching !== null
                   && matching.maximumTcpLinearSpeedMps !== limit.value && (
                   <p className="deployment-applied-comparison">
@@ -1161,8 +1248,10 @@ function ModelAndTargetSection({
                 {runtime !== undefined && <OrdinaryMotionJerkEditor
                   controller={controller} runtime={runtime} limit={limit}
                   descriptor={selectedDescriptor} />}
+                {/* Only a compiled runtime unit carries direct-control caps; the
+                    ROS runtime of a Scenario component has no such field. */}
                 {matching !== null && selectedDescriptor !== null && (
-                  runtime !== undefined && (
+                  runtime !== undefined && runtime.intentTargetSettings === null && (
                     <DirectControlJointLimitsEditor
                       controller={controller}
                       runtime={runtime}
@@ -1181,51 +1270,6 @@ function ModelAndTargetSection({
         </p>
       </div>
     </details>
-  );
-}
-
-/**
- * D11: the payload of a ROS component's tool (mass and centre of mass in the
- * robot flange frame). Only a Real robot applies it, at Enable; Mock and
- * Isaac carry it unchanged and ignore it.
- */
-function ToolPayloadFields({
-  controller,
-  runtime,
-  disabled,
-}: {
-  controller: DeploymentWorkspaceController;
-  runtime: RuntimeConfiguration;
-  disabled: boolean;
-}) {
-  const path = ['components', runtime.index, 'configuration', 'runtime_configuration', 'tool_payload'];
-  const payload = objectValue(objectValue(runtime.configuration.runtime_configuration)?.tool_payload);
-  if (payload === null) {
-    return (
-      <div className="deployment-focused-field">
-        <span>Tool payload</span>
-        <button type="button" disabled={disabled}
-          onClick={() => controller.mutate(path, 'set', { mass_kg: 0, center_of_mass_m: [0, 0, 0] })}>
-          Add tool payload
-        </button>
-      </div>
-    );
-  }
-  const center = Array.isArray(payload.center_of_mass_m) ? payload.center_of_mass_m : [];
-  return (
-    <fieldset className="deployment-initial-joints">
-      <legend>Tool payload (applied to a real robot at Enable)</legend>
-      <NumberDraft label="Mass" value={numberValue(payload.mass_kg) ?? 0} unit="kg" min={0} max={100}
-        disabled={disabled} onCommit={(value) => controller.mutate([...path, 'mass_kg'], 'set', value)} />
-      {['X', 'Y', 'Z'].map((axis, index) => (
-        <NumberDraft key={axis} label={`Centre of mass ${axis}`} value={numberValue(center[index]) ?? 0}
-          unit="m" min={-2} max={2} disabled={disabled}
-          onCommit={(value) => controller.mutate([...path, 'center_of_mass_m', index], 'set', value)} />
-      ))}
-      <button type="button" disabled={disabled} onClick={() => controller.mutate(path, 'remove')}>
-        Remove tool payload
-      </button>
-    </fieldset>
   );
 }
 
@@ -1299,16 +1343,16 @@ function NativeRuntimeSection({
     <details className="dcard">
       <summary>Native runtime configuration</summary>
       <div className="deployment-focused-body">
-        {controller.error?.includes('pneumatic_io_presets_coincident') && (
+        {controller.error !== null && controller.errorCauseCode === 'pneumatic_io_presets_coincident' && (
           <p className="inline-message severity-error" role="alert">The gripper's Open and Close presets have the same position. Choose distinct preset positions before using pneumatic I/O.</p>
         )}
-        {controller.error?.includes('pneumatic_io_unsupported_on_isaac') && (
+        {controller.error !== null && controller.errorCauseCode === 'pneumatic_io_unsupported_on_isaac' && (
           <p className="inline-message severity-error" role="alert">This pneumatic I/O mapping is not supported by Isaac. Use an unmapped Isaac gripper configuration.</p>
         )}
         {runtimes.length === 0 && <p className="muted">No native runtime configuration is declared.</p>}
         {runtimes.map((runtime) => {
-          const prefix = runtime.configurationPath;
-          const positions = runtime.configuration.initial_joint_positions_rad;
+          const { settings, path: prefix } = runtimeSettingsAt(runtime);
+          const positions = settings.initial_joint_positions_rad;
           return (
             <section className="deployment-runtime-unit" key={runtime.runtimeUnitId}>
               <header><strong>{runtime.runtimeUnitId}</strong><small>Named authored inputs</small></header>
@@ -1317,10 +1361,14 @@ function NativeRuntimeSection({
                   <FramePrefixDraft value={runtime.framePrefix} disabled={disabled}
                     onCommit={(value) => controller.mutate(['components', runtime.index, 'frame_prefix'], 'set', value)} />
                 )}
-                {numberValue(runtime.configuration.execution_tick_hz) !== null && (
+                {runtime.intentTargetSettings !== null && (
+                  <LifecycleBudgetField controller={controller} componentIndex={runtime.index}
+                    componentId={runtime.runtimeUnitId} disabled={disabled} />
+                )}
+                {numberValue(settings.execution_tick_hz) !== null && (
                   <NumberDraft
                     label="Execution cadence"
-                    value={runtime.configuration.execution_tick_hz as number}
+                    value={settings.execution_tick_hz as number}
                     unit="Hz"
                     min={1}
                     max={10000}
@@ -1328,10 +1376,10 @@ function NativeRuntimeSection({
                     onCommit={(value) => controller.mutate([...prefix, 'execution_tick_hz'], 'set', value)}
                   />
                 )}
-                {numberValue(runtime.configuration.collision_monitor_period_ms) !== null && (
+                {numberValue(settings.collision_monitor_period_ms) !== null && (
                   <NumberDraft
                     label="Collision monitor period"
-                    value={runtime.configuration.collision_monitor_period_ms as number}
+                    value={settings.collision_monitor_period_ms as number}
                     unit="ms"
                     min={1}
                     max={60000}
@@ -1339,19 +1387,75 @@ function NativeRuntimeSection({
                     onCommit={(value) => controller.mutate([...prefix, 'collision_monitor_period_ms'], 'set', value)}
                   />
                 )}
-                {numberValue(runtime.configuration.planner_rng_seed) !== null && (
+                {numberValue(settings.planner_rng_seed) !== null && (
                   <NumberDraft
                     label="Planner seed"
-                    value={runtime.configuration.planner_rng_seed as number}
+                    value={settings.planner_rng_seed as number}
                     min={0}
                     disabled={disabled}
                     onCommit={(value) => controller.mutate([...prefix, 'planner_rng_seed'], 'set', value)}
                   />
                 )}
+                {runtime.configuration.runtime_kind === 'ros2_control' && (
+                  <>
+                    <NumberDraft
+                      label="Collision clearance"
+                      title="Planned and validated moves keep at least this from obstacles the collision policy does not allow them to touch; 0 turns it off. A motion's own clearance replaces it. Default 0 (off)."
+                      value={numberValue(settings.collision_clearance_m) ?? 0}
+                      unit="m"
+                      min={0}
+                      max={0.05}
+                      step={0.0005}
+                      disabled={disabled}
+                      onCommit={(value) => controller.mutate([...prefix, 'collision_clearance_m'], 'set', value)}
+                    />
+                    <NumberDraft
+                      label="Collision check step"
+                      title="Joint-space distance between collision-checked configurations, for the planner and for validation of the executed curve. A replan after a refusal, and its validation, use the finer of this and 0.01 rad. Default 0.05 rad."
+                      value={numberValue(settings.collision_check_step_rad) ?? 0.05}
+                      unit="rad"
+                      exclusiveMin={0}
+                      max={0.2}
+                      disabled={disabled}
+                      onCommit={(value) => controller.mutate([...prefix, 'collision_check_step_rad'], 'set', value)}
+                    />
+                  </>
+                )}
+                {runtime.configuration.runtime_kind === 'ros2_control' && typeof settings.real_profile === 'string' && (
+                  <label className="deployment-focused-field"
+                    title="Where a soft Stop's 0.1 s lead-in starts. Commanded position continues what the controller already commands. Measured position starts where the robot is measured; it trails the command, so the Stop can fall back to the hard stop. Default: Commanded position.">
+                    <span>Stop lead-in start</span>
+                    <select
+                      aria-label="Stop lead-in start"
+                      value={settings.stop_lead_in_anchor === 'measured' ? 'measured' : 'commanded'}
+                      disabled={disabled}
+                      onChange={(event) => {
+                        void (event.target.value === 'measured'
+                          ? controller.mutate([...prefix, 'stop_lead_in_anchor'], 'set', 'measured')
+                          : controller.mutate([...prefix, 'stop_lead_in_anchor'], 'remove'));
+                      }}
+                    >
+                      <option value="commanded">Commanded position</option>
+                      <option value="measured">Measured position</option>
+                    </select>
+                  </label>
+                )}
+                {runtime.configuration.runtime_kind === 'ros2_control' && typeof settings.real_profile === 'string' && (
+                  <label className="toggle-control"
+                    title="Selected (default): before a motion that needs another TCP, the robot's controller is sent that TCP offset, and the motion starts once the robot has settled. Unselected: the controller's TCP offset is kept at zero (the flange) and no TCP is ever sent; the payload is still sent. Save and Apply are required.">
+                    <input type="checkbox"
+                      aria-label="Send TCP offset to controller"
+                      checked={settings.controller_tcp_offset_sync !== false}
+                      disabled={disabled}
+                      onChange={(event) => {
+                        void (event.target.checked
+                          ? controller.mutate([...prefix, 'controller_tcp_offset_sync'], 'remove')
+                          : controller.mutate([...prefix, 'controller_tcp_offset_sync'], 'set', false));
+                      }} />
+                    Send TCP offset to controller
+                  </label>
+                )}
               </div>
-              {runtime.framePrefix !== null && (
-                <ToolPayloadFields controller={controller} runtime={runtime} disabled={disabled} />
-              )}
               {pneumaticRows.filter((row) => runtime.configurationPath.every((part, index) => row.path[index] === part))
                 .map((row) => <PneumaticIoDraftFields key={JSON.stringify([row.componentId, row.targetId])}
                   controller={controller} row={row} document={document} />)}
@@ -1489,7 +1593,7 @@ function ControlledStopEditor({ controller, target }: {
               });
             }}
           />
-          <label className="toggle-control" title="Unselected: this robot's controlled Stop must finish within its deceleration time plus 0.5 s. Selecting sets an explicit maximum Stop time for this profile (never below the deceleration time); Save and Apply are still required.">
+          <label className="toggle-control" title="Unselected: this robot's controlled Stop must start braking within its deceleration time plus 0.5 s. Once started, it finishes like a normal motion: when the controller reports it stopped (or stopped outside its arrival tolerance), with at least 10 s before a missing report brings the hard stop. Selecting sets an explicit time to start braking for this profile (never below the deceleration time); Save and Apply are still required.">
             <input type="checkbox" checked={draft.max_stop_time_s !== undefined} disabled={disabled}
               onChange={(event) => {
                 const next = { ...draft };
@@ -1500,9 +1604,9 @@ function ControlledStopEditor({ controller, target }: {
             Explicit maximum Stop time
           </label>
           {draft.max_stop_time_s === undefined
-            ? <p className="field-help">{`Automatic: ${Number((draft.deceleration_time_s + 0.5).toFixed(3))} s (deceleration time + 0.5 s).`}</p>
+            ? <p className="field-help">{`Automatic: ${Number((draft.deceleration_time_s + 0.5).toFixed(3))} s (deceleration time + 0.5 s) to start braking; the Stop then finishes like a normal motion, when the controller reports it.`}</p>
             : <NumberDraft label="Max Stop time" value={draft.max_stop_time_s}
-              title="This robot's controlled Stop must finish within this time from the Stop request; on overrun its hard stop follows, bounded by the lane's stop-completion timeout."
+              title="This robot's controlled Stop must start braking within this time from the Stop request; it then finishes like a normal motion, on the controller's report. On overrun, or with no report within a normal motion's bound (at least 10 s), its hard stop follows: a brake that also finishes like a normal motion, or the controller cancel within the lane's stop-completion timeout."
               unit="s" min={0.001} max={9_007_199} disabled={disabled}
               onCommit={(value) => commit({
                 ...draft, max_stop_time_s: Math.max(draft.deceleration_time_s, value),
@@ -1593,14 +1697,136 @@ function ControlledStopEditor({ controller, target }: {
   );
 }
 
+/** Where one authored gripper row sits in the Draft. */
+function gripperRowPath(
+  runtimes: RuntimeConfiguration[],
+  row: GripperTargetConfigurationDraft,
+): Array<string | number> {
+  return [
+    ...gripperRowsAt(runtimes.find((runtime) => runtime.index === row.runtimeIndex)!).path,
+    row.rowIndex,
+  ];
+}
+
+/**
+ * The row's opt-in grasp confirmation. Like the other fields here, it writes
+ * itself into the Draft once complete: the select on change, the stall window
+ * on Enter or blur; Escape restores the Draft value. An incomplete or invalid
+ * setting shows its local validation and writes nothing. Each write is one
+ * Draft edit of this field only, so it never carries unsaved gripper edits.
+ * Off without a stall window removes the field (the default).
+ */
+function GraspConfirmationFields({ controller, row, path, descriptor }: {
+  controller: DeploymentWorkspaceController;
+  row: GripperTargetConfigurationDraft;
+  path: Array<string | number>;
+  descriptor: ManualControlGripperDescriptor | null;
+}) {
+  const position = row.actuationKind === 'position_commanded';
+  const sourceKey = JSON.stringify(row.graspConfirmation ?? null);
+  const [form, setForm] = useState<GraspConfirmationForm>(() => graspConfirmationForm(row.graspConfirmation));
+  const [formSource, setFormSource] = useState(sourceKey);
+  const [error, setError] = useState<string | null>(null);
+  if (formSource !== sourceKey) {
+    // The Draft row changed (this write or another one): show it.
+    setFormSource(sourceKey);
+    setForm(graspConfirmationForm(row.graspConfirmation));
+    setError(null);
+  }
+  const grasped = position ? null : workpieceGraspedSignal(row.pneumaticIo);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const range = descriptor !== null && descriptor.minPosition !== null && descriptor.maxPosition !== null
+    ? ` (gripper range ${format(descriptor.minPosition)} to ${format(descriptor.maxPosition)} ${descriptor.unit})` : '';
+  const commit = async (next: GraspConfirmationForm) => {
+    const problem = graspConfirmationProblem(next, position);
+    setError(problem);
+    if (problem !== null) return;
+    const value = graspConfirmationValue(next, position);
+    if (JSON.stringify(value ?? null)
+      === JSON.stringify(graspConfirmationValue(graspConfirmationForm(row.graspConfirmation), position) ?? null)) return;
+    // A refusal shows once, in the yellow Deployment notice row.
+    if (value === undefined) await controller.mutate([...path, 'grasp_confirmation'], 'remove');
+    else await controller.mutate([...path, 'grasp_confirmation'], 'set', value);
+  };
+  return (
+    <fieldset className="deployment-gripper-editor">
+      <legend>{`Grasp confirmation · ${row.componentId} / ${row.targetId}`}</legend>
+      <div className="deployment-focused-form-grid">
+        <label className="deployment-focused-field">
+          <span>Grasp confirmation</span>
+          <select
+            value={form.policy}
+            disabled={disabled}
+            onChange={(event) => {
+              let next = { ...form, policy: event.target.value as GraspConfirmationForm['policy'] };
+              // Off always writes: it keeps a complete, valid window and drops
+              // an incomplete or invalid one.
+              if (next.policy === 'not_required' && graspConfirmationProblem(next, position) !== null) {
+                next = { ...next, minPosition: '', maxPosition: '' };
+              }
+              setForm(next);
+              void commit(next);
+            }}
+          >
+            <option value="not_required">Off</option>
+            <option value="required">Required</option>
+          </select>
+        </label>
+        {position && ([
+          ['Stall window min', 'minPosition'],
+          ['Stall window max', 'maxPosition'],
+        ] as const).map(([label, field]) => (
+          <label className="deployment-focused-field" key={field}>
+            <span>{label}</span>
+            <span className="deployment-number-with-unit">
+              <input
+                type="number"
+                step="any"
+                value={form[field]}
+                disabled={disabled}
+                aria-invalid={error !== null}
+                onChange={(event) => { setForm({ ...form, [field]: event.target.value }); setError(null); }}
+                onBlur={() => { void commit(form); }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                  if (event.key === 'Escape') {
+                    setForm(graspConfirmationForm(row.graspConfirmation));
+                    setError(null);
+                  }
+                }}
+              />
+              <small>{descriptor?.unit ?? ''}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+      <p className="field-help">
+        {position
+          ? `Controlled gripper: a Close counts as a grasp when the fingers finish inside the stall window${range}. `
+          : `Pneumatic gripper: the evidence is the Workpiece grasped input, ${grasped === null ? 'not mapped' : `${grasped.componentId} · ${grasped.signalName}`}. `}
+        Required: a Program Close without this evidence fails its node.
+      </p>
+      {!position && form.policy === 'required' && grasped === null && (
+        <p className="inline-message severity-warning" role="status">
+          Required needs a mapped Workpiece grasped input on this pneumatic gripper. Map it in this gripper's pneumatic I/O under Native runtime configuration; until then the Deployment refuses this setting.
+        </p>
+      )}
+      {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
+    </fieldset>
+  );
+}
+
 function GripperSection({
   controller,
   descriptors,
   runtimes,
+  componentId,
 }: {
   controller: DeploymentWorkspaceController;
   descriptors: ManualControlGripperDescriptor[];
   runtimes: RuntimeConfiguration[];
+  /** One component's page; null for every component. */
+  componentId: string | null;
 }) {
   const authored = useMemo(() => gripperTargetConfigurations(runtimes), [runtimes]);
   const [selectedTarget, setSelectedTarget] = useState('');
@@ -1679,22 +1905,30 @@ function GripperSection({
       setError(validation);
       return;
     }
-    const result = await controller.mutate(
+    setError(null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    await controller.mutate(
       [
-        ...runtimes.find((runtime) => runtime.index === normalizedDraft.runtimeIndex)!
-          .configurationPath,
-        'gripper_target_configurations', normalizedDraft.rowIndex,
+        ...gripperRowsAt(runtimes.find((runtime) => runtime.index === normalizedDraft.runtimeIndex)!).path,
+        normalizedDraft.rowIndex,
       ],
       'set',
       gripperConfigurationValue(normalizedDraft),
     );
-    setError(result === null ? 'The Deployment owner rejected this gripper configuration.' : null);
   };
   return (
     <details className="dcard">
       <summary>Current gripper configuration</summary>
       <div className="deployment-focused-body">
-        {descriptor === null ? <p className="muted">No current addressed gripper descriptor is available.</p> : (
+        {descriptor === null ? (
+          <>
+            <p className="muted">No current addressed gripper descriptor is available.</p>
+            {authored.filter((row) => componentId === null || row.componentId === componentId).map((row) => (
+              <GraspConfirmationFields key={JSON.stringify([row.componentId, row.targetId])} controller={controller}
+                row={row} path={gripperRowPath(runtimes, row)} descriptor={null} />
+            ))}
+          </>
+        ) : (
           <>
             {descriptors.length > 1 && <label className="deployment-focused-field">
               <span>Target</span>
@@ -1716,7 +1950,8 @@ function GripperSection({
               <span><small>Transport</small><strong>{descriptor.transportKind.replaceAll('_', ' ')} · {descriptor.controlInterfaceContractId ?? 'no resolved interface'}</strong></span>
               <span><small>State authority</small><strong>{descriptor.stateAuthorityClass ?? 'unavailable'} · {descriptor.stateAuthorityId ?? descriptor.sourceKind.replaceAll('_', ' ')}</strong></span>
               <span><small>Completion policy</small><strong>{descriptor.completionPolicy.replaceAll('_', ' ')}</strong></span>
-              <span><small>Grasp confirmation</small><strong>{descriptor.graspConfirmationPolicy.replaceAll('_', ' ')}</strong></span>
+              <span><small>Grasp feedback policy</small><strong>{descriptor.graspConfirmationPolicy.replaceAll('_', ' ')}</strong></span>
+              <span><small>Grasp confirmation (Applied)</small><strong>{descriptor.graspConfirmation === 'required' ? 'Required' : 'Off'}</strong></span>
               <span><small>Command capability / schema</small><strong>{descriptor.contracts.operationCapabilityId} · {shortIdentity(descriptor.contracts.commandSchema?.commandSchemaId)}</strong></span>
               <span><small>Presets</small><strong>{descriptor.namedPresets.map((preset) => preset.name).join(', ') || 'not declared'}</strong></span>
               <span><small>Mimic followers</small><strong>{descriptor.mimicFollowers.length}</strong></span>
@@ -1859,7 +2094,11 @@ function GripperSection({
                 </div>
               </fieldset>
             )}
-            <p className="field-help">The Deployment owns tool geometry, presets, and motion time. Transport, state authority, completion, and grasp confirmation above are exact addressed-owner facts and remain read-only.</p>
+            {source !== null && (
+              <GraspConfirmationFields key={descriptorKey(descriptor)} controller={controller}
+                row={source} path={gripperRowPath(runtimes, source)} descriptor={descriptor} />
+            )}
+            <p className="field-help">The Deployment owns tool geometry, presets, motion time, and grasp confirmation. Transport, state authority, completion, and the grasp feedback policy above are exact addressed-owner facts and remain read-only.</p>
           </>
         )}
       </div>
@@ -1869,6 +2108,7 @@ function GripperSection({
 
 export function DeploymentFocusedEditor({
   controller,
+  scope = 'all',
   sourceModel,
   motionDescriptors,
   gripperDescriptors,
@@ -1880,34 +2120,29 @@ export function DeploymentFocusedEditor({
   systemSignalsNeedApply = false,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
-  const geometricContactEndpoints = useMemo(() => {
-    const motionEndpoints = motionDescriptors.flatMap((descriptor) => descriptor.frames.map(
-      (frame): GeometricContactEndpointOption => ({
-        componentId: descriptor.controllableComponentId,
-        targetId: descriptor.commandTargetId,
-        frameRoleId: frame.frameRoleId,
-      }),
-    ));
-    const retainedEndpoints = sourceModel.status === 'ready'
-      ? sourceModel.data.targets.flatMap((target) => target.frames.map(
-        (frame): GeometricContactEndpointOption => ({
-          componentId: target.component_id,
-          targetId: target.target_id,
-          frameRoleId: frame.frame_role_id,
-        }),
-      )) : [];
-    return [...new Map([...motionEndpoints, ...retainedEndpoints].map((endpoint) => [
-      JSON.stringify([endpoint.componentId, endpoint.targetId, endpoint.frameRoleId]), endpoint,
-    ])).values()];
-  }, [motionDescriptors, sourceModel]);
-  const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
+  const componentId = typeof scope === 'object' ? scope.componentId : null;
+  const geometricContactRobots = useMemo(
+    () => geometricContactRobotOptions(motionDescriptors),
+    [motionDescriptors],
+  );
+  const runtimes = useMemo(() => runtimeConfigurations(document).filter((runtime) => (
+    componentId === null || runtimeHoldsComponent(runtime, componentId)
+  )), [componentId, document]);
   // Model-free components (I/O devices, pose sources, AI models) have no model,
   // motion, gripper, frame or Stop inputs.
   const motionRuntimes = useMemo(
     () => runtimes.filter((runtime) => !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel),
     [runtimes]);
-  const limits = useMemo(() => motionTargetLimits(motionRuntimes), [motionRuntimes]);
-  const controlledStop = useMemo(() => controlledStopTargets(document), [document]);
+  const limits = useMemo(() => motionTargetLimits(motionRuntimes)
+    .filter((limit) => componentId === null || limit.componentId === componentId), [componentId, motionRuntimes]);
+  const controlledStop = useMemo(() => controlledStopTargets(document)
+    .filter((target) => componentId === null || target.componentId === componentId), [componentId, document]);
+  const ownMotionDescriptors = useMemo(() => motionDescriptors.filter((descriptor) => (
+    componentId === null || descriptor.controllableComponentId === componentId
+  )), [componentId, motionDescriptors]);
+  const ownGripperDescriptors = useMemo(() => gripperDescriptors.filter((descriptor) => (
+    componentId === null || descriptor.controllableComponentId === componentId
+  )), [componentId, gripperDescriptors]);
   const ioRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.poseSource && !runtime.aiModel).map((runtime) => ({
     index: runtime.index,
     runtimeUnitId: runtime.runtimeUnitId,
@@ -1919,37 +2154,52 @@ export function DeploymentFocusedEditor({
   if (document === null) {
     return <div className="panel-state">Open a Deployment artifact to edit its Draft.</div>;
   }
+  const intent = document.api_version === 'manyforge.deployment_intent.v2';
+  const all = scope === 'all';
+  const cell = scope === 'all' || scope === 'cell';
+  // One component's page shows only the sections that have its rows.
+  const shown = {
+    model: all || (componentId !== null && (limits.length > 0 || ownMotionDescriptors.length > 0)),
+    native: all || (componentId !== null && motionRuntimes.length > 0),
+    stop: all || (componentId !== null && controlledStop.length > 0),
+    gripper: all || (componentId !== null
+      && (ownGripperDescriptors.length > 0 || gripperTargetConfigurations(motionRuntimes).length > 0)),
+    ioSignals: all || (componentId !== null && ioRuntimes.some((runtime) => runtime.ioProvider
+      || Array.isArray(ioSignalsConfiguration(runtime.configuration, runtime.configurationPath).configuration.io_signals))),
+  };
   return (
     <section className="deployment-focused-editor" aria-labelledby="deployment-focused-title">
       <header className="scene-authoring-heading">
         <div>
           <p className="eyebrow">Focused compiler inputs</p>
-          <h3 id="deployment-focused-title">Robot and runtime configuration</h3>
+          <h3 id="deployment-focused-title">{componentId !== null ? `${componentId} settings`
+            : scope === 'cell' ? 'Cell settings' : 'Robot and runtime configuration'}</h3>
         </div>
       </header>
-      <ModelAndTargetSection
+      {shown.model && <ModelAndTargetSection
         controller={controller}
         sourceModel={sourceModel}
-        motionDescriptors={motionDescriptors}
+        motionDescriptors={ownMotionDescriptors}
         limits={limits}
         runtimes={motionRuntimes}
-      />
-      <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} document={document} />
-      <ControlledStopSection controller={controller} targets={controlledStop} />
-      <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={motionRuntimes} />
-      {document.api_version === 'manyforge.deployment_intent.v2' && (
-        <IoDeviceSection controller={controller} document={document}
-          geometricContactEndpoints={geometricContactEndpoints} />
+      />}
+      {shown.native && <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} document={document} />}
+      {shown.stop && <ControlledStopSection controller={controller} targets={controlledStop} />}
+      {shown.gripper && <GripperSection controller={controller} descriptors={ownGripperDescriptors} runtimes={motionRuntimes}
+        componentId={componentId} />}
+      {intent && scope !== 'cell' && (
+        <IoDeviceSection controller={controller} document={document} componentId={componentId}
+          geometricContactRobots={geometricContactRobots} />
       )}
-      <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
-        geometricContactEndpoints={geometricContactEndpoints} />
-      <PoseSourceComponentSection controller={controller} programSceneIds={programSceneIds} />
-      <AiModelComponentSection controller={controller} />
-      <ComponentStreamsSection controller={controller} />
-      {document.api_version === 'manyforge.deployment_intent.v2' && (
+      {shown.ioSignals && <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
+        geometricContactRobots={geometricContactRobots} />}
+      <PoseSourceComponentSection controller={controller} programSceneIds={programSceneIds} scope={scope} />
+      <AiModelComponentSection controller={controller} scope={scope} />
+      <ComponentStreamsSection controller={controller} scope={scope} />
+      {intent && cell && (
         <MotionTakeoverSection controller={controller} document={document} />
       )}
-      {document.api_version === 'manyforge.deployment_intent.v2' && (
+      {intent && cell && (
         <GlobalInterruptRulesSection controller={controller} document={document} programKeys={programKeys}
           stopChains={stopChains} executionGroupIds={executionGroupIds}
           systemSignalChoices={systemSignalChoices} systemSignalsNeedApply={systemSignalsNeedApply} />
@@ -1996,7 +2246,8 @@ function MotionTakeoverSection({ controller, document }: {
       : policies === null
         ? await controller.mutate(['policies'], 'set', { [key]: value })
         : await controller.mutate(['policies', key], 'set', value);
-    setError(result === null ? 'The Deployment owner rejected this timing change.' : null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    setError(null);
     return result;
   };
   return (
@@ -2034,106 +2285,126 @@ interface IoDeviceRow {
  * Model-free I/O device components (io_device_v0 / runtime_kind io_provider):
  * add one (a single `components` append), edit its lifecycle command time
  * limit, or remove it. Its signals are edited in the I/O signals section. An
- * I/O device is not drawn in the 3D scene.
+ * I/O device is not drawn in the 3D scene. With `componentId`, only that
+ * device (its Components page; the add form is under Add component there).
  */
-function IoDeviceSection({ controller, document, geometricContactEndpoints }: {
+function IoDeviceSection({ controller, document, geometricContactRobots, componentId = null }: {
   controller: DeploymentWorkspaceController;
   document: Record<string, JsonValue>;
-  geometricContactEndpoints: readonly GeometricContactEndpointOption[];
+  geometricContactRobots: readonly GeometricContactRobotOption[];
+  componentId?: string | null;
 }) {
   const components = Array.isArray(document.components) ? document.components : [];
-  const componentIds = components.flatMap((value) => {
-    const id = objectValue(value)?.component_id;
-    return typeof id === 'string' ? [id] : [];
-  });
   const devices: IoDeviceRow[] = components.flatMap((value, index) => {
     const component = objectValue(value);
-    const componentId = component?.component_id;
-    return isIoProviderComponent(value) && typeof componentId === 'string' ? [{
+    const id = component?.component_id;
+    return isIoProviderComponent(value) && typeof id === 'string' && (componentId === null || id === componentId) ? [{
       index,
-      componentId,
+      componentId: id,
       runtimeConfiguration: objectValue(objectValue(component?.configuration)?.runtime_configuration),
     }] : [];
   });
-  const [draft, setDraft] = useState<IoDeviceDraft | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  if (componentId !== null && devices.length === 0) return null;
+  return (
+    <details className="dcard" open={devices.length > 0 || adding}>
+      <summary>I/O devices</summary>
+      <div className="deployment-focused-body">
+        {devices.length === 0 && !adding && <p className="muted">No I/O device is declared.</p>}
+        {devices.map((device) => (
+          <IoDeviceEditor key={device.componentId} controller={controller} device={device} disabled={disabled} />
+        ))}
+        {componentId === null && (adding ? (
+          <AddIoDeviceForm controller={controller} document={document}
+            geometricContactRobots={geometricContactRobots} onDone={() => setAdding(false)} />
+        ) : (
+          <div className="button-row">
+            <button type="button" disabled={disabled} onClick={() => setAdding(true)}>Add I/O device</button>
+          </div>
+        ))}
+        <p className="field-help">An I/O device is a model-free component whose connection to its I/O (subscription or service client) is its own control domain: own Enable/Disable, time limit and re-sync recovery. Sources: Mock, generic ROS Bool / SetBool, Universal Robots io_states / set_io and ros2_control GPIO. I/O physically on a robot is declared here too: it shares the robot's driver without owning it, and the robot's Enable/Disable does not touch it. It has no model, pose, frames or Stop settings and is not drawn in the 3D scene.</p>
+      </div>
+    </details>
+  );
+}
+
+/** A new I/O device with its first signal: one `components` append. */
+export function AddIoDeviceForm({ controller, document, geometricContactRobots, onDone }: {
+  controller: DeploymentWorkspaceController;
+  document: Record<string, JsonValue>;
+  geometricContactRobots: readonly GeometricContactRobotOption[];
+  onDone: () => void;
+}) {
+  const componentIds = (Array.isArray(document.components) ? document.components : []).flatMap((value) => {
+    const id = objectValue(value)?.component_id;
+    return typeof id === 'string' ? [id] : [];
+  });
+  const [draft, setDraft] = useState<IoDeviceDraft>(() => newIoDeviceDraft(componentIds));
+  // Local validation (red) or a neutral pointer to the owner's refusal in the notices.
+  const [error, setError] = useState<{ message: string; refused: boolean } | null>(null);
   const disabled = !controller.mutationAvailable || controller.busy;
   const update = (next: IoDeviceDraft) => {
     setDraft(next);
     setError(null);
   };
   const create = async () => {
-    if (draft === null) return;
     const problem = validateIoDeviceDraft(draft, componentIds);
     if (problem !== null) {
-      setError(problem);
+      setError({ message: problem, refused: false });
       return;
     }
     const result = await controller.mutate(['components'], 'append', ioDeviceComponentValue(draft));
-    if (result === null) setError('The Deployment owner rejected this I/O device.');
-    else setDraft(null);
+    if (result === null) {
+      setError({ message: 'The Deployment owner did not add this I/O device; its reason is shown in the notices.', refused: true });
+    }
+    else onDone();
   };
-  const signal = draft?.signal ?? null;
+  const signal = draft.signal;
   return (
-    <details className="dcard" open={devices.length > 0 || draft !== null}>
-      <summary>I/O devices</summary>
-      <div className="deployment-focused-body">
-        {devices.length === 0 && draft === null && <p className="muted">No I/O device is declared.</p>}
-        {devices.map((device) => (
-          <IoDeviceEditor key={device.componentId} controller={controller} device={device} disabled={disabled} />
-        ))}
-        {draft === null ? (
-          <div className="button-row">
-            <button type="button" disabled={disabled}
-              onClick={() => update(newIoDeviceDraft(componentIds))}>Add I/O device</button>
-          </div>
-        ) : (
-          <fieldset className="deployment-gripper-editor">
-            <legend>New I/O device</legend>
-            <div className="deployment-focused-form-grid">
-              <label className="deployment-focused-field">
-                <span>Component id</span>
-                <input aria-label="I/O device component id" value={draft.componentId} disabled={disabled}
-                  onChange={(event) => update({
-                    ...draft,
-                    componentId: event.target.value,
-                    signal: { ...draft.signal, draft: { ...draft.signal.draft, componentId: event.target.value } } as IoDeviceDraft['signal'],
-                  })} />
-              </label>
-              <label className="deployment-focused-field">
-                <span>Lifecycle command time limit</span>
-                <span className="deployment-number-with-unit">
-                  <input aria-label="I/O device lifecycle command time limit" inputMode="decimal"
-                    value={draft.lifecycleTimeoutS} disabled={disabled}
-                    title={`Enable/Disable of this device's driver must finish within this time (above 0, at most ${IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S} s).`}
-                    onChange={(event) => update({ ...draft, lifecycleTimeoutS: event.target.value })} />
-                  <small>s</small>
-                </span>
-              </label>
-            </div>
-            <p className="field-help">First signal (an I/O device needs at least one). Leave Resource role blank to use the signal name, and Source blank to use {draft.componentId}_source.</p>
-            {signal?.kind === 'input' ? (
-              <IoSignalInputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
-                geometricContactEndpoints={geometricContactEndpoints}
-                onChange={(patch: Partial<IoSignalInputDraft>) => update({ ...draft, signal: { kind: 'input', draft: { ...signal.draft, ...patch } } })}
-                onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
-            ) : signal?.kind === 'output' ? (
-              <IoSignalOutputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
-                onChange={(patch: Partial<IoSignalOutputDraft>) => update({ ...draft, signal: { kind: 'output', draft: { ...signal.draft, ...patch } } })}
-                onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
-            ) : null}
-            {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
-            <div className="button-row">
-              <button type="button" className="primary-action" disabled={disabled}
-                onClick={() => { void create(); }}>Create I/O device</button>
-              <button type="button" disabled={controller.busy}
-                onClick={() => { setDraft(null); setError(null); }}>Cancel</button>
-            </div>
-          </fieldset>
-        )}
-        <p className="field-help">An I/O device is a model-free component whose connection to its I/O (subscription or service client) is its own control domain: own Enable/Disable, time limit and re-sync recovery. Sources: Mock, generic ROS Bool / SetBool, Universal Robots io_states / set_io and ros2_control GPIO. I/O physically on a robot is declared here too: it shares the robot's driver without owning it, and the robot's Enable/Disable does not touch it. It has no model, pose, frames or Stop settings and is not drawn in the 3D scene.</p>
+    <fieldset className="deployment-gripper-editor">
+      <legend>New I/O device</legend>
+      <div className="deployment-focused-form-grid">
+        <label className="deployment-focused-field">
+          <span>Component id</span>
+          <input aria-label="I/O device component id" value={draft.componentId} disabled={disabled}
+            onChange={(event) => update({
+              ...draft,
+              componentId: event.target.value,
+              signal: { ...draft.signal, draft: { ...draft.signal.draft, componentId: event.target.value } } as IoDeviceDraft['signal'],
+            })} />
+        </label>
+        <label className="deployment-focused-field">
+          <span>Lifecycle command time limit</span>
+          <span className="deployment-number-with-unit">
+            <input aria-label="I/O device lifecycle command time limit" inputMode="decimal"
+              value={draft.lifecycleTimeoutS} disabled={disabled}
+              title={`Enable/Disable of this device's driver must finish within this time (above 0, at most ${IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S} s).`}
+              onChange={(event) => update({ ...draft, lifecycleTimeoutS: event.target.value })} />
+            <small>s</small>
+          </span>
+        </label>
       </div>
-    </details>
+      <p className="field-help">First signal (an I/O device needs at least one). Leave Resource role blank to use the signal name, and Source blank to use {draft.componentId}_source.</p>
+      {signal.kind === 'input' ? (
+        <IoSignalInputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
+          geometricContactRobots={geometricContactRobots}
+          onChange={(patch: Partial<IoSignalInputDraft>) => update({ ...draft, signal: { kind: 'input', draft: { ...signal.draft, ...patch } } })}
+          onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
+      ) : (
+        <IoSignalOutputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
+          onChange={(patch: Partial<IoSignalOutputDraft>) => update({ ...draft, signal: { kind: 'output', draft: { ...signal.draft, ...patch } } })}
+          onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
+      )}
+      {error !== null && (error.refused
+        ? <p className="inline-message severity-info" role="status">{error.message}</p>
+        : <p className="deployment-field-error inline-message severity-error" role="alert">{error.message}</p>)}
+      <div className="button-row">
+        <button type="button" className="primary-action" disabled={disabled}
+          onClick={() => { void create(); }}>Create I/O device</button>
+        <button type="button" disabled={controller.busy} onClick={onDone}>Cancel</button>
+      </div>
+    </fieldset>
   );
 }
 
@@ -2160,12 +2431,13 @@ function IoDeviceEditor({ controller, device, disabled }: {
   // Writes the device's one row; the acknowledgement timeout is kept only
   // while the device has ROS SetBool / UR set_io outputs (contracts 68, 82).
   const commitRow = async (timeoutS: number, ackS: number | null) => {
-    const result = await controller.mutate(
+    setError(null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    await controller.mutate(
       ['components', device.index, 'configuration', 'runtime_configuration', 'io_provider_devices'],
       'set',
       [ioProviderDeviceValue(device.componentId, timeoutS, rosOutputs && ackS !== null ? ackS : undefined)],
     );
-    setError(result === null ? 'The Deployment owner rejected this setting.' : null);
   };
   const commit = async () => {
     const problem = lifecycleTimeoutProblem(text);
@@ -2240,13 +2512,14 @@ function IoDeviceEditor({ controller, device, disabled }: {
   );
 }
 
-const ON_TRIP_HELP = 'Gate (default): while the condition holds, new motion in the scope is refused and moving motion gets its Stop; motion is allowed again when it clears, with no acknowledgement. Full Stop: the cell gets a Full Stop and the rule stays latched until the operator clears it. A Program Reset never clears it.';
+const ON_TRIP_HELP = 'Gate (default): while the condition holds, new motion in the scope is refused and moving motion gets its Stop; motion is allowed again when it clears, with no acknowledgement. Full Stop: the cell gets a Full Stop and the rule stays latched until the operator clears it. A Program Reset never clears it. Notify: a trip only updates the rule state for the Program to read; motion is not affected. If a Notify rule cannot watch its signals (setup failed, or a signal is stale or lost), it gates its scope like a Gate rule until it can watch again.';
 const IDLE_BEHAVIOUR_HELP = 'Full Stop only. Default: latches while a Program Run is in flight and the robot is still; ignored when no Run exists. Moving motion is always stopped.';
 
 /**
  * Global (Deployment) interrupt rules, `policies.interrupt_rules` (schema04
- * §3): each with its condition, scope, priority, on-trip outcome (gate or
- * Full Stop; Full Stop also has an idle behaviour) and Stop entry stage. A rule stops, latches and publishes the read-only key
+ * §3): each with its condition, scope, priority, on-trip reaction (gate, Full
+ * Stop, or publish-only notify; Full Stop also has an idle behaviour) and Stop
+ * entry stage. A rule publishes the read-only key
  * `interrupt_state.<rule_id>`. The whole list is committed per change.
  */
 export function GlobalInterruptRulesSection({
@@ -2272,6 +2545,17 @@ export function GlobalInterruptRulesSection({
     [document, programKeys, systemSignalChoices],
   );
   const [error, setError] = useState<string | null>(null);
+  const section = useRef<HTMLDetailsElement>(null);
+  // An "Open global rules" link opens and shows this section.
+  useEffect(() => {
+    const reveal = () => {
+      if (!takeOpenGlobalRulesRequest() || section.current === null) return;
+      section.current.open = true;
+      section.current.scrollIntoView?.({ block: 'start' });
+    };
+    reveal();
+    return onOpenGlobalRulesRequest(reveal);
+  }, []);
   const disabled = !controller.mutationAvailable || controller.busy;
   if (rows === null) {
     return (
@@ -2295,10 +2579,10 @@ export function GlobalInterruptRulesSection({
         return;
       }
     }
-    const result = next.length === 0
-      ? await controller.mutate(['policies', 'interrupt_rules'], 'remove')
-      : await controller.mutate(['policies', 'interrupt_rules'], 'set', next);
-    setError(result === null ? 'The Deployment owner rejected this rule change.' : null);
+    setError(null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    if (next.length === 0) await controller.mutate(['policies', 'interrupt_rules'], 'remove');
+    else await controller.mutate(['policies', 'interrupt_rules'], 'set', next);
   };
   const update = (index: number, patch: Record<string, JsonValue | undefined>) => {
     const current = objectValue(rows[index]) ?? {};
@@ -2310,10 +2594,10 @@ export function GlobalInterruptRulesSection({
     void commit(rows.map((row, at) => (at === index ? merged : row)), index);
   };
   return (
-    <details className="dcard" open={rows.length > 0}>
+    <details ref={section} className="dcard" open={rows.length > 0}>
       <summary>Global interrupt rules</summary>
       <div className="deployment-focused-body">
-        <p className="field-help">A global rule stops the motion in its scope when its condition holds and either gates new motion until it clears or trips a Full Stop that the operator clears. It publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched), always current. Program nodes react to a rule only through that key.</p>
+        <p className="field-help">A global rule publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched); Program nodes read a rule only through that key. Gate and Full Stop stop motion in their scope; Notify only updates the key. A rule that cannot watch its signals shows "can't watch" with the reason, and blocks motion in its scope until it can watch again. A signal that is published only on change cannot be detected as stale.</p>
         {systemSignalsNeedApply && (
           <p className="field-help">Apply to list system signals.</p>
         )}
@@ -2328,6 +2612,16 @@ export function GlobalInterruptRulesSection({
           const ruleId = typeof rule.rule_id === 'string' ? rule.rule_id : `rule ${index + 1}`;
           const ruleChoices = globalRuleChoices(document, programKeys, rule.condition, systemSignalChoices);
           const keyNotes = globalRuleKeyNotes(rule.condition, programKeys);
+          const notifyHasDisallowedFields = rule.on_trip === 'notify' && (
+            rule.idle_behaviour !== undefined || rule.stop_entry_stage_id !== undefined
+          );
+          const notifyProblem = notifyHasDisallowedFields
+            ? globalRuleProblem(
+              row,
+              ids.flatMap((id, at) => at !== index && typeof id === 'string' ? [id] : []),
+              ruleChoices,
+            )
+            : null;
           return (
             <fieldset className="deployment-gripper-editor" key={`${index}:${ruleId}`} aria-label={`Global rule ${ruleId}`}>
               <legend>{ruleId}</legend>
@@ -2389,16 +2683,23 @@ export function GlobalInterruptRulesSection({
                 <label className="deployment-focused-field" title={ON_TRIP_HELP}>
                   <span>On trip</span>
                   <select aria-label={`${ruleId} on trip`}
-                    value={rule.on_trip === 'full_stop' ? 'full_stop' : ''}
+                    value={rule.on_trip === 'full_stop' || rule.on_trip === 'notify' ? rule.on_trip : ''}
                     disabled={disabled}
                     onChange={(event) => update(index, event.target.value === 'full_stop'
                       ? { on_trip: 'full_stop' }
-                      // Only Full Stop has an idle behaviour; a gate always gates.
-                      : { on_trip: undefined, idle_behaviour: undefined })}>
+                      : event.target.value === 'notify'
+                        ? { on_trip: 'notify', idle_behaviour: undefined, stop_entry_stage_id: undefined }
+                        // Only Full Stop has an idle behaviour; gate and notify do not.
+                        : { on_trip: undefined, idle_behaviour: undefined })}>
                     <option value="">Gate: refuse motion while active (default)</option>
                     <option value="full_stop">Full Stop, operator clears</option>
+                    <option value="notify">Notify: Program reads the state, no Stop</option>
                   </select>
                 </label>
+                {notifyProblem !== null && (
+                  <p className="deployment-field-error inline-message severity-error" role="alert"
+                    aria-label={`${ruleId} notify settings`}>{notifyProblem}</p>
+                )}
                 {rule.on_trip === 'full_stop' && (
                   <label className="deployment-focused-field" title={IDLE_BEHAVIOUR_HELP}>
                     <span>When nothing moves</span>
@@ -2445,13 +2746,13 @@ export function GlobalInterruptRulesSection({
                   );
                 })()}
               </div>
-              <div className="deployment-focused-field">
+              {rule.on_trip !== 'notify' && <div className="deployment-focused-field">
                 <span>Stop entry stage</span>
                 <StopStagePicker label={`${ruleId} stop entry stage`}
                   value={typeof rule.stop_entry_stage_id === 'string' ? rule.stop_entry_stage_id : undefined}
                   stages={stopStages} omittedLabel="First stage (default)" disabled={disabled}
                   onChange={(next) => update(index, { stop_entry_stage_id: next })} />
-              </div>
+              </div>}
               <div className="button-row">
                 <button type="button" disabled={disabled}
                   onClick={() => { void commit(rows.filter((_, at) => at !== index), null); }}>Remove rule</button>

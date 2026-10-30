@@ -92,6 +92,21 @@ build_selected_collision_distance_pairs(
     const CollisionWorldSnapshot& world,
     std::string_view active_contact_policy_id = {});
 
+/// Clearance margins for one move (M6 collision clearance), from the
+/// existing contact policies. `margin_m` goes on every pair of a robot body
+/// (a component-model body or a carried scene body) and an environment body
+/// (a detached scene resource or a runtime object). A pair the policy allows
+/// to touch keeps margin 0: static, touch-link and support-contact pairs, and
+/// the active contact-grasp entry's pairs. Their penetration tolerances stay
+/// with the policy evaluator, which needs the real contact evidence. Self
+/// pairs (robot-robot) and environment-only pairs keep 0. Null when margin_m
+/// is not positive or no pair qualifies.
+[[nodiscard]] std::shared_ptr<const CollisionClearanceMargins>
+build_collision_clearance_margins(
+    const CollisionWorldSnapshot& world,
+    const CollisionPolicySnapshot& policy,
+    std::string_view active_contact_policy_id, double margin_m);
+
 /// One logical support-pair observation for the shared contact-release state
 /// machine. `signed_clearance_m` is required only when `in_contact` is true and
 /// the policy selects signed-penetration release evidence or bounded-

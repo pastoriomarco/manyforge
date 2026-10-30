@@ -29,6 +29,7 @@
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "content_identity_internal.hpp"
+#include "program_binding_internal.hpp"
 #include "canonical_empty_admission_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
@@ -184,7 +185,8 @@ make_ros_motion_context(const std::filesystem::path &root) {
 [[nodiscard]] CanonicalValue
 make_program_root(const RetainedBundle &bundle,
                   bool include_node_policy = false,
-                  bool own_group_intervention = false) {
+                  bool own_group_intervention = false,
+                  bool planning_only = false) {
   CanonicalValue::Object tree{
       {"node_id", CanonicalValue("sequence")},
       {"instance_id", CanonicalValue("root")},
@@ -203,6 +205,24 @@ make_program_root(const RetainedBundle &bundle,
     tree.emplace_back("recovery_policy", CanonicalValue(std::move(recovery)));
     tree.emplace_back("operator_stop_policy", CanonicalValue("hold"));
   }
+  const CanonicalValue::Array required_capabilities = planning_only
+      ? CanonicalValue::Array{
+            CanonicalValue(CanonicalValue::Object{
+                {"capability_id", CanonicalValue("planning.motion.pose_goal")},
+                {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                {"disposition", CanonicalValue("required")},
+            }),
+            CanonicalValue(CanonicalValue::Object{
+                {"capability_id", CanonicalValue("state.observed.current")},
+                {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                {"disposition", CanonicalValue("required")},
+            }),
+        }
+      : CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"capability_id", CanonicalValue("state.observed.current")},
+            {"parameters", CanonicalValue(CanonicalValue::Object{})},
+            {"disposition", CanonicalValue("required")},
+        })};
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.program.v2")},
       {"program_id", CanonicalValue("i6_binding_compiler_program")},
@@ -225,15 +245,7 @@ make_program_root(const RetainedBundle &bundle,
            {"arm",
             CanonicalValue(CanonicalValue::Object{
                 {"component_role", CanonicalValue("robot")},
-                {"required_capabilities",
-                 CanonicalValue(CanonicalValue::Array{
-                     CanonicalValue(CanonicalValue::Object{
-                         {"capability_id",
-                          CanonicalValue("state.observed.current")},
-                         {"parameters",
-                          CanonicalValue(CanonicalValue::Object{})},
-                         {"disposition", CanonicalValue("required")},
-                     })})},
+                {"required_capabilities", CanonicalValue(required_capabilities)},
                 {"required_frame_roles",
                  CanonicalValue(CanonicalValue::Array{CanonicalValue("tcp")})},
                 {"required_resource_roles",
@@ -361,11 +373,13 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
 [[nodiscard]] std::string
 make_program_bytes(const RetainedBundle &bundle, bool aggregate_gripper = false,
                    bool include_node_policy = false,
-                   bool own_group_intervention = false) {
+                   bool own_group_intervention = false,
+                   bool planning_only = false) {
   CanonicalValue root = aggregate_gripper
                             ? make_aggregate_program_root(bundle)
                             : make_program_root(bundle, include_node_policy,
-                                                own_group_intervention);
+                                                own_group_intervention,
+                                                planning_only);
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
@@ -498,6 +512,36 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
+     PlanningOnlyProgramStillCarriesTcpInventoryForExecutionCapableTarget) {
+  ScopedTrustedRoot root;
+  // The observed ROS fixture retains both required definitions (pose goal and
+  // state.observed.current) on a target that also offers trajectory execution.
+  const BindingCompilerContext context = make_context(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle, false, false, false, true),
+      *context.bundle);
+  const auto binding = compile_program_binding(
+      *contract, valid_assignment(), *context.bundle, context.model_map,
+      catalog_store);
+
+  ASSERT_NE(binding, nullptr);
+  ASSERT_EQ(binding->value().target_role_bindings.size(), 1U);
+  const auto &target = binding->value().target_role_bindings.front();
+  ASSERT_EQ(target.capability_bindings.size(), 2U);
+  EXPECT_FALSE(std::any_of(
+      target.capability_bindings.begin(), target.capability_bindings.end(),
+      [](const auto &capability) {
+        return capability.capability_id.value() ==
+               "execution.trajectory.execute";
+      }));
+  ASSERT_TRUE(target.robot_tcps.has_value());
+  ASSERT_EQ(target.robot_tcps->size(), 2U);
+  EXPECT_EQ(target.robot_tcps->front().entry.frame_role_id.value(), "flange");
+  EXPECT_EQ(target.robot_tcps->back().entry.frame_role_id.value(), "tcp");
+}
+
+TEST(ProgramBindingCompilerTest,
      CopiesVerifiedNodePoliciesAndLeavesDirectControlEmpty) {
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_context(root.path());
@@ -575,14 +619,12 @@ TEST(ProgramBindingCompilerTest,
                          manyforge::deployment::kDirectControlBaseFrameRoleId;
                 }),
             target.frame_role_bindings.end());
-  EXPECT_NE(
-      std::find_if(target.frame_role_bindings.begin(),
-                   target.frame_role_bindings.end(),
-                   [](const auto &frame) {
-                     return frame.frame_role_id.value() ==
-                            manyforge::deployment::kDirectControlTcpFrameRoleId;
-                   }),
-      target.frame_role_bindings.end());
+  // C-P3: the binding holds `base` and exactly the target's tagged TCPs
+  // (`flange` and `tcp` on this arm, as on the maintained Lite6 arm).
+  std::vector<std::string> frame_roles;
+  for (const auto &frame : target.frame_role_bindings)
+    frame_roles.push_back(frame.frame_role_id.value());
+  EXPECT_EQ(frame_roles, (std::vector<std::string>{"base", "flange", "tcp"}));
   EXPECT_FALSE(target.resource_role_bindings.empty());
   EXPECT_FALSE(target.collision_body_role_bindings.empty());
   EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
@@ -596,6 +638,146 @@ TEST(ProgramBindingCompilerTest,
                                       "planning.motion.cartesian_path",
                                       "planning.motion.joint_goal",
                                       "planning.motion.pose_goal"}));
+}
+
+// B2: a target frame role binds the target's own row, and an absent role
+// binds nothing; the direct-control binding holds `base` and the target's
+// tagged TCPs (C-P3).
+TEST(ProgramBindingCompilerTest, TargetFrameRolesBindTheTargetsOwnRow) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_ros_motion_context(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const manyforge::core::ControllableComponentId component{
+      std::string(kLite6ControllableComponentId)};
+  const auto *target = context.model_map.find_target(
+      component, manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)));
+  ASSERT_NE(target, nullptr);
+  ASSERT_TRUE(context.bundle->value().cell_graph.component_attachments.empty());
+  for (const std::string_view role :
+       {std::string_view("tcp"), std::string_view("flange"),
+        manyforge::deployment::kDirectControlBaseFrameRoleId}) {
+    const manyforge::core::FrameRoleId id{std::string(role)};
+    const auto own = std::find_if(
+        target->frames.begin(), target->frames.end(),
+        [&](const auto &frame) { return frame.frame_role_id == id; });
+    ASSERT_NE(own, target->frames.end());
+    EXPECT_EQ(manyforge::deployment::find_target_frame_role(*target, id), &*own);
+  }
+  EXPECT_EQ(manyforge::deployment::find_target_frame_role(
+                *target, manyforge::core::FrameRoleId("cup_center")),
+            nullptr);
+  const auto direct = compile_direct_control_motion_program_binding(
+      component, manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+  ASSERT_NE(direct, nullptr);
+  EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
+                direct->canonical_bytes(), *context.bundle, context.model_map)
+                ->value(),
+            direct->value());
+  auto forged = direct->value();
+  ASSERT_TRUE(forged.target_role_bindings.front().robot_tcps);
+  ASSERT_FALSE(forged.target_role_bindings.front().robot_tcps->empty());
+  forged.target_role_bindings.front().robot_tcps->front().frame.compiled_frame_name =
+      "foreign_tcp_frame";
+  const auto resealed = manyforge::deployment::detail::
+      ProgramBindingConstructionAuthority::seal(std::move(forged));
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::reload_verified_program_binding(
+                   resealed->canonical_bytes(), *context.bundle, context.model_map)),
+               manyforge::deployment::ProgramBindingError);
+  const auto &frames = direct->value().target_role_bindings.front().frame_role_bindings;
+  std::vector<std::string> roles;
+  for (const auto &frame : frames) roles.push_back(frame.frame_role_id.value());
+  EXPECT_EQ(roles, (std::vector<std::string>{"base", "flange", "tcp"}));
+}
+
+// C-RQ8: a declared frame role binds as itself only; a default TCP named
+// otherwise (`cup_center`, or a tool's `flange`) has no `tcp` name.
+TEST(ProgramBindingCompilerTest, DeclaredFrameRolesBindUnderTheirOwnNameOnly) {
+  using manyforge::core::CollisionBodyRoleId;
+  using manyforge::core::FrameRoleId;
+  using manyforge::core::ModelRoleId;
+  const auto frame = [](std::string id, std::vector<CollisionBodyRoleId> bodies,
+                        bool tcp) {
+    return manyforge::core::ComponentTypeFrameRoleDTO{
+        FrameRoleId(id), ModelRoleId("tool_model"), FrameRoleId(id),
+        std::move(bodies), tcp};
+  };
+  manyforge::core::ComponentTypeCommandTargetDTO tool{
+      manyforge::core::CommandTargetId("effector"), {}, {}, {}, {}, {}};
+  tool.frame_roles = {
+      frame("cup_center", {CollisionBodyRoleId("cup_lip")}, true),
+      frame("side", {}, false)};
+  tool.default_tcp_frame_role_id = FrameRoleId("cup_center");
+
+  namespace detail = manyforge::deployment::detail;
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("tcp")), nullptr);
+  const auto *named =
+      detail::declared_target_frame_role(tool, FrameRoleId("cup_center"));
+  ASSERT_NE(named, nullptr);
+  EXPECT_EQ(named->contact_body_role_ids,
+            std::vector<CollisionBodyRoleId>{CollisionBodyRoleId("cup_lip")});
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("side")),
+            &tool.frame_roles[1]);
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("missing")),
+            nullptr);
+
+  // A declared `tcp` binds as itself.
+  tool.frame_roles = {frame("tcp", {CollisionBodyRoleId("cup_lip")}, true)};
+  tool.default_tcp_frame_role_id = FrameRoleId("tcp");
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("tcp")),
+            &tool.frame_roles[0]);
+
+  // A tool's default named `flange` is `flange` only.
+  tool.frame_roles = {frame("flange", {CollisionBodyRoleId("cup_lip")}, true)};
+  tool.default_tcp_frame_role_id = FrameRoleId("flange");
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("tcp")), nullptr);
+  EXPECT_EQ(detail::declared_target_frame_role(tool, FrameRoleId("flange")),
+            &tool.frame_roles[0]);
+}
+
+// TCP-C/B1: the direct-control TCP list of a robot without a tool lists its
+// tagged TCPs only (`base` is never listed), owner-qualified, with the robot's
+// own default TCP (its End-effector TCP, `{arm, tcp}`) first. The
+// mounted-tool and primary cases run on maintained cells (migration check)
+// and in `test_cell_kinematic_index` (the mark itself).
+TEST(ProgramBindingCompilerTest, DirectControlMotionTcpsListOnlyTaggedTcps) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_ros_motion_context(root.path());
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const manyforge::core::ControllableComponentId component{
+      std::string(kLite6ControllableComponentId)};
+  const auto direct = compile_direct_control_motion_program_binding(
+      component, manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+      *context.bundle, context.model_map, catalog_store);
+  ASSERT_NE(direct, nullptr);
+  const auto inventory =
+      compile_direct_control_program_binding_inventory(
+          *context.bundle, context.model_map, catalog_store);
+  const auto tcps = manyforge::deployment::direct_control_motion_tcps(
+      *direct, inventory, *context.bundle, context.model_map);
+  ASSERT_EQ(tcps.size(), 2U);
+  const std::string owner(kLite6ControllableComponentId);
+  EXPECT_EQ(tcps[0].display, owner + ".tcp");
+  EXPECT_TRUE(tcps[0].binding.end_effector);
+  EXPECT_EQ(tcps[1].display, owner + ".flange");
+  EXPECT_FALSE(tcps[1].binding.end_effector);
+  EXPECT_TRUE(tcps[0].mounted_here);
+  EXPECT_TRUE(tcps[1].mounted_here);
+  EXPECT_FALSE(tcps[0].mounted_elsewhere);
+  EXPECT_FALSE(tcps[1].mounted_elsewhere);
+  for (const auto &tcp : tcps) {
+    ASSERT_TRUE(tcp.target_role_id.has_value());
+    EXPECT_EQ(tcp.target_role_id->value(),
+              manyforge::deployment::kDirectControlTargetRoleId);
+    EXPECT_EQ(tcp.binding.entry.component_id, component);
+    EXPECT_EQ(tcp.binding.entry.target_id.value(), kLite6ArmTargetId);
+  }
+  const auto mark = context.model_map.kinematic_index().end_effector_entry(
+      component, manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)));
+  ASSERT_TRUE(mark.has_value());
+  EXPECT_EQ(mark->component_id, component);
+  EXPECT_EQ(mark->target_id.value(), kLite6ArmTargetId);
+  EXPECT_EQ(mark->frame_role_id.value(), "tcp");
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -649,6 +831,12 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_EQ(target.target_role_id.value(),
             manyforge::deployment::kDirectControlTargetRoleId);
   EXPECT_EQ(target.command_target_id.value(), kLite6GripperTargetId);
+  EXPECT_FALSE(target.robot_tcps.has_value());
+  EXPECT_EQ(first->canonical_bytes().find("\"robot_tcps\""), std::string::npos);
+  const auto reloaded = manyforge::deployment::reload_verified_program_binding(
+      first->canonical_bytes(), *context.bundle, context.model_map);
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_FALSE(reloaded->value().target_role_bindings.front().robot_tcps);
   ASSERT_EQ(target.capability_bindings.size(), 1U);
   const auto &capability = target.capability_bindings.front();
   EXPECT_EQ(capability.capability_id.value(), "tool.gripper.command");

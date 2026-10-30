@@ -81,6 +81,14 @@ struct Ros2GripperActionConfig {
   /// Display-only callback for pneumatic paths with feedback or no model group.
   std::function<core::Result<void>(double)> publish_display_position;
   core::GripperOutputMode output_mode{core::GripperOutputMode::kCommanded};
+  /// Opt-in stall-window grasp evidence for position grippers: a completed
+  /// command whose terminal position lies in [min, max] is confirmed, outside
+  /// it is not. Absence publishes no grasp evidence (the existing default).
+  struct GraspStallWindow {
+    double min_position{};
+    double max_position{};
+  };
+  std::optional<GraspStallWindow> grasp_stall_window;
 };
 
 struct Ros2GripperLifecycleResult {

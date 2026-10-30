@@ -59,21 +59,16 @@ class SceneClient:
             value = getattr(error, "response", None)
             if value is None:
                 raise SceneOutcomeUnknownError("Scene transaction delivery/outcome is unconfirmed") from error
-        return self.result(request, value)
+        return self.result(value)
 
     @staticmethod
-    def result(request: Mapping[str, Any], value: Any) -> dict[str, Any]:
-        context = request.get("request_context", {})
+    def result(value: Any) -> dict[str, Any]:
         if (
             not isinstance(value, dict)
             or value.get("api_version")
             != "manyforge.manager_command_response.v1"
-            or not context.get("request_id")
-            or value.get("request_id") != context["request_id"]
-            or not context.get("request_owner_epoch")
-            or value.get("request_owner_epoch") != context["request_owner_epoch"]
         ):
-            raise SceneOutcomeUnknownError("Scene result is malformed or names another request")
+            raise SceneOutcomeUnknownError("Scene result is malformed")
         if (value.get("ok") is False
             and value.get("projection_status") in {"not_attempted", "rejected_rollback_proven"}
             and isinstance(value.get("error"), dict)
@@ -92,7 +87,7 @@ class SceneClient:
             or value.get("api_version") != "manyforge.manager_command_response.v1"
             or value.get("ok") is not True):
             raise SceneOutcomeUnknownError("Scene result lookup is unavailable")
-        return None if value["result"] is None else self.result(request, value["result"])
+        return None if value["result"] is None else self.result(value["result"])
 
 
 __all__ = [

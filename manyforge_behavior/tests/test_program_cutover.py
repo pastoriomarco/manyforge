@@ -1107,20 +1107,20 @@ def _endpoint_motion_document():
         raise AssertionError('fixture has no pose motion')
     parameters = document['tree']['parameters']
     parameters.pop('tcp_frame_role', None)  # Build only the new fixture form.
-    parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+    parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}  # TCP migration: selector now needs kind (entry)
     return document
 
 
 def test_motion_endpoint_uses_qualified_declared_target_frame() -> None:
     document = _endpoint_motion_document()
     program = Program.from_dict(_identified(document), _catalog())
-    assert program.to_dict()['tree']['parameters']['tcp_endpoint'] == {
-        'target_role': 'gripper', 'frame_role': 'tcp',
+    assert program.to_dict()['tree']['parameters']['tcp_endpoint'] == {  # TCP migration: selector needs kind (entry)
+        'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp',
     }
     assert 'tcp_frame_role' not in program.to_dict()['tree']['parameters']
 
 
-@pytest.mark.parametrize('mutation', ['both', 'legacy_only', 'neither', 'unknown_target', 'wrong_frame', 'extra', 'null', 'dynamic'])
+@pytest.mark.parametrize('mutation', ['both', 'legacy_only', 'unknown_target', 'wrong_frame', 'extra', 'null', 'dynamic'])  # TCP migration: missing endpoint = current, not refused
 def test_motion_endpoint_rejects_ambiguous_or_uncaptured_selection(mutation) -> None:
     document = _endpoint_motion_document()
     parameters = document['tree']['parameters']
@@ -1129,8 +1129,6 @@ def test_motion_endpoint_rejects_ambiguous_or_uncaptured_selection(mutation) -> 
     elif mutation == 'legacy_only':
         parameters.pop('tcp_endpoint')
         parameters['tcp_frame_role'] = 'tcp'
-    elif mutation == 'neither':
-        parameters.pop('tcp_endpoint')
     elif mutation == 'unknown_target':
         parameters['tcp_endpoint']['target_role'] = 'missing'
     elif mutation == 'wrong_frame':
@@ -1152,7 +1150,7 @@ def test_contact_policy_motion_endpoint_is_one_exact_pair(reverse) -> None:
     for node in document['tree']['children']:
         parameters = node.get('parameters', {})
         if 'contact_policy_id' in parameters:
-            parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+            parameters['tcp_endpoint'] = {'kind': 'entry', 'target_role': 'gripper', 'frame_role': 'tcp'}  # TCP migration: selector now needs kind (entry)
     policy = document['contact_policies'][0]
     old_pair = policy['zones'][0]['body_pairs'][0]
     runtime = next(value for value in old_pair.values() if value['kind'] == 'runtime_object')
@@ -1170,7 +1168,7 @@ def test_contact_policy_motion_endpoint_is_one_exact_pair(reverse) -> None:
 
 
 @pytest.mark.parametrize("node_kind", ["probe", "pick"])
-@pytest.mark.parametrize("selection", ["qualified_explicit", "missing_endpoint", "qualified_endpoint"])
+@pytest.mark.parametrize("selection", ["qualified_explicit", "qualified_endpoint"])  # TCP migration: missing endpoint = current, not refused
 def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, selection) -> None:
     document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
     if node_kind == "probe":
@@ -1178,7 +1176,7 @@ def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, 
             "node_id": "motion.probe_search", "instance_id": "probe", "children": [],
             "parameters": {
                 "target_role": "arm", "base_frame_role": "base",
-                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+                "tcp_endpoint": {"kind": "current"},  # TCP migration: the arm declares no tcp frame
                 "goal": {
                     "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
                     "position_m": [0.4, 0.0, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
@@ -1203,7 +1201,7 @@ def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, 
     assert users[0]["node_id"] == (
         "motion.probe_search" if node_kind == "probe" else "planning.plan_pick_sequence"
     )
-    parameters["tcp_endpoint"] = {"target_role": parameters["target_role"], "frame_role": "tcp"}
+    parameters["tcp_endpoint"] = {"kind": "current"}  # TCP migration: contact follows the Active TCP
     policy = next(
         row for row in document["contact_policies"]
         if row["policy_id"] == parameters["contact_policy_id"]
@@ -1218,13 +1216,8 @@ def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, 
             policy, own_field="version", identity_domain="catalog-record-revision/contact_policy",
             api_version="manyforge.contact_policy.v1",
         )
-    if selection == "missing_endpoint":
-        parameters.pop("tcp_endpoint")
-        with pytest.raises(ProgramValidationError, match="requires tcp_endpoint"):
-            Program.from_dict(_identified(document), _catalog())
-    else:
-        parsed = Program.from_dict(_identified(document), _catalog())
-        assert parsed.to_dict()["contact_policies"] == document["contact_policies"]
+    parsed = Program.from_dict(_identified(document), _catalog())
+    assert parsed.to_dict()["contact_policies"] == document["contact_policies"]
 
 
 def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
@@ -1254,7 +1247,7 @@ def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
         if node['instance_id'] == 'end_rest':
             assert node['parameters']['contact_policy_id'] == 'withdrawal_contact_policy'
             assert node['parameters']['contact_scene_resource_id'] == 'probe_block'
-            assert node['parameters']['tcp_endpoint'] == {'target_role': 'gripper', 'frame_role': 'tcp'}
+            assert node['parameters']['tcp_endpoint'] == {'kind': 'default_of_role', 'role': 'gripper'}  # TCP migration: withdrawal follows gripper default
             break
         pending.extend(node.get('children', ()))
 
@@ -1272,7 +1265,7 @@ def _contact_release_document(*, evidence="signed_penetration", pick=False):
         else:
             raise AssertionError("contact fixture has no pose move")
         document["tree"]["parameters"].update(
-            tcp_endpoint={"target_role": "gripper", "frame_role": "tcp"},
+            tcp_endpoint={"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},  # TCP migration: selector now needs kind (entry)
             contact_policy_id=document["contact_policies"][0]["policy_id"],
             contact_scene_resource_id="cube_part",
         )
@@ -1314,8 +1307,8 @@ def test_contact_release_keeps_exact_endpoint_policy_and_authored_envelope(evide
     identified = _identify_contact_release(document)
     parsed = Program.from_dict(identified, _catalog())
     assert parsed.to_dict()["contact_policies"] == identified["contact_policies"]
-    assert parsed.to_dict()["tree"]["parameters"]["tcp_endpoint"] == {
-        "target_role": "gripper", "frame_role": "tcp",
+    assert parsed.to_dict()["tree"]["parameters"]["tcp_endpoint"] == {  # TCP migration: selector needs kind (entry)
+        "kind": "entry", "target_role": "gripper", "frame_role": "tcp",
     }
 
 
@@ -1353,3 +1346,152 @@ def test_pick_rejects_a_contact_release_policy_before_runtime():
     document = _contact_release_document(pick=True)
     with pytest.raises(ProgramValidationError, match="pick requires a contact_grasp policy"):
         Program.from_dict(_identify_contact_release(document), _catalog())
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        {"kind": "current"},
+        {"kind": "default_of_role", "role": "tool"},
+        {"kind": "entry", "target_role": "tool", "frame_role": "tip"},
+    ],
+)
+def test_portable_tcp_selector_forms(selector) -> None:
+    assert program_module.motion_tcp_selection({"tcp_endpoint": selector}) == {
+        "tcp_endpoint": selector
+    }
+    assert program_module.motion_tcp_selection({}) == {
+        "tcp_endpoint": {"kind": "current"}
+    }
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        {"target_role": "tool", "frame_role": "tip"},
+        {"kind": "current", "role": "tool"},
+        {"kind": "default_of_role"},
+        {"kind": "entry", "target_role": "tool"},
+        {"kind": []},
+    ],
+)
+def test_portable_tcp_selector_rejects_malformed_forms(selector) -> None:
+    with pytest.raises(ProgramValidationError):
+        program_module.motion_tcp_selection({"tcp_endpoint": selector})
+
+
+def test_tcp_entry_value_is_structured_and_preserves_dotted_ids() -> None:
+    entry = {"component_id": "tool.one", "target_id": "gripper.one", "frame_role_id": "tip.one"}
+    program_module._validate_declared_type_value("tcp_entry", entry, path="value")
+    for invalid in ("tool.one.gripper.one.tip.one", {**entry, "extra": "x"}, {"component_id": "tool"}):
+        with pytest.raises(ProgramValidationError):
+            program_module._validate_declared_type_value("tcp_entry", invalid, path="value")
+
+
+def test_active_tcp_namespace_is_reserved_for_system_keys() -> None:
+    assert program_module.active_tcp_key("arm.left") == "active_tcp.arm.left"
+    assert program_module.is_active_tcp_key("active_tcp.arm.left")
+    with pytest.raises(ProgramValidationError, match="reserved"):
+        program_module._validate_blackboard(
+            {"namespaces": [{"namespace_id": "active_tcp", "owner": "program"}], "keys": []},
+            path="blackboard", scene_resource_ids=set(), target_roles={},
+        )
+
+
+def test_motion_role_declares_read_only_active_tcp_key() -> None:
+    document = _logic_only_document()
+    document["component_roles"] = {"robot": {}}
+    document["target_roles"] = {
+        "arm": {
+            "component_role": "robot",
+            "required_capabilities": [{
+                "capability_id": "execution.trajectory.execute",
+                "parameters": {},
+                "disposition": "required",
+            }],
+        }
+    }
+    document["catalog"]["content_version"] = _catalog().content_version
+    program = Program.from_dict(_identified(document), _catalog())
+    key = program.blackboard_keys["active_tcp.arm"]
+    assert (key.type, key.access, key.persistence, key.has_initial) == (
+        "tcp_entry", "read", "run", False
+    )
+    program.validate_key_value(
+        key.key,
+        {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tip"},
+        path="value",
+    )
+
+
+def test_set_tcp_accepts_whole_tcp_entry_source() -> None:
+    document = _logic_only_document()
+    document["component_roles"] = {"robot": {}}
+    document["target_roles"] = {
+        "arm": {
+            "component_role": "robot",
+            "required_capabilities": [{
+                "capability_id": "execution.trajectory.execute",
+                "parameters": {},
+                "disposition": "required",
+            }],
+        }
+    }
+    document["catalog"]["content_version"] = _catalog().content_version
+    document["tree"] = {
+        "node_id": "motion.set_tcp", "instance_id": "choose_tcp",
+        "parameters": {"target_role": "arm"},
+        "value_sources": {"tcp": {"kind": "blackboard_key", "reference": "active_tcp.arm"}},
+        "children": [],
+    }
+    program = Program.from_dict(_identified(document), _catalog())
+    assert program.to_dict()["tree"]["value_sources"]["tcp"]["reference"] == "active_tcp.arm"
+
+
+def test_active_tcp_declarations_follow_bound_target_presence() -> None:
+    document = _logic_only_document()
+    document["component_roles"] = {"robot": {}}
+    document["target_roles"] = {
+        "arm": {
+            "component_role": "robot",
+            "required_capabilities": [{
+                "capability_id": "execution.trajectory.execute",
+                "parameters": {}, "disposition": "required",
+            }],
+        },
+        "planner": {
+            "component_role": "robot",
+            "required_capabilities": [{
+                "capability_id": "planning.pick_sequence",
+                "parameters": {}, "disposition": "required",
+            }],
+        },
+    }
+    document["catalog"]["content_version"] = _catalog().content_version
+    program = Program.from_dict(_identified(document), _catalog())
+    bound = program.with_active_tcp_binding({"target_role_bindings": [
+        {"target_role_id": "arm"},
+        {"target_role_id": "planner", "robot_tcps": []},
+    ]})
+    assert "active_tcp.arm" in program.blackboard_keys
+    assert "active_tcp.arm" not in bound.blackboard_keys
+    key = bound.blackboard_keys["active_tcp.planner"]
+    assert (key.type, key.access, key.persistence) == ("tcp_entry", "read", "run")
+    assert "active_tcp.planner" not in program.blackboard_keys
+
+
+def test_portable_active_tcp_key_is_declared_for_planning_role():
+    keys = program_module._declare_active_tcp_selector_keys(
+        {}, [{
+            "node_id": "planning.plan_pick_sequence",
+            "parameters": {"target_role": "planner"},
+            "children": [],
+        }], {"planner": {}},
+    )
+    assert keys["active_tcp.planner"].type == "tcp_entry"
+    assert keys["active_tcp.planner"].access == "read"
+    assert program_module._declare_active_tcp_selector_keys(
+        {}, [{"node_id": "planning.plan_place_sequence",
+              "parameters": {"target_role": "missing"}, "children": []}],
+        {"planner": {}},
+    ) == {}

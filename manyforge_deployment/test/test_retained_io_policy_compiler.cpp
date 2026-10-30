@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/global_io_rule_qualification.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
@@ -90,6 +91,88 @@ auto logical_arm(const std::filesystem::path &root, const V &config) {
 auto arm(const std::filesystem::path &root, const V &config) {
   return d::test::MaterializeMaintainedInterruptDeployment(root, config);
 }
+
+TEST(RetainedTcpInventoryTest, MountedToolIsMarkedElsewhereFromTheOtherRobot) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedInterruptDeployment(
+      root.path, parse(R"({"interrupt_rules":[]})"),
+      "examples/ur5e_lite6_wall_grouped.scenario");
+  ASSERT_TRUE(product.bundle);
+  ASSERT_TRUE(product.model_map);
+  const c::ControllableComponentId lite6("lite6_robot");
+  const c::ControllableComponentId ur5e("ur5e_robot");
+  const c::ControllableComponentId tool("lite_gripper");
+  const auto &index = product.model_map->kinematic_index();
+  EXPECT_TRUE(index.carries(lite6, tool));
+  EXPECT_FALSE(index.carries(ur5e, tool));
+
+  d::FilesystemCatalogArtifactStore catalog(root.path);
+  const auto inventory = d::compile_direct_control_program_binding_inventory(
+      *product.bundle, *product.model_map, catalog);
+  const auto lite_binding = d::compile_direct_control_motion_program_binding(
+      lite6, c::CommandTargetId("arm"), *product.bundle, *product.model_map, catalog);
+  const auto ur_binding = d::compile_direct_control_motion_program_binding(
+      ur5e, c::CommandTargetId("arm"), *product.bundle, *product.model_map, catalog);
+  ASSERT_TRUE(lite_binding);
+  ASSERT_TRUE(ur_binding);
+  const auto lite_rows = d::direct_control_motion_tcps(
+      *lite_binding, inventory, *product.bundle, *product.model_map);
+  const auto ur_rows = d::direct_control_motion_tcps(
+      *ur_binding, inventory, *product.bundle, *product.model_map);
+  const auto carried = std::find_if(lite_rows.begin(), lite_rows.end(),
+      [&](const auto &row) { return row.binding.entry.component_id == tool; });
+  ASSERT_NE(carried, lite_rows.end());
+  EXPECT_TRUE(carried->mounted_here);
+  EXPECT_FALSE(carried->mounted_elsewhere);
+  const auto elsewhere = std::find_if(ur_rows.begin(), ur_rows.end(),
+      [&](const auto &row) { return row.binding.entry == carried->binding.entry; });
+  ASSERT_NE(elsewhere, ur_rows.end());
+  EXPECT_FALSE(elsewhere->mounted_here);
+  EXPECT_TRUE(elsewhere->mounted_elsewhere);
+  EXPECT_EQ(elsewhere->binding.frame, carried->binding.frame);
+}
+
+TEST(RetainedTcpInventoryTest, IncludesRealUnmountedToolWithoutCarryingIt) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedLite6WithUnmountedTool(root.path);
+  ASSERT_TRUE(product.bundle);
+  ASSERT_TRUE(product.model_map);
+  const c::ControllableComponentId robot("lite6_robot");
+  const c::ControllableComponentId tool("lite_gripper");
+  const c::CommandTargetId arm_target("arm");
+  const c::CommandTargetId tool_target("gripper");
+  EXPECT_TRUE(product.model_map->kinematic_index().carries(robot, robot));
+  EXPECT_FALSE(product.model_map->kinematic_index().carries(robot, tool));
+  ASSERT_NE(product.model_map->find_target(tool, tool_target), nullptr);
+
+  d::FilesystemCatalogArtifactStore catalog(root.path);
+  const auto inventory = d::compile_direct_control_program_binding_inventory(
+      *product.bundle, *product.model_map, catalog);
+  const auto binding = d::compile_direct_control_motion_program_binding(
+      robot, arm_target, *product.bundle, *product.model_map, catalog);
+  ASSERT_TRUE(binding);
+  const auto target = std::find_if(
+      binding->value().target_role_bindings.begin(),
+      binding->value().target_role_bindings.end(),
+      [&](const auto &row) { return row.controllable_component_id == robot &&
+                                    row.command_target_id == arm_target; });
+  ASSERT_NE(target, binding->value().target_role_bindings.end());
+  ASSERT_TRUE(target->robot_tcps.has_value());
+  const auto row = std::find_if(target->robot_tcps->begin(), target->robot_tcps->end(),
+      [&](const auto &tcp) { return tcp.entry.component_id == tool &&
+                                   tcp.entry.target_id == tool_target &&
+                                   tcp.entry.frame_role_id.value() == "tcp"; });
+  ASSERT_NE(row, target->robot_tcps->end());
+  EXPECT_FALSE(row->end_effector);
+  const auto rows = d::direct_control_motion_tcps(
+      *binding, inventory, *product.bundle, *product.model_map);
+  const auto projected = std::find_if(rows.begin(), rows.end(),
+      [&](const auto &tcp) { return tcp.binding.entry == row->entry; });
+  ASSERT_NE(projected, rows.end());
+  EXPECT_FALSE(projected->mounted_here);
+  EXPECT_FALSE(projected->mounted_elsewhere);
+}
+
 V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   auto root = parse(
       R"({"api_version":"manyforge.program.v2","program_id":"global_rule_program",
@@ -111,7 +194,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
         R"({"arm_group":{"execution_policy":"independent"}})"));
     root = replace(root, "component_roles", parse(R"({"robot":{}})"));
     auto target = parse(
-        R"({"component_role":"robot","required_capabilities":[],"required_frame_roles":["base","tcp"],"required_resource_roles":["arm_joints"],"required_model_roles":["arm_model"],"required_collision_body_roles":["arm_collision"]})");
+        R"({"component_role":"robot","required_capabilities":[],"required_frame_roles":["base"],"required_resource_roles":["arm_joints"],"required_model_roles":["arm_model"],"required_collision_body_roles":["arm_collision"]})");
     V::Array capabilities;
     for (const auto *id :
          {"execution.feedback.phase_events", "execution.trajectory.execute",
@@ -127,7 +210,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
     root = replace(
         root, "tree",
         parse(
-            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target_role":"arm","base_frame_role":"base","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"goal":{"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
+            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target_role":"arm","base_frame_role":"base","tcp_endpoint":{"kind":"current"},"goal":{"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
   }
   root = d::normalize_program_authoring(root);
   const auto revision = d::detail::compute_content_identity(
@@ -170,6 +253,8 @@ void coincident_gripper_presets(V::Object &document) {
     if (!component.find_object_member("model_source")) continue;
     auto configuration = *component.find_object_member("configuration");
     auto runtime = *configuration.find_object_member("runtime_configuration");
+    // Since the M6 tool split only the gripper component carries the presets.
+    if (!runtime.find_object_member("gripper_target_configurations")) continue;
     auto grippers = runtime.find_object_member("gripper_target_configurations")->as_array();
     grippers.front() = replace(grippers.front(), "open_state_ref", V("closed"));
     runtime = replace(runtime, "gripper_target_configurations", V(std::move(grippers)));
@@ -187,7 +272,7 @@ void add_second_pneumatic_valve(V::Object &document) {
     const auto id = component.find_object_member("component_id")->as_string();
     auto configuration = *component.find_object_member("configuration");
     auto runtime = *configuration.find_object_member("runtime_configuration");
-    if (id == "lite6_robot") {
+    if (id == "lite_gripper") {
       auto grippers = runtime.find_object_member("gripper_target_configurations")->as_array();
       auto mapping = *grippers.front().find_object_member("pneumatic_io");
       auto outputs = mapping.find_object_member("outputs")->as_array();
@@ -273,8 +358,12 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivat
         root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario",
         coincident_gripper_presets);
     FAIL() << "coincident mapped presets must be refused";
-  } catch (const std::exception &error) {
-    EXPECT_NE(std::string(error.what()).find("pneumatic_io_presets_coincident"), std::string::npos);
+  } catch (const c::TypedError &error) {
+    // Typed for the GUI; the message text is unchanged.
+    EXPECT_EQ(error.code(), "pneumatic_io_presets_coincident");
+    EXPECT_EQ(std::string(error.what()).rfind(
+                  "Activation Deployment compiler: pneumatic_io_presets_coincident: ", 0),
+              0U);
   }
 }
 
@@ -384,6 +473,21 @@ TEST(RetainedIoPolicyCompilerTest,
   EXPECT_EQ(full_stop.idle_behaviour, c::IoRuleIdleBehaviourDTO::kIgnore);
   EXPECT_EQ(full_stop.post_latch_disposition,
             c::InterruptPostLatchDisposition::kAwaitOperatorAck);
+}
+
+TEST(RetainedIoPolicyCompilerTest, GlobalNotifyCompilesWithoutStopOrIdleLatch) {
+  Root root;
+  auto rules = V(V::Array{
+      replace(rule(V("all_motion"), true), "on_trip", V("notify"))});
+  const auto retained = d::test::materialize_boolean_io_retained_fixture(
+      root.path, true, false, false, false, false, &rules);
+  const auto compiled = d::compile_retained_io_policies(nullptr, nullptr, *retained.bundle);
+  ASSERT_TRUE(compiled.ok()) << compiled.error().message;
+  ASSERT_EQ(compiled.value().activation_policies.size(), 1U);
+  const auto &notify = compiled.value().activation_policies.front();
+  EXPECT_TRUE(notify.notify_on_trip);
+  EXPECT_FALSE(notify.full_stop_on_trip);
+  EXPECT_FALSE(notify.idle_behaviour);
 }
 
 TEST(RetainedIoPolicyCompilerTest,
@@ -789,7 +893,7 @@ TEST(RetainedIoPolicyCompilerTest,
     auto tree =
         parse(R"({"node_id":"motion.move_until_signal","instance_id":"move",
       "execution_groups":["arm_group"],"children":[],
-      "parameters":{"target_role":"arm","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"stop_mode":"soft_on_path","priority":0,
+      "parameters":{"target_role":"arm","tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
         "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
         "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
           "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},

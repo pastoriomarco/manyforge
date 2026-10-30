@@ -957,6 +957,7 @@ struct ManyForgeCollisionEngine::PreparedScene {
   std::map<std::string, core::CollisionBodyId> raw_name_to_body_id;
   std::map<std::string, core::CollisionBodyId> raw_to_body_map;
   std::vector<RuntimePairBinding> runtime_pair_bindings;
+  std::map<core::CollisionBodyId, bool> motion_relevant_by_body;
 };
 
 struct ManyForgeCollisionEngine::SharedSceneCache {
@@ -1569,6 +1570,24 @@ ManyForgeCollisionEngine::ManyForgeCollisionEngine(
                                          "continuous_collision"};
 }
 
+void ManyForgeCollisionEngine::apply_clearance_margins_locked(
+    const std::shared_ptr<const core::CollisionClearanceMargins>& margins) noexcept {
+  if (margins == applied_clearance_margins_ || !active_prepared_scene_ ||
+      !active_collision_data_) {
+    return;
+  }
+  const auto& bindings = active_prepared_scene_->runtime_pair_bindings;
+  auto& requests = active_collision_data_->collisionRequests;
+  for (std::size_t pair_index = 0;
+       pair_index < requests.size() && pair_index < bindings.size(); ++pair_index) {
+    requests[pair_index].security_margin =
+        margins && bindings[pair_index].mapped
+            ? margins->margin_for(bindings[pair_index].pair)
+            : 0.0;
+  }
+  applied_clearance_margins_ = margins;
+}
+
 const void* ManyForgeCollisionEngine::internal_model_identity() const {
   return static_cast<const void*>(shared_model_.get());
 }
@@ -1590,6 +1609,20 @@ ManyForgeCollisionEngine::QueryMechanismCounters
 ManyForgeCollisionEngine::internal_last_query_mechanism_counters() const {
   std::lock_guard<std::mutex> lock(scene_mutex_);
   return last_query_mechanism_counters_;
+}
+
+std::optional<bool> ManyForgeCollisionEngine::IsBodyStaticWrtGroup(
+    const core::CollisionWorldSnapshot& snapshot,
+    const core::CollisionBodyId& body) const {
+  std::lock_guard<std::mutex> lock(scene_mutex_);
+  const auto& prepared = active_prepared_scene_;
+  if (!prepared || prepared->revision.content_hash != snapshot.revision.content_hash ||
+      (prepared->publisher_id == snapshot.publisher_id &&
+       prepared->revision.revision_id != snapshot.revision.revision_id))
+    return std::nullopt;
+  const auto found = prepared->motion_relevant_by_body.find(body);
+  return found == prepared->motion_relevant_by_body.end()
+             ? std::nullopt : std::optional<bool>(!found->second);
 }
 
 bool ManyForgeCollisionEngine::runtime_query_covers_full_configuration() const {
@@ -1807,6 +1840,8 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
       }
     }
 
+    // The runtime surfaces detect real contact only: margin 0.
+    apply_clearance_margins_locked(nullptr);
     const bool in_collision = pinocchio::computeCollisions(
         shared_model_->model, *reusable_model_data_,
         prepared_scene->collision_model,
@@ -2316,6 +2351,7 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
             "snapshot collision data is inconsistent with the prepared model";
         return result;
       }
+      apply_clearance_margins_locked(query.clearance_margins);
       result.in_collision =
           pinocchio::computeCollisions(shared_model_->model,
                                        *reusable_model_data_,
@@ -2367,6 +2403,10 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
     };
 
     bool any_unknown_collision = false;
+    // Per colliding logical pair with a margin: the smallest signed clearance
+    // over its geometry pairs. Positive and below the margin: a clearance
+    // violation, not a contact.
+    std::map<core::CollisionPairId, double> margin_pair_clearance;
     for (std::size_t pair_index = 0; pair_index < pair_count; ++pair_index) {
       if (!active_collision_data_->activeCollisionPairs[pair_index]) {
         continue;
@@ -2385,6 +2425,24 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
         continue;
       }
       result.normalized_pairs.push_back(binding.pair);
+      const double margin =
+          active_collision_data_->collisionRequests[pair_index].security_margin;
+      if (margin > 0.0) {
+        const double clearance = active_collision_data_->collisionResults[pair_index]
+                                     .distance_lower_bound;
+        auto [entry, inserted] =
+            margin_pair_clearance.emplace(binding.pair, clearance);
+        if (!inserted) {
+          entry->second = std::min(entry->second, clearance);
+        }
+      }
+    }
+    for (const auto& [pair, clearance] : margin_pair_clearance) {
+      if (clearance > 0.0 &&
+          clearance < query.clearance_margins->margin_for(pair)) {
+        result.clearance_violations.push_back(
+            core::CollisionPairClearance{pair, clearance});
+      }
     }
     std::sort(result.normalized_pairs.begin(), result.normalized_pairs.end());
     result.normalized_pairs.erase(
@@ -2689,6 +2747,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   const auto bind_prepared_scene = [&](std::shared_ptr<const PreparedScene> prepared) {
     active_prepared_scene_ = std::move(prepared);
     active_collision_data_.emplace(active_prepared_scene_->collision_model);
+    applied_clearance_margins_.reset();
     runtime_collision_observations_.clear();
     runtime_clearance_observations_.clear();
     const auto pair_count =
@@ -2708,6 +2767,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
 
   active_prepared_scene_.reset();
   active_collision_data_.reset();
+  applied_clearance_margins_.reset();
   runtime_collision_observations_.clear();
   runtime_clearance_observations_.clear();
   auto prepared = std::make_shared<PreparedScene>();
@@ -2776,6 +2836,8 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       has_world_fixed_body = true;
     }
   }
+
+  prepared->motion_relevant_by_body = motion_relevant_by_body;
 
   std::map<std::string, core::CollisionBodyId> builtin_raw_to_body_id;
   std::map<core::CollisionBodyId, std::size_t> native_geometry_count_by_body;

@@ -2,16 +2,23 @@
 
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <algorithm>
 #include <memory>
+#include <optional>
+#include <set>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 #include "activation_deployment_compiler_internal.hpp"
+#include "apply_component_delta_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
@@ -286,6 +293,30 @@ TEST(ApplyComponentDelta,
   }
 }
 
+// S5: a robot model without a `flange` frame role is refused when the
+// Deployment compiles (Apply), typed, under `active_tcp_and_flange` (the
+// default); `active_tcp` needs no flange. The runtime host refused the same
+// robot only at activation, with untyped text.
+TEST(ApplyComponentDelta, SpeedCheckAtTheFlangeRefusesARobotWithoutFlangeAtCompile) {
+  const std::vector<core::ModelFrameRoleBindingDTO> without_flange{
+      {core::FrameRoleId("base"), "link_base"}, {core::FrameRoleId("tcp"), "link_eef"}};
+  auto with_flange = without_flange;
+  with_flange.push_back({core::FrameRoleId("flange"), "link6"});
+  try {
+    detail::require_speed_check_flange("third_party_robot", "active_tcp_and_flange",
+                                       without_flange);
+    FAIL() << "a robot without flange must be refused under active_tcp_and_flange";
+  } catch (const std::invalid_argument &error) {
+    const std::string what(error.what());
+    EXPECT_NE(what.find("robot_flange_frame_missing: third_party_robot"), std::string::npos)
+        << what;
+  }
+  EXPECT_NO_THROW(detail::require_speed_check_flange("third_party_robot", "active_tcp",
+                                                     without_flange));
+  EXPECT_NO_THROW(detail::require_speed_check_flange("lite6_robot", "active_tcp_and_flange",
+                                                     with_flange));
+}
+
 TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
   const auto catalog = test::lite6_controllable_fixture_detail::qualify_control_catalog(
       false, true, false, "resource", false, {}, true);
@@ -526,6 +557,213 @@ TEST(ApplyComponentDelta, EveryRuntimeChangeOwningADomainMustBeFenced) {
   auto passive = Change("sensor", ApplyComponentDisposition::kAdd);
   passive.candidate_domains.clear();
   EXPECT_TRUE(apply_component_delta_is_fenced({{passive}, false, {}}, {}));
+}
+
+// M7 part A (D17), equivalence oracle: the merge-6b `Relations` of
+// apply_component_delta.cpp, copied verbatim (only the result type is the
+// now-shared one). Test-local; removed at the next milestone.
+namespace m6b {
+
+[[nodiscard]] const core::ControllableComponentDTO *
+FindComponent(const core::RetainedBundleDTO &bundle,
+              const core::ControllableComponentId &id) {
+  const auto &components = bundle.cell_graph.controllable_components;
+  const auto found = std::find_if(
+      components.begin(), components.end(),
+      [&](const auto &component) { return component.controllable_component_id == id; });
+  return found == components.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] detail::ApplyComponentRelations
+Relations(const core::RetainedBundleDTO &bundle,
+          const core::ControllableComponentDTO &component) {
+  const auto &graph = bundle.cell_graph;
+  detail::ApplyComponentRelations relations;
+  for (const auto &role : component.model_role_bindings) {
+    relations.model_instances.insert(role.model_instance_id);
+  }
+  // A component's launch description carries the static frames of the
+  // components mounted on it (the mount, and a process-less tool's frames),
+  // so their model occurrences are part of its runtime facts.
+  for (const auto &attachment : graph.component_attachments) {
+    if (attachment.parent.controllable_component_id != component.controllable_component_id)
+      continue;
+    if (const auto *child = FindComponent(bundle, attachment.child.controllable_component_id)) {
+      for (const auto &role : child->model_role_bindings)
+        relations.model_instances.insert(role.model_instance_id);
+    }
+  }
+  relations.runtime_units.insert(component.runtime_unit_ids.begin(),
+                                 component.runtime_unit_ids.end());
+  for (const auto &binding : graph.control_bindings) {
+    if (binding.controllable_component_id != component.controllable_component_id) {
+      continue;
+    }
+    relations.bindings.insert(binding.control_binding_id);
+    relations.domains.insert(binding.control_domain_id);
+    relations.runtime_units.insert(binding.provider_runtime_unit_id);
+  }
+  for (const auto &domain : graph.control_domains) {
+    if (relations.domains.contains(domain.control_domain_id)) {
+      relations.runtime_units.insert(domain.runtime_unit_ids.begin(),
+                                     domain.runtime_unit_ids.end());
+    }
+  }
+  // A component depends on every runtime unit its units depend on.
+  bool grew = true;
+  while (grew) {
+    grew = false;
+    for (const auto &unit : graph.runtime_units) {
+      if (!relations.runtime_units.contains(unit.runtime_unit_id)) continue;
+      for (const auto &dependency : unit.dependency_runtime_unit_ids) {
+        grew = relations.runtime_units.insert(dependency).second || grew;
+      }
+    }
+  }
+  for (const auto &provider : bundle.capability_provider_bindings) {
+    const bool targets_component = std::visit(
+        [&](const auto &target) {
+          using Target = std::decay_t<decltype(target)>;
+          if constexpr (std::is_same_v<Target,
+                                       core::CellGlobalCapabilityProviderTargetDTO>) {
+            return true;
+          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
+            return target.controllable_component_id == component.controllable_component_id;
+          } else if constexpr (std::is_same_v<
+                                   Target,
+                                   core::TargetBindingCapabilityProviderTargetDTO>) {
+            return relations.bindings.contains(target.control_binding_id);
+          } else {
+            static_assert(std::is_same_v<
+                          Target, core::ControlDomainCapabilityProviderTargetDTO>);
+            return relations.domains.contains(target.control_domain_id);
+          }
+        },
+        provider.target);
+    if (targets_component) {
+      relations.providers.insert(provider.capability_provider_binding_id);
+    }
+  }
+  return relations;
+}
+
+} // namespace m6b
+
+[[nodiscard]] core::ControllableComponentDTO
+MountableComponent(std::string id, std::optional<std::string> model) {
+  std::vector<core::ModelRoleBindingDTO> roles;
+  if (model) roles.push_back({core::ModelRoleId("body"), core::ModelInstanceId(*model)});
+  return {core::ControllableComponentId(std::move(id)),
+          core::ComponentTypeId("partial_apply_tool"),
+          core::ComponentTypeRevision("partial_apply_tool-r1"),
+          std::move(roles),
+          {},
+          std::nullopt};
+}
+
+[[nodiscard]] core::ComponentAttachmentEdgeDTO
+EdgeOn(const core::ControllableComponentId &parent, std::string interface_id,
+       std::string child) {
+  return {core::ComponentAttachmentId(parent.value() + "." + interface_id + "->" + child),
+          core::ComponentAttachmentRevision("attachment-r1"),
+          {parent, core::AttachmentInterfaceId(std::move(interface_id))},
+          {core::ControllableComponentId(std::move(child)),
+           core::AttachmentInterfaceId("mount")},
+          core::PlacementPoseDTO{}};
+}
+
+/// One Apply side: the two retained ROS arms plus synthetic tools, a
+/// model-free tool and an unaffected station, mounted as `attachments` say.
+/// Only the typed relations read it; it is never verified or sealed.
+[[nodiscard]] core::RetainedBundleDTO
+PartialApplySide(std::vector<core::ComponentAttachmentEdgeDTO> attachments) {
+  auto bundle = RosTwoArms().value();
+  auto &components = bundle.cell_graph.controllable_components;
+  components.push_back(MountableComponent("zz_tool", "zz_tool_model"));
+  components.push_back(MountableComponent("aa_camera", "aa_camera_model"));
+  components.push_back(MountableComponent("bare_tool", std::nullopt));
+  components.push_back(MountableComponent("station", "station_model"));
+  bundle.cell_graph.component_attachments = std::move(attachments);
+  return bundle;
+}
+
+// D17 (M7 part A): each Apply side derives its relations from an index of its
+// own graph. A mount added, removed or changed, in both directions, and an
+// unaffected component: both sides equal the merge-6b relations exactly.
+TEST(ApplyComponentDelta, PartialApplyRelationsPerSideEqualMerge6b) {
+  const auto first = FirstArm();
+  const auto second = SecondArm();
+  using Edges = std::vector<core::ComponentAttachmentEdgeDTO>;
+  const Edges none;
+  const Edges tool_on_first{EdgeOn(first, "flange", "zz_tool")};
+  const Edges tool_on_second{EdgeOn(second, "flange", "zz_tool")};
+  const Edges tool_on_first_other_interface{EdgeOn(first, "tool_flange", "zz_tool")};
+  // Sibling edges in non-id order, and the same mounts in id order.
+  const Edges siblings{EdgeOn(first, "flange", "zz_tool"),
+                       EdgeOn(first, "flange", "aa_camera")};
+  const Edges siblings_id_order{EdgeOn(first, "flange", "aa_camera"),
+                                EdgeOn(first, "flange", "zz_tool")};
+  const Edges chained{EdgeOn(first, "flange", "zz_tool"),
+                      EdgeOn(core::ControllableComponentId("zz_tool"), "tool_flange",
+                             "aa_camera")};
+  const Edges model_free_tool{EdgeOn(first, "flange", "bare_tool")};
+  const Edges arm_on_arm{EdgeOn(first, "flange", second.value())};
+  const Edges missing_child{EdgeOn(first, "flange", "missing_tool")};
+
+  struct Case final {
+    const char *name;
+    const Edges &predecessor;
+    const Edges &candidate;
+    bool first_arm_changes;
+  };
+  const std::vector<Case> cases{
+      {"mount added", none, tool_on_first, true},
+      {"mount removed", tool_on_first, none, true},
+      {"mount moved to another arm", tool_on_first, tool_on_second, true},
+      {"mount moved back", tool_on_second, tool_on_first, true},
+      {"mount interface changed", tool_on_first, tool_on_first_other_interface, false},
+      {"mount interface changed back", tool_on_first_other_interface, tool_on_first, false},
+      {"second tool added", tool_on_first, siblings, true},
+      {"second tool removed", siblings, tool_on_first, true},
+      {"sibling edge order changed", siblings, siblings_id_order, false},
+      {"chained tool added", tool_on_first, chained, false},
+      {"chained tool removed", chained, tool_on_first, false},
+      {"model-free tool added", none, model_free_tool, false},
+      {"model-free tool removed", model_free_tool, none, false},
+      {"arm mounted on arm", none, arm_on_arm, true},
+      {"arm unmounted from arm", arm_on_arm, none, true},
+      {"mount to a missing component row", tool_on_first, missing_child, true},
+      {"mount from a missing component row", missing_child, tool_on_first, true},
+  };
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    const auto predecessor = PartialApplySide(test_case.predecessor);
+    const auto candidate = PartialApplySide(test_case.candidate);
+    // One index per side, as derive_apply_component_delta builds them.
+    const CellKinematicIndex predecessor_index(predecessor.cell_graph);
+    const CellKinematicIndex candidate_index(candidate.cell_graph);
+    for (const auto *side : {&predecessor, &candidate}) {
+      const auto &index = side == &predecessor ? predecessor_index : candidate_index;
+      for (const auto &component : side->cell_graph.controllable_components) {
+        SCOPED_TRACE(component.controllable_component_id.value());
+        EXPECT_EQ(detail::apply_component_relations(*side, index, component),
+                  m6b::Relations(*side, component));
+      }
+    }
+    const auto relations = [&](const core::RetainedBundleDTO &side,
+                               const CellKinematicIndex &index,
+                               const std::string &id) {
+      const auto *component = m6b::FindComponent(side, core::ControllableComponentId(id));
+      if (component == nullptr) throw std::logic_error("partial Apply side lacks " + id);
+      return detail::apply_component_relations(side, index, *component);
+    };
+    // The unaffected component keeps its relations across the Apply.
+    EXPECT_EQ(relations(predecessor, predecessor_index, "station"),
+              relations(candidate, candidate_index, "station"));
+    EXPECT_EQ(relations(predecessor, predecessor_index, first.value()) !=
+                  relations(candidate, candidate_index, first.value()),
+              test_case.first_arm_changes);
+  }
 }
 
 TEST(ApplyComponentDelta,

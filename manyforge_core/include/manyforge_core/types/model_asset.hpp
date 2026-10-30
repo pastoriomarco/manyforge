@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -59,13 +61,27 @@ struct ExpandedModelSourceDTO {
                          const ExpandedModelSourceDTO&) = default;
 };
 
+/// A frame role names an existing source link, or (`pose_in_source_link`
+/// present) an offset frame: a generated massless link named after the frame
+/// role, fixed to `source_link_name` at that pose (T_source_link_frame).
+/// Offset frames never chain: their parent is always a source link.
 struct ModelFrameRoleBindingDTO {
   FrameRoleId frame_role_id;
   std::string source_link_name;
+  std::optional<PlacementPoseDTO> pose_in_source_link{};
 
   friend bool operator==(const ModelFrameRoleBindingDTO&,
                          const ModelFrameRoleBindingDTO&) = default;
 };
+
+/// The source-local link a frame role resolves to: its own link, or the
+/// generated link of an offset frame (named after the frame role).
+[[nodiscard]] inline const std::string& frame_role_link_name(
+    const ModelFrameRoleBindingDTO& binding) noexcept {
+  return binding.pose_in_source_link.has_value()
+             ? binding.frame_role_id.value()
+             : binding.source_link_name;
+}
 
 struct ModelGroupRoleBindingDTO {
   ModelGroupRoleId model_group_role_id;
@@ -91,6 +107,17 @@ struct ModelCollisionBodyRoleBindingDTO {
                          const ModelCollisionBodyRoleBindingDTO&) = default;
 };
 
+/// A model's own payload for a robot controller: its mass and centre of
+/// mass in the model's root frame-role link. Only a mounted tool's payload
+/// is used (added to the robot's payload at the mount); absent means 0.
+struct ModelAssetPayloadDTO {
+  double mass_kg{};
+  std::array<double, 3> center_of_mass_m{};
+
+  friend bool operator==(const ModelAssetPayloadDTO&,
+                         const ModelAssetPayloadDTO&) = default;
+};
+
 /// Exact normalized payload for `manyforge.model_asset.v1`.
 ///
 /// This declaration does not prove source availability, byte integrity, XML
@@ -108,6 +135,7 @@ struct ModelAssetDTO {
   std::vector<ModelResourceRoleBindingDTO> resource_role_bindings;
   std::vector<ModelCollisionBodyRoleBindingDTO>
       collision_body_role_bindings;
+  std::optional<ModelAssetPayloadDTO> payload{};
 
   friend bool operator==(const ModelAssetDTO&, const ModelAssetDTO&) = default;
 };

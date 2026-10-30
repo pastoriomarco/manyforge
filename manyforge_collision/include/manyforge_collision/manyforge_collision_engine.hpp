@@ -258,6 +258,12 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
     return capability_;
   }
 
+  /// Classification used by collision-pair pruning for this prepared world.
+  /// Nullopt means the world is not the prepared world or the body is absent.
+  [[nodiscard]] std::optional<bool> IsBodyStaticWrtGroup(
+      const core::CollisionWorldSnapshot& snapshot,
+      const core::CollisionBodyId& body) const;
+
   /// Engine identity for traceability + mismatch records. Stable for
   /// the lifetime of the engine.
   std::string engine_id() const override { return engine_id_; }
@@ -284,6 +290,10 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
 
   std::shared_ptr<const PreparedScene> active_prepared_scene_;
   std::optional<pinocchio::GeometryData> active_collision_data_;
+  /// Clearance margins currently written into the collision requests of
+  /// active_collision_data_. Null: every pair at margin 0.
+  std::shared_ptr<const core::CollisionClearanceMargins>
+      applied_clearance_margins_;
   /// Reusable FK scratch for collision queries: constructed once per
   /// engine (the kinematic model never changes after construction);
   /// pinocchio writes per-query results into it. Accessed only under
@@ -306,6 +316,10 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   /// instance. Separate instances do not share this mutex.
   mutable std::mutex scene_mutex_;
 
+  /// Write `margins` (null: 0) into the active collision requests by logical
+  /// pair. No work when they are already applied.
+  void apply_clearance_margins_locked(
+      const std::shared_ptr<const core::CollisionClearanceMargins>& margins) noexcept;
   std::optional<std::string> sync_snapshot_locked(
       const core::CollisionWorldSnapshot& snapshot,
       bool allow_resource_io = true);

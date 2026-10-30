@@ -18,7 +18,6 @@ _COMMON_REQUIRED = frozenset(
         "target_role",
         "tool_target_role",
         "base_frame_role",
-        "tcp_endpoint",
         "carrier_frame_role",
         "selected_object_id",
         "tool_position",
@@ -27,6 +26,7 @@ _COMMON_REQUIRED = frozenset(
 _COMMON_OPTIONAL = frozenset(
     {
         "planning_profile",
+        "tcp_endpoint",
         "motion_options",
         "tool_max_effort",
         "tool_command_duration_s",
@@ -157,7 +157,6 @@ def build_pick_place_subtree(
             "target_role",
             "tool_target_role",
             "base_frame_role",
-            "tcp_endpoint",
             "carrier_frame_role",
         )
     }

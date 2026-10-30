@@ -65,10 +65,6 @@ _CLIENT_HELLO_TIMEOUT_SECONDS = 1.0
 _CONTROL_DEAD_PEER_TIMEOUT_NS = 30_000_000_000
 _MAXIMUM_RECEIPTS = 8
 _MAXIMUM_CLIENT_INCIDENTS_PER_SECOND = 8
-# m5.5: the re-arm refusal names the components (compact result).
-_REARM_RESULT_CODES = frozenset(
-    {"component_rearm_required"}
-)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -607,8 +603,7 @@ class ExecutionControlSession:
             # browsers parse data they immediately discard.
             result = (
                 dict(submission.result)
-                if (kind == "runtime_scale" or receipt.code in _REARM_RESULT_CODES)
-                and submission.result is not None
+                if kind == "runtime_scale" and submission.result is not None
                 else None
             )
         except Exception as error:

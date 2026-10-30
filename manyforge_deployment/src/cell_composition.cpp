@@ -420,21 +420,23 @@ struct CompositionPreflight final {
          std::to_string(index);
 }
 
+// `urdf` is the occurrence URDF: the source plus its offset frames.
 void register_source_symbols(const StructuralModelInstanceResolution& model,
+                             const UrdfDocumentIr& urdf,
                              const ModelSourceIr& source,
                              SymbolRegistry& symbols) {
   (void)symbols.add(model, OccurrenceSymbolKind::kModel, {},
                     model.model_instance_id.value());
   (void)symbols.add(model, OccurrenceSymbolKind::kRobot, {},
-                    source.urdf().robot_name);
-  for (const auto& material : source.urdf().materials) {
+                    urdf.robot_name);
+  for (const auto& material : urdf.materials) {
     if (!material.name.has_value()) {
       fail("source-qualified top-level material lost its required name");
     }
     (void)symbols.add(model, OccurrenceSymbolKind::kMaterial, {},
                       *material.name);
   }
-  for (const auto& link : source.urdf().links) {
+  for (const auto& link : urdf.links) {
     (void)symbols.add(model, OccurrenceSymbolKind::kLink, {}, link.name);
     for (std::size_t index = 0; index < link.visuals.size(); ++index) {
       const auto& visual = link.visuals[index];
@@ -464,14 +466,14 @@ void register_source_symbols(const StructuralModelInstanceResolution& model,
   std::map<std::string, std::size_t, std::less<>> joint_ranks;
   try {
     for (auto&& [name, rank] :
-         detail::dependency_ordered_joint_local_ranks(source.urdf())) {
+         detail::dependency_ordered_joint_local_ranks(urdf)) {
       joint_ranks.emplace(std::move(name), rank);
     }
   } catch (const detail::Mf2JointOrderingError& error) {
     fail("cell composition cannot generate dependency-ordered joint names: " +
          std::string(error.what()));
   }
-  for (const auto& joint : source.urdf().joints) {
+  for (const auto& joint : urdf.joints) {
     const auto rank = joint_ranks.find(joint.name);
     if (rank == joint_ranks.end()) {
       fail("internal mf2 joint ordering omitted a source joint");
@@ -889,29 +891,7 @@ void add_reference(
 
 [[nodiscard]] UrdfOriginIr origin_from_pose(
     const core::PlacementPoseDTO& pose) {
-  const double x = pose.orientation_xyzw[0];
-  const double y = pose.orientation_xyzw[1];
-  const double z = pose.orientation_xyzw[2];
-  const double w = pose.orientation_xyzw[3];
-  const double sinr_cosp = 2.0 * (w * x + y * z);
-  const double cosr_cosp = 1.0 - 2.0 * (x * x + y * y);
-  const double roll = std::atan2(sinr_cosp, cosr_cosp);
-  const double sinp = 2.0 * (w * y - z * x);
-  const double pitch =
-      std::abs(sinp) >= 1.0
-          ? std::copysign(std::numbers::pi_v<double> / 2.0, sinp)
-          : std::asin(sinp);
-  const double siny_cosp = 2.0 * (w * z + x * y);
-  const double cosy_cosp = 1.0 - 2.0 * (y * y + z * z);
-  const double yaw = std::atan2(siny_cosp, cosy_cosp);
-
-  UrdfOriginIr result;
-  result.element_authored = true;
-  result.authored_xyz_m = pose.position_m;
-  result.authored_rpy_rad = ModelSourceVector3{roll, pitch, yaw};
-  result.xyz_m = pose.position_m;
-  result.rpy_rad = *result.authored_rpy_rad;
-  return result;
+  return urdf_origin_from_pose(pose);
 }
 
 [[nodiscard]] UrdfJointIr fixed_joint(
@@ -1327,7 +1307,9 @@ build_control_binding_maps(
     const std::map<AssetKey, const SourceVerifiedModelAsset*>& assets,
     const SymbolRegistry& symbols,
     const std::map<std::tuple<std::string, std::string>,
-                   CompositionResolvedFrame>& frame_index) {
+                   CompositionResolvedFrame>& frame_index,
+    const std::map<std::string, const core::ModelInstanceDTO*, std::less<>>&
+        graph_models) {
   std::map<std::pair<std::string, std::string>,
            const ExpandedSrdfGroupIr*>
       expanded_group_index;
@@ -1451,6 +1433,38 @@ build_control_binding_maps(
         }
         resolved.frames.push_back({frame.frame_role_id, found->second});
       }
+      // A target with TCPs also exposes its component's custom TCPs.
+      if (target.default_tcp_frame_role_id.has_value()) {
+        for (const auto& role : component.model_roles) {
+          for (const auto& custom :
+               graph_models.at(role.model_instance_id.value())->custom_tcps) {
+            const auto duplicate = std::any_of(
+                resolved.frames.begin(), resolved.frames.end(),
+                [&custom](const auto& existing) {
+                  return existing.frame_role_id == custom.frame_role_id;
+                });
+            if (duplicate) {
+              fail("custom_tcp_name_collision: custom TCP '" +
+                   custom.frame_role_id.value() + "' of component '" +
+                   component.controllable_component_id.value() +
+                   "' collides with a frame role of target '" +
+                   target.command_target_id.value() + "'");
+            }
+            require_room(retained_semantic_rows, 1U,
+                         kMaxCompositionTargetProjectionRows,
+                         "target semantic projection");
+            ++retained_semantic_rows;
+            resolved.frames.push_back(
+                {custom.frame_role_id,
+                 frame_index.at(std::tuple{role.model_instance_id.value(),
+                                           custom.frame_role_id.value()})});
+          }
+        }
+      }
+      std::sort(resolved.frames.begin(), resolved.frames.end(),
+                [](const auto& left, const auto& right) {
+                  return left.frame_role_id < right.frame_role_id;
+                });
       resolved.collision_bodies.reserve(target.collision_bodies.size());
       for (const auto& body : target.collision_bodies) {
         require_room(retained_semantic_rows,
@@ -1665,10 +1679,39 @@ CompositionQualifiedCellIr compose_cell_occurrences(
             });
 
   const auto preflight = preflight_composition(structure, assets);
+  // Each occurrence composes its source URDF plus its offset frames: the
+  // asset's offset frame roles and the occurrence's Deployment custom TCPs,
+  // each one generated massless link and fixed joint. They are ordinary
+  // occurrence symbols from here on, so names are stable on re-Apply.
+  std::map<std::string, const core::ModelInstanceDTO*, std::less<>>
+      graph_models;
+  for (const auto& model : graph.model_instances) {
+    graph_models.emplace(model.model_instance_id.value(), &model);
+  }
+  std::map<std::string, UrdfDocumentIr, std::less<>> occurrence_urdfs;
+  for (const auto* model : ordered_models) {
+    const auto& asset = require_asset(assets, *model);
+    const auto& custom_tcps =
+        graph_models.at(model->model_instance_id.value())->custom_tcps;
+    if (!custom_tcps.empty() && !model->owner_component_id.has_value()) {
+      fail("custom TCPs belong to a component-owned model occurrence");
+    }
+    try {
+      occurrence_urdfs.emplace(
+          model->model_instance_id.value(),
+          with_offset_frame_links(
+              asset.source_ir().urdf(),
+              occurrence_offset_frames(asset.value().frame_role_bindings,
+                                       custom_tcps)));
+    } catch (const ModelSourceError& error) {
+      fail(error.what());
+    }
+  }
   SymbolRegistry symbols(graph.cell_id, all_compiled_names);
   for (const auto* model : ordered_models) {
-    register_source_symbols(*model, require_asset(assets, *model).source_ir(),
-                            symbols);
+    register_source_symbols(
+        *model, occurrence_urdfs.at(model->model_instance_id.value()),
+        require_asset(assets, *model).source_ir(), symbols);
   }
 
   UrdfDocumentIr flattened_urdf{flattened_robot_name, {},
@@ -1690,13 +1733,15 @@ CompositionQualifiedCellIr compose_cell_occurrences(
   for (const auto* model : ordered_models) {
     const auto& asset = require_asset(assets, *model);
     const auto& source = asset.source_ir();
+    const auto& occurrence_urdf =
+        occurrence_urdfs.at(model->model_instance_id.value());
     const auto resource_uris =
         planning_resources.by_asset.find(asset_key(*model));
     if (resource_uris == planning_resources.by_asset.end()) {
       fail("planning resource registry is missing one exact ModelAsset");
     }
     auto rewritten = rewrite_urdf_occurrence(
-        *model, source.urdf(), symbols, references,
+        *model, occurrence_urdf, symbols, references,
         resource_uris->second);
     flattened_urdf.version_major =
         std::max(flattened_urdf.version_major, rewritten.version_major);
@@ -1774,10 +1819,11 @@ CompositionQualifiedCellIr compose_cell_occurrences(
                          source.urdf().robot_name),
          compiled_root(*model, symbols)});
 
-    require_room(coordinates.size(), source.urdf().joints.size(),
+    require_room(coordinates.size(), occurrence_urdf.joints.size(),
                  kMaxCompositionSymbols, "model coordinate");
-    for (std::size_t index = 0; index < source.urdf().joints.size(); ++index) {
-      const auto& joint = source.urdf().joints[index];
+    for (std::size_t index = 0; index < occurrence_urdf.joints.size();
+         ++index) {
+      const auto& joint = occurrence_urdf.joints[index];
       std::optional<std::string> mimic_compiled;
       double multiplier = 1.0;
       double offset = 0.0;
@@ -1803,31 +1849,37 @@ CompositionQualifiedCellIr compose_cell_occurrences(
            offset});
     }
 
+    // Portable frames: the asset's frame roles (an offset frame resolves to
+    // its generated link), then the occurrence's custom TCPs.
+    std::vector<std::pair<core::FrameRoleId, std::string>> portable;
     for (const auto& frame_binding : asset.value().frame_role_bindings) {
+      portable.emplace_back(frame_binding.frame_role_id,
+                            core::frame_role_link_name(frame_binding));
+    }
+    for (const auto& custom :
+         graph_models.at(model->model_instance_id.value())->custom_tcps) {
+      portable.emplace_back(custom.frame_role_id,
+                            custom.frame_role_id.value());
+    }
+    for (const auto& [frame_role_id, link_name] : portable) {
       require_room(frames.size(), 1U,
                    kMaxCompositionFrameResolutions,
                    "portable frame resolution");
       const auto& compiled = symbols.require(
           model->model_instance_id, OccurrenceSymbolKind::kLink, {},
-          frame_binding.source_link_name);
-      auto resolved =
-          resolve_portable_frame(*model, frame_binding.frame_role_id, compiled);
+          link_name);
+      auto resolved = resolve_portable_frame(*model, frame_role_id, compiled);
       if (!frame_index
                .emplace(std::tuple{model->model_instance_id.value(),
-                                   frame_binding.frame_role_id.value()},
+                                   frame_role_id.value()},
                         resolved)
                .second) {
-        fail("portable frame resolution contains a duplicate exact identity");
+        fail("custom_tcp_name_collision: frame role '" +
+             frame_role_id.value() + "' is defined twice on model '" +
+             model->model_instance_id.value() + "'");
       }
-      frames.push_back({std::move(resolved),
-                        frame_binding.source_link_name});
+      frames.push_back({std::move(resolved), link_name});
     }
-  }
-
-  std::map<std::string, const core::ModelInstanceDTO*, std::less<>>
-      graph_models;
-  for (const auto& model : graph.model_instances) {
-    graph_models.emplace(model.model_instance_id.value(), &model);
   }
   std::map<std::string, const core::ControllableComponentDTO*, std::less<>>
       graph_components;
@@ -1999,6 +2051,50 @@ CompositionQualifiedCellIr compose_cell_occurrences(
          std::move(pending.compiled_child_link_name),
          pending.child_pose_in_parent});
   }
+  // A component attachment joins two rigid link groups: the parent interface
+  // link and the child root, each with the links fixed to it through its own
+  // model's source joints. Those groups touch at the mount by construction,
+  // so every pair across them is Adjacent. Only source joints are walked here
+  // (the connections are appended below), so a group never leaves its model.
+  const auto rigid_group = [&](const std::string& start) {
+    std::set<std::string, std::less<>> group{start};
+    for (bool grown = true; grown;) {
+      grown = false;
+      for (const auto& joint : flattened_urdf.joints) {
+        if (joint.type != UrdfJointType::kFixed) continue;
+        if (group.contains(joint.parent_link_name) &&
+            group.insert(joint.child_link_name).second)
+          grown = true;
+        if (group.contains(joint.child_link_name) &&
+            group.insert(joint.parent_link_name).second)
+          grown = true;
+      }
+    }
+    return group;
+  };
+  std::set<std::pair<std::string, std::string>> disabled_pairs;
+  for (const auto& pair : flattened_srdf.disabled_collisions) {
+    disabled_pairs.emplace(std::minmax(pair.first_link_name,
+                                       pair.second_link_name));
+  }
+  for (const auto& connection : connections) {
+    if (!std::holds_alternative<CompositionComponentAttachment>(
+            connection.source))
+      continue;
+    const auto parent_group = rigid_group(connection.compiled_parent_link_name);
+    const auto child_group = rigid_group(connection.compiled_child_link_name);
+    for (const auto& parent : parent_group) {
+      for (const auto& child : child_group) {
+        auto key = std::minmax(parent, child);
+        if (!disabled_pairs.emplace(key.first, key.second).second) continue;
+        require_room(flattened_srdf.disabled_collisions.size(), 1U,
+                     kMaxCompositionSymbols,
+                     "flattened SRDF disabled collision");
+        flattened_srdf.disabled_collisions.push_back(
+            {key.first, key.second, std::string("Adjacent")});
+      }
+    }
+  }
   for (const auto& connection : connections) {
     require_room(flattened_urdf.joints.size(), 1U,
                  kMaxCompositionSymbols, "flattened joint");
@@ -2083,7 +2179,8 @@ CompositionQualifiedCellIr compose_cell_occurrences(
 
   auto coordinate_maps = build_control_binding_maps(
       structure, components, models, assets, coordinates);
-  auto targets = build_targets(structure, models, assets, symbols, frame_index);
+  auto targets = build_targets(structure, models, assets, symbols, frame_index,
+                               graph_models);
   auto frame_paths = build_frame_paths(
       cell_frame, flattened_urdf, frames, connections, coordinates);
   auto reverse_rewrites = symbols.reverse();

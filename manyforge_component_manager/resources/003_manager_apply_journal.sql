@@ -1,4 +1,4 @@
--- ManyForge UA4 typed named-Apply journal, version 19.
+-- ManyForge UA4 typed named-Apply journal, version 20.
 --
 -- This schema stores immutable named-Apply intents, including the exact UA2A
 -- prepared activation each operation accepted (captured source-closure digest,
@@ -12,16 +12,20 @@
 -- exact Kernel-fence release intent and
 -- receipt, and exactly one terminal outcome per operation: either the
 -- successful publication, or the first retained failure with its effect
--- certainty. A terminal failure is never repaired, retried or rolled back.
+-- certainty, its typed inner cause (cause code, bounded cause details and
+-- the producing owner) and whether its source proved it happened before any
+-- configuration, runtime, component or Scene change (an admission claim, a
+-- Kernel fence and fail-closed readiness may still exist). A terminal failure is never repaired, retried or
+-- rolled back.
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 19;
+PRAGMA user_version = 20;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 19),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 20),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -426,6 +430,14 @@ CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
             effect_disposition IS NULL
             OR effect_disposition IN ('known', 'unknown')
         ),
+    cause_code TEXT,
+    cause_details TEXT,
+    producer TEXT,
+    effect_boundary TEXT
+        CHECK (
+            effect_boundary IS NULL
+            OR effect_boundary IN ('before_effect', 'unknown')
+        ),
     outcome_state TEXT NOT NULL
         CHECK (outcome_state IN ('succeeded', 'failed', 'unknown_effect')),
     terminal_outcome_digest TEXT NOT NULL,
@@ -445,6 +457,10 @@ CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
             AND failure_code IS NULL
             AND failure_message IS NULL
             AND effect_disposition IS NULL
+            AND cause_code IS NULL
+            AND cause_details IS NULL
+            AND producer IS NULL
+            AND effect_boundary IS NULL
         )
         OR (
             outcome_state <> 'succeeded'
@@ -461,6 +477,14 @@ CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
             AND failure_code IS NOT NULL
             AND failure_message IS NOT NULL
             AND effect_disposition IS NOT NULL
+            AND cause_code IS NOT NULL
+            AND cause_details IS NOT NULL
+            AND producer IS NOT NULL
+            AND effect_boundary IS NOT NULL
+            AND (
+                effect_boundary = 'unknown'
+                OR effect_disposition = 'known'
+            )
             AND (
                 (outcome_state = 'failed' AND effect_disposition = 'known')
                 OR (
@@ -656,4 +680,53 @@ CREATE TRIGGER IF NOT EXISTS manager_apply_bring_up_child_proofs_no_delete
 BEFORE DELETE ON manager_apply_bring_up_child_proofs
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_bring_up_child_proofs is immutable');
+END;
+
+-- Operator acknowledgement and its one fence-release attempt for a failed
+-- before-effect Apply. The terminal failure remains unchanged.
+CREATE TABLE IF NOT EXISTS manager_apply_failed_release (
+    apply_id TEXT NOT NULL,
+    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+    terminal_outcome_digest TEXT NOT NULL,
+    fence_acceptance_digest TEXT NOT NULL,
+    acknowledgement_request_id TEXT NOT NULL,
+    acknowledgement_source_label TEXT NOT NULL,
+    release_request_encoding TEXT NOT NULL,
+    released_fence_encoding TEXT,
+    acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
+    CHECK (acknowledged = 0 OR released_fence_encoding IS NOT NULL),
+    PRIMARY KEY (apply_id, apply_generation),
+    FOREIGN KEY (apply_id, apply_generation, terminal_outcome_digest)
+        REFERENCES manager_apply_terminal_outcomes
+            (apply_id, apply_generation, terminal_outcome_digest),
+    FOREIGN KEY (apply_id, apply_generation, fence_acceptance_digest)
+        REFERENCES manager_apply_fence_acceptances
+            (apply_id, apply_generation, acceptance_digest)
+) WITHOUT ROWID, STRICT;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_failed_release_no_delete
+BEFORE DELETE ON manager_apply_failed_release
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_failed_release cannot be deleted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS manager_apply_failed_release_one_completion
+BEFORE UPDATE ON manager_apply_failed_release
+WHEN OLD.apply_id IS NOT NEW.apply_id
+  OR OLD.apply_generation IS NOT NEW.apply_generation
+  OR OLD.terminal_outcome_digest IS NOT NEW.terminal_outcome_digest
+  OR OLD.fence_acceptance_digest IS NOT NEW.fence_acceptance_digest
+  OR OLD.acknowledgement_request_id IS NOT NEW.acknowledgement_request_id
+  OR OLD.acknowledgement_source_label IS NOT NEW.acknowledgement_source_label
+  OR OLD.release_request_encoding IS NOT NEW.release_request_encoding
+  OR NOT (
+      (OLD.released_fence_encoding IS NULL AND NEW.released_fence_encoding IS NOT NULL
+       AND OLD.acknowledged = 0 AND NEW.acknowledged = 0)
+      OR
+      (OLD.released_fence_encoding IS NOT NULL
+       AND OLD.released_fence_encoding IS NEW.released_fence_encoding
+       AND OLD.acknowledged = 0 AND NEW.acknowledged = 1)
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'manager_apply_failed_release permits one release and acknowledgement');
 END;

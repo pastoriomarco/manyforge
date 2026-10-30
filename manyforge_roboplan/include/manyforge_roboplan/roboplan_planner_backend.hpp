@@ -17,6 +17,9 @@ struct RoboPlanCandidateProjectionDTO final {
   /// Planning-only allowance for this operation's resolved grasp pairs.
   /// Coordinator and runtime contact constraints remain authoritative.
   std::optional<std::string> contact_policy_id{};
+  /// The Kernel's clearance margins for this operation. They do not change
+  /// the selected worker generation; they are sent with each plan request.
+  std::shared_ptr<const core::CollisionClearanceMargins> clearance_margins{};
 };
 
 /// Private candidate-computation transport used by the addressed planner

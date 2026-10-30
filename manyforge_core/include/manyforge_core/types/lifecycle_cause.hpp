@@ -66,6 +66,20 @@ inline constexpr std::string_view kDeviceMovedExternallyFactId = "device.moved_e
 /// m5.5: reported with `device.moved_externally`: the robot's controller
 /// still reports motion, so it is not re-armed now.
 inline constexpr std::string_view kDeviceInMotionFactId = "device.in_motion";
+/// M6 ADAPTERM: ManyForge's own re-arm of the robot is in progress (the
+/// re-engage after a move from its own interface, or a TCP offset send,
+/// which the controller answers by leaving the ready state). The vendor
+/// driver may switch its controllers off and on again meanwhile. Reported only
+/// when true, from the first vendor step until the handle has bound the
+/// reactivated controller. Never an incident: the CCLC target driver treats
+/// the controller and stream absence as expected, like an idle-cell move.
+inline constexpr std::string_view kDeviceRearmInProgressFactId = "device.rearm_in_progress";
+
+/// V-B1 (V2-3): the vendor-neutral lifecycle substep that clears the robot
+/// controller's error, which every real robot's vendor adapter implements
+/// with its own vendor call and judges on its own status reads. A
+/// vendor-only substep keeps its vendor name (e.g. `xarm.clear_warning`).
+inline constexpr std::string_view kDeviceClearErrorPrimitiveId = "device.clear_error";
 
 [[nodiscard]] constexpr std::string_view to_string(
     const LifecycleBlockingCauseClassDTO value) noexcept {

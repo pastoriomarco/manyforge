@@ -21,7 +21,7 @@ target_roles:
       - {capability_id: planning.trajectory.time_parameterized, parameters: {}, disposition: required}
       - {capability_id: state.observed.current, parameters: {}, disposition: required}
       - {capability_id: validation.trajectory.non_collision, parameters: {}, disposition: required}
-    required_frame_roles: [base, tcp]
+    required_frame_roles: [base]
     required_model_roles: [arm_model]
 parameters:
   - id: configuration_name
@@ -50,7 +50,7 @@ body:
   parameters:
     target_role: '${target:arm}'
     base_frame_role: base
-    tcp_endpoint: {target_role: "${target:arm}", frame_role: tcp}
+    tcp_endpoint: {kind: current}
     goal: '${param:goal}'
     velocity_scale: '${param:velocity_scale}'
     acceleration_scale: '${param:acceleration_scale}'

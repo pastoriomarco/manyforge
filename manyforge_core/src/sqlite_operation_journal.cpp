@@ -1,3 +1,4 @@
+#include <manyforge_core/admission_timing_diagnostic.hpp>
 #include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <sqlite3.h>
@@ -19,6 +20,8 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
+#include <manyforge_core/tcp_selector_codec.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -298,15 +301,10 @@ CREATE TABLE cell_admission_reconcile_settlements (
 ) STRICT;
 )sql";
 
-class JournalFailure final : public std::runtime_error {
+class JournalFailure final : public TypedError {
  public:
   JournalFailure(std::string code, std::string message)
-      : std::runtime_error(std::move(message)), code_(std::move(code)) {}
-
-  [[nodiscard]] const std::string& code() const noexcept { return code_; }
-
- private:
-  std::string code_;
+      : TypedError(std::move(code), message) {}
 };
 
 [[noreturn]] void Fail(std::string code, std::string message) {
@@ -374,16 +372,42 @@ void Exec(sqlite3* database, std::string_view sql) {
   }
 }
 
+// Capture only elapsed SQLite work; output is deferred to the host dispatch boundary.
+class AdmissionSqlTiming final {
+ public:
+  explicit AdmissionSqlTiming(const char* stage) noexcept
+      : stage_(stage) {
+    if (stage_ != nullptr) started_ = std::chrono::steady_clock::now();
+  }
+  ~AdmissionSqlTiming() {
+    if (stage_ == nullptr) return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started_).count();
+    if (elapsed >= 50'000'000)
+      detail::CaptureAdmissionJournalTiming(stage_, elapsed, rows, changes);
+  }
+  std::int64_t rows{-1};
+  std::int64_t changes{-1};
+ private:
+  const char* stage_;
+  std::chrono::steady_clock::time_point started_;
+};
+
 class Statement final {
  public:
-  Statement(sqlite3* database, std::string_view sql) : database_(database) {
+  Statement(sqlite3* database, std::string_view sql, const char* timing_stage = nullptr)
+      : database_(database), timing_stage_(timing_stage) {
     Check(database_,
           sqlite3_prepare_v3(database_, sql.data(), static_cast<int>(sql.size()),
                              SQLITE_PREPARE_PERSISTENT, &statement_, nullptr),
           "prepare SQLite statement");
   }
 
-  ~Statement() { sqlite3_finalize(statement_); }
+  ~Statement() {
+    sqlite3_finalize(statement_);
+    if (timing_stage_ != nullptr && elapsed_ns_ >= 50'000'000)
+      detail::CaptureAdmissionJournalTiming(timing_stage_, elapsed_ns_, rows_, changes_, outcome_);
+  }
   Statement(const Statement&) = delete;
   Statement& operator=(const Statement&) = delete;
 
@@ -407,7 +431,21 @@ class Statement final {
   }
 
   [[nodiscard]] bool Step() {
+    std::chrono::steady_clock::time_point started;
+    if (timing_stage_ != nullptr) started = std::chrono::steady_clock::now();
     const auto result = sqlite3_step(statement_);
+    if (timing_stage_ != nullptr) {
+      elapsed_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count();
+      if (result == SQLITE_ROW) {
+        ++rows_;
+      } else if (result == SQLITE_DONE) {
+        outcome_ = "completed";
+        if (!sqlite3_stmt_readonly(statement_)) changes_ = sqlite3_changes(database_);
+      } else {
+        outcome_ = "error";
+      }
+    }
     if (result == SQLITE_ROW) {
       return true;
     }
@@ -449,6 +487,11 @@ class Statement final {
  private:
   sqlite3* database_{};
   sqlite3_stmt* statement_{};
+  const char* timing_stage_{};
+  std::int64_t elapsed_ns_{};
+  std::int64_t rows_{};
+  std::int64_t changes_{-1};
+  const char* outcome_{"partial"};
 };
 
 class ReadSnapshot final {
@@ -464,7 +507,12 @@ class ReadSnapshot final {
 
 class Transaction final {
  public:
-  explicit Transaction(sqlite3* database) : database_(database) {
+  explicit Transaction(sqlite3* database, bool admission_timing = false,
+                       bool release_timing = false)
+      : database_(database), admission_timing_(admission_timing), release_timing_(release_timing) {
+    AdmissionSqlTiming timing(admission_timing_ ? (release_timing_ ? "release_transaction_begin"
+                                                           : "acquire_transaction_begin")
+                                          : nullptr);
     Exec(database_, "BEGIN IMMEDIATE");
   }
 
@@ -475,7 +523,12 @@ class Transaction final {
   }
 
   void Commit() {
-    Exec(database_, "COMMIT");
+    {
+      AdmissionSqlTiming timing(admission_timing_ ? (release_timing_ ? "release_transaction_commit"
+                                                             : "acquire_transaction_commit")
+                                            : nullptr);
+      Exec(database_, "COMMIT");
+    }
     committed_ = true;
     // After COMMIT: a woken event-stream reader sees this write.
     execution_event_change_signal().Notify();
@@ -484,6 +537,8 @@ class Transaction final {
  private:
   sqlite3* database_{};
   bool committed_{};
+  bool admission_timing_{};
+  bool release_timing_{};
 };
 
 // Only a failed COMMIT with no live transaction needs durable readback.
@@ -1112,10 +1167,7 @@ template <typename StrongId>
        })},
       {"target_mode", CanonicalValue(target_mode)},
       {"target_reference", ReferenceValue(motion.target_reference)},
-      {"tcp_endpoint",
-       CanonicalValue(CanonicalValue::Object{
-           {"frame_role_id", CanonicalValue(motion.tcp_endpoint.frame_role_id.value())},
-           {"target_role_id", CanonicalValue(motion.tcp_endpoint.target_role_id.value())}})},
+      {"tcp_endpoint", EncodeTcpSelector(motion.tcp_endpoint)},
       {"timeouts",
        [&] {
          CanonicalValue::Object timeouts{
@@ -1140,9 +1192,13 @@ template <typename StrongId>
   // established semantic digest.
   if (motion.goal_frame_reference.has_value()) {
     value.emplace_back("goal_frame_reference", ReferenceValue(motion.goal_frame_reference));
-    std::sort(value.begin(), value.end(),
-              [](const auto& left, const auto& right) { return left.first < right.first; });
   }
+  // Emitted only when the move sets its own clearance, for the same reason.
+  if (motion.clearance_m.has_value()) {
+    value.emplace_back("clearance_m", CanonicalValue(*motion.clearance_m));
+  }
+  std::sort(value.begin(), value.end(),
+            [](const auto& left, const auto& right) { return left.first < right.first; });
   return CanonicalValue(std::move(value));
 }
 
@@ -1485,7 +1541,11 @@ void AddExecutionScope(CanonicalValue::Object& row,
       metric_fields.emplace_back("cartesian_fidelity_metrics",
                                  fidelity_value(metrics.cartesian_fidelity_metrics));
     }
-    rows.emplace_back(CanonicalValue::Object{
+    if (metrics.peak_tcp_linear_speed_frame) {
+      metric_fields.emplace_back("peak_tcp_linear_speed_frame",
+                                 CanonicalValue(*metrics.peak_tcp_linear_speed_frame));
+    }
+    CanonicalValue::Object row{
         {"admitted_tcp_linear_speed_mps",
          CanonicalValue(diagnostic.admitted_tcp_linear_speed_mps)},
         {"deployment_maximum_tcp_linear_speed_mps",
@@ -1498,7 +1558,13 @@ void AddExecutionScope(CanonicalValue::Object& row,
          diagnostic.requested_tcp_linear_speed_mps.has_value()
              ? CanonicalValue(*diagnostic.requested_tcp_linear_speed_mps)
              : CanonicalValue(nullptr)},
-        {"trajectory_metrics", CanonicalValue(std::move(metric_fields))}});
+        {"trajectory_metrics", CanonicalValue(std::move(metric_fields))}};
+    if (!diagnostic.speed_check_frame_role_ids.empty()) {
+      CanonicalValue::Array roles;
+      for (const auto& role : diagnostic.speed_check_frame_role_ids) roles.emplace_back(role);
+      row.emplace_back("speed_check_frame_role_ids", CanonicalValue(std::move(roles)));
+    }
+    rows.emplace_back(std::move(row));
   }
   return CanonicalValue(std::move(rows));
 }
@@ -3033,7 +3099,8 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
 }
 
 [[nodiscard]] OperationJournalRecoveryDTO::RecoveredCellAdmissionClaimDTO LoadCellClaim(
-    sqlite3* database, std::uint64_t generation) {
+    sqlite3* database, std::uint64_t generation, bool admission_timing = false,
+    bool release_timing = false) {
   Statement row(
       database,
       "SELECT claim_kind,owner_role,owner_epoch,owner_transaction_id,request_id,"
@@ -3045,7 +3112,9 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
       "release_acquired_admission_generation,release_settlement_kind,release_evidence_digest,"
       "program_node_runner_owner_epoch,program_node_run_id,program_node_instance_id,"
       "program_node_attempt_id,program_node_owner_api "
-      "FROM cell_admission_claims WHERE claim_generation=?");
+      "FROM cell_admission_claims WHERE claim_generation=?", admission_timing ? (release_timing ? "release_load_claim_row_step"
+                                                      : "acquire_load_claim_row_step")
+                                       : nullptr);
   row.Bind(1, static_cast<std::int64_t>(generation));
   Require(row.Step(), "operation_journal_corrupt", "cell-admission claim row is missing");
   CellAdmissionClaimIntentDTO intent{
@@ -3093,7 +3162,9 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   }
   Statement resources(database,
                       "SELECT resource_id FROM cell_admission_claim_resources "
-                      "WHERE claim_generation=? ORDER BY resource_index");
+                      "WHERE claim_generation=? ORDER BY resource_index", admission_timing ? (release_timing ? "release_load_claim_resources_step"
+                                                      : "acquire_load_claim_resources_step")
+                                       : nullptr);
   resources.Bind(1, static_cast<std::int64_t>(generation));
   while (resources.Step()) {
     intent.scope.resources.emplace_back(resources.Text(0));
@@ -3102,7 +3173,9 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
       database,
       "SELECT control_domain_id,active_configuration_id,active_configuration_generation "
       "FROM cell_admission_claim_configurations WHERE claim_generation=? "
-      "ORDER BY configuration_index");
+      "ORDER BY configuration_index", admission_timing ? (release_timing ? "release_load_claim_configurations_step"
+                                                      : "acquire_load_claim_configurations_step")
+                                       : nullptr);
   configurations.Bind(1, static_cast<std::int64_t>(generation));
   while (configurations.Step()) {
     intent.scope.configurations.push_back(CellAdmissionConfigurationScopeDTO{
@@ -3159,15 +3232,17 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   return result;
 }
 
-[[nodiscard]] std::vector<CellAdmissionClaimDTO> LoadHeldCellClaims(sqlite3* database) {
+[[nodiscard]] std::vector<CellAdmissionClaimDTO> LoadHeldCellClaims(sqlite3* database,
+                                                                    bool admission_timing = false) {
   std::vector<CellAdmissionClaimDTO> rows;
   Statement held(database,
                  "SELECT claim_generation FROM cell_admission_claims "
                  "WHERE release_owner_role IS NULL AND reconciled_sequence IS NULL "
-                 "ORDER BY claim_generation");
+                 "ORDER BY claim_generation", admission_timing ? "acquire_held_claims_step" : nullptr);
   while (held.Step()) {
     rows.push_back(LoadCellClaim(database, PositiveIdentifier(held.Integer(0),
-                                                              "cell-admission claim generation"))
+                                                              "cell-admission claim generation"),
+                                 admission_timing)
                        .claim);
   }
   return rows;
@@ -3349,6 +3424,8 @@ class SqliteOperationJournal::Impl final {
                                                       AdmissionGeneration resulting_generation);
   std::uint64_t RecordInterruptRuleStateChanged(const IoRuleStateChangeDTO& change);
   std::uint64_t RecordGlobalIoRuleCleared(const IoGlobalRuleRecoveryRecordDTO& record);
+  std::uint64_t RecordActiveTcpChanged(const RequestOwnerEpoch& owner_epoch,
+                                       const ActiveTcpChangeDTO& change);
 
   OperationJournalEventPageDTO ReadEvents(const RequestOwnerEpoch& owner_epoch,
                                           std::uint64_t after_sequence, std::size_t limit,
@@ -3897,7 +3974,10 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
       transaction.Commit();
       return prior_sequence;
     }
-    Require(projection.checkpoint.checkpoint_generation >
+    // M6b: a checkpoint generation stays pending while newer samples arrive
+    // during its durable write, so the next checkpoint may repeat it; the
+    // surveillance generation (one per sample) still strictly advances.
+    Require(projection.checkpoint.checkpoint_generation >=
                     prior.value().checkpoint.checkpoint_generation &&
                 projection.checkpoint.surveillance_generation >
                     prior.value().checkpoint.surveillance_generation &&
@@ -4061,7 +4141,7 @@ OperationJournalEventPageDTO SqliteOperationJournal::Impl::ReadEvents(
                         "'stop_terminal_projected','stop_fault_cleared',"
                         "'runtime_scale_accepted','operation_prepared',"
                         "'state_observed','interrupt_rule_state_changed',"
-                        "'host_replaced') "
+                        "'active_tcp_changed','host_replaced') "
                         "ORDER BY sequence LIMIT ?"
                       : "SELECT sequence,record_kind,request_id,operation_id,"
                         "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,"
@@ -4563,7 +4643,6 @@ std::uint64_t SqliteOperationJournal::Impl::RecordControlAccepted(
               request.request_context.request_id == accepted.request_id &&
               request.operation_id == accepted.operation_id &&
               request.operation_id == state.operation_id &&
-              request.expected_operation_revision == accepted.accepted_against_revision &&
               accepted.operation_revision_after_acceptance == state.operation_revision &&
               accepted.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
               accepted.accepted_at_ns == state.updated_at_ns,
@@ -4663,21 +4742,21 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
           "Stop fault clear does not join durable terminal truth");
   auto prior_latch = *terminal.value().fault_latch;
   auto expected_status = terminal.value().stop_status;
-  if (current.IsNull(1)) {
-    Require(!resulting_stop_status.surveillance.has_value(),
-            "operation_journal_stop_projection_conflict",
-            "Stop fault clear invents surveillance truth");
-  } else {
+  if (!current.IsNull(1)) {
     auto surveillance = DecodeStopJournalSurveillanceProjection(current.Text(1));
-    Require(surveillance.ok() && resulting_stop_status.surveillance.has_value() &&
-                *resulting_stop_status.surveillance == surveillance.value().checkpoint &&
+    Require(surveillance.ok() &&
                 terminal.value().fault_latch->latch_id == surveillance.value().fault_latch.latch_id,
             "operation_journal_stop_projection_conflict",
             "Stop fault clear does not join latest durable surveillance truth");
     prior_latch = surveillance.value().fault_latch;
-    expected_status.surveillance = surveillance.value().checkpoint;
-    expected_status.surveillance_projection = surveillance.value().checkpoint.checkpoint_projection;
   }
+  // M6b: current rest may clear while surveillance still runs, so the clear
+  // records the current surveillance (and a persistence degradation the
+  // in-memory latch keeps as history), not only the latest durable
+  // checkpoint. Neither is stored (clear v3); recovery keeps reading the
+  // latest checkpoint.
+  expected_status.surveillance = resulting_stop_status.surveillance;
+  expected_status.surveillance_projection = resulting_stop_status.surveillance_projection;
   Require(recovery_intent.expected_latch_id == prior_latch.latch_id &&
               recovery_intent.expected_latch_generation == prior_latch.latch_generation &&
               recovery_intent.expected_recovery_assessment_revision >=
@@ -4694,6 +4773,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
   expected_cleared_latch.recovery_assessment_revision =
       recovery_intent.expected_recovery_assessment_revision + 1U;
   expected_cleared_latch.state = StopFaultLatchStateDTO::kCleared;
+  expected_cleared_latch.persistence_degraded = cleared_latch.persistence_degraded;
   expected_cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
   expected_cleared_latch.reason_code = "stop_fault_recovery_cleared";
   expected_cleared_latch.evidence_refs = cleared_latch.evidence_refs;
@@ -4839,7 +4919,6 @@ std::uint64_t SqliteOperationJournal::Impl::RecordRuntimeScaleAccepted(
               request.request_context.request_id == accepted.request_id &&
               request.operation_id == accepted.operation_id &&
               request.operation_id == state.operation_id &&
-              request.expected_operation_revision == accepted.operation_revision &&
               accepted.operation_revision == state.operation_revision &&
               request.scale == accepted.requested_scale &&
               accepted.runtime_scale_generation == scale_status.runtime_scale_generation &&
@@ -4904,19 +4983,21 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     CellAdmissionClaimDTO* persisted_claim) {
   const bool configuration_apply = verified_manager != nullptr;
   Require(ValidateCellAdmissionClaimIntent(claim.intent).ok() && claim.claim_generation.nonzero() &&
-              claim.acquired_admission_generation.nonzero() &&
-              claim.intent.expected_admission_generation == claim.acquired_admission_generation &&
-              claim.accepted_at_ns >= 0,
+              claim.acquired_admission_generation.nonzero() && claim.accepted_at_ns >= 0,
           "operation_journal_record_invalid", "cell-admission acquire record is invalid");
-  const auto lock = LockOrdinaryWriter();
+  const auto lock = [&] {
+    AdmissionSqlTiming timing("acquire_writer_wait");
+    return LockOrdinaryWriter();
+  }();
   if (critical_section_observer_) {
     critical_section_observer_("cell_admission_acquire");
   }
   RequireOpen();
-  Transaction transaction(database_);
+  AdmissionSqlTiming transaction_timing("acquire_transaction_scope");
+  Transaction transaction(database_, true, false);
   Statement active(database_,
                    "SELECT request_capacity FROM owner_epochs "
-                   "WHERE owner_epoch=? AND active=1");
+                   "WHERE owner_epoch=? AND active=1", "acquire_active_step");
   active.Bind(1, owner_epoch.value());
   Require(active.Step(), "operation_journal_owner_epoch_stale",
           "cell-admission acquire names a non-active Kernel owner epoch");
@@ -4954,7 +5035,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
               [](const auto& a, const auto& b) { return a.owner_role < b.owner_role; });
   }
   Statement current_owner(
-      database_, "SELECT owner_epoch FROM cell_admission_current_owners WHERE owner_role=?");
+      database_, "SELECT owner_epoch FROM cell_admission_current_owners WHERE owner_role=?", "acquire_current_owner_step");
   current_owner.Bind(1, to_string(claim.intent.owner_role));
   if (current_owner.Step()) {
     const bool matches = current_owner.Text(0) == claim.intent.owner_epoch.value();
@@ -4964,7 +5045,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   Statement membership(
       database_,
       "SELECT semantic_intent_digest,claim_generation "
-      "FROM cell_admission_request_membership WHERE owner_epoch=? AND request_id=?");
+      "FROM cell_admission_request_membership WHERE owner_epoch=? AND request_id=?", "acquire_membership_step");
   membership.Bind(1, claim.intent.owner_epoch.value());
   membership.Bind(2, claim.intent.request_id.value());
   if (membership.Step()) {
@@ -4977,7 +5058,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
             "cell-admission request reuses compact membership with different intent");
     Statement resident(database_,
                        "SELECT COUNT(*) FROM cell_admission_claims WHERE claim_generation=? "
-                       "AND release_owner_role IS NULL AND reconciled_sequence IS NULL");
+                       "AND release_owner_role IS NULL AND reconciled_sequence IS NULL", "acquire_resident_step");
     resident.Bind(1, static_cast<std::int64_t>(existing_generation));
     Require(resident.Step(), "operation_journal_corrupt",
             "cell-admission resident membership query returned no row");
@@ -4990,7 +5071,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   Statement replay(database_,
                    "SELECT claim_generation FROM cell_admission_claims "
                    "WHERE owner_epoch=? AND request_id=? "
-                   "AND release_owner_role IS NULL AND reconciled_sequence IS NULL");
+                   "AND release_owner_role IS NULL AND reconciled_sequence IS NULL", "acquire_replay_step");
   replay.Bind(1, claim.intent.owner_epoch.value());
   replay.Bind(2, claim.intent.request_id.value());
   if (replay.Step()) {
@@ -4998,7 +5079,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
         PositiveIdentifier(replay.Integer(0), "cell-admission claim generation");
     Require(!replay.Step(), "operation_journal_corrupt",
             "cell-admission request identity is duplicated");
-    const auto existing = LoadCellClaim(database_, existing_generation);
+    const auto existing = LoadCellClaim(database_, existing_generation, true);
     if (configuration_apply) {
       auto expected_replay = *expected_held_claims;
       expected_replay.push_back(existing.claim);
@@ -5006,7 +5087,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
           existing.claim.intent == claim.intent &&
               existing.claim.claim_generation == claim.claim_generation &&
               existing.claim.acquired_admission_generation == claim.acquired_admission_generation &&
-              LoadHeldCellClaims(database_) == expected_replay &&
+              LoadHeldCellClaims(database_, true) == expected_replay &&
               LoadCellCurrentOwners(database_) == resulting_owners &&
               ScalarInteger(database_,
                             "SELECT cell_admission_generation_high_water "
@@ -5023,7 +5104,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     return existing_generation;
   }
   if (configuration_apply) {
-    Require(LoadHeldCellClaims(database_) == *expected_held_claims &&
+    Require(LoadHeldCellClaims(database_, true) == *expected_held_claims &&
                 LoadCellCurrentOwners(database_) == *expected_current_owners,
             "operation_journal_request_conflict",
             "configuration Apply inventory or current-owner membership changed");
@@ -5031,7 +5112,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
                     "INSERT INTO cell_admission_current_owners(owner_role,owner_epoch,"
                     "established_kernel_owner_epoch) VALUES(?,?,?) ON CONFLICT(owner_role) "
                     "DO UPDATE SET owner_epoch=excluded.owner_epoch,"
-                    "established_kernel_owner_epoch=excluded.established_kernel_owner_epoch");
+                    "established_kernel_owner_epoch=excluded.established_kernel_owner_epoch", "acquire_adopt_step");
     adopt.Bind(1, to_string(verified_manager->owner_role));
     adopt.Bind(2, verified_manager->owner_epoch.value());
     adopt.Bind(3, owner_epoch.value());
@@ -5043,7 +5124,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       "DELETE FROM cell_admission_request_membership WHERE claim_generation IN ("
       "SELECT claim_generation FROM cell_admission_claims "
       "WHERE owner_role=? AND owner_epoch=? "
-      "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL)");
+      "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL)", "acquire_retire_membership_step");
   retire_membership.Bind(1, to_string(claim.intent.owner_role));
   retire_membership.Bind(2, claim.intent.owner_epoch.value());
   Require(!retire_membership.Step(), "operation_journal_corrupt",
@@ -5051,14 +5132,14 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   Statement retire_claim(database_,
                          "DELETE FROM cell_admission_claims "
                          "WHERE owner_role=? AND owner_epoch=? "
-                         "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL");
+                         "AND release_owner_role IS NOT NULL AND reconciled_sequence IS NULL", "acquire_retire_claim_step");
   retire_claim.Bind(1, to_string(claim.intent.owner_role));
   retire_claim.Bind(2, claim.intent.owner_epoch.value());
   Require(!retire_claim.Step(), "operation_journal_corrupt",
           "cell-admission released result retirement returned a row");
   Statement count(database_,
                   "SELECT COUNT(*),COALESCE(MAX(claim_generation),0) "
-                  "FROM cell_admission_request_membership");
+                  "FROM cell_admission_request_membership", "acquire_count_step");
   Require(count.Step(), "operation_journal_corrupt",
           "cell-admission capacity query returned no row");
   const auto resident = count.Integer(0);
@@ -5066,7 +5147,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
           "cell-admission durable membership is exhausted");
   Statement high_water(database_,
                        "SELECT cell_admission_generation_high_water,"
-                       "cell_claim_generation_high_water FROM journal_metadata WHERE singleton=1");
+                       "cell_claim_generation_high_water FROM journal_metadata WHERE singleton=1", "acquire_high_water_step");
   Require(high_water.Step(), "operation_journal_corrupt",
           "cell-admission high-water query returned no row");
   const auto admission_high_water = high_water.Integer(0);
@@ -5081,7 +5162,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
 
   Statement bind_owner(database_,
                        "INSERT OR IGNORE INTO cell_admission_current_owners("
-                       "owner_role,owner_epoch,established_kernel_owner_epoch) VALUES(?,?,?)");
+                       "owner_role,owner_epoch,established_kernel_owner_epoch) VALUES(?,?,?)", "acquire_bind_owner_step");
   bind_owner.Bind(1, to_string(claim.intent.owner_role));
   bind_owner.Bind(2, claim.intent.owner_epoch.value());
   bind_owner.Bind(3, owner_epoch.value());
@@ -5091,7 +5172,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       database_,
       "INSERT INTO cell_admission_request_membership("
       "owner_role,owner_epoch,request_id,semantic_intent_digest,claim_generation) "
-      "VALUES(?,?,?,?,?)");
+      "VALUES(?,?,?,?,?)", "acquire_insert_membership_step");
   insert_membership.Bind(1, to_string(claim.intent.owner_role));
   insert_membership.Bind(2, claim.intent.owner_epoch.value());
   insert_membership.Bind(3, claim.intent.request_id.value());
@@ -5110,7 +5191,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       "offer_digest,parent_program_cycle_claim_generation,program_node_runner_owner_epoch,"
       "program_node_run_id,program_node_instance_id,program_node_attempt_id,program_node_owner_api)"
       " "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", "acquire_insert_step");
   insert.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
   insert.Bind(2, owner_epoch.value());
   insert.Bind(3, to_string(claim.intent.claim_kind));
@@ -5162,7 +5243,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     Statement resource(
         database_,
         "INSERT INTO cell_admission_claim_resources(claim_generation,resource_index,resource_id)"
-        " VALUES(?,?,?)");
+        " VALUES(?,?,?)", "acquire_resource_step");
     resource.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
     resource.Bind(2, static_cast<std::int64_t>(index));
     resource.Bind(3, claim.intent.scope.resources[index].value());
@@ -5174,7 +5255,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     Statement row(database_,
                   "INSERT INTO cell_admission_claim_configurations("
                   "claim_generation,configuration_index,control_domain_id,"
-                  "active_configuration_id,active_configuration_generation) VALUES(?,?,?,?,?)");
+                  "active_configuration_id,active_configuration_generation) VALUES(?,?,?,?,?)", "acquire_row_step");
     row.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
     row.Bind(2, static_cast<std::int64_t>(index));
     row.Bind(3, configuration.control_domain_id.value());
@@ -5187,7 +5268,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       database_,
       "UPDATE journal_metadata SET cell_admission_generation_high_water=?,"
       "cell_claim_generation_high_water=? WHERE singleton=1 "
-      "AND cell_admission_generation_high_water=? AND cell_claim_generation_high_water=?");
+      "AND cell_admission_generation_high_water=? AND cell_claim_generation_high_water=?", "acquire_advance_step");
   advance.Bind(1, static_cast<std::int64_t>(claim.acquired_admission_generation.value() + 1U));
   advance.Bind(2, static_cast<std::int64_t>(claim.claim_generation.value()));
   advance.Bind(3, static_cast<std::int64_t>(claim.acquired_admission_generation.value()));
@@ -5200,7 +5281,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
     auto expected_committed = *expected_held_claims;
     expected_committed.push_back(claim);
     CommitConfigurationApply(transaction, database_, claim, [&] {
-      const auto held = LoadHeldCellClaims(database_);
+      const auto held = LoadHeldCellClaims(database_, true);
       const auto owners = LoadCellCurrentOwners(database_);
       const auto generation = ScalarInteger(
           database_,
@@ -5235,16 +5316,20 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
               claim.acquired_admission_generation == release.acquired_admission_generation &&
               resulting_generation.nonzero() && resulting_generation.value() <= kMaximumSafeInteger,
           "operation_journal_record_invalid", "cell-admission release record is invalid");
-  const auto lock = LockOrdinaryWriter();
+  const auto lock = [&] {
+    AdmissionSqlTiming timing("release_writer_wait");
+    return LockOrdinaryWriter();
+  }();
   RequireOpen();
-  Transaction transaction(database_);
-  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  AdmissionSqlTiming transaction_timing("release_transaction_scope");
+  Transaction transaction(database_, true, true);
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1", "release_active_step");
   active.Bind(1, owner_epoch.value());
   Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
           "operation_journal_owner_epoch_stale",
           "cell-admission release names a non-active Kernel owner epoch");
   Statement current_owner(
-      database_, "SELECT owner_epoch FROM cell_admission_current_owners WHERE owner_role=?");
+      database_, "SELECT owner_epoch FROM cell_admission_current_owners WHERE owner_role=?", "release_current_owner_step");
   current_owner.Bind(1, to_string(claim.intent.owner_role));
   if (current_owner.Step()) {
     Require(current_owner.Text(0) == claim.intent.owner_epoch.value() && !current_owner.Step(),
@@ -5252,7 +5337,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
             "cell-admission release names a stale request-owner epoch");
   }
   Statement resident(database_,
-                     "SELECT COUNT(*) FROM cell_admission_claims WHERE claim_generation=?");
+                     "SELECT COUNT(*) FROM cell_admission_claims WHERE claim_generation=?", "release_resident_step");
   resident.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
   Require(resident.Step(), "operation_journal_corrupt",
           "cell-admission release resident query returned no row");
@@ -5262,7 +5347,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
   if (!has_resident_claim) {
     Statement compacted(database_,
                         "SELECT semantic_intent_digest FROM cell_admission_request_membership "
-                        "WHERE owner_epoch=? AND request_id=?");
+                        "WHERE owner_epoch=? AND request_id=?", "release_compacted_step");
     compacted.Bind(1, claim.intent.owner_epoch.value());
     compacted.Bind(2, claim.intent.request_id.value());
     auto digest = CellAdmissionClaimIntentDigest(claim.intent);
@@ -5273,12 +5358,12 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
     Fail("operation_journal_owner_epoch_stale",
          "cell-admission predecessor claim is already terminal or reconciled");
   }
-  auto existing = LoadCellClaim(database_, claim.claim_generation.value());
+  auto existing = LoadCellClaim(database_, claim.claim_generation.value(), true, true);
   Require(existing.claim == claim, "operation_journal_request_conflict",
           "cell-admission release conflicts with the durable claim");
   Statement reconciled(database_,
                        "SELECT reconciled_sequence FROM cell_admission_claims "
-                       "WHERE claim_generation=?");
+                       "WHERE claim_generation=?", "release_reconciled_step");
   reconciled.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
   Require(reconciled.Step() && reconciled.IsNull(0) && !reconciled.Step(),
           "operation_journal_owner_epoch_stale",
@@ -5294,7 +5379,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
       "UPDATE cell_admission_claims SET release_owner_role=?,release_owner_epoch=?,"
       "release_owner_transaction_id=?,release_request_id=?,release_request_payload_digest=?,"
       "release_acquired_admission_generation=?,release_settlement_kind=?,"
-      "release_evidence_digest=? WHERE claim_generation=? AND release_owner_role IS NULL");
+      "release_evidence_digest=? WHERE claim_generation=? AND release_owner_role IS NULL", "release_update_step");
   update.Bind(1, to_string(release.owner_role));
   update.Bind(2, release.owner_epoch.value());
   update.Bind(3, release.owner_transaction_id);
@@ -5309,7 +5394,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimReleased(
   Statement advance(
       database_,
       "UPDATE journal_metadata SET cell_admission_generation_high_water=? WHERE singleton=1 "
-      "AND cell_admission_generation_high_water=?");
+      "AND cell_admission_generation_high_water=?", "release_advance_step");
   advance.Bind(1, static_cast<std::int64_t>(resulting_generation.value()));
   advance.Bind(2, static_cast<std::int64_t>(resulting_generation.value() - 1U));
   Require(!advance.Step() && sqlite3_changes(database_) == 1, "operation_journal_record_invalid",
@@ -5939,7 +6024,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordInterruptRuleStateChanged(
              {"source_id", CanonicalValue(cursor.source_id.value())},
              {"record_sequence", CanonicalValue(std::to_string(cursor.record_sequence))}})}});
   }
-  const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"owner_epoch", CanonicalValue(context.owner_epoch.value())},
       {"catalog_generation", CanonicalValue(std::to_string(context.catalog_generation))},
       {"active_publication_generation",
@@ -5948,7 +6033,10 @@ std::uint64_t SqliteOperationJournal::Impl::RecordInterruptRuleStateChanged(
       {"graph_revision", CanonicalValue(context.graph_revision.value())},
       {"rule_id", CanonicalValue(change.rule.rule_id.value())},
       {"state", CanonicalValue(std::string(io_global_rule_state_token(change.rule.state)))},
-      {"triggering_acquisition", std::move(acquisition)}}));
+      {"triggering_acquisition", std::move(acquisition)}};
+  if (change.rule.unavailable_reason)
+    fields.emplace_back("unavailable_reason", ErrorValue(change.rule.unavailable_reason));
+  const auto payload = content_identity::canonical_json(CanonicalValue(std::move(fields)));
   Require(payload.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
           "global rule-state projection exceeds the fixed payload bound");
   const auto digest = content_identity::sha256_digest(payload);
@@ -5988,6 +6076,72 @@ std::uint64_t SqliteOperationJournal::Impl::RecordInterruptRuleStateChanged(
   compact.Bind(3, static_cast<std::int64_t>(history_capacity_));
   Require(!compact.Step(), "operation_journal_corrupt",
           "global rule-state compaction returned a row");
+  transaction.Commit();
+  return sequence;
+}
+
+// Active TCP (M7, design 4): one confirmed Active TCP change. Sparse and
+// owner-epoch scoped like the rule-state rows; current truth is the robot
+// owner's baseline (with this row's sequence), never old rows still kept.
+std::uint64_t SqliteOperationJournal::Impl::RecordActiveTcpChanged(
+    const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) {
+  Require(!owner_epoch.empty() && !change.component_id.empty() &&
+              (!change.entry || valid_tcp_entry(*change.entry)) &&
+              (!change.previous || valid_tcp_entry(*change.previous)) &&
+              change.registration_generation != 0U &&
+              change.occurred_at_ns >= 0,
+          "operation_journal_record_invalid", "Active TCP change is invalid");
+  const auto entry_value = [](const std::optional<TcpEntryDTO>& entry) {
+    return entry ? EncodeTcpEntry(*entry) : CanonicalValue(nullptr);
+  };
+  const auto payload = content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.active_tcp_change.v1")},
+      {"owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"component_id", CanonicalValue(change.component_id.value())},
+      {"previous", entry_value(change.previous)},
+      {"entry", entry_value(change.entry)},
+      {"source", CanonicalValue(std::string(to_string(change.source)))},
+      {"offset_sent", CanonicalValue(change.offset_sent)},
+      {"registration_generation",
+       CanonicalValue(static_cast<double>(change.registration_generation))},
+      {"sequence", CanonicalValue(static_cast<double>(change.sequence))}}));
+  Require(payload.size() <= kMaximumRecordJsonBytes, "operation_journal_record_too_large",
+          "Active TCP change exceeds the fixed payload bound");
+  const auto digest = content_identity::sha256_digest(payload);
+  const auto lock = LockOrdinaryWriter();
+  RequireOpen();
+  const auto occurred_at_wall = wall_time_text_();
+  ValidateWallTimeText(occurred_at_wall);
+  Transaction transaction(database_);
+  if (critical_section_observer_) critical_section_observer_("ordinary_write");
+  Statement active(database_, "SELECT COUNT(*) FROM owner_epochs WHERE owner_epoch=? AND active=1");
+  active.Bind(1, owner_epoch.value());
+  Require(active.Step() && active.Integer(0) == 1 && !active.Step(),
+          "operation_journal_owner_epoch_stale", "Active TCP change owner is not active");
+  Statement insert(
+      database_,
+      "INSERT INTO journal_records(owner_epoch,record_kind,request_id,operation_id,"
+      "operation_revision,occurred_at_ns,occurred_at_wall,effect_pending,payload_json,"
+      "payload_digest) VALUES(?,'active_tcp_changed',NULL,NULL,NULL,?,?,0,?,?)");
+  insert.Bind(1, owner_epoch.value());
+  insert.Bind(2, change.occurred_at_ns);
+  insert.Bind(3, occurred_at_wall);
+  insert.Bind(4, payload);
+  insert.Bind(5, digest);
+  Require(!insert.Step(), "operation_journal_corrupt", "Active TCP change insert returned a row");
+  const auto sequence =
+      PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
+  // The journal's existing retained-history bound, as for rule-state rows.
+  Statement compact(
+      database_,
+      "DELETE FROM journal_records WHERE owner_epoch=? AND record_kind='active_tcp_changed' "
+      "AND sequence NOT IN (SELECT sequence FROM journal_records WHERE owner_epoch=? "
+      "AND record_kind='active_tcp_changed' ORDER BY sequence DESC LIMIT ?)");
+  compact.Bind(1, owner_epoch.value());
+  compact.Bind(2, owner_epoch.value());
+  compact.Bind(3, static_cast<std::int64_t>(history_capacity_));
+  Require(!compact.Step(), "operation_journal_corrupt",
+          "Active TCP change compaction returned a row");
   transaction.Commit();
   return sequence;
 }
@@ -6152,6 +6306,12 @@ Result<std::uint64_t> SqliteOperationJournal::RecordCellAdmissionGenerationAdvan
 Result<std::uint64_t> SqliteOperationJournal::RecordGlobalIoRuleCleared(
     const IoGlobalRuleRecoveryRecordDTO& record) {
   return AsResult<std::uint64_t>([&] { return impl_->RecordGlobalIoRuleCleared(record); });
+}
+
+Result<std::uint64_t> SqliteOperationJournal::RecordActiveTcpChanged(
+    const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) {
+  return AsResult<std::uint64_t>(
+      [&] { return impl_->RecordActiveTcpChanged(owner_epoch, change); });
 }
 
 Result<std::uint64_t> SqliteOperationJournal::RecordInterruptRuleStateChanged(

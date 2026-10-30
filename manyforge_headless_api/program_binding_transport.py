@@ -34,8 +34,10 @@ _FIELDS = {
     "node_environment": ("catalog_id", "content_version", "catalog_digest", "environment_digest"),
     "component": ("component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
-    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings", "pneumatic_io"),
+    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings", "pneumatic_io", "robot_tcps", "default_tcp"),
     "frame": ("frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name", "contact_body_role_ids"),
+    "tcp_entry": ("component_id", "target_id", "frame_role_id"),
+    "robot_tcp": ("entry", "frame", "end_effector", "component_default"),
     "resource": ("resource_role_id", "resource_ids", "compiled_resource_names"),
     "collision": ("collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"),
     "capability": ("capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"),
@@ -54,7 +56,7 @@ _FIELDS = {
     "pneumatic_input": ("input", "target_role_id", "resource_role_id"),
     "contact_release": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact", "bodies_from_motion_endpoint"),
 }
-_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings', 'pneumatic_io'), 'frame': ('contact_body_role_ids',), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
+_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings', 'pneumatic_io', 'robot_tcps', 'default_tcp'), 'frame': ('contact_body_role_ids',), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
 _STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
 _INTERVENTION_STOP_SCOPES = frozenset(('all', 'own_groups'))
 _PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
@@ -217,6 +219,44 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         component = component_by_role.get(target["component_role_id"])
         if component is None or component["controllable_component_id"] != target["controllable_component_id"]:
             _fail(path, "target must resolve through component binding")
+        if "default_tcp" in target:
+            dp = f"{path}.default_tcp"
+            default_tcp = _record(target["default_tcp"], _FIELDS["tcp_entry"], dp)
+            for field in ("component_id", "target_id", "frame_role_id"):
+                _identity(default_tcp[field], f"{dp}.{field}")
+        if "robot_tcps" in target:
+            tcp_path = f"{path}.robot_tcps"
+            robot_tcps = _array(target["robot_tcps"], tcp_path)
+            for ti, item2 in enumerate(robot_tcps):
+                rp = f"{tcp_path}[{ti}]"
+                tcp = _record(item2, _FIELDS["robot_tcp"], rp)
+                entry_path = f"{rp}.entry"
+                entry = _record(tcp["entry"], _FIELDS["tcp_entry"], entry_path)
+                for field in ("component_id", "target_id", "frame_role_id"):
+                    _identity(entry[field], f"{entry_path}.{field}")
+                frame_path = f"{rp}.frame"
+                frame = _record(tcp["frame"], _FIELDS["frame"], frame_path,
+                                optional=_OPTIONAL_FIELDS["frame"])
+                _identity(frame["frame_role_id"], f"{frame_path}.frame_role_id")
+                _identity(frame["model_instance_id"], f"{frame_path}.model_instance_id")
+                _digest(frame["model_revision"], f"{frame_path}.model_revision")
+                _string(frame["compiled_frame_name"], f"{frame_path}.compiled_frame_name")
+                if frame["frame_role_id"] != entry["frame_role_id"]:
+                    _fail(rp, "TCP entry/frame role correspondence")
+                if "contact_body_role_ids" in frame:
+                    body_roles = _array(frame["contact_body_role_ids"],
+                                        f"{frame_path}.contact_body_role_ids")
+                    for role in body_roles:
+                        _identity(role, f"{frame_path}.contact_body_role_ids")
+                    _sorted_unique(body_roles, lambda role: role,
+                                   f"{frame_path}.contact_body_role_ids")
+                if type(tcp["end_effector"]) is not bool or type(tcp["component_default"]) is not bool:
+                    _fail(rp, "TCP marks must be boolean")
+            _sorted_unique(robot_tcps,
+                           lambda row: (row["entry"]["component_id"],
+                                        row["entry"]["target_id"],
+                                        row["entry"]["frame_role_id"]),
+                           tcp_path)
         frames = _array(target["frame_role_bindings"], f"{path}.frame_role_bindings")
         for fi, item2 in enumerate(frames):
             fp = f"{path}.frame_role_bindings[{fi}]"

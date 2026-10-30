@@ -17,6 +17,7 @@
 #include <string_view>
 #include <tuple>
 #include <unistd.h>
+#include <vector>
 
 #include "build_manifest_internal.hpp"
 #include "content_identity_internal.hpp"
@@ -286,39 +287,6 @@ make_runtime_context(const RetainedBundle &retained_bundle,
           source_runtime_unit_id, source_runtime_epoch};
 }
 
-class MemoryPlanRepository final
-    : public core::IResolvedStopBasePlanRepository {
-public:
-  [[nodiscard]] core::Result<core::ResolvedStopBasePlanId>
-  PutIfAbsent(core::ResolvedStopBasePlanDTO plan) override {
-    auto made = core::MakeResolvedStopBasePlan(std::move(plan));
-    if (!made.ok()) {
-      return core::Result<core::ResolvedStopBasePlanId>::Err(made.error());
-    }
-    value_ = std::move(made.value());
-    return core::Result<core::ResolvedStopBasePlanId>::Ok(
-        value_->resolved_stop_base_plan_id);
-  }
-
-  [[nodiscard]] core::Result<core::ResolvedStopBasePlanDTO>
-  LoadVerified(const core::ResolvedStopBasePlanId &id) const override {
-    if (!value_.has_value() || value_->resolved_stop_base_plan_id != id) {
-      return core::Result<core::ResolvedStopBasePlanDTO>::Err(
-          core::ErrorDTO{"missing_reference", "plan is absent", {}});
-    }
-    auto result = *value_;
-    if (corrupt_readback_) {
-      result.source_sequence += 1U;
-    }
-    return core::Result<core::ResolvedStopBasePlanDTO>::Ok(std::move(result));
-  }
-
-  bool corrupt_readback_{};
-
-private:
-  std::optional<core::ResolvedStopBasePlanDTO> value_;
-};
-
 [[nodiscard]] core::RouteSelectionAcceptedDTO make_route_acceptance(
     const RuntimeContext &runtime,
     const VerifiedControllerLifecycleExpectedDomain &expected) {
@@ -491,10 +459,9 @@ TEST(ResolvedStopBasePlanResolverTest,
   EXPECT_EQ(core::controlled_stop_deadline_from_contract_parameters(
                 *nominal.default_contract_parameters),
             std::optional<core::Duration>(3'000'000'000));
-  MemoryPlanRepository repository;
-  const auto readiness = store_and_verify_runtime_participant_stop_readiness(
+  const auto readiness = seal_runtime_participant_stop_readiness(
       *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-      runtime.binding, repository);
+      runtime.binding);
   ASSERT_TRUE(readiness.ok()) << readiness.error().message;
 
   const auto different_time =
@@ -503,10 +470,10 @@ TEST(ResolvedStopBasePlanResolverTest,
           test::make_lite6_stop_qualified_ros_motion_retention_fixture(2.5));
   EXPECT_NE(different_time.bundle->retained_bundle_id(),
             retained.bundle->retained_bundle_id());
-  EXPECT_FALSE(store_and_verify_runtime_participant_stop_readiness(
+  EXPECT_FALSE(seal_runtime_participant_stop_readiness(
                    *different_time.bundle, plan,
                    core::ComponentLifecycleGeneration(11U), expected,
-                   runtime.binding, repository)
+                   runtime.binding)
                    .ok());
   // Shorter than the 1.0 s deceleration: not refused in advance.
   EXPECT_NO_THROW(
@@ -533,7 +500,7 @@ TEST(ResolvedStopBasePlanResolverTest,
 }
 
 TEST(ResolvedStopBasePlanResolverTest,
-     ResolvesExactActiveProductAndPublishesOnlyAfterIndependentReadback) {
+     ResolvesExactActiveProductAndSealsReadiness) {
   ScopedTrustedRoot root;
   const auto retained = test::
       materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
@@ -564,20 +531,11 @@ TEST(ResolvedStopBasePlanResolverTest,
       plan.escalation_stages.back().command_qualification.stop_action_class,
       core::StopActionClass::kSoftwareHard);
 
-  MemoryPlanRepository repository;
-  auto readiness = store_and_verify_runtime_participant_stop_readiness(
+  auto readiness = seal_runtime_participant_stop_readiness(
       *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-      runtime.binding, repository);
+      runtime.binding);
   ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   EXPECT_EQ(readiness.value().value().resolved_stop_base_plan, plan);
-
-  repository.corrupt_readback_ = true;
-  readiness = store_and_verify_runtime_participant_stop_readiness(
-      *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-      runtime.binding, repository);
-  ASSERT_FALSE(readiness.ok());
-  EXPECT_EQ(readiness.error().details.at("reason"),
-            "resolved_stop_base_plan_repository_readback_mismatch");
 }
 
 TEST(ResolvedStopBasePlanResolverTest,
@@ -632,11 +590,9 @@ TEST(ResolvedStopBasePlanResolverTest,
        core::ComponentLifecycleStateDTO::kActive}};
   const std::vector<core::RuntimeParticipantBinding> participants{
       runtime.binding};
-  MemoryPlanRepository repository;
 
-  auto batch = resolve_store_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, participants,
-      repository);
+  auto batch = resolve_and_verify_route_readiness_batch(
+      *retained.bundle, source, expected, active, components, participants);
   ASSERT_TRUE(batch.ok()) << batch.error().message;
   ASSERT_EQ(batch.value().size(), 1U);
   const auto &published = batch.value().front();
@@ -664,36 +620,30 @@ TEST(ResolvedStopBasePlanResolverTest,
     auto declared = components;
     declared.front().expected_component_lifecycle_state =
         core::ComponentLifecycleStateDTO::kDeclared;
-    MemoryPlanRepository declared_repository;
-    const auto installed = resolve_store_and_verify_route_readiness_batch(
-        *retained.bundle, source, expected, active, declared, participants,
-        declared_repository);
+    const auto installed = resolve_and_verify_route_readiness_batch(
+        *retained.bundle, source, expected, active, declared, participants);
     ASSERT_TRUE(installed.ok()) << installed.error().message;
     auto undeclared = components;
     undeclared.front().expected_component_lifecycle_state =
         core::ComponentLifecycleStateDTO::kUndeclared;
-    MemoryPlanRepository undeclared_repository;
-    const auto refused = resolve_store_and_verify_route_readiness_batch(
-        *retained.bundle, source, expected, active, undeclared, participants,
-        undeclared_repository);
+    const auto refused = resolve_and_verify_route_readiness_batch(
+        *retained.bundle, source, expected, active, undeclared, participants);
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"),
               "route_readiness_batch_shape_invalid");
   }
 
   const std::vector<core::RuntimeParticipantBinding> missing;
-  batch = resolve_store_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, missing,
-      repository);
+  batch = resolve_and_verify_route_readiness_batch(
+      *retained.bundle, source, expected, active, components, missing);
   ASSERT_FALSE(batch.ok());
   EXPECT_EQ(batch.error().details.at("reason"),
             "route_readiness_batch_shape_invalid");
 
   active.state =
       core::ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
-  batch = resolve_store_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, participants,
-      repository);
+  batch = resolve_and_verify_route_readiness_batch(
+      *retained.bundle, source, expected, active, components, participants);
   ASSERT_FALSE(batch.ok());
   EXPECT_EQ(batch.error().details.at("reason"),
             "route_readiness_batch_shape_invalid");
@@ -712,10 +662,9 @@ TEST(ResolvedStopBasePlanResolverTest,
       runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
   const auto acceptance = make_route_acceptance(runtime, expected);
   const auto configuration = make_route_configuration(runtime);
-  MemoryPlanRepository repository;
   MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
   VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, repository, owner,
+      *retained.bundle, source, owner,
       runtime.active_configuration.kinematic_resource_source_projections,
       [] { return 75; });
 
@@ -802,10 +751,9 @@ TEST(ResolvedStopBasePlanResolverTest,
       runtime.active_configuration.kinematic_resource_source_projections;
   cell_projections.push_back(std::move(foreign));
 
-  MemoryPlanRepository repository;
   MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
   VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, repository, owner, std::move(cell_projections),
+      *retained.bundle, source, owner, std::move(cell_projections),
       [] { return 90; });
   const auto resolved = publisher.ResolveResultingActiveControlConfiguration(
       acceptance, expected.sealed(), observation, reconciliation.value(),
@@ -831,7 +779,7 @@ TEST(ResolvedStopBasePlanResolverTest,
                std::tie(rhs.control_binding_id, rhs.control_binding_revision);
       });
   VerifiedRouteConfigurationPublicationPort mixed_publisher(
-      *retained.bundle, source, repository, owner, std::move(mixed),
+      *retained.bundle, source, owner, std::move(mixed),
       [] { return 91; });
   const auto rejected =
       mixed_publisher.ResolveResultingActiveControlConfiguration(
@@ -857,10 +805,9 @@ TEST(ResolvedStopBasePlanResolverTest,
   auto configuration = make_route_configuration(runtime);
   configuration.state =
       core::ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
-  MemoryPlanRepository repository;
   MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
   VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, repository, owner,
+      *retained.bundle, source, owner,
       runtime.active_configuration.kinematic_resource_source_projections,
       [] { return 80; });
 
@@ -874,7 +821,7 @@ TEST(ResolvedStopBasePlanResolverTest,
   EXPECT_TRUE(owner.published_participants_.empty());
 
   VerifiedRouteConfigurationPublicationPort unsafe_clock(
-      *retained.bundle, source, repository, owner,
+      *retained.bundle, source, owner,
       runtime.active_configuration.kinematic_resource_source_projections,
       [] { return 9'007'199'254'740'992LL; });
   const auto unsafe = unsafe_clock.PublishAndReadBack(
@@ -931,10 +878,9 @@ TEST(ResolvedStopBasePlanResolverTest, RosGripperLogicalEvidenceSurvivesDurableR
       EXPECT_FALSE(stage.evidence_requirements.front().resolved_source.runtime_target
                        .endpoint_role_id.has_value());
     }
-    MemoryPlanRepository repository;
-    const auto readiness = store_and_verify_runtime_participant_stop_readiness(
+    const auto readiness = seal_runtime_participant_stop_readiness(
         *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-        runtime.binding, repository);
+        runtime.binding);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   }
 }
@@ -960,6 +906,19 @@ TEST(ResolvedStopBasePlanResolverTest, ModelBackedCommandedGripperWithoutRowReta
       if (rows != values.end()) {
         rows->second = CanonicalValue(CanonicalValue::Array{});
         ++cleared;
+      }
+      // M6 TOOLSPLIT: the runtime codec requires the gripper_feedback stream
+      // exactly for the authored rows; drop it with the row so the compiler's
+      // own refusal is what is tested.
+      const auto streams = std::find_if(values.begin(), values.end(),
+          [](const auto &field) { return field.first == "component_streams"; });
+      if (streams != values.end()) {
+        auto kept = streams->second.as_array();
+        std::erase_if(kept, [](const CanonicalValue &stream) {
+          const auto *id = stream.find_object_member("stream_id");
+          return id != nullptr && id->as_string() == "gripper_feedback";
+        });
+        streams->second = CanonicalValue(std::move(kept));
       }
       configuration->second = CanonicalValue(std::move(values));
       unit = CanonicalValue(std::move(fields));
@@ -1083,10 +1042,9 @@ TEST(ResolvedStopBasePlanResolverTest, NoOutputGripperSealsOnlyItsExactLocalOwne
               std::optional(core::GripperActuationKind::kPneumatic));
     ASSERT_EQ(plan.escalation_stages.size(), 1U);
     EXPECT_EQ(plan.escalation_stages.front().stage_kind, core::StopEscalationStageKind::kNominal);
-    MemoryPlanRepository repository;
-    const auto readiness = store_and_verify_runtime_participant_stop_readiness(
+    const auto readiness = seal_runtime_participant_stop_readiness(
         *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-        runtime.binding, repository);
+        runtime.binding);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   }
 }

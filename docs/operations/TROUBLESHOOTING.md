@@ -18,6 +18,7 @@ API, `http://127.0.0.1:9020`.
 | Alarm remains after Isaac/provider returns | Condition returned but its activation still requires acknowledgement | Inspect `lifecycle_state` in `GET /api/execution/alarms`; acknowledge the returned activation |
 | Retry/Resume/Reset only works on the second press | Stale recovery offer or a lifecycle command still pending; this is not expected UX | Save cycle status, alarm snapshot, and execution history; see [§Alarm and recovery behavior](#alarm-and-recovery-behavior) |
 | Motion refused with `validation_collision` | Stale pose source, scene drift, or genuine collision | See [§Collision rejection](#collision-rejection) below |
+| Motion stopped with **Robot position feedback lost** (`runtime_monitor_observation_lost`) | The robot's measured joint states stopped arriving or became too old during motion, typically because the robot controller faulted or its connection dropped; nothing was detected in contact | Inspect the operation alarm in Runtime and its History entry; check the robot component status and controller connection before using Recover as offered |
 | AI tab disabled or chat request fails | No `ai_model` component / assistant profile, model server down, token variable unset | See [§AI assistant](#ai-assistant) below |
 | Isaac lane never becomes ready | Isaac not playing, controller not active, DDS isolation | See [§Isaac controller discovery failing](#isaac-controller-discovery-failing) below |
 | Composer scene mesh shows `missing` / `parse_failed` / `outside_allowed_roots` | Path resolution mismatch / malformed OBJ / allowlist | See [`ISAAC_SCENE_AUTHORING.md`](ISAAC_SCENE_AUTHORING.md) §Troubleshooting table |
@@ -58,7 +59,14 @@ so a separate later Run/Resume press is required to plan and move.
 **Symptom**: a motion is refused with the typed code `validation_collision`.
 The same code also covers cancellation or an inconclusive fail-closed query;
 use the message and `details` to distinguish them. Collision details include
-the colliding pair and body ids when available.
+the colliding pair and body ids when available. `details.classification:
+clearance` means the trajectory passes closer than the move's collision
+clearance (`collision_clearance_m`) to that pair without touching it
+(`signed_clearance_m`); the planner retries a detour first. A goal (or start)
+inside the clearance is refused by the planner (`planning_failed`,
+`native_goal_state_collision`, `classification: clearance`). For deliberate
+close work, set a smaller `clearance_m` on that motion node or in Robot
+Control's Advanced settings, or lower the Deployment `collision_clearance_m`.
 
 **Where to look**:
 

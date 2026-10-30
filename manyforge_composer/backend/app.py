@@ -13,10 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
-from fastapi.exception_handlers import (
-    http_exception_handler,
-    request_validation_exception_handler,
-)
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,6 +25,7 @@ from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
 )
+from manyforge_headless_api.request_validation import request_validation_detail
 
 from .composer_settings import ComposerSettingsStore
 from .log_throttle import ThrottledLog
@@ -232,6 +230,41 @@ class ComposerRequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
+async def _typed_http_exception_handler(
+    request: Request, error: StarletteHTTPException
+) -> Response:
+    """Render one HTTP refusal; Composer's own typed refusals name Composer.
+
+    A refusal forwarded from the headless API keeps the producer it carries.
+    """
+
+    detail = error.detail
+    if isinstance(detail, dict) and "code" in detail and "producer" not in detail:
+        error = StarletteHTTPException(
+            status_code=error.status_code,
+            detail={**detail, "producer": "composer"},
+            headers=error.headers,
+        )
+    return await http_exception_handler(request, error)
+
+
+async def _request_validation_response(
+    request: Request, error: RequestValidationError
+) -> Response:
+    """The one request-validation refusal shape (see the headless API)."""
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": request_validation_detail(
+                error.errors(),
+                producer="composer",
+                request_id=getattr(request.state, "request_id", None),
+            )
+        },
+    )
+
+
 def create_app(
     state: ComposerState,
     static_dir: str | None = None,
@@ -305,6 +338,8 @@ def create_app(
         title="ManyForge Composer (replaceable client)",
         lifespan=lifespan,
     )
+    app.add_exception_handler(StarletteHTTPException, _typed_http_exception_handler)
+    app.add_exception_handler(RequestValidationError, _request_validation_response)
     app.add_middleware(
         ComposerRequestBodyLimitMiddleware,
         maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
@@ -377,7 +412,7 @@ def create_app(
         try:
             response: Response = await call_next(request)
         except (HTTPException, StarletteHTTPException) as exc:
-            response = await http_exception_handler(request, exc)
+            response = await _typed_http_exception_handler(request, exc)
         except Exception:
             logger.exception(
                 "Unhandled exception for %s %s",
@@ -392,7 +427,13 @@ def create_app(
             response = JSONResponse(
                 status_code=500,
                 content={
-                    "detail": "Internal Server Error",
+                    "detail": {
+                        "code": "composer_internal_failure",
+                        "message": "Internal Server Error",
+                        "details": {},
+                        "producer": "composer",
+                        "request_id": request_id,
+                    },
                     "request_id": request_id,
                 },
             )
@@ -669,7 +710,7 @@ def create_app(
                 ):
                     response.headers["Connection"] = "close"
                 return response
-            return await request_validation_exception_handler(request, error)
+            return await _request_validation_response(request, error)
 
         @app.websocket("/ws/control")
         async def headless_state_websocket(websocket: WebSocket) -> None:

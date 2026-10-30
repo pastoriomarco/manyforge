@@ -1,0 +1,379 @@
+{
+  "description": "The Real xArm-family arm's lifecycle plans for the provider manyforge.provider.ros2_control.xarm, as data the deployment generator reads (V-A A7). They mirror manyforge_xarm_control::make_xarm_ros2_control_lifecycle_plans (src/lifecycle_profile.cpp); the test MaintainedRealProviderManifestAnchorsTheseRos2ControlPlans checks that the generated manifest carries the C++ plans' semantic digest. Prepare clears a vendor error left on the unarmed robot (m5.5), arms through the hardware activation (D1), absorbs the plugin's reactivate-all, switches the joint state broadcaster back on when that reactivation left it off, and marks the arm prepared; Enable activates the trajectory controller; Disable switches off the controller, then the hardware (D4 option B); Recover clears the vendor error first (M6 XADAPT), then switches both off and clears the warning (D10).",
+  "plans": [
+    {
+      "intent": "prepare",
+      "requested_postcondition": {
+        "allowed_states": ["prepared"],
+        "fact_predicates": [
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.measured_joints_valid"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+        ]
+      },
+      "requested_state": "prepared",
+      "timeout_duration_ns": 10000000000,
+      "transitions": [
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "device.clear_error",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_spawned"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.hardware.activate",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.deactivate",
+          "postcondition_predicate": {
+            "allowed_states": ["disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.broadcaster.activate",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.measured_joints_valid"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.measured_joints_valid"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.prepare",
+          "postcondition_predicate": {
+            "allowed_states": ["prepared"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.measured_joints_valid"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "intent": "enable",
+      "requested_postcondition": {
+        "allowed_states": ["active"],
+        "fact_predicates": [
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+          {
+            "expected_value": {"boolean_value": true, "kind": "boolean"},
+            "lifecycle_fact_id": "external.controller_configuration_ready"
+          },
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+        ]
+      },
+      "requested_state": "active",
+      "timeout_duration_ns": 10000000000,
+      "transitions": [
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["prepared"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.broadcaster_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {
+                "expected_value": {"boolean_value": false, "kind": "boolean"},
+                "lifecycle_fact_id": "external.controller_configuration_ready"
+              },
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.measured_joints_valid"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.activate",
+          "postcondition_predicate": {
+            "allowed_states": ["active"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.accepts_commands"},
+              {
+                "expected_value": {"boolean_value": true, "kind": "boolean"},
+                "lifecycle_fact_id": "external.controller_configuration_ready"
+              },
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_loaded"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "intent": "disable",
+      "requested_postcondition": {
+        "allowed_states": ["disabled"],
+        "fact_predicates": [
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+          {
+            "expected_value": {"boolean_value": false, "kind": "boolean"},
+            "lifecycle_fact_id": "external.controller_configuration_ready"
+          },
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+        ]
+      },
+      "requested_state": "disabled",
+      "timeout_duration_ns": 10000000000,
+      "transitions": [
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["prepared", "active", "degraded"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.deactivate",
+          "postcondition_predicate": {
+            "allowed_states": ["disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.hardware.deactivate",
+          "postcondition_predicate": {
+            "allowed_states": ["disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {
+                "expected_value": {"boolean_value": false, "kind": "boolean"},
+                "lifecycle_fact_id": "external.controller_configuration_ready"
+              },
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "intent": "recover",
+      "recover_target_eligibility": {
+        "allowed_states": ["degraded", "faulted"],
+        "fact_predicates": [
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+        ]
+      },
+      "requested_postcondition": {
+        "allowed_states": ["declared", "disabled"],
+        "fact_predicates": [
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.warning_present"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+          {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+          {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+        ]
+      },
+      "requested_state": "disabled",
+      "timeout_duration_ns": 10000000000,
+      "transitions": [
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "faulted", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "device.clear_error",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "faulted", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.deactivate",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "faulted", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.hardware.deactivate",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "faulted", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "device.warning_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "xarm.clear_warning",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.warning_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        },
+        {
+          "eligibility_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "faulted", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "device.error_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.controller_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.hardware_active"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          },
+          "lifecycle_primitive_id": "ros2_control.controller.recover",
+          "postcondition_predicate": {
+            "allowed_states": ["declared", "prepared", "active", "degraded", "disabled"],
+            "fact_predicates": [
+              {"expected_value": {"boolean_value": false, "kind": "boolean"}, "lifecycle_fact_id": "external.fault_present"},
+              {"expected_value": {"boolean_value": true, "kind": "boolean"}, "lifecycle_fact_id": "external.transport_ready"}
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,425 @@
+import { describe, expect, it } from 'vitest';
+
+import type { JsonValue, ManagerDeploymentCandidatePreviewResponse, SourceModelTarget } from '../types/api';
+import type { ComponentCatalogEntry } from '../types/componentCatalog';
+import {
+  addComponentProblem,
+  componentFrameTargets,
+  componentManagerRows,
+  componentSignals,
+  draftGripperFrames,
+  rolesOfComponent,
+  framePrefixFor,
+  mountCandidates,
+  nextFreeComponentId,
+  previewChanges,
+  renameComponentRows,
+  resolvedRobotTcp,
+  roleFeedback,
+  rolesFittingEntry,
+  toolMountRow,
+  withMountRobot,
+} from './componentManager';
+
+const robot = {
+  component_id: 'lite6_robot',
+  component_profile_id: 'lite6_mock_commanded_v0',
+  configuration: {
+    runtime_kind: 'ros2_control',
+    runtime_configuration: {
+      component_streams: [{ controllable_component_id: 'lite6_robot', stream_id: 'measured_joints' }],
+      gripper_target_configurations: [{
+        controllable_component_id: 'lite6_robot',
+        pneumatic_io: { outputs: [{ signal: { controllable_component_id: 'gripper_io', signal_name: 'valve' } }] },
+      }],
+    },
+  },
+};
+
+const device = {
+  component_id: 'gripper_io',
+  component_profile_id: 'io_device_v0',
+  target_settings: {},
+  configuration: {
+    runtime_kind: 'io_provider',
+    runtime_configuration: {
+      io_provider_devices: [{ controllable_component_id: 'gripper_io' }],
+      io_signals: [{ controllable_component_id: 'gripper_io', signal_name: 'valve', source_id: 'gripper_io.valve' }],
+    },
+  },
+};
+
+function document(...components: JsonValue[]): Record<string, JsonValue> {
+  return { api_version: 'manyforge.deployment_intent.v2', components, attachments: [], policies: {} };
+}
+
+const entry: ComponentCatalogEntry = {
+  entryId: 'lite6_pneumatic_mock.scenario/lite6_robot',
+  kind: 'robot',
+  componentId: 'lite6_robot',
+  componentProfileId: 'lite6_mock_commanded_v0',
+  modelFamilyId: 'lite6_lite_gripper',
+  tags: ['articulated-arm', 'gripper'],
+  lane: 'manyforge-only',
+  description: null,
+  sources: ['examples/lite6_pneumatic_mock.scenario'],
+  components: [device, robot],
+};
+
+const roles = {
+  robot: { required_component_type_tags: ['articulated-arm'] },
+  tool: { required_component_type_tags: ['gripper'] },
+  camera: { required_component_type_tags: ['camera'] },
+};
+
+describe('Component Manager rows', () => {
+  it('classifies Draft components against Manager Applied', () => {
+    const rows = componentManagerRows(document(robot, device), ['lite6_robot', 'old_robot']);
+    expect(rows.map((row) => [row.componentId, row.kind, row.change])).toEqual([
+      ['gripper_io', 'io_device', 'added'],
+      ['lite6_robot', 'robot', 'applied'],
+      ['old_robot', null, 'removed'],
+    ]);
+    // A compiled (non-Scenario) Draft lists the Applied components unchanged.
+    expect(componentManagerRows({ api_version: 'manyforge.deployment.v1' }, ['b', 'a'])
+      .map((row) => [row.componentId, row.change])).toEqual([['a', 'applied'], ['b', 'applied']]);
+    // Nothing applied yet: every Draft component is to be added.
+    expect(componentManagerRows(document(robot), null).map((row) => row.change)).toEqual(['added']);
+  });
+});
+
+describe('Tools mounted on a robot flange', () => {
+  const hand = {
+    component_id: 'lite_gripper',
+    component_profile_id: 'lite_gripper_v0',
+    configuration: { runtime_kind: 'ros2_control', runtime_configuration: {} },
+  };
+  const profiles = {
+    lite6_mock_commanded_v0: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
+    lite_gripper_v0: { tags: ['gripper', 'tool'], attachmentInterfaces: [], tcpTargets: [] },
+  };
+  const mounted = (...components: JsonValue[]) => ({
+    ...document(...components), attachments: [toolMountRow('lite6_robot', 'lite_gripper')],
+  });
+
+  it('lists a tool with its mount', () => {
+    const rows = componentManagerRows(mounted(robot, hand), null, profiles);
+    expect(rows.map((row) => [row.componentId, row.kind, row.mount])).toEqual([
+      ['lite_gripper', 'tool', 'lite6_robot.flange'],
+      ['lite6_robot', 'robot', null],
+    ]);
+    // Not mounted yet: the component type's `tool` tag still names the kind.
+    expect(componentManagerRows(document(hand), null, profiles)[0].kind).toBe('tool');
+    // Without type facts an unmounted model row reads as a robot.
+    expect(componentManagerRows(document(hand), null)[0].kind).toBe('robot');
+  });
+
+  it('offers robots with a free flange as mounts, one tool per flange', () => {
+    expect(mountCandidates(document(robot, hand), profiles)).toEqual(['lite6_robot']);
+    expect(mountCandidates(mounted(robot, hand), profiles)).toEqual([]);
+    // A profile without type facts or without a flange is never offered.
+    expect(mountCandidates(document(robot), {})).toEqual([]);
+    expect(mountCandidates(document(hand, device), profiles)).toEqual([]);
+  });
+
+  it('writes the flange-to-mount attachment row', () => {
+    expect(toolMountRow('lite6_robot', 'lite_gripper')).toEqual({
+      parent: { component_id: 'lite6_robot', interface: 'flange' },
+      child: { component_id: 'lite_gripper', interface: 'mount' },
+    });
+  });
+
+  it('resolves the robot tcp: mounted tool, else own tcp, else flange (D1)', () => {
+    const frames = (tcp: string | null) => [
+      { frame_role_id: 'base', source_link_name: 'link_base' },
+      { frame_role_id: 'flange', source_link_name: 'link_eef' },
+      ...(tcp === null ? [] : [{ frame_role_id: 'tcp', source_link_name: tcp }]),
+    ];
+    expect(resolvedRobotTcp(mounted(robot, hand), 'lite6_robot', frames('link_tcp'))).toBe('lite_gripper default TCP');
+    expect(resolvedRobotTcp(mounted(robot, hand), 'lite6_robot', null)).toBe('lite_gripper default TCP');
+    expect(resolvedRobotTcp(document(robot), 'lite6_robot', frames('link_tcp'))).toBe('robot TCP (link_tcp)');
+    expect(resolvedRobotTcp(document(robot), 'lite6_robot', frames('link_eef'))).toBe('flange (link_eef)');
+    expect(resolvedRobotTcp(document(robot), 'lite6_robot', frames(null))).toBe('flange');
+    // Not a robot motion target (no base frame), or nothing Applied: no annotation.
+    expect(resolvedRobotTcp(document(robot), 'lite6_robot', [{ frame_role_id: 'tcp', source_link_name: 'link_tcp' }]))
+      .toBeNull();
+    expect(resolvedRobotTcp(document(robot), 'lite6_robot', null)).toBeNull();
+  });
+});
+
+describe('Add component rows', () => {
+  it('renames a component everywhere it is named, including source ids', () => {
+    const [renamedDevice, renamedRobot] = renameComponentRows([device, robot], {
+      gripper_io: 'gripper_io_2', lite6_robot: 'lite6_b',
+    });
+    expect(renamedDevice.component_id).toBe('gripper_io_2');
+    expect(JSON.stringify(renamedDevice)).not.toContain('"gripper_io"');
+    expect(JSON.stringify(renamedDevice)).toContain('"gripper_io_2.valve"');
+    expect(renamedRobot.component_id).toBe('lite6_b');
+    expect(JSON.stringify(renamedRobot)).not.toContain('lite6_robot');
+    // The robot's gripper still names the renamed device.
+    expect(JSON.stringify(renamedRobot)).toContain('"controllable_component_id":"gripper_io_2"');
+    // Other strings (profiles, signal names) are untouched.
+    expect(renamedRobot.component_profile_id).toBe('lite6_mock_commanded_v0');
+  });
+
+  it('points every robot_component_id of added rows at the mount robot', () => {
+    const valve: Record<string, JsonValue> = {
+      component_id: 'valve_io',
+      configuration: {
+        runtime_configuration: {
+          io_signals: [
+            { signal_name: 'valve', provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot' } },
+            { signal_name: 'contact', provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot',
+              target_scene_resource_id: 'workpiece' } },
+          ],
+        },
+      },
+    };
+    const [bound] = withMountRobot([valve], 'lite6_robot_2');
+    expect(JSON.stringify(bound)).toContain('"robot_component_id":"lite6_robot_2"');
+    expect(JSON.stringify(bound)).not.toContain('"lite6_robot"');
+    expect(bound.configuration).toMatchObject({ runtime_configuration: { io_signals: [
+      {}, { provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot_2' } },
+    ] } });
+    // Rows without one are unchanged.
+    expect(withMountRobot([device], 'lite6_robot_2')).toEqual([device]);
+  });
+
+  it('chooses free ids and frame prefixes', () => {
+    expect(nextFreeComponentId('lite6_robot', new Set(['lite6_robot', 'lite6_robot_2']))).toBe('lite6_robot_3');
+    expect(nextFreeComponentId('ur5_robot', new Set(['lite6_robot']))).toBe('ur5_robot');
+    expect(framePrefixFor('lite6.robot-b')).toBe('lite6_robot_b/');
+  });
+
+  it('refuses existing, repeated and malformed ids', () => {
+    const draft = document(robot);
+    expect(addComponentProblem([device], draft)).toBeNull();
+    expect(addComponentProblem([robot], draft)).toContain('already has a component "lite6_robot"');
+    expect(addComponentProblem([device, device], draft)).toContain('Two added components');
+    expect(addComponentProblem([{ ...device, component_id: 'Gripper' }], draft)).toContain('lowercase');
+  });
+});
+
+describe('Program role feedback', () => {
+  const profiles = { [entry.componentProfileId]: { tags: entry.tags, attachmentInterfaces: ['flange'], tcpTargets: [] } };
+  const assignment = {
+    component_roles: [
+      { component_role_id: 'robot', controllable_component_id: 'lite6_robot' },
+      { component_role_id: 'tool', controllable_component_id: 'missing_tool' },
+      { component_role_id: 'camera', controllable_component_id: 'lite6_robot' },
+    ],
+  };
+
+  it('reports satisfied, unbound and incompatible roles', () => {
+    const rows = componentManagerRows(document(robot), ['lite6_robot']);
+    const feedback = roleFeedback({ ...roles, extra: {} }, assignment, rows, profiles);
+    expect(feedback.map((role) => [role.roleId, role.status])).toEqual([
+      ['robot', 'satisfied'],
+      ['tool', 'unbound'],
+      ['camera', 'incompatible'],
+      ['extra', 'unbound'],
+    ]);
+    expect(feedback[1].detail).toContain('"missing_tool" is not in the Deployment Draft');
+    expect(feedback[2].detail).toContain('camera');
+    expect(feedback[3].detail).toContain('assigns no component');
+  });
+
+  it('marks a role bound only by a Draft-added component as pending Apply', () => {
+    const rows = componentManagerRows(document(robot), null);
+    const [robotRole] = roleFeedback({ robot: roles.robot }, assignment, rows, profiles);
+    expect(robotRole.status).toBe('satisfied');
+    expect(robotRole.pendingApply).toBe(true);
+  });
+
+  it('reports unknown, never satisfied, for a profile without known type tags', () => {
+    const rows = componentManagerRows(document(robot), ['lite6_robot']);
+    const [camera] = roleFeedback({ camera: roles.camera }, assignment, rows, {});
+    expect(camera.status).toBe('unknown');
+    expect(camera.detail).toContain('not known');
+    // A role without required tags needs no type facts.
+    const [plain] = roleFeedback({ robot: {} }, assignment, rows, {});
+    expect(plain.status).toBe('satisfied');
+  });
+
+  it('reads tags from componentProfiles for a profile that has no catalog entry', () => {
+    const uf850 = { ...robot, component_id: 'uf850_robot', component_profile_id: 'uf850_xarm_gripper_mock_commanded_v0' };
+    const rows = componentManagerRows(document(uf850), ['uf850_robot']);
+    const bound = { component_roles: [{ component_role_id: 'tool', controllable_component_id: 'uf850_robot' }] };
+    expect(roleFeedback({ tool: roles.tool }, bound, rows, {})[0].status).toBe('unknown');
+    const known = { uf850_xarm_gripper_mock_commanded_v0: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] } };
+    expect(roleFeedback({ tool: roles.tool }, bound, rows, known)[0].status).toBe('incompatible');
+    const withGripper = { uf850_xarm_gripper_mock_commanded_v0: { tags: ['articulated-arm', 'gripper'], attachmentInterfaces: ['flange'], tcpTargets: [] } };
+    expect(roleFeedback({ tool: roles.tool }, bound, rows, withGripper)[0].status).toBe('satisfied');
+  });
+
+  it('offers an entry for the open roles whose required tags it has', () => {
+    const rows = componentManagerRows(document(), null);
+    const feedback = roleFeedback(roles, assignment, rows, profiles);
+    expect(rolesFittingEntry(entry, feedback).map((role) => role.roleId)).toEqual(['robot', 'tool']);
+  });
+});
+
+describe('Manager preview changes', () => {
+  it('keeps changed components and non-empty record diffs', () => {
+    const preview = {
+      converged: false,
+      diff: {
+        model_instances: { added: ['lite6_b.model'], changed: [], removed: [] },
+        control_domains: { added: [], changed: [], removed: [] },
+      },
+      impact: {
+        destructive: false,
+        components: [
+          { controllable_component_id: 'lite6_robot', disposition: 'retain', replacement_reasons: [] },
+          { controllable_component_id: 'lite6_b', disposition: 'add', replacement_reasons: [] },
+        ],
+      },
+    } as unknown as ManagerDeploymentCandidatePreviewResponse;
+    const changes = previewChanges(preview);
+    expect(changes.components.map((row) => row.controllable_component_id)).toEqual(['lite6_b']);
+    expect(changes.records).toEqual([
+      { recordKind: 'model_instances', added: ['lite6_b.model'], changed: [], removed: [] },
+    ]);
+  });
+});
+
+describe('Component page facts', () => {
+  const mockInput = (component: string, signal: string): Record<string, JsonValue> => ({
+    controllable_component_id: component, command_target_id: 'io', resource_role_id: signal,
+    signal_name: signal, source_id: `${component}_source`, value_type: 'bool', direction: 'input',
+    update_mode: 'change_only', transition_capability: 'sampled_only',
+    freshness: { mode: 'provider_validity' }, provider: { profile: 'mock' },
+  });
+  const output = (component: string, signal: string, provider: Record<string, JsonValue>): Record<string, JsonValue> => ({
+    controllable_component_id: component, command_target_id: 'io', resource_role_id: signal,
+    signal_name: signal, source_id: `${component}_source`, value_type: 'bool', direction: 'output', provider,
+  });
+  const ioDevice = (id: string, signals: JsonValue[]): Record<string, JsonValue> => ({
+    component_id: id, component_profile_id: 'io_device_v0',
+    configuration: { runtime_kind: 'io_provider', runtime_configuration: { io_signals: signals } },
+  });
+  const cell = {
+    api_version: 'manyforge.deployment_intent.v2',
+    components: [
+      { component_id: 'lite6_robot', component_profile_id: 'lite6_mock_commanded_v0',
+        configuration: { runtime_kind: 'ros2_control', runtime_configuration: {} } },
+      { component_id: 'lite_gripper', component_profile_id: 'lite_gripper_v0',
+        configuration: { runtime_kind: 'ros2_control', runtime_configuration: {
+          gripper_target_configurations: [{
+            controllable_component_id: 'lite_gripper', command_target_id: 'gripper',
+            tcp_frame: 'tcp', attach_frame: 'attach', mount_frame: 'mount',
+            pneumatic_io: {
+              outputs: [{ signal: { controllable_component_id: 'gripper_io', signal_name: 'valve' },
+                open_value: true, close_value: false }],
+              inputs: { open: { signal: { controllable_component_id: 'gripper_io', signal_name: 'open_sensor' } } },
+            },
+          }],
+        } } },
+      ioDevice('gripper_io', [
+        mockInput('gripper_io', 'open_sensor'),
+        output('gripper_io', 'valve', { profile: 'mock_output', channel: 'valve' }),
+      ]),
+      ioDevice('arm_io', [output('arm_io', 'tool_do2', {
+        profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 2,
+      })]),
+      ioDevice('contact_io', [{
+        ...mockInput('contact_io', 'touching'), update_mode: 'sampled',
+        freshness: { mode: 'sample_age', maximum_age_ns: 100_000_000 },
+        provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot',
+          target_scene_resource_id: 'box' },
+      }]),
+    ],
+    attachments: [toolMountRow('lite6_robot', 'lite_gripper')],
+  } as Record<string, JsonValue>;
+
+  it('lists the signals an I/O device declares and the gripper that uses them', () => {
+    const signals = componentSignals(cell, 'gripper_io');
+    expect(signals.owned.map((row) => [row.signalName, row.direction, row.detail])).toEqual([
+      ['open_sensor', 'input', 'Mock input'],
+      ['valve', 'output', 'Mock output'],
+    ]);
+    expect(signals.uses).toEqual([]);
+    expect(signals.usedBy.map((row) => `${row.componentId}.${row.signalName}: ${row.detail}`)).toEqual([
+      'gripper_io.open_sensor: Open input of lite_gripper',
+      'gripper_io.valve: valve output of lite_gripper',
+    ]);
+  });
+
+  it('lists the signals a gripper uses without assigning robot contact to its frame', () => {
+    const signals = componentSignals(cell, 'lite_gripper');
+    expect(signals.owned).toEqual([]);
+    expect(signals.uses.map((row) => `${row.componentId}.${row.signalName} (${row.direction}): ${row.detail}`)).toEqual([
+      'gripper_io.open_sensor (input): Open input of gripper',
+      'gripper_io.valve (output): valve output of gripper',
+    ]);
+    expect(signals.usedBy).toEqual([]);
+  });
+
+  it('lists geometric contact under the selected robot whose Active TCP it follows', () => {
+    const signals = componentSignals(cell, 'lite6_robot');
+    // The same robot also hosts arm_io's xArm pin (next test).
+    expect(signals.usedBy.filter((row) => row.componentId === 'contact_io')).toEqual([{
+      componentId: 'contact_io', signalName: 'touching', direction: 'input',
+      detail: 'Active TCP contact with box',
+    }]);
+  });
+
+  it('lists an xArm pin hosted on a robot under the robot', () => {
+    const signals = componentSignals(cell, 'lite6_robot');
+    expect(signals.owned).toEqual([]);
+    // The same robot's Active TCP also feeds contact_io (previous test).
+    expect(signals.usedBy.filter((row) => row.componentId === 'arm_io')).toEqual([{
+      componentId: 'arm_io', signalName: 'tool_do2', direction: 'output',
+      detail: 'tool digital pin 2 on this robot',
+    }]);
+  });
+
+  it('reads a gripper\'s authored frames from the nested runtime configuration', () => {
+    expect(draftGripperFrames(cell, 'lite_gripper')).toEqual([
+      { targetId: 'gripper', tcpFrame: 'tcp', attachFrame: 'attach', mountFrame: 'mount' },
+    ]);
+    expect(draftGripperFrames(cell, 'lite6_robot')).toEqual([]);
+  });
+
+  it('lists the Applied frames of each target with the tcp it resolves to', () => {
+    const target = (componentId: string, targetId: string, frames: Array<[string, string | null]>) => ({
+      component_id: componentId, target_id: targetId, collision_bodies: [], model_groups: [],
+      frames: frames.map(([role, link]) => ({
+        frame_kind: 'component_model_frame', frame_role_id: role, model_instance_id: 'm', source_link_name: link,
+      })),
+    }) as SourceModelTarget;
+    const targets = [
+      target('lite6_robot', 'arm', [['base', 'link_base'], ['tcp', 'link_eef'], ['flange', 'link_eef']]),
+      target('other', 'arm', [['base', 'b']]),
+    ];
+    // The mounted tool's default TCP is the robot's tcp (D1).
+    expect(componentFrameTargets(targets, cell, 'lite6_robot')).toEqual([{
+      targetId: 'arm',
+      frames: [
+        { frameRoleId: 'base', sourceLinkName: 'link_base' },
+        { frameRoleId: 'tcp', sourceLinkName: 'link_eef' },
+        { frameRoleId: 'flange', sourceLinkName: 'link_eef' },
+      ],
+      resolvedTcp: 'lite_gripper default TCP',
+    }]);
+    // Without the tool: the flange, named by its link.
+    const bare = { ...cell, attachments: [] } as Record<string, JsonValue>;
+    expect(componentFrameTargets(targets, bare, 'lite6_robot')[0].resolvedTcp).toBe('flange (link_eef)');
+    expect(componentFrameTargets(null, cell, 'lite6_robot')).toEqual([]);
+  });
+
+  it('names the Program roles assigned to a component', () => {
+    const feedback = roleFeedback(
+      { arm: {}, gripper: {} },
+      { component_roles: [
+        { component_role_id: 'arm', controllable_component_id: 'lite6_robot' },
+        { component_role_id: 'gripper', controllable_component_id: 'lite_gripper' },
+      ] },
+      componentManagerRows(cell, ['lite6_robot']),
+      {},
+    );
+    expect(rolesOfComponent(feedback, 'lite6_robot').map((role) => role.roleId)).toEqual(['arm']);
+    expect(rolesOfComponent(feedback, 'gripper_io')).toEqual([]);
+  });
+});

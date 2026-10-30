@@ -4,6 +4,7 @@
 #include "cell_admission_command_codec.hpp"
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_roboplan/controller_launch_process.hpp>
 #endif
@@ -28,15 +29,34 @@ namespace manyforge::roboplan_backend::host_detail {
   });
 }
 
+[[nodiscard]] CanonicalValue ErrorValue(const core::ErrorDTO &error,
+                                        const std::string_view producer) {
+  auto value = ErrorValue(error);
+  auto object = value.as_object();
+  object.emplace_back("producer", CanonicalValue(std::string(producer)));
+  return CanonicalValue(std::move(object));
+}
+
 [[nodiscard]] CanonicalValue
 ErrorResponse(std::string code, std::string message,
               std::map<std::string, std::string> details) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"error", ErrorValue(core::ErrorDTO{std::move(code), std::move(message),
-                                          std::move(details)})},
+                                          std::move(details)}, "kernel")},
       {"ok", CanonicalValue(false)},
   });
+}
+
+[[nodiscard]] core::ErrorDTO ExecutionCommandExceptionError(
+    const std::exception &error) {
+  core::ErrorDTO result{"execution_command_invalid", error.what(), {}};
+  if (dynamic_cast<const core::TypedError *>(&error) != nullptr) {
+    const auto cause = core::CauseOf(error, result.code, "kernel");
+    result.details.emplace("cause_code", cause.error.code);
+    result.details.emplace("cause_producer", cause.producer);
+  }
+  return result;
 }
 
 [[nodiscard]] CanonicalValue ExecutionOwnerNotReadyIdentityResponse(
@@ -51,7 +71,7 @@ ErrorResponse(std::string code, std::string message,
        ErrorValue(core::ErrorDTO{
            "execution_owner_not_ready",
            "the managed execution owner has no active physical product",
-           {{"owner_epoch", owner_epoch.value()}}})},
+           {{"owner_epoch", owner_epoch.value()}}}, "kernel")},
       {"ok", CanonicalValue(false)},
   });
 }
@@ -970,10 +990,13 @@ CanonicalValue GlobalRuleStateValue(const core::IoRuleStateContextDTO &context,
         {"source_sequence", CanonicalValue(std::to_string(a.source_sequence))},
         {"source_cursor", IoSourceCursorValue(a.source_cursor)}});
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object fields{
       {"rule_id", CanonicalValue(row.rule_id.value())},
       {"state", CanonicalValue(std::string(core::io_global_rule_state_token(row.state)))},
-      {"triggering_acquisition", std::move(acquisition)}});
+      {"triggering_acquisition", std::move(acquisition)}};
+  if (row.unavailable_reason)
+    fields.emplace_back("unavailable_reason", ErrorValue(*row.unavailable_reason));
+  return CanonicalValue(std::move(fields));
 }
 } // namespace
 
@@ -2686,6 +2709,7 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
   };
   const auto rule_fields = [](const auto &rules, bool waiting_only) {
     CanonicalValue::Array ids;
+    CanonicalValue::Array notify_ids;
     CanonicalValue::Array waiting;
     std::optional<core::InterruptPolicyId> previous;
     for (const auto &rule : rules) {
@@ -2694,6 +2718,7 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
                   (!previous || *previous < rule.policy_id),
               "rule catalog IDs are not canonical");
       ids.emplace_back(rule.policy_id.value());
+      if (rule.notify_on_trip) notify_ids.emplace_back(rule.policy_id.value());
       previous = rule.policy_id;
       Require(!waiting_only ||
                   (!rule.waiting_for_program_keys.empty() &&
@@ -2719,6 +2744,8 @@ CanonicalValue::Object InterruptRuleEventMetadataFields(
         {"rule_ids", CanonicalValue(std::move(ids))}};
     if (!waiting.empty())
       fields.emplace_back("waiting_for_program", CanonicalValue(std::move(waiting)));
+    if (!notify_ids.empty())
+      fields.emplace_back("notify_rule_ids", CanonicalValue(std::move(notify_ids)));
     return fields;
   };
   if (actual->waiting_for_program) {

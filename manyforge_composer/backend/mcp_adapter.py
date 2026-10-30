@@ -97,8 +97,10 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
     "manyforge_files": {"browse": ("GET", "/api/files/browse")},
     "manyforge_deployment": {
         "workspace": ("GET", "/api/deployment/workspace"),
+        "component_catalog": ("GET", "/api/deployment/component-catalog"),
         "open_draft": ("POST", "/api/deployment/open-draft"),
         "mutate": ("POST", "/api/deployment/draft/mutations"),
+        "add_components": ("POST", "/api/deployment/draft/components"),
         "stop_policy": ("POST", "/api/deployment/draft/controlled-stop"),
         "motion_limit": ("POST", "/api/deployment/draft/motion-target-limit"),
         "preview": ("POST", "/api/deployment/draft/preview"),

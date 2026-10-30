@@ -1,5 +1,5 @@
 import type {
-  CanonicalEmptySelection, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
+  CanonicalEmptySelection, ForceCloseResult, ForceCloseStep, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
   LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult,
   LifecycleTargetRetirementRow, LifecycleTargetRetirementScope,
 } from '../types/scenarioClose';
@@ -103,4 +103,31 @@ export function parseCanonicalEmptySelection(value: unknown): CanonicalEmptySele
   return { request_owner_epoch: identity(row.request_owner_epoch), cell_id: identity(row.cell_id), deployment_artifact_id: identity(row.deployment_artifact_id),
     deployment_revision: digest(row.deployment_revision), candidate_retained_bundle_id: digest(row.candidate_retained_bundle_id),
     candidate_graph_revision: digest(row.candidate_graph_revision), admission_digest: digest(row.admission_digest) };
+}
+/** Item 37: the reply of one Force close step (`ok: true` only; refusals throw). */
+export function parseForceCloseResult(value: unknown, step: ForceCloseStep): ForceCloseResult {
+  const record = (raw: unknown): Record<string, unknown> => {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Force close reply is invalid.');
+    return raw as Record<string, unknown>;
+  };
+  const response = record(value);
+  const result = record(response.result);
+  // Night change 8: the `stop` step's reply is the Kernel's `arm` confirmation.
+  if (response.ok !== true || response.command !== 'force_close' || result.step !== (step === 'stop' ? 'arm' : step)
+    || !Array.isArray(result.operations)) throw new Error('Force close reply does not match its step.');
+  if (step === 'end') return { step, stopGeneration: 0, motionBlockCleared: false, operations: [] };
+  return { step, stopGeneration: generation(result.stop_generation), motionBlockCleared: result.motion_block_cleared === true,
+    operations: result.operations.map((raw) => {
+    const row = record(raw);
+    if (!Array.isArray(row.targets) || typeof row.state !== 'string' || typeof row.containment_uncertain !== 'boolean') {
+      throw new Error('Force close operation row is invalid.');
+    }
+    return { operationId: identity(row.operation_id), operationRevision: generation(row.operation_revision),
+      state: row.state, containmentUncertain: row.containment_uncertain, targets: row.targets.map((target) => {
+        const item = record(target);
+        if (typeof item.output_unknown !== 'boolean') throw new Error('Force close target row is invalid.');
+        return { controllableComponentId: identity(item.controllable_component_id),
+          commandTargetId: identity(item.command_target_id), outputUnknown: item.output_unknown };
+      }) };
+  }) };
 }

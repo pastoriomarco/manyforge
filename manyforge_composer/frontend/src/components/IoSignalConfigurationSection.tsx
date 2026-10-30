@@ -35,11 +35,9 @@ export interface IoSignalRuntimeConfiguration {
   ioProvider?: boolean;
 }
 
-/** One exact retained motion endpoint offered to geometric-contact authoring. */
-export interface GeometricContactEndpointOption {
+/** One motion robot offered to geometric-contact authoring. */
+export interface GeometricContactRobotOption {
   componentId: string;
-  targetId: string;
-  frameRoleId: string;
 }
 
 /**
@@ -52,12 +50,12 @@ export interface GeometricContactEndpointOption {
 export function IoSignalConfigurationSection({
   controller,
   runtimes,
-  geometricContactEndpoints = [],
+  geometricContactRobots = [],
 }: {
   controller: DeploymentWorkspaceController;
   runtimes: IoSignalRuntimeConfiguration[];
-  /** Exact retained motion endpoints used to select geometric-contact references. */
-  geometricContactEndpoints?: readonly GeometricContactEndpointOption[];
+  /** Motion robots used to select a dynamic geometric-contact source. */
+  geometricContactRobots?: readonly GeometricContactRobotOption[];
 }) {
   const [selected, setSelected] = useState(0);
   // Arms are listed only while they still declare rows (to review/remove them).
@@ -109,10 +107,10 @@ export function IoSignalConfigurationSection({
       return;
     }
     if (rows.length === 0 && !declared) return;
-    const result = rows.length === 0
-      ? await controller.mutate(location.path, 'remove')
-      : await controller.mutate(location.path, 'set', ioSignalRowsValue(rows));
-    setError(result === null ? 'The Deployment owner rejected these I/O signals.' : null);
+    setError(null);
+    // A refusal shows once, in the yellow Deployment notice row.
+    if (rows.length === 0) await controller.mutate(location.path, 'remove');
+    else await controller.mutate(location.path, 'set', ioSignalRowsValue(rows));
   };
 
   return (
@@ -161,7 +159,7 @@ export function IoSignalConfigurationSection({
                   draft={row.draft}
                   disabled={disabled}
                   ioProvider={runtime.ioProvider === true}
-                  geometricContactEndpoints={geometricContactEndpoints}
+                  geometricContactRobots={geometricContactRobots}
                   onChange={(patch) => updateRow(index, patch)}
                   onDirection={(direction) => setDirection(index, direction)}
                   onRemove={() => setRows(rows.filter((_row, rowIndex) => rowIndex !== index))}
@@ -312,7 +310,7 @@ export function IoSignalInputFields({
   draft,
   disabled,
   ioProvider = false,
-  geometricContactEndpoints = [],
+  geometricContactRobots = [],
   onChange,
   onDirection,
   onRemove,
@@ -322,8 +320,8 @@ export function IoSignalInputFields({
   disabled: boolean;
   /** An I/O device row: component read-only. */
   ioProvider?: boolean;
-  /** Exact retained motion endpoints used to select geometric-contact references. */
-  geometricContactEndpoints?: readonly GeometricContactEndpointOption[];
+  /** Motion robots used to select a dynamic geometric-contact source. */
+  geometricContactRobots?: readonly GeometricContactRobotOption[];
   onChange: (patch: Partial<IoSignalInputDraft>) => void;
   onDirection: (direction: 'input' | 'output') => void;
   onRemove?: () => void;
@@ -331,11 +329,8 @@ export function IoSignalInputFields({
   const label = draft.signalName.trim() === '' ? `Signal ${index + 1}` : draft.signalName;
   const profiles = Object.keys(IO_SOURCE_PROFILE_LABELS) as IoSourceProfile[];
   const liveness = inputLivenessMode(draft);
-  const endpointOptions = [...geometricContactEndpoints]
-    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-  const endpointValue = JSON.stringify([
-    draft.endpointComponentId, draft.endpointTargetId, draft.endpointFrameRoleId,
-  ]);
+  const robotOptions = [...geometricContactRobots]
+    .sort((left, right) => left.componentId.localeCompare(right.componentId));
   const text = (name: string, field: keyof IoSignalInputDraft, help?: string) => (
     <label className="deployment-focused-field" key={field}>
       <span>{name}</span>
@@ -406,34 +401,23 @@ export function IoSignalInputFields({
         )}
         {draft.profile === 'geometric_contact' && (
           <>
-            {endpointOptions.length > 0 ? (
+            {robotOptions.length > 0 ? (
               <label className="deployment-focused-field">
-                <span>Contact endpoint</span>
-                <select aria-label={`${label} Contact endpoint`} value={endpointValue}
+                <span>Robot</span>
+                <select aria-label={`${label} Robot`} value={draft.robotComponentId}
                   disabled={disabled}
-                  onChange={(event) => {
-                    const [endpointComponentId, endpointTargetId, endpointFrameRoleId] = JSON.parse(event.target.value) as string[];
-                    onChange({ endpointComponentId, endpointTargetId, endpointFrameRoleId });
-                  }}>
-                  <option value={JSON.stringify(['', '', ''])}>Select a motion endpoint</option>
-                  {!endpointOptions.some((option) => JSON.stringify([
-                    option.componentId, option.targetId, option.frameRoleId,
-                  ]) === endpointValue) && draft.endpointFrameRoleId !== ''
-                    && <option value={endpointValue}>{draft.endpointComponentId} / {draft.endpointTargetId} / {draft.endpointFrameRoleId} (not in current model)</option>}
-                  {endpointOptions.map((option) => {
-                    const value = JSON.stringify([option.componentId, option.targetId, option.frameRoleId]);
-                    return <option key={value} value={value}>
-                      {option.componentId} / {option.targetId} / {option.frameRoleId}
-                    </option>;
-                  })}
+                  onChange={(event) => onChange({ robotComponentId: event.target.value })}>
+                  <option value="">Select a robot</option>
+                  {!robotOptions.some((option) => option.componentId === draft.robotComponentId)
+                    && draft.robotComponentId !== ''
+                    && <option value={draft.robotComponentId}>{draft.robotComponentId} (not currently listed)</option>}
+                  {robotOptions.map((option) => (
+                    <option key={option.componentId} value={option.componentId}>{option.componentId}</option>
+                  ))}
                 </select>
               </label>
             ) : (
-              <>
-                {text('Endpoint component', 'endpointComponentId')}
-                {text('Endpoint target', 'endpointTargetId')}
-                {text('Endpoint frame role', 'endpointFrameRoleId')}
-              </>
+              text('Robot component id', 'robotComponentId', 'The motion robot whose Active TCP is followed.')
             )}
             {text('Target Scene resource', 'targetSceneResourceId',
               'Exact logical Scene resource id whose current collision shapes are queried.')}
@@ -476,9 +460,12 @@ export function IoSignalInputFields({
       )}
       {draft.profile === 'geometric_contact' && (
         <p className="field-help" data-geometric-contact-note>
-          Derived read-only input. Runtime resolves the selected endpoint&apos;s existing contact-body roles and the
-          Scene resource; neither is copied into the Program. Missing, stale, busy or inconclusive geometry is
-          unavailable, never false. A maximum age below runtime production latency can make the input stale.
+          Derived read-only input. Runtime reads the selected robot&apos;s current Active TCP at each evaluation and
+          uses the contact bodies declared for that TCP&apos;s owner with the selected Scene resource; neither is copied
+          into the Program. No Active TCP, no contact bodies declared for its owner, an uncarried TCP tool, or
+          missing, stale, busy or inconclusive geometry makes the input unavailable, never false. A maximum age
+          below runtime production latency can make the input stale. Contact bodies must move with the robot;
+          bodies static relative to its motion group produce contact_bodies_static (unavailable, never false).
           Manual and timed Mock writes do not apply.
         </p>
       )}

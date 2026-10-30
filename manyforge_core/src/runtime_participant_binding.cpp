@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/types/projection_common.hpp>
@@ -125,9 +126,7 @@ bool runtime_participant_binding_physically_contains(
          is_unambiguous_subset(
              available.frame_bindings, value.frame_bindings,
              [](const auto& left, const auto& right) {
-               return left.model_instance_id == right.model_instance_id &&
-                      left.model_revision == right.model_revision &&
-                      left.compiled_frame_name == right.compiled_frame_name;
+               return same_program_frame(left, right);
              }) &&
          is_unambiguous_subset(
              available.resources, value.resources,
@@ -260,7 +259,8 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     return invalid("runtime participant model groups are incomplete or duplicate",
                    "runtime_model_group_invalid");
   }
-  if (!unique_nonempty(value.frame_bindings, [](const auto& item) { return item.frame_role_id; }) ||
+  if ((!value.frame_bindings.empty() &&
+       !unique_nonempty(value.frame_bindings, [](const auto& item) { return item.frame_role_id; })) ||
       std::any_of(value.frame_bindings.begin(), value.frame_bindings.end(), [](const auto& item) {
         return item.frame_role_id.empty() || item.model_instance_id.empty() ||
                item.model_revision.empty() || item.compiled_frame_name.empty();
@@ -276,12 +276,8 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
         endpoint.command_target_id.empty() || frame.frame_role_id.empty() ||
         frame.model_instance_id.empty() || frame.model_revision.empty() ||
         frame.compiled_frame_name.empty() ||
-        frame.model_instance_id != value.model_groups.front().model_instance_id ||
-        std::count_if(value.model_bindings.begin(), value.model_bindings.end(),
-                      [&](const auto& model) {
-                        return model.model_instance_id == frame.model_instance_id &&
-                               model.model_revision == frame.model_revision;
-                      }) != 1 ||
+        // TCP-D: the frame may be on a tool mounted on the motion component;
+        // the resolver proves that owner against the cell graph.
         roles.size() > kMaxProgramNestedRoleBindings ||
         !sorted_unique(roles, [](const auto& role) { return role; }) ||
         std::any_of(roles.begin(), roles.end(), [](const auto& role) { return role.empty(); }) ||
@@ -292,7 +288,7 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     for (std::size_t index = 0; index < roles.size(); ++index) {
       const auto& body = endpoint.contact_body_bindings[index];
       if (body.component_role_id.empty() || body.target_role_id != endpoint.target_role_id ||
-          body.controllable_component_id != value.controllable_component_id ||
+          body.controllable_component_id.empty() ||
           body.command_target_id != endpoint.command_target_id ||
           (body.model_role_id && body.model_role_id->empty()) ||
           body.collision_body_role_id != roles[index] ||
@@ -304,7 +300,7 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       }
       for (std::size_t body_index = 0; body_index < body.collision_body_ids.size(); ++body_index) {
         if (body.collision_body_ids[body_index] !=
-            make_component_collision_body_id(value.controllable_component_id,
+            make_component_collision_body_id(body.controllable_component_id,
                                              frame.model_instance_id, roles[index], body_index)) {
           return invalid("motion endpoint body does not retain its exact semantic identity",
                          "runtime_motion_endpoint_body_invalid");

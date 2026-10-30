@@ -1,236 +1,379 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:054f5d3489c52eee6ef6af52cb36cd8fcc4ba60efd0070b1fc2e2c00e30b97c6
+program_revision: sha256:cc9a618e0c4b05ebeeabbc504b3f916f2cc8ed9f73b6892238258974efe06185
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
-description: >-
-  Retained Isaac UR10e runtime-collision scenario. It starts from the exact
-  light-scene geometry, removes the declared probe wall before planning, then
-  re-inserts that wall concurrently with command execution so the Manager-owned
-  collision and Stop path can be observed without a supervisor fallback.
+description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
+  removes the declared probe wall before planning, then re-inserts that wall concurrently with command
+  execution so the Manager-owned collision and Stop path can be observed without a supervisor fallback.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.8.0
+  content_version: 2.9.0
 compatibility:
-  lanes: [isaac-sim]
+  lanes:
+  - isaac-sim
   assistant: forbidden
-  requires: [robotiq_2f_140_gripper, ros2_control]
-  tags: [isaac-sim, robotiq, runtime-collision, ur10e]
+  requires:
+  - robotiq_2f_140_gripper
+  - ros2_control
+  tags:
+  - isaac-sim
+  - robotiq
+  - runtime-collision
+  - ur10e
 component_roles:
   robot:
-    required_component_type_tags: [articulated-arm]
-    required_model_roles: [arm_model]
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
   tool:
-    required_component_type_tags: [gripper]
+    required_component_type_tags:
+    - gripper
 target_roles:
   arm:
     component_role: robot
     required_capabilities:
-      - capability_id: execution.feedback.phase_events
-        parameters: {}
-        disposition: required
-      - capability_id: execution.trajectory.execute
-        parameters: {}
-        disposition: required
-      - capability_id: planning.motion.joint_goal
-        parameters: {}
-        disposition: required
-      - capability_id: planning.motion.pose_goal
-        parameters: {}
-        disposition: required
-      - capability_id: planning.profile.balanced
-        parameters: {}
-        disposition: required
-      - capability_id: planning.trajectory.time_parameterized
-        parameters: {}
-        disposition: required
-      - capability_id: state.observed.current
-        parameters: {}
-        disposition: required
-      - capability_id: validation.trajectory.non_collision
-        parameters: {}
-        disposition: required
-    required_frame_roles: [base, tcp]
-    required_resource_roles: [arm_joints]
-    required_collision_body_roles: [arm_collision]
-    required_model_roles: [arm_model]
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.profile.balanced
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    required_model_roles:
+    - arm_model
   gripper:
     component_role: tool
     required_capabilities:
-      - capability_id: model.kinematics.fk
-        parameters: {}
-        disposition: required
-      - capability_id: tool.gripper.command
-        parameters: {}
-        disposition: required
-      - capability_id: tool.gripper.feedback
-        parameters: {}
-        disposition: required
-    required_frame_roles: [tcp]
-    required_resource_roles: [fingers]
-    required_collision_body_roles: [gripper_collision]
+    - capability_id: model.kinematics.fk
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.command
+      parameters: {}
+      disposition: required
+    - capability_id: tool.gripper.feedback
+      parameters: {}
+      disposition: required
+    required_frame_roles: []
+    required_resource_roles:
+    - fingers
+    required_collision_body_roles:
+    - gripper_collision
 scene:
-  - scene_resource_id: isaac_cheese_box
-    shape:
-      type: mesh
-      mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
-      mesh_scale: [1.0, 1.0, 1.0]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [-0.455038, 0.076595, 0.087827]
-      orientation: {rpy_deg: [92.340746, -1.76826, -90.093258]}
-    resource_roles: [pick_object]
-  - scene_resource_id: isaac_small_klt
-    shape:
-      type: mesh
-      mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
-      mesh_scale: [1.0, 1.0, 1.0]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [-0.561839, -0.367252, 0.073459]
-      orientation: {rpy_deg: [-0.000076, 0.162992, 0.006698]}
-  - scene_resource_id: isaac_small_klt_01
-    shape:
-      type: mesh
-      mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
-      mesh_scale: [1.0, 1.0, 1.0]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [0.27161648869514465, -0.35853588581085205, 0.07468909025192261]
-      orientation: {rpy_deg: [-0.000021, -0.104678, -0.00004]}
-  - scene_resource_id: isaac_soup_can
-    shape:
-      type: mesh
-      mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
-      mesh_scale: [1.0, 1.0, 1.0]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [0.085370734333992, -0.004780956543982029, 0.05248536914587021]
-      orientation: {rpy_deg: [89.988004, 0.106372, 173.509839]}
-  - scene_resource_id: isaac_table_low_327
-    shape:
-      type: mesh
-      mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
-      mesh_scale: [1.0, 1.5, 1.149999976]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [0.0, 0.0, -0.7695999827980996]
-      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
-  - scene_resource_id: runtime_collision_wall
-    shape:
-      type: box
-      box_dimensions_m: [0.02, 0.2, 0.2]
-    pose:
-      frame_ref: {kind: cell_frame}
-      position_m: [-0.4, 0.0, 0.4]
-      orientation: {rpy_deg: [0.0, 0.0, 0.0]}
+- scene_resource_id: isaac_cheese_box
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
+    mesh_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - -0.455038
+    - 0.076595
+    - 0.087827
+    orientation:
+      rpy_deg:
+      - 92.340746
+      - -1.76826
+      - -90.093258
+  resource_roles:
+  - pick_object
+- scene_resource_id: isaac_small_klt
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
+    mesh_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - -0.561839
+    - -0.367252
+    - 0.073459
+    orientation:
+      rpy_deg:
+      - -7.6e-05
+      - 0.162992
+      - 0.006698
+- scene_resource_id: isaac_small_klt_01
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
+    mesh_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.27161648869514465
+    - -0.35853588581085205
+    - 0.07468909025192261
+    orientation:
+      rpy_deg:
+      - -2.1e-05
+      - -0.104678
+      - -4.0e-05
+- scene_resource_id: isaac_soup_can
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
+    mesh_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.085370734333992
+    - -0.004780956543982029
+    - 0.05248536914587021
+    orientation:
+      rpy_deg:
+      - 89.988004
+      - 0.106372
+      - 173.509839
+- scene_resource_id: isaac_table_low_327
+  shape:
+    type: mesh
+    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
+    mesh_scale:
+    - 1.0
+    - 1.5
+    - 1.149999976
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.0
+    - -0.7695999827980996
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+- scene_resource_id: runtime_collision_wall
+  shape:
+    type: box
+    box_dimensions_m:
+    - 0.02
+    - 0.2
+    - 0.2
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - -0.4
+    - 0.0
+    - 0.4
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
 parameters:
-  - parameter_id: velocity_scale
-    type: float64
-    default: 0.2
-    constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
-    description: Velocity scale for the collision-bearing move.
+- parameter_id: velocity_scale
+  type: float64
+  default: 0.2
+  constraints:
+    min_exclusive: 0.0
+    max_inclusive: 1.0
+  description: Velocity scale for the collision-bearing move.
 tree:
   node_id: sequence
   instance_id: isaac_collision_cycle
   parameters: {}
   children:
-    - node_id: simulation.set_entity_pose
-      instance_id: set_cheese_initial_pose
-      parameters:
-        scene_resource_id: isaac_cheese_box
-        pose:
-          frame_ref: {kind: cell_frame}
-          position_m: [-0.455038, 0.076595, 0.087827]
-          orientation: {rpy_deg: [92.340746, -1.76826, -90.093258]}
-      children: []
-    - node_id: simulation.set_state
-      instance_id: play_simulation
-      parameters: {state: play}
-      children: []
-    - node_id: scene.remove_object
-      instance_id: clear_collision_wall
-      parameters: {scene_resource_id: runtime_collision_wall}
-      children: []
-    - node_id: parallel
-      instance_id: insert_wall_during_motion
-      parameters: {success_policy: all}
+  - node_id: simulation.set_entity_pose
+    instance_id: set_cheese_initial_pose
+    parameters:
+      scene_resource_id: isaac_cheese_box
+      pose:
+        frame_ref:
+          kind: cell_frame
+        position_m:
+        - -0.455038
+        - 0.076595
+        - 0.087827
+        orientation:
+          rpy_deg:
+          - 92.340746
+          - -1.76826
+          - -90.093258
+    children: []
+  - node_id: simulation.set_state
+    instance_id: play_simulation
+    parameters:
+      state: play
+    children: []
+  - node_id: scene.remove_object
+    instance_id: clear_collision_wall
+    parameters:
+      scene_resource_id: runtime_collision_wall
+    children: []
+  - node_id: parallel
+    instance_id: insert_wall_during_motion
+    parameters:
+      success_policy: all
+    children:
+    - node_id: sequence
+      instance_id: collision_wall_lifecycle
+      parameters: {}
       children:
-        - node_id: sequence
-          instance_id: collision_wall_lifecycle
-          parameters: {}
-          children:
-            - node_id: timer
-              instance_id: wait_before_collision
-              parameters: {duration_s: 1.0}
-              children: []
-            - node_id: scene.add_object
-              instance_id: insert_collision_wall
-              parameters:
-                scene_resource_id: runtime_collision_wall
-                shape:
-                  type: box
-                  box_dimensions_m: [0.02, 0.2, 0.2]
-                pose:
-                  frame_ref: {kind: cell_frame}
-                  position_m: [-0.4, 0.0, 0.4]
-                  orientation: {rpy_deg: [0.0, 0.0, 0.0]}
-              children: []
-            - node_id: timer
-              instance_id: hold_collision_wall
-              parameters: {duration_s: 2.0}
-              children: []
-            - node_id: scene.remove_object
-              instance_id: remove_collision_wall
-              parameters: {scene_resource_id: runtime_collision_wall}
-              children: []
-        - node_id: sequence
-          instance_id: collision_motion
-          parameters: {}
-          children:
-            - node_id: gripper.command_position
-              instance_id: open_gripper_start
-              parameters:
-                target_role: gripper
-                position: {kind: angular_rad, value_rad: 0.0}
-                max_effort: {kind: angular_newton_meter, value_nm: 40.0}
-                command_duration_s: 1.0
-              children: []
-            - node_id: motion.move_to_pose
-              instance_id: move_to_pick_approach
-              parameters:
-                target_role: arm
-                base_frame_role: base
-                tcp_endpoint: {target_role: arm, frame_role: tcp}
-                target_mode: relative
-                target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
-                offset_reference: {type: frame_role, frame_role_id: base}
-                goal:
-                  position_m: [0.0, 0.0, 0.2]
-                  orientation: {rpy_deg: [180.0, 0.0, -180.0]}
-                planning_timeout_s: 10.0
-                execution_timeout_s: 30.0
-              value_sources:
-                velocity_scale: {kind: program_parameter, reference: velocity_scale}
-              children: []
-            - node_id: motion.move_to_pose
-              instance_id: move_to_pick
-              parameters:
-                target_role: arm
-                base_frame_role: base
-                tcp_endpoint: {target_role: arm, frame_role: tcp}
-                target_mode: relative
-                target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
-                offset_reference: {type: frame_role, frame_role_id: base}
-                goal:
-                  position_m: [0.0, 0.0, 0.08]
-                  orientation: {rpy_deg: [180.0, 0.0, -180.0]}
-                planning_timeout_s: 10.0
-                execution_timeout_s: 30.0
-              value_sources:
-                velocity_scale: {kind: program_parameter, reference: velocity_scale}
-              children: []
-    - node_id: simulation.set_state
-      instance_id: pause_if_no_collision
-      parameters: {state: pause}
-      children: []
+      - node_id: timer
+        instance_id: wait_before_collision
+        parameters:
+          duration_s: 1.0
+        children: []
+      - node_id: scene.add_object
+        instance_id: insert_collision_wall
+        parameters:
+          scene_resource_id: runtime_collision_wall
+          shape:
+            type: box
+            box_dimensions_m:
+            - 0.02
+            - 0.2
+            - 0.2
+          pose:
+            frame_ref:
+              kind: cell_frame
+            position_m:
+            - -0.4
+            - 0.0
+            - 0.4
+            orientation:
+              rpy_deg:
+              - 0.0
+              - 0.0
+              - 0.0
+        children: []
+      - node_id: timer
+        instance_id: hold_collision_wall
+        parameters:
+          duration_s: 2.0
+        children: []
+      - node_id: scene.remove_object
+        instance_id: remove_collision_wall
+        parameters:
+          scene_resource_id: runtime_collision_wall
+        children: []
+    - node_id: sequence
+      instance_id: collision_motion
+      parameters: {}
+      children:
+      - node_id: gripper.command_position
+        instance_id: open_gripper_start
+        parameters:
+          target_role: gripper
+          position:
+            kind: angular_rad
+            value_rad: 0.0
+          max_effort:
+            kind: angular_newton_meter
+            value_nm: 40.0
+          command_duration_s: 1.0
+        children: []
+      - node_id: motion.move_to_pose
+        instance_id: move_to_pick_approach
+        parameters:
+          target_role: arm
+          base_frame_role: base
+          tcp_endpoint:
+            kind: current
+          target_mode: relative
+          target_reference:
+            type: scene_resource
+            scene_resource_id: isaac_cheese_box
+          offset_reference:
+            type: frame_role
+            frame_role_id: base
+          goal:
+            position_m:
+            - 0.0
+            - 0.0
+            - 0.2
+            orientation:
+              rpy_deg:
+              - 180.0
+              - 0.0
+              - -180.0
+          planning_timeout_s: 10.0
+          execution_timeout_s: 30.0
+          acceleration_scale: 0.8
+        children: []
+        value_sources:
+          velocity_scale:
+            kind: program_parameter
+            reference: velocity_scale
+      - node_id: motion.move_to_pose
+        instance_id: move_to_pick
+        parameters:
+          target_role: arm
+          base_frame_role: base
+          tcp_endpoint:
+            kind: current
+          target_mode: relative
+          target_reference:
+            type: scene_resource
+            scene_resource_id: isaac_cheese_box
+          offset_reference:
+            type: frame_role
+            frame_role_id: base
+          goal:
+            position_m:
+            - 0.0
+            - 0.0
+            - 0.08
+            orientation:
+              rpy_deg:
+              - 180.0
+              - 0.0
+              - -180.0
+          planning_timeout_s: 10.0
+          execution_timeout_s: 30.0
+          acceleration_scale: 0.8
+        children: []
+        value_sources:
+          velocity_scale:
+            kind: program_parameter
+            reference: velocity_scale
+  - node_id: simulation.set_state
+    instance_id: pause_if_no_collision
+    parameters:
+      state: pause
+    children: []

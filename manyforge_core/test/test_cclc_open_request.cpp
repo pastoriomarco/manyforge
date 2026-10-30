@@ -111,10 +111,39 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
         {RequestReplayStatusDTO::kRequestIdConflict, std::nullopt, std::nullopt});
   }
 
+  Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleWithoutIncidentAcknowledgement(
+      const ComponentLifecycleIntentDTO& intent) override {
+    no_acknowledgement_intent = intent;
+    if (incident_open) {
+      return Result<CCLCLifecycleRequestResultDTO>::Err(
+          {"cclc_incident_open", "a component incident is open",
+           {{"effect", "not_started"}, {"reason", "incident_open"}}});
+    }
+    return SubmitLifecycle(intent);
+  }
+  std::optional<ComponentLifecycleIntentDTO> no_acknowledgement_intent;
+  bool incident_open{};
+
+  Result<CCLCLifecycleRequestResultDTO> SubmitLifecycleExpectingIncident(
+      const ComponentLifecycleIntentDTO& intent, const std::string& expected) override {
+    expected_incident_id = expected;
+    if (expected != open_incident_id) {
+      return Result<CCLCLifecycleRequestResultDTO>::Err(
+          {"cclc_incident_changed", "the component's open incident is another one",
+           {{"effect", "not_started"},
+            {"reason", "incident_changed"},
+            {"expected_incident_id", expected},
+            {"incident_id", open_incident_id}}});
+    }
+    return SubmitLifecycle(intent);
+  }
+  std::optional<std::string> expected_incident_id;
+  std::string open_incident_id{"incident.b"};
+
   Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& transaction_id) override {
     lifecycle_status_id = transaction_id;
-    return Result<std::optional<ComponentLifecycleStatusDTO>>::Ok(std::nullopt);
+    return Result<std::optional<ComponentLifecycleStatusDTO>>::Ok(lifecycle_status);
   }
 
   Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
@@ -193,6 +222,7 @@ class FakeOpenPort final : public ICCLCOpenRequestPort {
   std::optional<RouteSelectionIntentDTO> route_intent;
   std::optional<RouteSelectionIntentDTO> route_result_intent;
   std::optional<LifecycleTransactionId> lifecycle_status_id;
+  std::optional<ComponentLifecycleStatusDTO> lifecycle_status;
   std::optional<RouteSelectionTransactionId> route_status_id;
   mutable std::optional<ControllableComponentId> component_id_read;
   mutable std::optional<ControllableComponentId> route_template_component_id;
@@ -227,6 +257,114 @@ TEST(CCLCOpenRequest, StampsTransportAttributionAndPreservesLifecycleReplayResul
   EXPECT_EQ(Member(response, "command").as_string(), "lifecycle_submit");
   EXPECT_EQ(Member(Member(response, "result"), "replay_status").as_string(), "request_id_conflict");
   EXPECT_TRUE(Member(Member(response, "result"), "acceptance").is_null());
+}
+
+// M6: `acknowledge_incident: false` never reaches the acknowledging Recover;
+// absent or true keeps today's path.
+TEST(CCLCOpenRequest, LifecycleWithoutIncidentAcknowledgementIsRoutedAndRefusedTyped) {
+  auto fields = LifecycleIntentValue().as_object();
+  for (auto& [name, value] : fields) {
+    if (name == "intent") value = CanonicalValue("recover");
+  }
+  const auto with = [&](std::optional<CanonicalValue> acknowledge) {
+    auto copy = fields;
+    if (acknowledge) copy.emplace_back("acknowledge_incident", *acknowledge);
+    return Request("lifecycle_submit", CanonicalValue(copy));
+  };
+  {
+    FakeOpenPort port;
+    ASSERT_TRUE(ExecuteCanonicalCCLCOpenRequest(with(std::nullopt), port, {}).ok());
+    EXPECT_TRUE(port.lifecycle_intent);
+    EXPECT_FALSE(port.no_acknowledgement_intent);
+  }
+  {
+    FakeOpenPort port;
+    ASSERT_TRUE(ExecuteCanonicalCCLCOpenRequest(with(CanonicalValue(true)), port, {}).ok());
+    EXPECT_FALSE(port.no_acknowledgement_intent);
+  }
+  {
+    // An incident opened before the request arrived: refused typed, no effect.
+    FakeOpenPort port;
+    port.incident_open = true;
+    const auto refused = ExecuteCanonicalCCLCOpenRequest(with(CanonicalValue(false)), port, {});
+    ASSERT_TRUE(refused.ok());
+    const auto response = content_identity::parse_canonical_json(refused.value());
+    EXPECT_FALSE(Member(response, "ok").as_bool());
+    EXPECT_EQ(Member(Member(response, "error"), "code").as_string(), "cclc_incident_open");
+    EXPECT_TRUE(port.no_acknowledgement_intent);
+    EXPECT_FALSE(port.lifecycle_intent);
+  }
+  {
+    FakeOpenPort port;
+    const auto malformed = ExecuteCanonicalCCLCOpenRequest(with(CanonicalValue("no")), port, {});
+    ASSERT_TRUE(malformed.ok());
+    EXPECT_FALSE(Member(content_identity::parse_canonical_json(malformed.value()), "ok").as_bool());
+    EXPECT_FALSE(port.lifecycle_intent);
+    EXPECT_FALSE(port.no_acknowledgement_intent);
+  }
+}
+
+// M6 (item 36): `expected_incident_id` routes the Recover through the
+// expected-incident check; a replaced incident is refused typed, naming the
+// current one; omitted keeps today's path.
+TEST(CCLCOpenRequest, RecoverExpectingAnIncidentIsRoutedAndRefusedTypedWhenReplaced) {
+  auto fields = LifecycleIntentValue().as_object();
+  for (auto& [name, value] : fields) {
+    if (name == "intent") value = CanonicalValue("recover");
+  }
+  const auto with = [&](std::optional<std::string> expected,
+                        CanonicalValue::Object base) {
+    if (expected) base.emplace_back("expected_incident_id", CanonicalValue(*expected));
+    return Request("lifecycle_submit", CanonicalValue(base));
+  };
+  {
+    // Omitted: today's Recover, no check.
+    FakeOpenPort port;
+    ASSERT_TRUE(ExecuteCanonicalCCLCOpenRequest(with(std::nullopt, fields), port, {}).ok());
+    EXPECT_TRUE(port.lifecycle_intent);
+    EXPECT_FALSE(port.expected_incident_id);
+  }
+  {
+    // A was replaced by B: refused typed, the details name B; nothing submitted.
+    FakeOpenPort port;
+    const auto refused =
+        ExecuteCanonicalCCLCOpenRequest(with(std::string("incident.a"), fields), port, {});
+    ASSERT_TRUE(refused.ok());
+    const auto response = content_identity::parse_canonical_json(refused.value());
+    EXPECT_FALSE(Member(response, "ok").as_bool());
+    const auto& error = Member(response, "error");
+    EXPECT_EQ(Member(error, "code").as_string(), "cclc_incident_changed");
+    EXPECT_EQ(Member(Member(error, "details"), "incident_id").as_string(), "incident.b");
+    EXPECT_EQ(Member(Member(error, "details"), "effect").as_string(), "not_started");
+    EXPECT_EQ(port.expected_incident_id, "incident.a");
+    EXPECT_FALSE(port.lifecycle_intent);
+  }
+  {
+    // Expecting the current incident: the ordinary Recover follows.
+    FakeOpenPort port;
+    const auto accepted =
+        ExecuteCanonicalCCLCOpenRequest(with(std::string("incident.b"), fields), port, {});
+    ASSERT_TRUE(accepted.ok());
+    EXPECT_TRUE(Member(content_identity::parse_canonical_json(accepted.value()), "ok").as_bool());
+    EXPECT_EQ(port.expected_incident_id, "incident.b");
+    EXPECT_TRUE(port.lifecycle_intent);
+  }
+  {
+    // Only an acknowledging ordinary Recover may carry it.
+    auto enable = LifecycleIntentValue().as_object();
+    auto no_ack = fields;
+    no_ack.emplace_back("acknowledge_incident", CanonicalValue(false));
+    for (const auto& base : {enable, no_ack}) {
+      FakeOpenPort port;
+      const auto malformed =
+          ExecuteCanonicalCCLCOpenRequest(with(std::string("incident.b"), base), port, {});
+      ASSERT_TRUE(malformed.ok());
+      EXPECT_FALSE(Member(content_identity::parse_canonical_json(malformed.value()), "ok").as_bool());
+      EXPECT_FALSE(port.lifecycle_intent);
+      EXPECT_FALSE(port.no_acknowledgement_intent);
+      EXPECT_FALSE(port.expected_incident_id);
+    }
+  }
 }
 
 TEST(CCLCOpenRequest, CloseRecoveryIsClosedTypedAndCannotAliasOrdinaryRecover) {
@@ -326,6 +464,66 @@ TEST(CCLCOpenRequest, StatusAndSnapshotReadsCarryNoClientOwnedTruth) {
   const auto template_response = content_identity::parse_canonical_json(templates.value());
   EXPECT_TRUE(Member(template_response, "ok").as_bool());
   EXPECT_TRUE(Member(Member(template_response, "result"), "templates").as_array().empty());
+}
+
+// V-B2 (V2-4): three terminal outcomes; the domain carries no effect class.
+TEST(CCLCOpenRequest, LifecycleStatusCarriesTheThreeOutcomesWithoutDomainEffect) {
+  FakeOpenPort port;
+  const ErrorDTO lost{"robot_controller_unresponsive", "no answer", {}};
+  const ComponentLifecycleRequestedStateDTO active{
+      ComponentLifecycleRequestedStatePresenceDTO::kResolved, ComponentLifecycleStateDTO::kActive};
+  port.lifecycle_status = ComponentLifecycleStatusDTO{
+      {RequestId("request.1"), RequestReplayStatusDTO::kAcceptedNew,
+       LifecycleTransactionId("lifecycle.7"), LifecycleTransactionGeneration(7U),
+       ComponentLifecycleGeneration(5U), 10, 1'000},
+      {{RequestId("request.1"), RequestOwnerEpoch("owner.1"), "operator", std::nullopt},
+       ControllableComponentId("component.arm"),
+       ComponentLifecycleIntentKindDTO::kEnable,
+       GraphRevision("graph.revision.1"),
+       ComponentLifecycleGeneration(4U),
+       {},
+       std::nullopt},
+      3U,
+      RequestOwnerEpoch("owner.1"),
+      ComponentLifecycleStateDTO::kPrepared,
+      ComponentLifecycleStateDTO::kDeclared,
+      active,
+      ComponentLifecycleTransactionPhaseDTO::kFailed,
+      {{ControlDomainId("domain.arm"), std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, active, ComponentLifecycleDomainActionStateDTO::kFailed, {}, lost}},
+      false,
+      ComponentLifecycleTerminalResultDTO::kConnectionLost,
+      lost,
+      10,
+      20,
+      0};
+  const auto read = [&] {
+    const auto response = ExecuteCanonicalCCLCOpenRequest(
+        Request("lifecycle_status",
+                CanonicalValue(CanonicalValue::Object{
+                    {"lifecycle_transaction_id", CanonicalValue("lifecycle.7")}})),
+        port, {});
+    EXPECT_TRUE(response.ok());
+    return Member(content_identity::parse_canonical_json(response.value()), "result");
+  };
+  auto result = read();
+  EXPECT_EQ(Member(result, "terminal_result").as_string(), "connection_lost");
+  EXPECT_EQ(Member(result, "phase").as_string(), "failed");
+  const auto& row = Member(result, "domains").as_array().front();
+  EXPECT_EQ(Member(row, "action_state").as_string(), "failed");
+  EXPECT_EQ(row.find_object_member("effect"), nullptr);
+
+  port.lifecycle_status->terminal_result = ComponentLifecycleTerminalResultDTO::kFailed;
+  EXPECT_EQ(Member(read(), "terminal_result").as_string(), "failed");
+
+  // A stopped Apply bring-up keeps its bookkeeping (VB2-O4 (a)).
+  port.lifecycle_status->phase = ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown;
+  port.lifecycle_status->terminal_result.reset();
+  port.lifecycle_status->reconciliation_required = true;
+  result = read();
+  EXPECT_EQ(Member(result, "phase").as_string(), "outcome_unknown");
+  EXPECT_TRUE(Member(result, "reconciliation_required").as_bool());
+  EXPECT_TRUE(Member(result, "terminal_result").is_null());
 }
 
 TEST(CCLCOpenRequest, RejectsNoncanonicalUnknownAndPayloadAttributionFields) {
@@ -734,6 +932,13 @@ TEST(CCLCOpenRequest, ComponentOutputDropsAreAnOptionalInformationalFullWidthPai
   EXPECT_EQ(snapshot.find_object_member("lifecycle_progress")->is_null(), true);
   port.view.dropped_output_bytes.reset();
   EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
+}
+
+TEST(CCLCOpenRequest, IncidentRetiredActiveTargetIsShownOnlyWhileTrue) {
+  TargetViewPort port;
+  EXPECT_EQ(SnapshotResult(port).find_object_member("active_target_retired_by_incident"), nullptr);
+  port.view.active_target_retired_by_incident = true;
+  EXPECT_TRUE(Member(SnapshotResult(port), "active_target_retired_by_incident").as_bool());
 }
 
 TEST(CCLCOpenRequest, ComponentSnapshotShowsTheOpenIncidentInContractShape) {

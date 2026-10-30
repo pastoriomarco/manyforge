@@ -216,7 +216,9 @@ def test_client_surfaces_exact_owner_rejection_code(tmp_path: Path) -> None:
                         "api_version": MANAGER_RESPONSE_VERSION,
                         "error": {
                             "code": "scene_runtime_identity_changed",
+                            "details": {},
                             "message": "runtime advanced",
+                            "producer": "component_manager",
                         },
                         "ok": False,
                     }
@@ -444,7 +446,7 @@ def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> 
         assert raised.value.code == "manager_scene_runtime_response_invalid"
 
 
-def test_client_rejects_wrong_endpoint_and_response_identity(
+def test_client_rejects_wrong_endpoint_and_response_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -469,19 +471,28 @@ def test_client_rejects_wrong_endpoint_and_response_identity(
     owner_response = _owner_response()
     monkeypatch.setattr(client, "_exchange", lambda _command: owner_response)
     owner = client.read_owner()
-    wrong_open = _open_response()
-    wrong_open["source_id"] = "another.observer"
-    monkeypatch.setattr(client, "_exchange", lambda _command: wrong_open)
-    with pytest.raises(SceneRuntimeManagerError) as crossed:
+    # Each exchange is its own connection: the echoed identity is not compared.
+    echo_open = _open_response()
+    echo_open["source_id"] = "another.observer"
+    monkeypatch.setattr(client, "_exchange", lambda _command: echo_open)
+    session = client.open_observer(
+        owner,
+        bindings=_bindings(),
+        source_id="isaac.observer",
+        source_epoch="orin-observer.1",
+    )
+    assert session.source_id == "isaac.observer"
+    malformed_open = _open_response()
+    del malformed_open["source_epoch_order"]
+    monkeypatch.setattr(client, "_exchange", lambda _command: malformed_open)
+    with pytest.raises(SceneRuntimeManagerError) as malformed:
         client.open_observer(
             owner,
             bindings=_bindings(),
             source_id="isaac.observer",
             source_epoch="orin-observer.1",
         )
-    assert crossed.value.code == (
-        "manager_scene_runtime_response_identity_mismatch"
-    )
+    assert malformed.value.code == "manager_scene_runtime_response_invalid"
 
 
 def test_client_rejects_unsafe_or_replaced_manager_run_root(

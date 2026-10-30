@@ -1,3 +1,5 @@
+#include "admission_timing_internal.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -5,6 +7,20 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+
+namespace manyforge::core::detail {
+namespace { thread_local AdmissionTimingData* admission_timing = nullptr; }
+AdmissionTimingData* CurrentAdmissionTiming() noexcept { return admission_timing; }
+void SetAdmissionTiming(AdmissionTimingData* data) noexcept { admission_timing = data; }
+void CaptureAdmissionJournalTiming(const char* stage, std::int64_t elapsed_ns,
+                                   std::int64_t rows, std::int64_t changes, const char* outcome,
+                                   AdmissionJournalRowsKind rows_kind) noexcept {
+  auto* data = CurrentAdmissionTiming();
+  if (!data || elapsed_ns < 50'000'000) return;
+  if (data->event_count == data->events.size()) { ++data->dropped; return; }
+  data->events[data->event_count++] = {stage, elapsed_ns, rows, changes, outcome, rows_kind};
+}
+}  // namespace manyforge::core::detail
 
 namespace manyforge::core {
 namespace {
@@ -1108,13 +1124,18 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const PreparedProgramResetStatus* reset_proof,
     const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator,
     const bool close_step_claim) {
+  detail::AdmissionTiming timing(false, intent.request_id.value());
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
+  auto wait_start = detail::AdmissionTiming::Clock::now();
   std::lock_guard transition_lock(liveness_transition_mutex_);
+  timing.record->transition_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto valid = ValidateCellAdmissionClaimIntent(intent);
   if (!valid.ok()) {
     return Result<CellAdmissionClaimDTO>::Err(valid.error());
   }
+  wait_start = detail::AdmissionTiming::Clock::now();
   std::lock_guard lock(mutex_);
+  timing.record->owner_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   if (!configuration_apply && IsStaleOwnerLocked(intent)) {
     return Reject<CellAdmissionClaimDTO>("stale_request_owner_epoch", "request_owner_epoch_stale");
   }
@@ -1144,9 +1165,10 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     }
     return Reject<CellAdmissionClaimDTO>("request_result_expired", "request_result_compacted");
   }
-  if (!intent.program_node_evidence && intent.expected_admission_generation != generation_) {
-    return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
-  }
+  // The intent's expected admission generation is claim evidence only and is
+  // never compared: every admission fact below is evaluated now, under these
+  // locks, so a generation that merely moved since the caller's read is not a
+  // refusal.
   // Exact replay above remains observable during a fault. The private Q91
   // parent alternative still requires its positive plan validation below.
   // D6: Close of a latched Scenario admits its motion-free steps, and a latch
@@ -1306,9 +1328,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     // cannot release the fence until this exact child becomes visible/settled.
     const auto admitted = program_node_validator_(evidence);
     if (!admitted.ok()) return Result<CellAdmissionClaimDTO>::Err(admitted.error());
-    if (intent.expected_admission_generation != generation_) {
-      return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
-    }
   } else if (configuration_apply) {
     if (!manager_liveness_required_set_ ||
         intent.owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
@@ -1449,9 +1468,11 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   std::sort(prepared_owners.begin(), prepared_owners.end(),
             [](const auto& a, const auto& b) { return a.owner_role < b.owner_role; });
   if (configuration_apply) {
+    const auto journal_start = detail::AdmissionTiming::Clock::now();
     auto recorded = journal_.RecordConfigurationApplyClaimAcquired(
         kernel_owner_epoch_, claim, {CellAdmissionOwnerRoleDTO::kManager, intent.owner_epoch},
         configuration_held, current_owners_);
+    timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
     if (!recorded.ok()) {
       if (recorded.error().code == "persistence_outcome_unknown") {
         CloseForPersistenceUnknownLocked(std::move(recorded.error()), claim);
@@ -1469,7 +1490,9 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     prepared_entry.claim.accepted_at_ns = recorded.value().accepted_at_ns;
     claim.accepted_at_ns = recorded.value().accepted_at_ns;
   } else {
+    const auto journal_start = detail::AdmissionTiming::Clock::now();
     auto recorded = journal_.RecordCellAdmissionClaimAcquired(kernel_owner_epoch_, claim);
+    timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
     if (!recorded.ok()) return Result<CellAdmissionClaimDTO>::Err(recorded.error());
   }
   // Both prepared copies carry the exact persisted timestamp on replay.
@@ -1509,12 +1532,17 @@ std::vector<std::string> KernelCellAdmissionOwner::unsettled_program_child_nodes
 
 Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClaim(
     const CellAdmissionClaimReleaseDTO& release) {
+  detail::AdmissionTiming timing(true, release.request_id.value());
+  auto wait_start = detail::AdmissionTiming::Clock::now();
   std::lock_guard transition_lock(liveness_transition_mutex_);
+  timing.record->transition_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   auto valid = ValidateCellAdmissionClaimRelease(release);
   if (!valid.ok()) {
     return Result<AuthoringAdmissionDTO>::Err(valid.error());
   }
+  wait_start = detail::AdmissionTiming::Clock::now();
   std::lock_guard lock(mutex_);
+  timing.record->owner_wait += detail::AdmissionTiming::Clock::now() - wait_start;
   const auto current_owner =
       std::find_if(current_owners_.begin(), current_owners_.end(),
                    [&](const auto& owner) { return owner.owner_role == release.owner_role; });
@@ -1536,7 +1564,9 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClai
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_,
                                                     "settlement_validator_unavailable");
   }
+  const auto settlement_start = detail::AdmissionTiming::Clock::now();
   auto settlement = settlement_validator_(entry->claim, release);
+  timing.record->settlement += detail::AdmissionTiming::Clock::now() - settlement_start;
   if (!settlement.ok()) {
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "settlement_not_proven");
   }
@@ -1544,8 +1574,10 @@ Result<AuthoringAdmissionDTO> KernelCellAdmissionOwner::ReleaseCellAdmissionClai
     return AuthoringNotReady<AuthoringAdmissionDTO>(generation_, "admission_generation_exhausted");
   }
   const AdmissionGeneration next(generation_.value() + 1U);
+  const auto journal_start = detail::AdmissionTiming::Clock::now();
   auto recorded =
       journal_.RecordCellAdmissionClaimReleased(kernel_owner_epoch_, entry->claim, release, next);
+  timing.record->journal += detail::AdmissionTiming::Clock::now() - journal_start;
   if (!recorded.ok()) {
     return Result<AuthoringAdmissionDTO>::Err(recorded.error());
   }

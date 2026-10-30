@@ -204,10 +204,18 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     const auto &row = family_rows[index];
     const std::string label =
         "description.model_families[" + std::to_string(index) + "]";
-    require_fields(row,
-                   {"catalog_source", "model_asset_id", "model_family_id",
-                    "semantics", "source"},
-                   label);
+    // A descriptor-registered family may also record its TCPs (optional).
+    if (row.find_object_member("tcp_frame_role_ids") != nullptr) {
+      require_fields(row,
+                     {"catalog_source", "model_asset_id", "model_family_id",
+                      "semantics", "source", "tcp_frame_role_ids"},
+                     label);
+    } else {
+      require_fields(row,
+                     {"catalog_source", "model_asset_id", "model_family_id",
+                      "semantics", "source"},
+                     label);
+    }
     const auto &source = member(row, "source", label);
     require_fields(source,
                    {"accepted_package_uri_prefix", "historical_srdf_path",

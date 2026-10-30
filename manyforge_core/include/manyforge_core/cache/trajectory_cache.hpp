@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
 #include <manyforge_core/cache/cache_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -45,6 +46,9 @@ enum class TrajectoryCacheLookupDisposition {
 struct TrajectoryCacheLookupResult {
   TrajectoryCacheLookupDisposition disposition = TrajectoryCacheLookupDisposition::kMiss;
   std::optional<TrajectoryDTO> trajectory;
+  /// Planning attempt that produced the trajectory; a reuse is revalidated at
+  /// that attempt's collision-check step.
+  std::uint32_t planning_attempt_index = 0;
 };
 
 /// Trajectory cache indexed by the complete stable Program/move slot and the
@@ -61,9 +65,10 @@ class TrajectoryCache {
  public:
   explicit TrajectoryCache(CacheConfig config = {});
 
-  /// Store a trajectory with the planner intent that produced it (overwrites
-  /// the same exact slot).
-  void store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory, std::string intent_identity);
+  /// Store a trajectory with the planner intent and the planning attempt that
+  /// produced it (overwrites the same exact slot).
+  void store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory, std::string intent_identity,
+             std::uint32_t planning_attempt_index = 0);
 
   /// Whether an entry exists for an exact slot. Existence probe only (e.g.
   /// invalidate-if-present); never use to serve a trajectory.
@@ -100,6 +105,7 @@ class TrajectoryCache {
     /// Canonical identity of the resolved motion, frames, tolerances, speed
     /// profile, and request-level dynamics limits that produced this trajectory.
     std::string intent_identity;
+    std::uint32_t planning_attempt_index = 0;
   };
 
   CacheConfig config_;

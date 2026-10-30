@@ -1,0 +1,45 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/lite6`.
+# The arm only: a tool mounts on `flange` as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: robot
+id: ufactory.lite6
+version: 1.0.0
+title: UFACTORY Lite 6
+license: BSD-3-Clause
+provenance:
+  source: https://github.com/pastoriomarco/xarm_ros2
+  notes: README.md (cut from the combined bundle) and its licenses/
+model:
+  urdf: lite6.urdf
+  srdf: lite6.srdf
+  package_name: manyforge_example_models
+roles:
+  root_frame: world
+  frames:
+    base: link_base
+    flange: link_eef
+  groups:
+    arm: lite6
+  joints:
+    arm_joints: [joint1, joint2, joint3, joint4, joint5, joint6]
+  collision_bodies:
+    arm_collision: [link1, link2, link3, link4, link5, link6, link_base]
+tcps:                             # without a tool; a mounted tool's default TCP wins (D1)
+  - {id: flange, frame: link_eef}
+tcp_speed_check: active_tcp_and_flange
+limits:
+  max_tcp_linear_speed_mps: 0.5
+lanes:
+  mock:
+    controllers:
+      template: ufactory
+      hardware_component_name: MockLite6System
+      arm_controller: lite6_traj_controller
+      vendor_joint_constraints: {trajectory: "1.0"}
+      hard_stop_completion_timeout_s: 1.5
+      gripper_result_timeout_s: 5.0
+      arrival_tolerance_rad: 0.01
+defaults:
+  initial_joint_positions_rad: [0.0, 0.0, 1.57, 0.0, 0.0, 0.0]
+  maximum_tcp_linear_speed_mps: 0.15

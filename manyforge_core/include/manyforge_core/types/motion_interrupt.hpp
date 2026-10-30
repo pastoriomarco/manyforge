@@ -36,6 +36,23 @@ inline constexpr double kMaxControlledStopDecelerationTimeS = 2.0;
 /// feedback when no prepared per-resource settle threshold is available.
 inline constexpr double kDefaultSettleVelocityThresholdRadS = 0.01;
 
+/// Where a soft Stop's lead-in starts on a lane whose trip evidence carries
+/// measured velocity (the Real lane's measured trip authority). A lane whose
+/// trip evidence is the controller's own command always starts at the command
+/// cursor, whichever value it carries.
+enum class StopLeadInAnchor {
+  /// At the controller's active command cursor: the lead-in continues exactly
+  /// what the controller already commands (the default on every lane).
+  kCommanded,
+  /// At the measured position's projection onto the path, which trails the
+  /// command by the robot's following lag.
+  kMeasured,
+};
+
+[[nodiscard]] inline std::string_view stop_lead_in_anchor_string(const StopLeadInAnchor anchor) {
+  return anchor == StopLeadInAnchor::kMeasured ? "measured" : "commanded";
+}
+
 /// Backend-declared planner parameters for production `soft_on_path`.
 /// These are deployment/runtime facts, not behavior-node policy: the
 /// kernel uses them for pre-dispatch feasibility envelopes and the

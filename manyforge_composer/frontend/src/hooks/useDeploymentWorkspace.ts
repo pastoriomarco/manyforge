@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
+import {
+  api, authoringRefusalMessage, isStaleWorkspaceError, preparationCauseCode,
+} from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
@@ -16,6 +18,7 @@ import type {
   DeploymentControlledStopUpdate,
   JsonValue,
   LocalWorkspaceFenceRequest,
+  TcpSpeedCheck,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
@@ -64,6 +67,8 @@ export function useDeploymentWorkspace(
     generation: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** The typed cause of the shown preparation refusal, if the preparer named one. */
+  const [errorCauseCode, setErrorCauseCode] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
   /** The shared Reset/Apply correlation the accepted Apply carries, if any. */
@@ -94,6 +99,7 @@ export function useDeploymentWorkspace(
     const sequence = ++refreshSequence.current;
     setLoading(true);
     setError(null);
+    setErrorCauseCode(null);
     try {
       const next = await api.deploymentWorkspace.get();
       if (mounted.current && sequence === refreshSequence.current) {
@@ -120,6 +126,7 @@ export function useDeploymentWorkspace(
       setWorkspace(null);
       setLoading(false);
       setError(null);
+      setErrorCauseCode(null);
       setFeedback(null);
       setPendingApplyConfirmation(null);
     }
@@ -219,6 +226,7 @@ export function useDeploymentWorkspace(
     inFlight.current = true;
     setBusy(true);
     setError(null);
+    setErrorCauseCode(null);
     setFeedback(null);
     try {
       const next = await operation(requestFence);
@@ -242,6 +250,7 @@ export function useDeploymentWorkspace(
       return next;
     } catch (reason: unknown) {
       authoring.finishMutation(null, reason);
+      if (mounted.current) setErrorCauseCode(preparationCauseCode(reason));
       const message = errorMessage(reason, 'Deployment authoring request failed.');
       // A stale fence is also refused before any effect, but it needs the
       // refresh below, so it is never handled as a plain refusal.
@@ -287,6 +296,7 @@ export function useDeploymentWorkspace(
     setBusy(true);
     setApplying(true);
     setError(null);
+    setErrorCauseCode(null);
     setFeedback(null);
     try {
       const response = await operation(requestFence, scope);
@@ -331,6 +341,7 @@ export function useDeploymentWorkspace(
       return response;
     } catch (reason: unknown) {
       authoring.finishMutation(null, reason);
+      if (mounted.current) setErrorCauseCode(preparationCauseCode(reason));
       const message = errorMessage(
         reason,
         'Deployment Apply request failed.',
@@ -380,6 +391,31 @@ export function useDeploymentWorkspace(
       'Deployment Draft updated; Manager Applied was unchanged.',
       'edit',
     ),
+    /**
+     * Add complete component rows (Add component) and the attachment rows
+     * that mount a new tool, in one Draft edit. The backend admits only a pure
+     * addition; the components run only after the one confirmed Deployment
+     * Apply.
+     */
+    addComponents: (
+      rows: Array<Record<string, JsonValue>>,
+      attachments: Array<Record<string, JsonValue>> = [],
+    ) => run(
+      (requestFence) => api.deploymentWorkspace.addComponents(requestFence, rows, attachments),
+      'Component added to the Deployment Draft; it runs only after Apply.',
+      'edit',
+    ),
+    /**
+     * Manager's convergence diff of the Draft against Applied. Effect-free:
+     * nothing is claimed or installed. Null when no request can be fenced;
+     * a refusal rejects with the owner's message.
+     */
+    previewDraft: () => {
+      const requestFence = fence('edit');
+      return requestFence === null
+        ? Promise.resolve(null)
+        : api.deploymentWorkspace.previewDraft(requestFence);
+    },
     updateControlledStop: (update: DeploymentControlledStopUpdate) => run(
       (requestFence) => api.deploymentWorkspace.updateControlledStop(
         requestFence, update,
@@ -391,12 +427,14 @@ export function useDeploymentWorkspace(
       controllableComponentId: string,
       commandTargetId: string,
       maximumTcpLinearSpeedMps: number,
+      tcpSpeedCheck?: TcpSpeedCheck,
     ) => run(
       (requestFence) => api.deploymentWorkspace.updateMotionTargetLimit(
         requestFence,
         controllableComponentId,
         commandTargetId,
         maximumTcpLinearSpeedMps,
+        tcpSpeedCheck,
       ),
       'Target maximum TCP speed updated in Draft; Manager Applied was unchanged.',
       'edit',
@@ -488,7 +526,7 @@ export function useDeploymentWorkspace(
       pendingConfirmationContext.current = null;
       setPendingApplyConfirmation(null);
     },
-  }), [documentUnavailableReason, pendingApplyConfirmation, run, runApply]);
+  }), [documentUnavailableReason, fence, pendingApplyConfirmation, run, runApply, workspace]);
 
   return {
     workspace,
@@ -496,6 +534,7 @@ export function useDeploymentWorkspace(
     busy,
     applying,
     error,
+    errorCauseCode,
     feedback,
     acceptedApply,
     acceptedApplyCorrelationId,
@@ -508,7 +547,10 @@ export function useDeploymentWorkspace(
     comparisonUnavailableReason,
     refresh,
     clearFeedback: () => setFeedback(null),
-    dismissError: () => setError(null),
+    dismissError: () => {
+      setError(null);
+      setErrorCauseCode(null);
+    },
     ...actions,
   };
 }

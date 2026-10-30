@@ -11,6 +11,7 @@
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/provider_manifest_codec.hpp>
 #include <memory>
 #include <optional>
@@ -486,20 +487,15 @@ class VerifiedRetainedModelMap final {
       const noexcept {
     return frame_paths_;
   }
-  [[nodiscard]] const std::vector<core::KinematicFramePathDTO>&
-  kinematic_frame_paths() const noexcept {
-    return kinematic_frame_paths_;
+  /// The mount and ownership index of the retained cell graph, with the
+  /// owner-stamped runtime frame paths. Derived with this map.
+  [[nodiscard]] const CellKinematicIndex& kinematic_index() const noexcept {
+    return kinematic_index_;
   }
   [[nodiscard]] const std::vector<CompositionTargetResolution>& targets()
       const noexcept {
     return targets_;
   }
-
-  /// Exact compiler-owned path lookup for one retained runtime frame.
-  /// Missing and duplicate terminal identities both fail closed.
-  [[nodiscard]] const core::KinematicFramePathDTO*
-  find_kinematic_frame_path(
-      const core::ResolvedFrameDTO& terminal_frame) const noexcept;
 
   [[nodiscard]] const CompositionTargetResolution* find_target(
       const core::ControllableComponentId& component_id,
@@ -541,7 +537,7 @@ class VerifiedRetainedModelMap final {
       std::vector<CompositionControlBindingCoordinateMap> control_bindings,
       std::vector<CompositionFixedConnection> fixed_connections,
       std::vector<CompositionFramePath> frame_paths,
-      std::vector<core::KinematicFramePathDTO> kinematic_frame_paths,
+      CellKinematicIndex kinematic_index,
       std::vector<CompositionTargetResolution> targets)
       : query_(std::move(query)),
         product_contract_id_(std::move(product_contract_id)),
@@ -555,7 +551,7 @@ class VerifiedRetainedModelMap final {
         control_bindings_(std::move(control_bindings)),
         fixed_connections_(std::move(fixed_connections)),
         frame_paths_(std::move(frame_paths)),
-        kinematic_frame_paths_(std::move(kinematic_frame_paths)),
+        kinematic_index_(std::move(kinematic_index)),
         targets_(std::move(targets)) {}
 
   RetainedModelMapQuery query_;
@@ -571,7 +567,7 @@ class VerifiedRetainedModelMap final {
   std::vector<CompositionControlBindingCoordinateMap> control_bindings_;
   std::vector<CompositionFixedConnection> fixed_connections_;
   std::vector<CompositionFramePath> frame_paths_;
-  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths_;
+  CellKinematicIndex kinematic_index_;
   std::vector<CompositionTargetResolution> targets_;
 
   friend class FilesystemVerifiedRetainedModelMapSource;
@@ -680,6 +676,12 @@ struct VerifiedRetainedModelSourceUrdf final {
   core::ModelAssetId model_asset_id;
   core::ModelRevision model_revision;
   std::string urdf_bytes;
+  /// The asset's offset frame roles (`pose_in_source_link` rows), which the
+  /// URDF itself does not carry; robot_state_publisher descriptions add them.
+  std::vector<core::ModelFrameRoleBindingDTO> offset_frame_roles{};
+  /// The asset's own payload (mass and centre of mass in its root frame-role
+  /// link); a mounted tool's adds to the robot controller's payload.
+  std::optional<core::ModelAssetPayloadDTO> payload{};
 
   friend bool operator==(const VerifiedRetainedModelSourceUrdf&,
                          const VerifiedRetainedModelSourceUrdf&) = default;

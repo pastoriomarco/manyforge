@@ -259,12 +259,12 @@ configure_file(
 unset(_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES)
 
 # E1: the Mock controller rows are data. The shared loader validates the file
-# (the same rules as scripts/robots/check_robot.py) and writes the rows the
+# (the same rules as `manyforge component check`) and writes the rows the
 # launch artifacts compile in; an invalid row stops the configure.
 set(_MANYFORGE_MOCK_CONTROLLER_PROFILES
   "${_MANYFORGE_CONTROLLER_TEMPLATE_ROOT}/mock_controller_profiles.yaml")
 set(_MANYFORGE_MOCK_CONTROLLER_PROFILE_TOOL
-  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/scripts/robots/mock_controller_profiles.py")
+  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/scripts/components/mock_controller_profiles.py")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${_MANYFORGE_MOCK_CONTROLLER_PROFILES}"
   "${_MANYFORGE_MOCK_CONTROLLER_PROFILE_TOOL}")
@@ -433,8 +433,10 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
 
   find_package(pal_statistics_msgs REQUIRED)
   find_package(diagnostic_msgs REQUIRED)
-  # R7: the per-vendor adapters of Real components (xArm).
-  if(NOT TARGET manyforge_xarm_control_brand_lifecycle)
+  # R7 / V-A: the vendor adapter libraries of Real components (xArm), behind
+  # the header-only vendor device adapter interface; the vendor registry
+  # (`retained_vendor_device_status.cpp`) lists their family rows.
+  if(NOT TARGET manyforge_xarm_control_device_adapter)
     set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
     set(BUILD_TESTING OFF)
     add_subdirectory(
@@ -453,6 +455,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     src/retained_ros2_control_lifecycle_product.cpp
     src/retained_ros2_control_runtime_handle.cpp
     src/retained_ros2_control_statistics_monitor.cpp
+    src/retained_static_frames.cpp
+    src/retained_tool_context.cpp
     src/retained_vendor_device_status.cpp)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -471,7 +475,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     ${pal_statistics_msgs_TARGETS}
     ${diagnostic_msgs_TARGETS}
     manyforge::content_identity
-    PRIVATE manyforge_xarm_control_brand_lifecycle)
+    PRIVATE manyforge_xarm_control_device_adapter)
 endif()
 
 if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
@@ -846,10 +850,11 @@ if(BUILD_TESTING)
       manyforge_roboplan_cell_admission_command_codec GTest::gtest_main)
 
     add_executable(test_owner_settlement_readers
+      src/applied_program_owner_reader.cpp
       test/test_owner_settlement_readers.cpp)
     target_link_libraries(test_owner_settlement_readers PRIVATE
-      manyforge_roboplan_cell_admission_command_codec GTest::gtest_main
-      SQLite::SQLite3)
+      manyforge_roboplan_cell_admission_command_codec manyforge_deployment
+      GTest::gtest_main SQLite::SQLite3)
 
     # The projection registry compiled alone, behind an injected asset source
     # and clock; the installed hosts compile the same source unit.
@@ -957,7 +962,9 @@ if(BUILD_TESTING)
         manyforge_ros_boolean_input_provider GTest::gtest_main)
 
       add_executable(test_retained_ros2_control_backend_factory
-        test/test_retained_ros2_control_backend_factory.cpp)
+        test/test_retained_ros2_control_backend_factory.cpp
+        test/test_retained_static_frames.cpp
+        test/test_retained_tool_context.cpp)
       target_include_directories(test_retained_ros2_control_backend_factory PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
       target_link_libraries(test_retained_ros2_control_backend_factory PRIVATE
@@ -965,6 +972,13 @@ if(BUILD_TESTING)
         manyforge_component_manager
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_backend_factory)
+
+      # Merge 6: the Isaac robot and tool rows.
+      add_executable(test_retained_isaac_profile_rows
+        test/test_retained_isaac_profile_rows.cpp)
+      target_link_libraries(test_retained_isaac_profile_rows PRIVATE
+        manyforge_roboplan_ros2_control_runtime GTest::gtest_main)
+      gtest_discover_tests(test_retained_isaac_profile_rows)
 
       # Runtime handle, CCLC controller switching and binding epochs against
       # in-process ROS stand-ins.
@@ -1327,6 +1341,17 @@ if(BUILD_TESTING)
       "package://manyforge_example_models/models/lite6_lite_gripper/"
       _MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT
       _MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS)
+    # The split Lite6 arm and gripper (M6 tool split), beside the combined
+    # root: the maintained activation fixture prepares each model component.
+    foreach(_lite6_split_asset lite6 lite_gripper)
+      _manyforge_prepare_roboplan_model_fixture(
+        "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/${_lite6_split_asset}"
+        "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
+        ${_lite6_split_asset} ${_lite6_split_asset}.urdf ${_lite6_split_asset}.srdf
+        "package://manyforge_example_models/models/lite6_lite_gripper/"
+        _MANYFORGE_ROBOPLAN_LITE6_SPLIT_FIXTURE_ROOT
+        _MANYFORGE_ROBOPLAN_LITE6_SPLIT_RESOURCE_INPUTS)
+    endforeach()
 
     set(_MANYFORGE_ROBOPLAN_IMPORT_VIEW_TOOL
       "${CMAKE_CURRENT_SOURCE_DIR}/test/prepare_roboplan_import_view.py")
@@ -1396,7 +1421,7 @@ if(BUILD_TESTING)
       _MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT
       _MANYFORGE_ROBOTIQ_GRIPPER_ONLY_RESOURCE_INPUTS)
     set(_MANYFORGE_ROBOTIQ_GRIPPER_ONLY_CATALOG_PATH
-      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_assets/robotiq_2f_85.model_asset.json")
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/resources/maintained/model_sources/robotiq_2f_85/robotiq_2f_85.model_asset.json")
 
     # Deployment owns this deterministic test-only generator. It publishes
     # exact retained bytes and compiler maps, without importing any RoboPlan,
@@ -1697,7 +1722,6 @@ if(BUILD_TESTING)
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/test")
     target_link_libraries(test_retained_product_consumer PRIVATE
       manyforge_deployment_program_io_condition_compiler
-      manyforge_core_filesystem_resolved_stop_base_plan_repository
       manyforge_roboplan_retained_consumer
       manyforge_roboplan_collision_projection
       manyforge_roboplan_native_state_projection

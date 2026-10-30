@@ -460,19 +460,8 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
       return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
           catalog.error());
     }
-    const auto catalog_verified =
-        core::VerifyBrandLifecyclePlanCatalog(catalog.value());
-    if (!catalog_verified.ok() ||
-        catalog.value().provider_manifest_id !=
-            occurrence->provider_manifest_id ||
-        catalog.value().provider_manifest_revision !=
-            occurrence->provider_manifest_revision ||
-        catalog.value().catalog_digest !=
-            occurrence->lifecycle_plan_catalog_digest) {
-      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
-          "lifecycle_catalog_readback_mismatch",
-          "lifecycle catalog source returned a non-exact provider occurrence");
-    }
+    // The source selects by manifest pair and digest and verified its
+    // catalogs once when composed.
     domains.push_back(std::move(built.value()));
     providers.push_back(*occurrence);
   }

@@ -31,12 +31,14 @@ import {
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
+import { ActiveTcpHoldHistory, activeTcpSnapshot, type ResumeTcpChange } from '../state/activeTcpResume';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
 import { incidentFacts } from '../state/componentLifecyclePresentation';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
+import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import {
   isAutomaticRetryAuditEvent,
   isTakeoverFallbackAuditEvent,
@@ -49,7 +51,7 @@ import {
   blackboardValueEditable,
   parseBlackboardValueDraft,
 } from './BlackboardValueEditor';
-import { PersistentKeyValuesSection } from './PersistentKeyValues';
+import { PersistentKeyResetNotice, PersistentKeyValuesSection } from './PersistentKeyValues';
 import { UncertainOutputConfirmation } from './UncertainOutputConfirmation';
 import { globalRuleLatchNotices, type GlobalRuleLatch } from '../state/globalRuleLatches';
 import { useGlobalRuleRecovery } from '../hooks/useGlobalRuleRecovery';
@@ -63,6 +65,7 @@ import {
 import {
   useBriefNotice,
   usePublishWorkbenchNotices,
+  type NoticeAction,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
 import {
@@ -80,6 +83,8 @@ export interface ProgramRecoveryCommand {
   /** Why it is disabled, shown next to it. */
   reason: string | null;
   run: () => void;
+  /** What it does, when it differs from the command's usual meaning. */
+  meaning?: string;
 }
 
 /**
@@ -180,6 +185,14 @@ const AUTOMATIC_RETRY_CAUSE_LABELS: Readonly<Record<string, string>> = {
 };
 
 /** The Stop fault's other latched causes, so none is hidden behind the primary. */
+/** The Recover cell button label while a press runs; null when idle. */
+function recoverCellBusyLabel(
+  robot: Pick<RobotControlController, 'stopFaultRecoveryPending' | 'stopFaultRecoveryInProgress'>,
+): string | null {
+  if (!robot.stopFaultRecoveryPending) return null;
+  return robot.stopFaultRecoveryInProgress ? 'Recovering… (in progress)' : 'Checking recovery';
+}
+
 function alsoObservedTriggers(fault: { trigger: string; observedTriggers: string[] }): string {
   const others = fault.observedTriggers.filter((trigger) => trigger !== fault.trigger);
   return others.length > 0 ? ` Also observed: ${others.map(humanizeReasonCode).join(', ')}.` : '';
@@ -475,6 +488,24 @@ function actionLabel(value: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+const RUNTIME_MONITOR_OBSERVATION_LOST = 'runtime_monitor_observation_lost';
+
+/**
+ * The Recovery line's class label. A runtime-monitor Stop for lost position
+ * feedback keeps the `runtime_collision` recovery class but is not a
+ * collision: it is named by its reason's catalog text. Display only.
+ */
+export function recoveryClassLabel(
+  offer: Pick<CycleRecoveryOffer, 'recoveryClass' | 'reason'>,
+): string {
+  if (offer.recoveryClass === 'runtime_collision'
+    && (offer.reason.code === RUNTIME_MONITOR_OBSERVATION_LOST
+      || offer.reason.details?.reason === RUNTIME_MONITOR_OBSERVATION_LOST)) {
+    return ERROR_CATALOG[RUNTIME_MONITOR_OBSERVATION_LOST][0];
+  }
+  return actionLabel(offer.recoveryClass);
+}
+
 function cycleFailureMessage(failure: Record<string, JsonValue> | null): string | null {
   const structured = parseApiErrorDto({ detail: failure });
   if (structured !== null) return structuredErrorText(structured);
@@ -519,6 +550,9 @@ export function ProgramRuntimePanel({
     ? []
     : motionGateWaitNodes(controls.audit, state.run.nodeStatuses);
   const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
+  // A Close whose required grasp confirmation saw no evidence: the run's
+  // reason reads as a failure.
+  const graspNotConfirmed = state.run?.reason?.code === 'grasp_not_confirmed';
   // A held failure carries its cause on the offer; the run's failure is set
   // only once the cycle itself requires recovery.
   const failureHold = recoveryOffer !== null && !ordinaryMotionHeld;
@@ -717,9 +751,9 @@ export function ProgramRuntimePanel({
           <span>Program motion stopped and held. Resume Motion replans from current state.</span>
         </div>
       ) : runReason !== null && (
-        <div className={`program-feedback${failureHold ? ' error-state' : ''}`} role="status">
+        <div className={`program-feedback${failureHold || graspNotConfirmed ? ' error-state' : ''}`} role="status">
           <span>
-            {runReason.title}
+            {graspNotConfirmed ? <strong>{runReason.title}</strong> : runReason.title}
             {runReason.message ? `: ${runReason.message}` : ''}
             {runReason.rows.map((row) => (
               <small key={row.label}>{` · ${row.label}: ${row.value}`}</small>
@@ -761,7 +795,7 @@ export function ProgramRuntimePanel({
           </div>
           {recoveryCause !== null && <p className="program-recovery-cause">{recoveryCause}</p>}
           <p>
-            {actionLabel(recoveryOffer.recoveryClass)} · node{' '}
+            {recoveryClassLabel(recoveryOffer)} · node{' '}
             <code>{recoveryOffer.nodeInstanceId}</code>
           </p>
           <ol className="program-recovery-steps">
@@ -804,7 +838,7 @@ export function ProgramRuntimePanel({
                 {recovery.continue !== null && (
                   <RecoveryCommandRow
                     command={recovery.continue}
-                    meaning={RECOVERY_COMMAND_MEANING.continue}
+                    meaning={recovery.continue.meaning ?? RECOVERY_COMMAND_MEANING.continue}
                     className="danger-button"
                   />
                 )}
@@ -1086,6 +1120,52 @@ function manualRecoveryTarget(
 }
 
 /**
+ * Select the exact addressed component in Robot Control for a manual
+ * recovery. A gripper operation selects its owning motion target first; the
+ * tool then follows. A tool component (merge 6) has no motion target: it is
+ * selected itself, as the Components page does.
+ */
+export function selectManualRecoveryTarget(
+  robot: RobotControlController,
+  operation: ManualRecoveryOperation,
+): void {
+  const target = manualRecoveryTarget(robot, operation);
+  const owningMotion = target.motionTarget
+    ?? (target.target === undefined ? undefined : (robot.motionTargets ?? [])
+      .find((candidate) => (
+        candidate.controllableComponentId
+          === target.target?.controllableComponentId
+      )));
+  if (owningMotion !== undefined) {
+    robot.selectRobot(
+      owningMotion.controllableComponentId,
+      owningMotion.commandTargetId,
+    );
+  } else if (target.gripper && target.target !== undefined) {
+    robot.selectRobot(target.target.controllableComponentId, '');
+  }
+  if (target.gripperTarget !== undefined) {
+    robot.selectTool(target.gripperTarget.commandTargetId);
+  }
+  robot.selectMode(target.gripper ? 'gripper' : 'joint');
+}
+
+/** Program cycle states in which the cell latch is not cleared: Reset first. */
+const PROGRAM_CYCLE_ACTIVE: ReadonlySet<string> = new Set(['starting', 'running', 'stopping']);
+
+const COMPONENT_LIFECYCLE_FAULT_ALARM = 'manyforge.runtime.component_lifecycle_fault';
+
+function programResetAction(onReset: { run: () => void; disabled: boolean }): NoticeAction {
+  return {
+    id: 'reset',
+    label: 'Reset',
+    title: 'Reset the Program cycle, as Reset in the Program controls.',
+    disabled: onReset.disabled,
+    run: onReset.run,
+  };
+}
+
+/**
  * Execution guidance as typed notices for the one notification stack.
  * Recovery conditions are errors carrying their existing guarded owner
  * actions (the single place those actions appear); they have no
@@ -1181,26 +1261,78 @@ export function deriveTransportGuidance({
     });
   }
   if (facts.cellFault != null) {
+    // One item per failure: the incidents' causes, the latch they set and
+    // the action that clears both. Its alarms (the Stop fault and each
+    // incident component's lifecycle fault) are shown inside it.
     const fault = facts.cellFault;
+    const incidents = robot.componentIncidents;
+    const componentIds = [...new Set(incidents.map(({ controllableComponentId }) => controllableComponentId))];
+    const recoverLabel = fault.recoveryStatus === 'ready' || incidents.length > 0
+      ? 'Recover cell' : 'Retry recovery';
+    // The latch is not cleared while a Program cycle is active
+    // (`program_cycle_state_*`), so Reset comes first.
+    const resetFirst = onReset !== undefined && program.cycleState !== null
+      && PROGRAM_CYCLE_ACTIVE.has(program.cycleState);
     notices.push({
       id: 'recovery.cell',
       severity: 'error',
       domain: 'recovery',
-      title: 'Cell recovery required',
+      title: componentIds.length === 0
+        ? 'Cell recovery required'
+        : `Open incident on ${componentIds.join(', ')}`,
       alarmDefinitionIds: ['manyforge.motion.stop_fault'],
-      message: `${humanizeReasonCode(fault.reasonCode)} · ${
-        fault.recoveryStatus.replaceAll('_', ' ')
-      }. Motion remains blocked.${robot.componentIncidents.map(({ controllableComponentId, incident }) =>
-        ` Incident on ${controllableComponentId}: ${incidentFacts(incident)}.`).join('')}`,
+      alarmSubjects: componentIds.map((subjectId) => ({
+        definitionId: COMPONENT_LIFECYCLE_FAULT_ALARM, subjectId,
+      })),
+      message: [
+        ...incidents.map(({ controllableComponentId, incident }) => (
+          `${controllableComponentId}: ${incidentFacts(incident)}.`)),
+        `Motion is blocked: ${humanizeReasonCode(fault.reasonCode)} · ${
+          fault.recoveryStatus.replaceAll('_', ' ')}.`,
+        'Programs and robot commands stay unavailable until the cell is recovered.',
+        resetFirst
+          ? `A Program run is still active: Reset the Program first, then ${recoverLabel}.`
+          : incidents.length > 0
+            ? 'Press Recover cell: it acknowledges the incident and recovers the cell.'
+            : `Press ${recoverLabel}.`,
+        recoverLabel === 'Recover cell'
+          ? 'This clears the cause of the alarms shown here; Acknowledge only marks them as seen.'
+          : null,
+        'Motion never resumes by itself.',
+      ].filter((part): part is string => part !== null).join(' '),
       busy: robot.stopFaultRecoveryPending,
+      actions: [
+        ...(resetFirst && onReset !== undefined ? [programResetAction(onReset)] : []),
+        {
+          id: 'recover-cell',
+          label: recoverCellBusyLabel(robot) ?? recoverLabel,
+          // SX-679: Recover cell waits while Scenario Close runs.
+          title: robot.cellRecoverBlockedReason ?? undefined,
+          disabled: robot.stopFaultRecoveryPending || robot.cellRecoverBlockedReason !== null,
+          run: () => { void robot.recoverStopFault(); },
+        },
+      ],
+    });
+  }
+  if (robot.stopFaultRecoveryPending) {
+    // SX-679: while a press runs (also after its latch is cleared, during the
+    // re-enable), the operator can abort it. No later step starts; the step
+    // in flight settles and the press reports what it did.
+    notices.push({
+      id: 'recovery.cell.running',
+      severity: 'warning',
+      domain: 'recovery',
+      title: 'Recover cell running',
+      message: 'Recover cell is running; Scenario Close waits until it finishes. '
+        + 'Abort stops it after the step in progress: no later step starts, and '
+        + 'its result lists what was done.',
+      busy: true,
       actions: [{
-        id: 'recover-cell',
-        label: robot.stopFaultRecoveryPending
-          ? 'Checking recovery'
-          : fault.recoveryStatus === 'ready' || robot.componentIncidents.length > 0
-            ? 'Recover cell' : 'Retry recovery',
-        disabled: robot.stopFaultRecoveryPending,
-        run: () => { void robot.recoverStopFault(); },
+        id: 'abort-recover-cell',
+        label: robot.stopFaultRecoveryAbortPending ? 'Aborting…' : 'Abort Recover cell',
+        title: 'Start no further Recover cell step; the step in progress finishes or fails within its own limit.',
+        disabled: robot.stopFaultRecoveryAbortPending,
+        run: () => { void robot.abortRecoverStopFault(); },
       }],
     });
   }
@@ -1231,13 +1363,8 @@ export function deriveTransportGuidance({
         ? 'Use Reset in the Program controls before another Execute.'
         : facts.programRecoveryMessage,
       // Red blocks the next Run until Reset, so it carries Reset.
-      actions: program.cycleFailure === null || onReset === undefined ? undefined : [{
-        id: 'reset',
-        label: 'Reset',
-        title: 'Reset the Program cycle, as Reset in the Program controls.',
-        disabled: onReset.disabled,
-        run: onReset.run,
-      }],
+      actions: program.cycleFailure === null || onReset === undefined
+        ? undefined : [programResetAction(onReset)],
     });
   } else if (facts.cellFault === null && facts.manualRecovery.length === 0
     && program.commandDisabledReason('program_run') === PROGRAM_RESET_READINESS_MESSAGE) {
@@ -1461,6 +1588,27 @@ export function ProgramTransportControls({
   viewerPreviewActive?: boolean;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const tcpHoldHistory = useRef(new ActiveTcpHoldHistory());
+  const locallyStartedRun = useRef(false);
+  const [resumeIntent, setResumeIntent] = useState<{
+    runId: string; groupId: string | null; changes: ResumeTcpChange[]; error?: string;
+  } | null>(null);
+  useEffect(() => {
+    const source = robot.controlSource;
+    if (source == null) return;
+    const onShellChange = () => {
+      const transport = source.getShellSnapshot().transportStatus;
+      if (transport !== 'connecting' && transport !== 'disconnected') return;
+      tcpHoldHistory.current.clear();
+      locallyStartedRun.current = false;
+      setResumeIntent(null);
+    };
+    onShellChange();
+    const unsubscribe = source.subscribeShell(onShellChange);
+    return () => {
+      unsubscribe();
+    };
+  }, [robot.controlSource]);
   const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
   // Reset during execution ends the run and restarts the tree, so it is
   // confirmed like Halt: motion stops first, the question comes after.
@@ -1527,6 +1675,55 @@ export function ProgramTransportControls({
       request.kind === kind && request.groupIds.includes(groupId)
     ))
   );
+  const runCapture = state.run?.capture;
+  const runBinding = state.applied !== null && runCapture !== undefined
+    && state.applied.programRevision === runCapture.programRevision
+    && state.applied.programBinding.program_binding_id === runCapture.programBindingId
+    ? state.applied.programBinding : null;
+  const currentTcp = activeTcpSnapshot(runBinding, robot.tcpResumeStatus ?? null,
+    runCapture?.graphRevision ?? '', runCapture?.retainedBundleId ?? '');
+  // DX-3102 accepts that the Runner and TCP streams have no shared ordering
+  // at Hold, so this GUI observation is not an exact hold-time TCP reading.
+  const observedRun = robot.tcpResumeCycle?.run ?? null;
+  const observedControls = robot.tcpResumeCycle?.runtimeControls ?? null;
+  const resumeCycleMatches = robot.tcpResumeFresh === true && state.run !== null
+    && observedRun !== null && observedControls !== null
+    && observedRun.ownerEpoch === state.run.ownerEpoch
+    && observedRun.capture.programRunId === runCapture?.programRunId
+    && observedRun.runRevision === state.run.runRevision
+    && observedControls.ownerEpoch === observedRun.ownerEpoch
+    && observedControls.programRunId === observedRun.capture.programRunId
+    && observedControls.runRevision === observedRun.runRevision;
+  const tcpSelections = resumeCycleMatches ? observedControls?.executionSelections.groups ?? [] : [];
+  const heldTcpKeys = tcpSelections.filter((group) => (group.ordinaryHeldNodeCount ?? 0) > 0)
+    .map((group) => `group:${group.groupId}`);
+  const unknownTcpKeys = tcpSelections.filter((group) => group.ordinaryHeldNodeCount == null)
+    .map((group) => `group:${group.groupId}`);
+  if (resumeCycleMatches && observedRun?.state === 'full_stopped') heldTcpKeys.push('full');
+  else if (resumeCycleMatches && observedRun?.state === 'full_stopping') unknownTcpKeys.push('full');
+  useEffect(() => {
+    if (robot.tcpResumeConnectionLost === true) {
+      tcpHoldHistory.current.clear();
+      locallyStartedRun.current = false;
+      setResumeIntent(null);
+      return;
+    }
+    if (state.run === null) {
+      locallyStartedRun.current = state.pending === 'run';
+      return;
+    }
+    if (!resumeCycleMatches) return;
+    tcpHoldHistory.current.observe(runCapture?.programRunId ?? null, heldTcpKeys, currentTcp, unknownTcpKeys,
+      locallyStartedRun.current);
+    locallyStartedRun.current = false;
+  });
+  const requestTcpResume = (key: string, groupId: string | null, send: () => void) => {
+    const runId = runCapture?.programRunId;
+    const changes = heldTcpKeys.includes(key) && !tcpHoldHistory.current.isOverlapping(heldTcpKeys, unknownTcpKeys)
+      ? tcpHoldHistory.current.changes(key, currentTcp, runId) : [];
+    if (runId !== undefined && changes.length > 0) setResumeIntent({ runId, groupId, changes });
+    else send();
+  };
   const motionActive = robotControlHasActiveOperation(robot.state);
   // Includes the other manual mode, not just the operation currently shown
   // in Robot Control. The native owner independently fences Program Resume.
@@ -1621,6 +1818,8 @@ export function ProgramTransportControls({
         && continueAction?.enabled === true
         && continueAlarmBlock === null,
       continuePending: state.controlPending === `recovery:${offer.offerId}:continue_with_failure`,
+      // An unconfirmed Stop's hold: its Continue is the operator's Acknowledge.
+      acknowledgesStop: offer.reason.code === 'program_stop_settlement_unconfirmed',
     };
   };
   const holdsControls = recoveryHolds.map((hold) => ({
@@ -1720,11 +1919,19 @@ export function ProgramTransportControls({
   const positionUnavailableReason = positionAvailability === null
     ? 'The backend does not report whether robot positions can be reset.'
     : positionAvailability.reason;
+  // Reload needs an applied Program: with none there is no initial scene.
+  const reloadAvailable = state.applied !== null;
+  const reloadUnavailableReason = reloadAvailable
+    ? null
+    : 'No applied Program is available, so there is no initial scene to reload. Load a Scenario first.';
   const resetSelectionApplied = {
-    reloadInitialScene: resetSelection.reloadInitialScene,
+    reloadInitialScene: reloadAvailable && resetSelection.reloadInitialScene,
     resetRobotPosition: positionAvailable && resetSelection.resetRobotPosition,
   };
   const resetKept = resetKeptMessage(resetSelectionApplied);
+  // Reload initial scene also resets persistent keys; the confirmation lists them.
+  const appliedPersistentKeys = (state.applied?.program.blackboard?.keys ?? [])
+    .some((key) => key.persistence === 'persistent');
   // Uncertain outputs always ask: each needs its own acknowledgement.
   const confirmReset = preferences.confirmReset || resetUncertain.length > 0;
   const requestProgramReset = async () => {
@@ -1798,25 +2005,7 @@ export function ProgramTransportControls({
                 ? 'No robot loaded'
                 : 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
   const openManualRecovery = (operation: ManualRecoveryOperation) => {
-    const target = manualRecoveryTarget(robot, operation);
-    // Select the exact addressed robot before opening the panel. A gripper
-    // operation selects its owning motion target first; the tool then follows.
-    const owningMotion = target.motionTarget
-      ?? (target.target === undefined ? undefined : (robot.motionTargets ?? [])
-        .find((candidate) => (
-          candidate.controllableComponentId
-            === target.target?.controllableComponentId
-        )));
-    if (owningMotion !== undefined) {
-      robot.selectRobot(
-        owningMotion.controllableComponentId,
-        owningMotion.commandTargetId,
-      );
-    }
-    if (target.gripperTarget !== undefined) {
-      robot.selectTool(target.gripperTarget.commandTargetId);
-    }
-    robot.selectMode(target.gripper ? 'gripper' : 'joint');
+    selectManualRecoveryTarget(robot, operation);
     onOpenRobotControls?.();
   };
   const briefRetry = useBriefAutomaticRetry(
@@ -1870,7 +2059,12 @@ export function ProgramTransportControls({
     },
     // Continue exists only for a failure hold, as in the Motion panel.
     continue: focusedHoldControls?.continueAction == null ? null : {
-      label: focusedHoldControls.continuePending ? 'Continuing' : 'Continue',
+      label: focusedHoldControls.acknowledgesStop
+        ? (focusedHoldControls.continuePending ? 'Acknowledging' : 'Acknowledge')
+        : (focusedHoldControls.continuePending ? 'Continuing' : 'Continue'),
+      meaning: focusedHoldControls.acknowledgesStop
+        ? 'Stop not confirmed: acknowledge to continue. The node goes on with its normal Stop outcome.'
+        : undefined,
       enabled: focusedHoldControls.canContinue,
       reason: focusedHoldControls.canContinue ? null
         : focusedHoldControls.continueAlarmBlock?.message
@@ -1989,6 +2183,11 @@ export function ProgramTransportControls({
               && state.controlPending === null
               && program.commandAllowed('program_motion_resume');
             const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
+            // Resume follows the recorded hold: while the group's Stop still
+            // settles (Kernel stopping, or its hold not yet recorded), it shows
+            // a disabled "Stopping…" rather than an action the Runner refuses.
+            const stopSettling = group.state === 'stopping'
+              || group.resumeUnavailableReason === 'selected_motion_stop_settling';
             // The hold that owns this group takes its Retry and Continue. A group
             // no hold owns takes an operator Stop's Retry when it has one;
             // otherwise a stopped or held group waits while any hold is active.
@@ -2038,11 +2237,13 @@ export function ProgramTransportControls({
                 <button
                   type="button"
                   className="transport-group-resume"
-                  disabled={retry !== null ? !canRetryGroup : waitsForHold || !canGroupRelease}
+                  disabled={retry !== null ? !canRetryGroup : waitsForHold || stopSettling || !canGroupRelease}
                   title={retry !== null && retryTarget !== null
                     ? retryTitle(retryTarget)
                     : waitsForHold
                       ? `${group.groupId} waits for held node${recoveryHolds.length > 1 ? 's' : ''} ${heldNodeNames}: Retry or Continue ${recoveryHolds.length > 1 ? 'them' : 'it'} first.`
+                      : stopSettling
+                        ? `${group.groupId} is stopping: Resume is available once its Stop has settled.`
                       : canGroupRelease
                         ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                         : group.state === 'running'
@@ -2054,20 +2255,30 @@ export function ProgramTransportControls({
                   onClick={() => {
                     if (retryTarget !== null && retry !== null) {
                       if (canRetryGroup) program.applyRecoveryAction(retryTarget.offer, retry.actionId);
-                    } else if (!waitsForHold && canGroupRelease) void program.resumeMotion([group.groupId]);
+                    } else if (!waitsForHold && !stopSettling && canGroupRelease) {
+                      requestTcpResume(`group:${group.groupId}`, group.groupId, () => { void program.resumeMotion([group.groupId]); });
+                    }
                   }}
                 >{retry !== null ? (retryPending ? 'Retrying' : 'Retry')
                   : releasePending ? (group.state === 'ready' ? 'Starting' : 'Resuming')
+                    : stopSettling ? 'Stopping…'
                     : group.state === 'running' ? 'Running' : releaseLabel}</button>
                 {owner?.continueAction != null ? (
                   <button
                     type="button"
                     className="danger-button transport-group-stop"
                     disabled={!owner.canContinue}
-                    title={owner.continueAlarmBlock?.message ?? 'Continuing fails the node'}
-                    aria-label={`Continue ${group.groupId}: fail held node ${owner.offer.nodeInstanceId}`}
+                    title={owner.continueAlarmBlock?.message
+                      ?? (owner.acknowledgesStop
+                        ? 'Stop not confirmed: acknowledge to continue'
+                        : 'Continuing fails the node')}
+                    aria-label={owner.acknowledgesStop
+                      ? `Acknowledge ${group.groupId}: Stop not confirmed for held node ${owner.offer.nodeInstanceId}`
+                      : `Continue ${group.groupId}: fail held node ${owner.offer.nodeInstanceId}`}
                     onClick={() => requestContinue(owner)}
-                  >{owner.continuePending ? 'Continuing' : 'Continue'}</button>
+                  >{owner.acknowledgesStop
+                    ? (owner.continuePending ? 'Acknowledging' : 'Acknowledge')
+                    : (owner.continuePending ? 'Continuing' : 'Continue')}</button>
                 ) : (
                   <button
                     type="button"
@@ -2131,7 +2342,7 @@ export function ProgramTransportControls({
                     ?? blockedReason
                     ?? 'Execute requires an Applied Program and an idle, reset runner.'}
             onClick={() => {
-              if (canResumeFullStop) void program.resumeFullStop();
+              if (canResumeFullStop) requestTcpResume('full', null, () => { void program.resumeFullStop(); });
               else void program.run();
             }}
           >{state.pending === 'run' || state.pending === 'resume-full-stop'
@@ -2279,6 +2490,11 @@ export function ProgramTransportControls({
                 Motion never resumes by itself.
               </p>
             )}
+            {program.cycleState !== null && PROGRAM_CYCLE_ACTIVE.has(program.cycleState) && (
+              <p className="inline-message severity-warning">
+                A Program run is still active: Reset the Program first, then Recover cell.
+              </p>
+            )}
             {robot.componentIncidentsUnavailableReason && (
               <p className="inline-message severity-warning">
                 Component incidents are unavailable: {robot.componentIncidentsUnavailableReason}
@@ -2291,16 +2507,16 @@ export function ProgramTransportControls({
               <button
                 type="button"
                 className="runtime-detail-button"
-                disabled={!enabled || robot.stopFaultRecoveryPending}
-                title={fullCellStop.fault.recoveryStatus === 'ready'
+                disabled={!enabled || robot.stopFaultRecoveryPending
+                  || robot.cellRecoverBlockedReason !== null}
+                title={robot.cellRecoverBlockedReason ?? (fullCellStop.fault.recoveryStatus === 'ready'
                   ? 'Clear the stop fault and allow motion again.'
-                  : 'Ask the backend to check again; it clears the fault only when every safety check passes.'}
+                  : 'Ask the backend to check again; it clears the fault only when every safety check passes.')}
                 onClick={() => { void robot.recoverStopFault(); }}
               >
-                {robot.stopFaultRecoveryPending
-                  ? 'Checking recovery'
-                  : fullCellStop.fault.recoveryStatus === 'ready' || robot.componentIncidents.length > 0
-                    ? 'Recover cell' : 'Check again'}
+                {recoverCellBusyLabel(robot)
+                  ?? (fullCellStop.fault.recoveryStatus === 'ready' || robot.componentIncidents.length > 0
+                    ? 'Recover cell' : 'Check again')}
               </button>
             </div>
           </section>
@@ -2468,6 +2684,58 @@ export function ProgramTransportControls({
         )}
       </OverlayPanel>
       <OverlayPanel
+        open={resumeIntent !== null}
+        title="Resume with the new TCP?"
+        titleId="program-resume-tcp-confirmation-title"
+        kind="dialog"
+        compact
+        onClose={() => setResumeIntent(null)}
+      >
+        <div className="dialog-copy transport-confirmation">
+          {resumeIntent?.changes.map((change) => (
+            <p key={change.robot}>{change.robot}: Active TCP is now {change.newDisplay} (was {change.oldDisplay}).</p>
+          ))}
+          {resumeIntent?.error && <p>{resumeIntent.error}</p>}
+          <div className="dialog-actions">
+            <button type="button" onClick={() => setResumeIntent(null)}>Cancel</button>
+            <button type="button" onClick={() => {
+              if (resumeIntent === null || runCapture?.programRunId !== resumeIntent.runId) {
+                if (resumeIntent !== null) setResumeIntent({ ...resumeIntent, error: 'Resume is no longer available.' });
+                return;
+              }
+              const key = resumeIntent.groupId === null ? 'full' : `group:${resumeIntent.groupId}`;
+              const changes = !heldTcpKeys.includes(key)
+                || tcpHoldHistory.current.isOverlapping(heldTcpKeys, unknownTcpKeys) ? []
+                : tcpHoldHistory.current.changes(key, currentTcp, runCapture.programRunId);
+              if (JSON.stringify(changes) !== JSON.stringify(resumeIntent.changes)) {
+                if (changes.length > 0) { setResumeIntent({ ...resumeIntent, changes, error: undefined }); return; }
+              }
+              const group = selections.find((row) => row.groupId === resumeIntent.groupId);
+              const owner = group === undefined ? null : groupHold(group.groupId);
+              const retryTarget = owner ?? operatorControls;
+              const waitsForHold = owner === null && recoveryHolds.length > 0
+                && (group?.state === 'held' || group?.state === 'ready');
+              if (resumeIntent.groupId === null) {
+                if (canResumeFullStop) {
+                  setResumeIntent(null);
+                  void program.resumeFullStop();
+                } else setResumeIntent({ ...resumeIntent, error: 'Resume is no longer available.' });
+              } else if (enabled && state.runnerAvailable && cycleState === 'running'
+                  && programMotionRunning && !manualResident && state.pending === null
+                  && state.controlPending === null && state.selectionPending.length === 0
+                  && retryTarget?.retryAction == null && !waitsForHold
+                  && group?.resumeAllowed && group.state !== 'stopping'
+                  && group.resumeUnavailableReason !== 'selected_motion_stop_settling'
+                  && program.motionAttentionBlock(group.resourceIds) === null
+                  && program.commandAllowed('program_motion_resume')) {
+                setResumeIntent(null);
+                void program.resumeMotion([resumeIntent.groupId]);
+              } else setResumeIntent({ ...resumeIntent, error: 'Resume is no longer available.' });
+            }}>Resume</button>
+          </div>
+        </div>
+      </OverlayPanel>
+      <OverlayPanel
         open={resetIntent === 'confirm'}
         title={idleReset ? 'Reset the Program?'
           : endedReset ? 'Reset the ended Program run?' : 'Reset the running Program?'}
@@ -2488,10 +2756,12 @@ export function ProgramTransportControls({
               </ul>
             </>}
           <fieldset className="transport-reset-options">
-            <label className="toggle-control">
+            <label className="toggle-control" title={reloadUnavailableReason ?? undefined}>
               <input
                 type="checkbox"
-                checked={resetSelection.reloadInitialScene}
+                name="reloadInitialScene"
+                checked={resetSelectionApplied.reloadInitialScene}
+                disabled={!reloadAvailable}
                 onChange={(event) => {
                   const reloadInitialScene = event.target.checked;
                   setResetSelection((current) => ({ ...current, reloadInitialScene }));
@@ -2500,7 +2770,9 @@ export function ProgramTransportControls({
               <span>Reload initial scene</span>
             </label>
             <small className="transport-reset-option-note">
-              Scene objects, including carried ones, are replaced by the Program&apos;s initial Scene.
+              {reloadUnavailableReason
+                ?? 'Scene objects, including carried ones, are replaced by the Program\'s initial Scene.'}
+              {appliedPersistentKeys && ' Persistent keys return to their initial values.'}
             </small>
             <label className="toggle-control" title={positionUnavailableReason ?? undefined}>
               <input
@@ -2520,6 +2792,9 @@ export function ProgramTransportControls({
                 : positionUnavailableReason}
             </small>
           </fieldset>
+          {resetSelectionApplied.reloadInitialScene && appliedPersistentKeys && (
+            <PersistentKeyResetNotice client={program.persistentValues} />
+          )}
           {resetKept !== null && <p>{resetKept}</p>}
           <UncertainOutputConfirmation outputs={resetUncertain} approved={approvedUncertain}
             onToggle={(key, approved) => setApprovedUncertain((current) => {
@@ -2595,18 +2870,29 @@ export function ProgramTransportControls({
       </OverlayPanel>
       <OverlayPanel
         open={continueIntent !== null}
-        title="Continue with a failed node?"
+        title={continueTarget?.acknowledgesStop
+          ? 'Stop not confirmed: acknowledge to continue'
+          : 'Continue with a failed node?'}
         titleId="program-continue-confirmation-title"
         kind="dialog"
         compact
         onClose={() => setContinueIntent(null)}
       >
         <div className="dialog-copy transport-confirmation">
-          <p>
-            Continuing fails the node <code>{continueIntent?.nodeInstanceId}</code>:
-            its held operation is closed, it returns FAILURE to the Program
-            tree, and the motion groups it holds resume.
-          </p>
+          {continueTarget?.acknowledgesStop ? (
+            <p>
+              The Stop of node <code>{continueIntent?.nodeInstanceId}</code> was
+              not confirmed. Acknowledging continues the node with its normal
+              Stop outcome, and the motion groups it holds resume. Its stopped
+              operation stays retained until Reset if it still cannot close.
+            </p>
+          ) : (
+            <p>
+              Continuing fails the node <code>{continueIntent?.nodeInstanceId}</code>:
+              its held operation is closed, it returns FAILURE to the Program
+              tree, and the motion groups it holds resume.
+            </p>
+          )}
           {continueTarget === null || !continueTarget.canContinue ? (
             <p role="status">Continue is no longer available for this hold.</p>
           ) : null}
@@ -2623,7 +2909,7 @@ export function ProgramTransportControls({
                   setDetailsOpen(false);
                 }
               }}
-            >Continue</button>
+            >{continueTarget?.acknowledgesStop ? 'Acknowledge' : 'Continue'}</button>
           </div>
         </div>
       </OverlayPanel>

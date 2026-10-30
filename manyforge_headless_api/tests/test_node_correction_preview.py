@@ -73,7 +73,7 @@ def _operation() -> dict[str, Any]:
                     "kind": "motion",
                     "move_id": "preview-move:1",
                     "base_frame_role_id": "base",
-                    "tcp_endpoint": {"target_role_id": "arm", "frame_role_id": "tcp"},
+                    "tcp_endpoint": {"kind": "entry", "entry": {"component_id": "robot", "target_id": "arm", "frame_role_id": "tcp"}},
                     "tolerances": {
                         "joint_position_tol_rad": 0.01,
                         "translation_tol_m": 0.001,

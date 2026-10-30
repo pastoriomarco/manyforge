@@ -201,8 +201,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     }
     {
       const auto& endpoint = *binding.motion_endpoint;
-      if (endpoint.target_role_id != motion->tcp_endpoint.target_role_id ||
-          endpoint.frame.frame_role_id != motion->tcp_endpoint.frame_role_id)
+      if (!tcp_selector_admits(motion->tcp_endpoint, endpoint, std::nullopt))
         return Result<ExecuteRequestDTO>::Err(
             ErrorDTO{"invalid_request", "fixture endpoint capture differs from motion", {}});
       request.binding.tcp_frame = ResolvedComponentModelFrameDTO{
@@ -355,8 +354,7 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
                                      CapabilityId("execution.trajectory.execute"), std::nullopt,
                                      MotionParticipantIntentDTO{MoveId(std::move(move_id)),
                                                                 FrameRoleId("frame-role:base"),
-                                                                MotionEndpointReferenceDTO{TargetRoleId("target-role:test"),
-                                                                                           FrameRoleId("frame-role:tcp")},
+                                                                CurrentTcpDTO{},
                                                                 TolerancesDTO{},
                                                                 SpeedProfileDTO{},
                                                                 TimeoutsDTO{1.0, 1.0},
@@ -1106,8 +1104,7 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
     const auto qualified = [&](OperationIntentDTO operation) {
       auto& payload = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
-      payload.tcp_endpoint = MotionEndpointReferenceDTO{arm.motion_endpoint->target_role_id,
-                                                        arm.motion_endpoint->frame.frame_role_id};
+      payload.tcp_endpoint = tcp_entry_of(*arm.motion_endpoint, arm.controllable_component_id);
       return operation;
     };
     const PickSequencePlanningIntentDTO request{
@@ -1259,6 +1256,70 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
   EXPECT_NEAR(inverse_candidate.pick_pose.position_m.y_m, 0.0, 1.0e-9);
   EXPECT_NEAR(inverse_candidate.approach_pose.position_m.x_m, 0.02, 1.0e-9);
   EXPECT_NEAR(inverse_candidate.approach_pose.position_m.y_m, 0.05, 1.0e-9);
+}
+
+// C-P7 (G7): an offset whose reference is the move's TCP entry keeps the
+// candidate TCP's orientation also when the entry belongs to a tool mounted on
+// the arm (before: only the arm's own component matched, so a tool TCP
+// reference was resolved like any frame and took the start orientation). A
+// different entry of the same tool is an ordinary reference.
+TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesTheCandidateTcp) {
+  auto predecessor = predecessor_projection();
+  FakeMotionPreviewOwner motion;
+  motion.motion_binding = arm_runtime_binding();
+  auto& arm = *motion.motion_binding;
+  auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
+  endpoint_bodies.front().target_role_id = TargetRoleId("target-role:gripper");
+  arm.motion_endpoint =
+      RuntimeMotionEndpointBindingDTO{TargetRoleId("target-role:gripper"),
+                                      CommandTargetId("target:test"),
+                                      {FrameRoleId("frame-role:fingertip"),
+                                       ModelInstanceId("model:test"),
+                                       ModelRevision("model-revision:test"),
+                                       "fingertip",
+                                       {CollisionBodyRoleId("collision-body-role:tool")}},
+                                      std::move(endpoint_bodies)};
+  arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
+  arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
+  motion.carrier_binding = carrier_runtime_binding();
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+  const auto qualified = [&](OperationIntentDTO operation) {
+    auto& payload = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+    payload.tcp_endpoint = tcp_entry_of(*arm.motion_endpoint, arm.controllable_component_id);
+    return operation;
+  };
+  const auto request = [&](const std::string& id, PickCandidateSynthesisIntentDTO synthesis) {
+    return PickSequencePlanningIntentDTO{
+        id,
+        SceneResourceId("workpiece"),
+        RuntimeObjectId("selected_object"),
+        FrameRoleId("frame-role:tcp"),
+        std::move(synthesis),
+        qualified(motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}})),
+        qualified(motion_operation(
+            id + ".descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+            {{RuntimeObjectId("selected_object"), SceneResourceId("workpiece")}})),
+        tool_operation(id + ".tool", 0.0),
+        qualified(motion_operation(id + ".retreat", "retreat", CartesianPathDTO{}))};
+  };
+  // The tool's entry, named by its own component (not the arm's).
+  const ReferenceTargetDTO tool_entry_owner{TargetRoleId("target-role:gripper"),
+                                            ControllableComponentId("component:gripper"),
+                                            CommandTargetId("target:test")};
+  ASSERT_NE(tool_entry_owner.controllable_component_id, arm.controllable_component_id);
+  auto synthesis = PickCandidateSynthesisIntentDTO{};
+  synthesis.pick_offset_reference =
+      ReferenceDTO(FrameRoleId("frame-role:fingertip"), tool_entry_owner);
+  const auto candidate = owner.PlanPick(request("tool-entry-offset", synthesis));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  EXPECT_EQ(motion.reference_resolution_count, 0U);
+
+  synthesis.pick_offset_reference = ReferenceDTO(FrameRoleId("frame-role:base"), tool_entry_owner);
+  const auto other_entry = owner.PlanPick(request("other-entry-offset", synthesis));
+  ASSERT_TRUE(other_entry.ok()) << other_entry.error().message;
+  EXPECT_EQ(motion.reference_resolution_count, 1U);
 }
 
 TEST(AddressedPickPlacePlanningOwner, AcceptsAnyFrameOffsetReferenceAndNamesAnUnboundObject) {

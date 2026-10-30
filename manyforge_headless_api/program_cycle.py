@@ -127,6 +127,7 @@ def program_cycle_event_class(
                 group.get(field)
                 for field in (
                     "group_id",
+                    "ordinary_held_node_count",
                     "state",
                     "stop_allowed",
                     "start_allowed",

@@ -241,6 +241,15 @@ describe('CCLC closed response parsers', () => {
     }
   });
 
+  it('accepts the incident-retired Active target fact only as true', () => {
+    expect(() => parseCCLCComponentSnapshot({
+      ...componentSnapshot(), active_target_retired_by_incident: true,
+    })).not.toThrow();
+    expect(() => parseCCLCComponentSnapshot({
+      ...componentSnapshot(), active_target_retired_by_incident: false,
+    })).toThrow('active_target_retired_by_incident');
+  });
+
   it('rejects unknown fields and malformed typed nullable evidence', () => {
     const invalidFacts: Array<[string[], unknown]> = [
       [['extra'], true],
@@ -512,7 +521,6 @@ describe('CCLC closed response parsers', () => {
         action_state: 'not_started',
         control_domain_id: 'domain.arm',
         current_state: 'prepared',
-        effect: 'none',
         error: null,
       }],
       error: null,
@@ -541,15 +549,65 @@ describe('CCLC closed response parsers', () => {
     const failed = {
       ...structuredClone(status),
       phase: 'failed',
-      terminal_result: 'failed_known_no_effect',
+      terminal_result: 'failed',
       error: {
         code: 'native_lifecycle_route_unavailable',
         message: 'The native route did not become ready',
         details: { reason: 'route_readback_missing' },
       },
     };
-    expect(parseCCLCStatusEnvelope({ status: failed }, 'lifecycle')?.error)
-      .toEqual(failed.error);
+    expect(parseCCLCStatusEnvelope({ status: failed }, 'lifecycle')?.terminalResult).toBe('failed');
+    expect(parseCCLCStatusEnvelope({ status: failed }, 'lifecycle')?.error).toEqual(failed.error);
+    expect(parseCCLCStatusEnvelope({ status: { ...failed, terminal_result: 'connection_lost' } }, 'lifecycle')
+      ?.terminalResult).toBe('connection_lost');
+    expect(() => parseCCLCStatusEnvelope({ status: { ...failed,
+      terminal_result: 'failed_known_no_effect' } }, 'lifecycle')).toThrow('known terminal result');
+    expect(() => parseCCLCStatusEnvelope({ status: { ...status,
+      domains: [{ ...status.domains[0], effect: 'none' }] } }, 'lifecycle')).toThrow('closed fields');
+    expect(() => parseCCLCStatusEnvelope({ status: { ...status, phase: 'reconciling' } }, 'lifecycle'))
+      .toThrow('known transaction phase');
+    expect(() => parseCCLCStatusEnvelope({ status: { ...status,
+      domains: [{ ...status.domains[0], action_state: 'reconciling' }] } }, 'lifecycle'))
+      .toThrow('known lifecycle action state');
+    expect(() => parseCCLCStatusEnvelope({ status: { ...status,
+      domains: [{ ...status.domains[0], action_state: 'outcome_unknown' }] } }, 'lifecycle'))
+      .toThrow('known lifecycle action state');
+
+    const routeAcceptance = {
+      accepted_at_ns: 100,
+      candidate_active_control_configuration_generation: 3,
+      candidate_active_control_configuration_id: 'active.next',
+      control_domain_id: 'domain.arm',
+      request_id: 'route.request.3',
+      route_selection_transaction_generation: 3,
+      route_selection_transaction_id: 'route.3',
+      timeout_duration_ns: 1_000_000,
+    };
+    const routeStatus = {
+      acceptance: routeAcceptance,
+      accepted_at_ns: 100,
+      affected_control_binding_ids: [],
+      affected_controller_role_ids: [],
+      effect: 'none',
+      error: null,
+      latest_updated_at_ns: 110,
+      phase: 'failed',
+      reconciliation_required: false,
+      remaining_duration_ns: 999_990,
+      resulting_active_control_configuration: null,
+      status_owner_epoch: 'cclc.epoch.1',
+      status_sequence: 1,
+      terminal_result: 'failed_known_no_effect',
+    };
+    for (const terminalResult of ['failed_known_no_effect', 'failed_partial_effect'] as const) {
+      expect(parseCCLCStatusEnvelope({ status: { ...routeStatus, terminal_result: terminalResult } }, 'route')
+        ?.terminalResult).toBe(terminalResult);
+    }
+    expect(() => parseCCLCStatusEnvelope({ status: { ...routeStatus, terminal_result: 'connection_lost' } }, 'route'))
+      .toThrow('known terminal result');
+    const routeReconciliation = parseCCLCStatusEnvelope({ status: { ...routeStatus,
+      phase: 'reconciling', reconciliation_required: true, terminal_result: null } }, 'route');
+    expect(routeReconciliation).toMatchObject({ phase: 'reconciling', reconciliationRequired: true });
 
     const mismatched = structuredClone(status);
     (mismatched.acceptance as Record<string, unknown>).lifecycle_transaction_id =

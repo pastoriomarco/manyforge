@@ -144,10 +144,11 @@ def _primitive_intent():
         core.ProviderManifestRevision("manifest-revision-1"),
         core.RuntimeUnitId("runtime-1"),
         core.RuntimeEpoch("runtime-epoch-1"),
-        core.LifecyclePrimitiveId("enable-control"),
+        core.LifecyclePrimitiveId("transition.enable"),
         core.LifecyclePrimitiveAttemptId("attempt-1"),
         4,
         1_000_000,
+        core.ComponentLifecycleStateDTO.kActive,
     )
 
 
@@ -293,9 +294,8 @@ def test_fact_union_rejects_cross_alternative_fields():
     assert not invalid.locally_valid()
 
 
-def test_primitive_result_distinguishes_refusal_from_uncertain_dispatch():
-    primitive = _primitive_intent()
-    refused = core.BrandLifecyclePrimitiveResultDTO(
+def _primitive_result(primitive, outcome, error=None, substeps=()):
+    return core.BrandLifecyclePrimitiveResultDTO(
         primitive.lifecycle_transaction_id,
         primitive.lifecycle_transaction_generation,
         primitive.controllable_component_id,
@@ -309,33 +309,87 @@ def test_primitive_result_distinguishes_refusal_from_uncertain_dispatch():
         primitive.lifecycle_primitive_id,
         primitive.lifecycle_primitive_attempt_id,
         primitive.expected_observation_generation,
-        core.LifecyclePrimitiveDispatchStateDTO.kNotDispatched,
-        core.LifecyclePrimitiveEffectDTO.kNone,
-        error=core.ErrorDTO("primitive_refused", "not accepted", {}),
-    )
-    uncertain = core.BrandLifecyclePrimitiveResultDTO(
-        primitive.lifecycle_transaction_id,
-        primitive.lifecycle_transaction_generation,
-        primitive.controllable_component_id,
-        primitive.control_domain_id,
-        primitive.control_domain_revision,
-        primitive.provider_instance_id,
-        primitive.provider_manifest_id,
-        primitive.provider_manifest_revision,
-        primitive.provider_runtime_unit_id,
-        primitive.provider_runtime_epoch,
-        primitive.lifecycle_primitive_id,
-        primitive.lifecycle_primitive_attempt_id,
-        primitive.expected_observation_generation,
-        core.LifecyclePrimitiveDispatchStateDTO.kDispatchedUncertain,
-        core.LifecyclePrimitiveEffectDTO.kPossible,
-        error=core.ErrorDTO("dispatch_uncertain", "response lost", {}),
+        outcome,
+        error=error,
+        substeps=list(substeps),
     )
 
-    assert refused.locally_valid()
-    assert uncertain.locally_valid()
-    assert refused.matches(primitive)
-    assert uncertain.matches(primitive)
+
+def test_transition_result_has_three_outcomes_and_lists_its_substeps():
+    primitive = _primitive_intent()
+    assert primitive.requested_state == core.ComponentLifecycleStateDTO.kActive
+    for removed in (
+        "LifecyclePrimitiveDispatchStateDTO",
+        "LifecyclePrimitiveEffectDTO",
+        "LifecyclePrimitiveKnownResultDTO",
+        "ComponentLifecycleDomainEffectDTO",
+        "LifecycleReconciliationEvidenceDTO",
+    ):
+        assert not hasattr(core, removed)
+    assert not hasattr(core.ComponentLifecycleTerminalResultDTO, "kFailedPartialEffect")
+    assert not hasattr(core.ComponentLifecycleTransactionPhaseDTO, "kReconciling")
+    assert not hasattr(core.ComponentLifecycleDomainActionStateDTO, "kOutcomeUnknown")
+
+    clear = core.LifecycleSubstepResultDTO(
+        core.LifecyclePrimitiveId("device.clear_error"),
+        None,
+        core.LifecycleTransitionOutcomeDTO.kSucceeded,
+        10,
+        20,
+    )
+    refused = core.LifecycleSubstepResultDTO(
+        core.LifecyclePrimitiveId("ros2_control.hardware.activate"),
+        None,
+        core.LifecycleTransitionOutcomeDTO.kFailed,
+        20,
+        30,
+        core.ErrorDTO("ros2_control_hardware_activation_refused", "refused", {}),
+    )
+    failed = _primitive_result(
+        primitive,
+        core.LifecycleTransitionOutcomeDTO.kFailed,
+        refused.error,
+        (clear, refused),
+    )
+    lost = _primitive_result(
+        primitive,
+        core.LifecycleTransitionOutcomeDTO.kConnectionLost,
+        core.ErrorDTO("robot_controller_unresponsive", "no answer", {}),
+    )
+    succeeded = _primitive_result(primitive, core.LifecycleTransitionOutcomeDTO.kSucceeded)
+    unexplained = _primitive_result(primitive, core.LifecycleTransitionOutcomeDTO.kFailed)
+
+    for result in (failed, lost, succeeded):
+        assert result.locally_valid()
+        assert result.matches(primitive)
+    assert not unexplained.locally_valid()
+    assert failed.substeps == (clear, refused)
+    assert failed.substeps[1].error.code == "ros2_control_hardware_activation_refused"
+
+    started = core.LifecycleSubstepEventDTO(
+        primitive.lifecycle_primitive_attempt_id,
+        clear.substep_id,
+        None,
+        core.LifecycleSubstepEventDTO.Phase.kStarted,
+        10,
+    )
+    finished = core.LifecycleSubstepEventDTO(
+        primitive.lifecycle_primitive_attempt_id,
+        refused.substep_id,
+        None,
+        core.LifecycleSubstepEventDTO.Phase.kFinished,
+        30,
+        core.LifecycleTransitionOutcomeDTO.kFailed,
+        "ros2_control_hardware_activation_refused",
+    )
+    assert started.locally_valid()
+    assert finished.locally_valid()
+    assert finished.error_code == "ros2_control_hardware_activation_refused"
+    observed = core.LifecycleTransitionObservationDTO(
+        core.ComponentLifecycleStateDTO.kDeclared, [], 5, 5, 40
+    )
+    assert observed.locally_valid()
+    assert observed.facts == ()
 
 
 def test_stop_certificate_reference_is_compact_and_exact():
@@ -462,9 +516,7 @@ def test_idle_disable_terminal_status_carries_no_stop_handoff():
         current_state=core.ComponentLifecycleStateDTO.kDisabled,
         requested_state=requested_state,
         action_state=core.ComponentLifecycleDomainActionStateDTO.kSucceeded,
-        effect=core.ComponentLifecycleDomainEffectDTO.kKnownNoEffect,
         primitive_attempts=(),
-        reconciliation_evidence=None,
         error=None,
     )
     status = core.ComponentLifecycleStatusDTO(
@@ -487,6 +539,8 @@ def test_idle_disable_terminal_status_carries_no_stop_handoff():
 
     assert status.locally_valid()
     assert domain.resolved_provider_occurrence == _provider_occurrence()
+    assert domain.substep_events == ()
+    assert domain.observed_before is None and domain.observed_after is None
     for removed in ("configuration_fence", "disable_handoff", "disable_fence_released"):
         assert not hasattr(status, removed)
     for removed in ("DisableHandoffRequestDTO", "DisableFenceReleasedDTO", "ConfigurationFenceHandleDTO"):

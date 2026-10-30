@@ -89,6 +89,10 @@ struct ComponentLifecycleAdmissionCandidate final {
   /// Q97 owner-read generation selection. Present only for private Apply
   /// admission; ordinary admission never consumes this value.
   std::optional<ApplyComponentGenerationSelectionDTO> apply_generation_selection{};
+  /// The component's own lifecycle time budget from its Deployment
+  /// (`lifecycle_command_timeout_s`). When present it bounds every
+  /// supported intent instead of the selected plan's bound.
+  std::optional<std::int64_t> lifecycle_budget_ns{};
 };
 
 /// Fully closed values ready for atomic reservation plus journal admission.
@@ -106,15 +110,5 @@ struct PreparedComponentLifecycleAdmission final {
 [[nodiscard]] Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
     const ComponentLifecycleIntentDTO& intent,
     const ComponentLifecycleAdmissionCandidate& candidate);
-
-/// Private pure Q91 construction. Candidate qualification is retained for the
-/// later installed successor; only genuine predecessor observations populate
-/// Accepted status. This value does not verify live held authority or effects.
-[[nodiscard]] Result<PreparedComponentLifecycleAdmission> PrepareApplyComponentBringUpAdmission(
-    const ComponentLifecycleIntentDTO& intent,
-    const ComponentLifecycleAdmissionCandidate& candidate,
-    const ApplyComponentBringUpEvidenceDTO& evidence,
-    const std::vector<ResolvedLifecycleControlDomainScopeDTO>& qualified_candidate_domains,
-    const std::vector<ResolvedLifecycleProviderOccurrenceDTO>& candidate_provider_occurrences);
 
 }  // namespace manyforge::core

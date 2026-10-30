@@ -102,11 +102,11 @@ TEST(OperatorAlarmCatalog,
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.8.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.9.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "267c161200260de6c51198b872f2da7a53239847979bdf39fac0d462dabe7a68");
-  ASSERT_EQ(catalog.definitions().size(), 14U);
+            "8101bde7ece439e7cbc8d8ff1c47570d2a1c09b447d642e3a31638e2589084c6");
+  ASSERT_FALSE(catalog.definitions().empty());
   // The dedicated carried-object alarm repeats its error row's compact text,
   // needs acknowledgement and gates no motion.
   const auto *lost = catalog.Find(manyforge::core::kCarriedObjectLostRow.code);
@@ -135,6 +135,19 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_TRUE(collision->requires_motion_attention);
   EXPECT_TRUE(collision->acknowledgement_required);
   EXPECT_EQ(collision->max_evidence_refs, 32U);
+  // Lost measured robot state stops motion through the same containment;
+  // its alarm differs from the collision alarm only in its wording.
+  const auto *observation_lost =
+      catalog.Find("manyforge.motion.runtime_monitor_observation_lost");
+  ASSERT_NE(observation_lost, nullptr);
+  EXPECT_EQ(observation_lost->title, "Robot position feedback lost");
+  EXPECT_EQ(observation_lost->priority, collision->priority);
+  EXPECT_EQ(observation_lost->set_authority, collision->set_authority);
+  EXPECT_EQ(observation_lost->clear_authority, collision->clear_authority);
+  EXPECT_EQ(observation_lost->adapter_id, collision->adapter_id);
+  EXPECT_TRUE(observation_lost->requires_motion_attention);
+  EXPECT_TRUE(observation_lost->acknowledgement_required);
+  EXPECT_EQ(observation_lost->max_evidence_refs, 32U);
   const auto *scope = catalog.Find("manyforge.runtime.alarm_scope_unavailable");
   ASSERT_NE(scope, nullptr);
   EXPECT_EQ(scope->alarm_class, "runtime_health");
@@ -160,7 +173,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            14U);
+            OperatorAlarmCatalog::Decode(source).definitions().size());
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

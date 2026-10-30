@@ -108,6 +108,21 @@ class OrchestratorRunner:
             target_role_id=target_role_id,
             capability_id="execution.trajectory.execute",
         )
+        target = next(
+            target for target in self._binding["target_role_bindings"]
+            if isinstance(target, Mapping)
+            and target.get("target_role_id") == target_role_id
+            and target.get("component_role_id") == component_role_id
+        )
+        tcps = target.get("robot_tcps")
+        end_effectors = [row.get("entry") for row in tcps if isinstance(row, Mapping)
+                         and row.get("end_effector") is True] if isinstance(tcps, list) else []
+        if len(end_effectors) != 1 or not isinstance(end_effectors[0], Mapping):
+            raise ValueError("applied Program binding has no unique end-effector TCP")
+        entry = end_effectors[0]
+        if not all(isinstance(entry.get(key), str) and entry[key]
+                   for key in ("component_id", "target_id", "frame_role_id")):
+            raise ValueError("applied Program binding has an invalid end-effector TCP")
         status = self._selected_status()
         span = ActionSpan(
             action_source="program_node",
@@ -141,8 +156,9 @@ class OrchestratorRunner:
                         "move_id": move_id,
                         "base_frame_role_id": "base",
                         "tcp_endpoint": {
-                            "target_role_id": target_role_id,
-                            "frame_role_id": "tcp",
+                            "kind": "entry",
+                            "entry": {key: entry[key] for key in
+                                      ("component_id", "target_id", "frame_role_id")},
                         },
                         "tolerances": {
                             "joint_position_tol_rad": 0.001,

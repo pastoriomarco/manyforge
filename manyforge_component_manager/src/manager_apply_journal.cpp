@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_core/admission_timing_diagnostic.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 
@@ -120,10 +121,10 @@ constexpr std::string_view kFenceReleaseIntentDigestDomain =
 constexpr std::string_view kFenceReleasedDigestDomain =
     "manyforge.component-manager-fence-released.v1";
 constexpr std::string_view kTerminalOutcomeDigestDomain =
-    "manyforge.component-manager-terminal-outcome.ua4.v3";
+    "manyforge.component-manager-terminal-outcome.ua4.v4";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 42;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 45;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -150,10 +151,71 @@ void Check(sqlite3 *database, const int result,
   }
 }
 
+using JournalTimingClock = std::chrono::steady_clock;
+
+std::int64_t JournalElapsedNs(JournalTimingClock::time_point start) noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             JournalTimingClock::now() - start).count();
+}
+
+const char *JournalStatementStage(std::string_view sql) noexcept {
+  if (sql.find("PRAGMA integrity_check") != std::string_view::npos)
+    return "manager_apply_sql_integrity_check";
+  if (sql.find("PRAGMA foreign_key_check") != std::string_view::npos)
+    return "manager_apply_sql_foreign_key_check";
+  if (sql.find("SELECT COUNT(*)") != std::string_view::npos)
+    return "manager_apply_sql_count";
+  if (sql.find("manager_apply_intents") != std::string_view::npos)
+    return "manager_apply_sql_intents";
+  if (sql.find("manager_apply_affected_scopes") != std::string_view::npos)
+    return "manager_apply_sql_scopes";
+  if (sql.find("manager_apply_fence_attempts") != std::string_view::npos)
+    return "manager_apply_sql_attempts";
+  if (sql.find("manager_apply_terminal_outcomes") != std::string_view::npos)
+    return "manager_apply_sql_outcomes";
+  return "manager_apply_sql_other";
+}
+
+void CaptureJournalTiming(const char *stage, JournalTimingClock::time_point start,
+                          std::int64_t rows = -1, std::int64_t changes = -1) noexcept {
+  core::detail::CaptureAdmissionJournalTiming(stage, JournalElapsedNs(start), rows, changes);
+}
+
+class JournalTimingSpan final {
+public:
+  explicit JournalTimingSpan(const char *stage) noexcept
+      : active_(core::detail::CurrentAdmissionTiming() != nullptr), stage_(stage),
+        started_(active_ ? JournalTimingClock::now() : JournalTimingClock::time_point{}) {}
+  ~JournalTimingSpan() {
+    if (active_) core::detail::CaptureAdmissionJournalTiming(
+        stage_, JournalElapsedNs(started_), rows_, -1, nullptr,
+        core::detail::AdmissionJournalRowsKind::kTableCardinality);
+  }
+  void Rows(std::int64_t rows) noexcept { rows_ = rows; }
+  void Count(const char *stage, std::int64_t count) const noexcept {
+    if (active_) core::detail::CaptureAdmissionJournalTiming(
+        stage, JournalElapsedNs(started_), count, -1, nullptr,
+        core::detail::AdmissionJournalRowsKind::kTableCardinality);
+  }
+private:
+  bool active_;
+  const char *stage_;
+  JournalTimingClock::time_point started_;
+  std::int64_t rows_{-1};
+};
+
 void Exec(sqlite3 *database, const std::string_view sql) {
+  const bool timing = core::detail::CurrentAdmissionTiming() != nullptr;
+  const auto started = timing ? JournalTimingClock::now() : JournalTimingClock::time_point{};
   char *error = nullptr;
   const auto result = sqlite3_exec(database, std::string(sql).c_str(), nullptr,
                                    nullptr, &error);
+  if (timing) {
+    const char *stage = sql == "COMMIT" ? "manager_apply_sql_commit"
+                        : sql == "BEGIN" || sql == "BEGIN IMMEDIATE" ? "manager_apply_sql_begin"
+                        : "manager_apply_sql_exec";
+    CaptureJournalTiming(stage, started);
+  }
   if (result != SQLITE_OK) {
     const std::string detail =
         error == nullptr ? sqlite3_errmsg(database) : error;
@@ -174,15 +236,19 @@ void Exec(sqlite3 *database, const std::string_view sql) {
 class Statement final {
 public:
   Statement(sqlite3 *database, const std::string_view sql)
-      : database_(database) {
-    Check(database_,
-          sqlite3_prepare_v2(database_, std::string(sql).c_str(), -1,
-                             &statement_, nullptr),
-          "prepare SQLite statement");
+      : database_(database), timing_(core::detail::CurrentAdmissionTiming() != nullptr),
+        stage_(timing_ ? JournalStatementStage(sql) : nullptr) {
+    const auto started = timing_ ? JournalTimingClock::now() : JournalTimingClock::time_point{};
+    const auto result = sqlite3_prepare_v2(database_, std::string(sql).c_str(), -1,
+                                          &statement_, nullptr);
+    if (timing_) CaptureJournalTiming("manager_apply_sql_prepare", started);
+    Check(database_, result, "prepare SQLite statement");
   }
 
   ~Statement() {
     if (statement_ != nullptr) {
+      if (timing_) core::detail::CaptureAdmissionJournalTiming(
+          stage_, step_ns_, rows_returned_, changes_);
       sqlite3_finalize(statement_);
     }
   }
@@ -214,7 +280,14 @@ public:
   }
 
   [[nodiscard]] bool Step() {
+    const auto started = timing_ ? JournalTimingClock::now() : JournalTimingClock::time_point{};
     const auto result = sqlite3_step(statement_);
+    if (timing_) {
+      step_ns_ += JournalElapsedNs(started);
+      if (result == SQLITE_ROW) ++rows_returned_;
+      if (result == SQLITE_DONE && !sqlite3_stmt_readonly(statement_))
+        changes_ = sqlite3_changes(database_);
+    }
     if (result == SQLITE_ROW) {
       return true;
     }
@@ -285,12 +358,18 @@ public:
 private:
   sqlite3 *database_;
   sqlite3_stmt *statement_{};
+  bool timing_{};
+  const char *stage_{};
+  std::int64_t step_ns_{};
+  std::int64_t rows_returned_{};
+  std::int64_t changes_{-1};
 };
 
 class Transaction final {
 public:
   Transaction(sqlite3 *database, const std::string_view begin)
-      : database_(database) {
+      : database_(database), timing_(core::detail::CurrentAdmissionTiming() != nullptr),
+        started_(timing_ ? JournalTimingClock::now() : JournalTimingClock::time_point{}) {
     Exec(database_, begin);
   }
 
@@ -298,6 +377,9 @@ public:
     if (!finished_) {
       sqlite3_exec(database_, "ROLLBACK", nullptr, nullptr, nullptr);
     }
+    if (timing_) CaptureJournalTiming(
+        finished_ ? "manager_apply_transaction_commit" : "manager_apply_transaction_rollback",
+        started_, -1, -1);
   }
 
   Transaction(const Transaction &) = delete;
@@ -310,6 +392,8 @@ public:
 
 private:
   sqlite3 *database_;
+  bool timing_{};
+  JournalTimingClock::time_point started_;
   bool finished_{};
 };
 
@@ -497,6 +581,60 @@ void AppendField(std::string &record, const std::string_view name,
   record.push_back(':');
   record.append(value);
   record.push_back('\n');
+}
+
+/// The bounded cause details of a retained failure, length-prefixed in key
+/// order like the digest records (`AppendField`); empty for no details.
+[[nodiscard]] std::string EncodeCauseDetails(
+    const std::map<std::string, std::string> &details) {
+  std::string encoded;
+  for (const auto &[key, value] : details) {
+    AppendField(encoded, key, value);
+  }
+  return encoded;
+}
+
+[[nodiscard]] std::map<std::string, std::string>
+DecodeCauseDetails(const std::string_view encoded) {
+  const auto length = [&](std::size_t &offset, const char separator) {
+    const auto end = encoded.find(separator, offset);
+    if (end == std::string_view::npos || end == offset || end - offset > 6U) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored terminal Apply cause details are malformed");
+    }
+    std::size_t value = 0U;
+    for (auto index = offset; index < end; ++index) {
+      const auto digit = encoded[index];
+      if (digit < '0' || digit > '9') {
+        throw ManagerApplyJournalIntegrityError(
+            "stored terminal Apply cause details are malformed");
+      }
+      value = value * 10U + static_cast<std::size_t>(digit - '0');
+    }
+    offset = end + 1U;
+    return value;
+  };
+  const auto text = [&](std::size_t &offset, const std::size_t size,
+                        const char terminator) {
+    if (offset + size >= encoded.size() || encoded[offset + size] != terminator) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored terminal Apply cause details are malformed");
+    }
+    std::string value(encoded.substr(offset, size));
+    offset += size + 1U;
+    return value;
+  };
+  std::map<std::string, std::string> details;
+  std::size_t offset = 0U;
+  while (offset < encoded.size()) {
+    auto key = text(offset, length(offset, ':'), '=');
+    auto value = text(offset, length(offset, ':'), '\n');
+    if (!details.emplace(std::move(key), std::move(value)).second) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored terminal Apply cause details repeat a key");
+    }
+  }
+  return details;
 }
 
 struct EncodedIntent final {
@@ -1420,12 +1558,21 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
     ValidateBoundedText(failure.failure_message,
                         kMaximumManagerApplyFailureMessageBytes,
                         "failure_message");
+    ValidateBoundedText(failure.cause_code,
+                        kMaximumManagerApplyFailureCodeBytes, "cause_code");
+    ValidateBoundedText(failure.producer,
+                        kMaximumManagerApplyFailureProducerBytes, "producer");
     AppendField(record, "intent_digest", failure.intent_digest.value());
     AppendField(record, "failure_phase", ToString(failure.phase));
     AppendField(record, "failure_code", failure.failure_code);
     AppendField(record, "failure_message", failure.failure_message);
     AppendField(record, "effect_disposition",
                 ToString(failure.effect_disposition));
+    AppendField(record, "cause_code", failure.cause_code);
+    AppendField(record, "cause_details",
+                EncodeCauseDetails(failure.cause_details));
+    AppendField(record, "producer", failure.producer);
+    AppendField(record, "effect_boundary", ToString(failure.effect_boundary));
   }
   encoded.digest = RawDigest(record);
   return encoded;
@@ -1476,6 +1623,18 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
   }
   throw ManagerApplyJournalIntegrityError(
       "stored terminal Apply failure has an unknown effect disposition");
+}
+
+[[nodiscard]] ManagerApplyEffectBoundary ParseEffectBoundary(
+    const std::string_view value) {
+  if (value == "before_effect") {
+    return ManagerApplyEffectBoundary::kBeforeEffect;
+  }
+  if (value == "unknown") {
+    return ManagerApplyEffectBoundary::kUnknown;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored terminal Apply failure has an unknown effect boundary");
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -2523,8 +2682,7 @@ void ValidateBringUpProof(
     for (const auto &domain : status.domains) {
       const bool retired = !domain.expected_domain.has_value();
       if (domain.error.has_value() ||
-          (retired ? domain.effect !=
-                         core::ComponentLifecycleDomainEffectDTO::kKnownNoEffect
+          (retired ? !domain.primitive_attempts.empty()
                    : (domain.action_state !=
                           core::ComponentLifecycleDomainActionStateDTO::
                               kSucceeded ||
@@ -2682,10 +2840,10 @@ void ValidateApplyJournalIdentityAndSchema(
              ? std::string(sqlite3_db_filename(database, "main"))
              : source_path.string()) +
         " has format version " + std::to_string(user_version) +
-        "; expected v19. Preserve this file, including interrupted operations; "
+        "; expected v20. Preserve this file, including interrupted operations; "
         "reconcile the original operations with their owner and retained "
         "evidence "
-        "before explicitly selecting a fresh v19 journal. No migration, "
+        "before explicitly selecting a fresh v20 journal. No migration, "
         "conversion "
         "or deletion is performed");
   }
@@ -2838,6 +2996,28 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
     return "settled";
   }
   return "unknown";
+}
+
+// Durable evidence remains valid if the set of failures offered to operators
+// is narrowed in a later version. Scope policy belongs at the attempt boundary.
+static bool HasFailedApplyReleaseEvidence(const PersistedManagerApplyStatus &status) noexcept {
+  if (!status.terminal_outcome || !status.affected_scope || !status.fence_attempt ||
+      !status.fence_acceptance || status.runtime_convergence_intent ||
+      status.latest_runtime_staged_ready || status.private_materialization ||
+      status.publication_receipt || status.fence_release_intent || status.fence_released ||
+      !status.bring_up_child_proofs.empty() ||
+      !status.affected_scope->affected_scope.component_delta.valid())
+    return false;
+  const auto &terminal = status.terminal_outcome->terminal_outcome;
+  return terminal.state == ManagerApplyTerminalOutcomeState::kFailed && terminal.failure &&
+         terminal.failure->effect_disposition == ManagerApplyEffectDisposition::kKnown &&
+         terminal.failure->effect_boundary == ManagerApplyEffectBoundary::kBeforeEffect;
+}
+
+bool FailedApplyAcknowledgementEligible(const PersistedManagerApplyStatus &status) noexcept {
+  // The maintainer approved all proven-before-effect component/Scene changes
+  // (DX-2814); planned bring-up claims stay excluded.
+  return HasFailedApplyReleaseEvidence(status) && !status.bring_up_plan;
 }
 
 ManagerApplyProgressDTO DeriveManagerApplyProgress(
@@ -3208,6 +3388,12 @@ public:
     }
 
     const auto high_water = GenerationHighWaterLocked(intent.apply_id);
+    if (high_water.has_value()) {
+      const auto predecessor = IntentUncachedLocked(intent.apply_id, *high_water);
+      ++record_verifications_;
+      if (!predecessor)
+        throw ManagerApplyJournalIntegrityError("Apply high-water intent missing");
+    }
     if (high_water.has_value() &&
         *high_water == std::numeric_limits<std::int64_t>::max()) {
       throw ManagerApplyJournalLimitError(
@@ -3315,6 +3501,24 @@ public:
       VerifiedRecordMap<PersistedManagerApplyBringUpPlan>,
       VerifiedRecordMap<std::vector<PersistedManagerApplyBringUpChildProof>>>;
 
+  // Generation predecessors are checked only during writes. Read the
+  // immediate predecessor through the uncached decoder, without recursively
+  // walking the generation history.
+  class WriteVerificationScope final {
+  public:
+    explicit WriteVerificationScope(Impl &impl) noexcept : impl_(impl) {
+      impl_.verify_write_generation_predecessors_ = true;
+    }
+    ~WriteVerificationScope() {
+      impl_.verify_write_generation_predecessors_ = false;
+    }
+    WriteVerificationScope(const WriteVerificationScope &) = delete;
+    WriteVerificationScope &operator=(const WriteVerificationScope &) = delete;
+
+  private:
+    Impl &impl_;
+  };
+
   /// Installs the change-gated verified-record cache for one public read
   /// transaction. Must be called first inside that transaction: reading
   /// `data_version` opens its read snapshot. Any commit through another
@@ -3383,8 +3587,19 @@ public:
   IntentLocked(const ApplyId &apply_id,
                const std::int64_t apply_generation) const {
     return ReadVerifiedRecord<PersistedManagerApplyIntent>(
-        {apply_id, apply_generation, 0},
-        [&] { return IntentUncachedLocked(apply_id, apply_generation); });
+        {apply_id, apply_generation, 0}, [&] {
+          auto result = IntentUncachedLocked(apply_id, apply_generation);
+          if (result && verify_write_generation_predecessors_ &&
+              apply_generation > 1) {
+            const auto predecessor =
+                IntentUncachedLocked(apply_id, apply_generation - 1);
+            ++record_verifications_;
+            if (!predecessor)
+              throw ManagerApplyJournalIntegrityError(
+                  "Apply predecessor intent missing");
+          }
+          return result;
+        });
   }
 
   std::optional<PersistedManagerApplyBringUpPlan>
@@ -4132,8 +4347,34 @@ public:
                            const std::int64_t staged_ready_generation) const {
     return ReadVerifiedRecord<PersistedManagerApplyRuntimeStagedReady>(
         {apply_id, apply_generation, staged_ready_generation}, [&] {
-          return RuntimeStagedReadyUncachedLocked(apply_id, apply_generation,
-                                                  staged_ready_generation);
+          if (verify_write_generation_predecessors_) {
+            Statement count(database_,
+                "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets "
+                "WHERE apply_id=? AND apply_generation=?");
+            count.Bind(1, apply_id.value());
+            count.Bind(2, apply_generation);
+            if (!count.Step() || count.Integer(0) > static_cast<std::int64_t>(
+                                      kMaximumRuntimeStagedReadySetsPerApply))
+              throw ManagerApplyJournalIntegrityError(
+                  "stored runtime staged-ready inventory exceeds its ceiling");
+          }
+          auto result = RuntimeStagedReadyUncachedLocked(
+              apply_id, apply_generation, staged_ready_generation);
+          if (result && verify_write_generation_predecessors_ &&
+              staged_ready_generation > static_cast<std::int64_t>(
+                                            kMaximumRuntimeStagedReadySetsPerApply))
+            throw ManagerApplyJournalIntegrityError(
+                "stored runtime staged-ready generation exceeds its ceiling");
+          if (result && verify_write_generation_predecessors_ &&
+              staged_ready_generation > 1) {
+            const auto predecessor = RuntimeStagedReadyUncachedLocked(
+                apply_id, apply_generation, staged_ready_generation - 1);
+            ++record_verifications_;
+            if (!predecessor)
+              throw ManagerApplyJournalIntegrityError(
+                  "staged-ready predecessor record missing");
+          }
+          return result;
         });
   }
 
@@ -4238,7 +4479,8 @@ public:
 
   std::optional<PersistedManagerApplyRuntimeStagedReady>
   LatestRuntimeStagedReadyLocked(const ApplyId &apply_id,
-                                 const std::int64_t apply_generation) const {
+                                 const std::int64_t apply_generation,
+                                 const bool predecessor_only = false) const {
     Statement row(database_, "SELECT staged_ready_generation "
                              "FROM manager_apply_runtime_staged_ready_sets "
                              "WHERE apply_id=? AND apply_generation=? "
@@ -4252,6 +4494,16 @@ public:
     if (generation <= 0 || row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "runtime staged-ready high-water row is invalid");
+    }
+    if (predecessor_only) {
+      if (generation > static_cast<std::int64_t>(
+                           kMaximumRuntimeStagedReadySetsPerApply))
+        throw ManagerApplyJournalIntegrityError(
+            "stored runtime staged-ready generation exceeds its ceiling");
+      auto result = RuntimeStagedReadyUncachedLocked(apply_id, apply_generation,
+                                                      generation);
+      ++record_verifications_;
+      return result;
     }
     return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
   }
@@ -4647,7 +4899,8 @@ public:
                   "candidate_graph_revision,candidate_scene_id,"
                   "candidate_scene_revision_id,candidate_scene_content_hash,"
                   "intent_digest,failure_phase,failure_code,failure_message,"
-                  "effect_disposition,outcome_state,terminal_outcome_digest "
+                  "effect_disposition,outcome_state,terminal_outcome_digest,"
+                  "cause_code,cause_details,producer,effect_boundary "
                   "FROM manager_apply_terminal_outcomes "
                   "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
@@ -4707,6 +4960,10 @@ public:
             row.Text(10),
             row.Text(11),
             disposition,
+            row.Text(15),
+            DecodeCauseDetails(row.Text(16)),
+            row.Text(17),
+            ParseEffectBoundary(row.Text(18)),
         };
       }
       const auto encoded = EncodeTerminalOutcome(outcome);
@@ -4759,7 +5016,122 @@ public:
     }
   }
 
+  std::optional<PersistedFailedApplyRelease>
+  FailedApplyReleaseLocked(const ApplyId &apply_id,
+                           const std::int64_t apply_generation) const {
+    Statement row(database_,
+                  "SELECT terminal_outcome_digest,fence_acceptance_digest,"
+                  "acknowledgement_request_id,acknowledgement_source_label,"
+                  "release_request_encoding,released_fence_encoding,acknowledged "
+                  "FROM manager_apply_failed_release "
+                  "WHERE apply_id=? AND apply_generation=?");
+    row.Bind(1, apply_id.value());
+    row.Bind(2, apply_generation);
+    if (!row.Step()) return std::nullopt;
+    const auto terminal_digest = row.Text(0);
+    const auto acceptance_digest = row.Text(1);
+    const auto acknowledgement_request_id = row.Text(2);
+    const auto acknowledgement_source_label = row.Text(3);
+    ValidateBoundedIdentity(acknowledgement_request_id, "acknowledgement_request_id");
+    ValidateBoundedText(acknowledgement_source_label, kMaximumManagerApplySourceLabelBytes,
+                        "acknowledgement_source_label");
+    const auto request = DecodeFenceReleaseRequest(row.Text(4));
+    const auto released_encoding = row.OptionalText(5);
+    const auto acknowledged = row.Integer(6);
+    if (row.Step() || apply_generation <= 0 || acknowledged < 0 || acknowledged > 1 ||
+        (acknowledged == 1 && !released_encoding))
+      throw ManagerApplyJournalIntegrityError("failed Apply release row is invalid");
+    const auto status = StatusLocked(apply_id, apply_generation);
+    if (!status || !HasFailedApplyReleaseEvidence(*status) ||
+        status->terminal_outcome->terminal_outcome_digest.value() != terminal_digest ||
+        status->fence_acceptance->acceptance_digest.value() != acceptance_digest)
+      throw ManagerApplyJournalIntegrityError("failed Apply release has no before-effect owner evidence");
+    const auto &evidence = request.reconciliation_evidence;
+    const auto &accepted = status->fence_acceptance->accepted_fence;
+    const auto &predecessor = status->intent.intent.expected_active_projection_revision;
+    if (evidence.owner_transaction.apply_id != apply_id ||
+        evidence.owner_transaction.apply_generation.value() != static_cast<std::uint64_t>(apply_generation) ||
+        evidence.configuration_fence_id != accepted.configuration_fence_id ||
+        evidence.configuration_fence_generation != accepted.configuration_fence_generation ||
+        evidence.reconciled_scope != accepted.captured_scope ||
+        evidence.active_projection_revision.retained_bundle_id != predecessor.retained_bundle_id ||
+        evidence.active_projection_revision.graph_revision != predecessor.graph_revision ||
+        evidence.active_projection_revision.scene_revision.scene_id != predecessor.scene_revision.scene_id)
+      throw ManagerApplyJournalIntegrityError("failed Apply release does not name its held predecessor");
+    std::optional<ConfigurationFenceReleasedDTO> released;
+    if (released_encoding) {
+      released = DecodeFenceReleased(*released_encoding);
+      if (released->request != request)
+        throw ManagerApplyJournalIntegrityError("failed Apply release receipt differs from its request");
+    }
+    return PersistedFailedApplyRelease{ContentDigest(terminal_digest),
+                                       ContentDigest(acceptance_digest),
+                                       RequestId(acknowledgement_request_id),
+                                       acknowledgement_source_label, request,
+                                       std::move(released), acknowledged == 1};
+  }
+
+  std::optional<PersistedManagerApplyStatus>
+  StatusWithFailedReleaseLocked(const ApplyId &apply_id,
+                                const std::int64_t generation) const {
+    const auto status = StatusLocked(apply_id, generation);
+    if (status)
+      static_cast<void>(FailedApplyReleaseLocked(apply_id, generation));
+    return status;
+  }
+
+  // Writes retain the existing page-image and cardinality limits without
+  // decoding unrelated historical records. Full verification runs at open
+  // and on explicit VerifyIntegrity, including startup after a crash.
+  void VerifyWriteLimitsLocked() const {
+    const auto page_count = ScalarInteger(database_, "PRAGMA page_count");
+    const auto page_size = ScalarInteger(database_, "PRAGMA page_size");
+    if (page_count < 0 || page_size <= 0 ||
+        page_count >
+            kMaximumManagerApplyJournalDatabasePageImageBytes / page_size) {
+      throw ManagerApplyJournalLimitError(
+          "SQLite main database page image exceeds its ceiling");
+    }
+    const auto intent_count =
+        ScalarInteger(database_, "SELECT COUNT(*) FROM manager_apply_intents");
+    if (intent_count < 0 ||
+        intent_count > static_cast<std::int64_t>(kMaximumManagerApplyIntents)) {
+      throw ManagerApplyJournalIntegrityError(
+          "stored Apply-journal cardinality is invalid");
+    }
+
+    const auto check_count = [&](const char *sql, const std::size_t maximum) {
+      const auto count = ScalarInteger(database_, sql);
+      if (count < 0 || count > static_cast<std::int64_t>(maximum))
+        throw ManagerApplyJournalIntegrityError(
+            "stored Apply-fence journal cardinality is invalid");
+    };
+    check_count("SELECT COUNT(*) FROM manager_apply_affected_scopes",
+                kMaximumManagerApplyAffectedScopes);
+    check_count("SELECT COUNT(*) FROM manager_apply_fence_attempts",
+                kMaximumManagerApplyFenceAttempts);
+    check_count("SELECT COUNT(*) FROM manager_apply_fence_acceptances",
+                kMaximumManagerApplyFenceAttempts);
+    check_count("SELECT COUNT(*) FROM manager_apply_runtime_convergence_intents",
+                kMaximumManagerApplyIntents);
+    check_count("SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets",
+                kMaximumRuntimeStagedReadySets);
+    check_count("SELECT COUNT(*) FROM manager_apply_private_materializations",
+                kMaximumManagerApplyPrivateMaterializations);
+    check_count("SELECT COUNT(*) FROM manager_apply_publication_receipts",
+                kMaximumManagerApplyPublicationReceipts);
+    check_count("SELECT COUNT(*) FROM manager_apply_fence_release_intents",
+                kMaximumManagerApplyFenceReleaseIntents);
+    check_count("SELECT COUNT(*) FROM manager_apply_fence_released_records",
+                kMaximumManagerApplyFenceReleasedRecords);
+    check_count("SELECT COUNT(*) FROM manager_apply_terminal_outcomes",
+                kMaximumManagerApplyTerminalOutcomes);
+    check_count("SELECT COUNT(*) FROM manager_apply_failed_release",
+                kMaximumManagerApplyTerminalOutcomes);
+  }
+
   ManagerApplyJournalIntegrityReport VerifyIntegrityLocked() const {
+    JournalTimingSpan timing("manager_apply_integrity_total_intent_count");
     Statement integrity(database_, "PRAGMA integrity_check");
     if (!integrity.Step() || integrity.Text(0) != "ok" || integrity.Step()) {
       throw ManagerApplyJournalIntegrityError(
@@ -4785,6 +5157,7 @@ public:
     }
     const auto intent_count =
         ScalarInteger(database_, "SELECT COUNT(*) FROM manager_apply_intents");
+    timing.Rows(intent_count);
     const auto distinct_apply_ids = ScalarInteger(
         database_,
         "SELECT COUNT(*) FROM ("
@@ -5160,6 +5533,32 @@ public:
       throw ManagerApplyJournalIntegrityError(
           "stored Apply completion inventory is inconsistent");
     }
+    Statement failed_releases(database_,
+                              "SELECT apply_id,apply_generation FROM manager_apply_failed_release "
+                              "ORDER BY apply_id,apply_generation LIMIT ?");
+    failed_releases.Bind(1, static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes + 1U));
+    std::size_t failed_release_count = 0U;
+    while (failed_releases.Step()) {
+      if (++failed_release_count > kMaximumManagerApplyTerminalOutcomes ||
+          !FailedApplyReleaseLocked(ApplyId(failed_releases.Text(0)), failed_releases.Integer(1)))
+        throw ManagerApplyJournalIntegrityError("stored failed Apply release inventory is inconsistent");
+    }
+    // These are table cardinalities already read by the integrity check. The
+    // elapsed time is for the whole check, not an individual COUNT query.
+    timing.Count("manager_apply_integrity_scope_count", affected_scope_count);
+    timing.Count("manager_apply_integrity_attempt_count", attempt_count);
+    timing.Count("manager_apply_integrity_acceptance_count", acceptance_count);
+    timing.Count("manager_apply_integrity_runtime_intent_count", runtime_intent_count);
+    timing.Count("manager_apply_integrity_staged_count", runtime_staged_ready_count);
+    timing.Count("manager_apply_integrity_materialization_count", private_materialization_count);
+    timing.Count("manager_apply_integrity_publication_count", publication_receipt_count);
+    timing.Count("manager_apply_integrity_release_intent_count", fence_release_intent_count);
+    timing.Count("manager_apply_integrity_released_count", fence_released_count);
+    timing.Count("manager_apply_integrity_terminal_count", terminal_outcome_count);
+    timing.Count("manager_apply_integrity_plan_count", bring_up_plan_count);
+    timing.Count("manager_apply_integrity_child_proof_count", bring_up_child_proof_count);
+    timing.Count("manager_apply_integrity_failed_release_count",
+                 static_cast<std::int64_t>(failed_release_count));
     return {
         cell_id_,
         std::string(kManagerApplyJournalSchemaId),
@@ -5188,6 +5587,7 @@ public:
   sqlite3 *database_{};
   mutable std::mutex mutex_;
   mutable VerifiedReads *verified_reads_{};
+  bool verify_write_generation_predecessors_{};
   bool closed_{};
   bool borrowed_{};
 
@@ -5235,10 +5635,11 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto result = impl_->EnsureIntentValueLocked(intent);
   if (result.inserted)
-    static_cast<void>(impl_->VerifyIntegrityLocked());
+    static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return result;
 }
@@ -5261,7 +5662,8 @@ SqliteManagerApplyJournal::EnsureBringUpIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto existing_plan = impl_->BringUpPlanLocked(
       intent.apply_id, encoded_intent.apply_generation);
   const auto existing_parent =
@@ -5296,7 +5698,7 @@ SqliteManagerApplyJournal::EnsureBringUpIntent(
     throw ManagerApplyJournalIntegrityError(
         "inserted configured bring-up plan cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {parent.record, *stored, parent.inserted};
 }
@@ -5347,7 +5749,8 @@ SqliteManagerApplyJournal::EnsureBringUpChildProof(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto plan = impl_->BringUpPlanLocked(proof.apply_id, generation);
   if (!plan.has_value())
     throw ManagerApplyJournalConflictError(
@@ -5394,7 +5797,7 @@ SqliteManagerApplyJournal::EnsureBringUpChildProof(
     throw ManagerApplyJournalIntegrityError(
         "inserted bring-up child proof cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*result, true};
 }
@@ -5535,7 +5938,8 @@ SqliteManagerApplyJournal::EnsureAffectedScope(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto parent =
       impl_->IntentLocked(affected_scope.apply_id, encoded.apply_generation);
   if (!parent.has_value() || parent->intent_digest != intent_digest) {
@@ -5586,7 +5990,7 @@ SqliteManagerApplyJournal::EnsureAffectedScope(
     throw ManagerApplyJournalIntegrityError(
         "inserted Apply affected scope cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -5617,7 +6021,8 @@ SqliteManagerApplyJournal::EnsureFenceAttempt(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto parent = impl_->IntentLocked(apply_id, encoded.apply_generation);
   if (!parent.has_value() || parent->intent_digest != intent_digest) {
     throw ManagerApplyJournalConflictError(
@@ -5706,7 +6111,7 @@ SqliteManagerApplyJournal::EnsureFenceAttempt(
     throw ManagerApplyJournalIntegrityError(
         "inserted Apply-fence attempt cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -5736,7 +6141,8 @@ SqliteManagerApplyJournal::EnsureFenceAcceptance(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto attempt =
       impl_->FenceAttemptLocked(apply_id, encoded.apply_generation);
   if (!attempt.has_value() ||
@@ -5796,7 +6202,7 @@ SqliteManagerApplyJournal::EnsureFenceAcceptance(
     throw ManagerApplyJournalIntegrityError(
         "inserted Apply-fence acceptance cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -5825,7 +6231,8 @@ SqliteManagerApplyJournal::EnsureRuntimeConvergenceIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto parent =
       impl_->IntentLocked(runtime_intent.apply_id, encoded.apply_generation);
   const auto acceptance = impl_->FenceAcceptanceLocked(
@@ -5884,7 +6291,7 @@ SqliteManagerApplyJournal::EnsureRuntimeConvergenceIntent(
     throw ManagerApplyJournalIntegrityError(
         "inserted runtime convergence intent cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -5912,7 +6319,8 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto intent = impl_->RuntimeConvergenceIntentLocked(
       staged_ready.apply_id, encoded.apply_generation);
   if (!intent.has_value() ||
@@ -5944,7 +6352,7 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
   // process epoch; append a fresh staged-ready row while retaining the
   // original digest as the immutable scene-stage parent.
   const auto latest = impl_->LatestRuntimeStagedReadyLocked(
-      staged_ready.apply_id, encoded.apply_generation);
+      staged_ready.apply_id, encoded.apply_generation, true);
   const auto expected_generation =
       latest.has_value() ? latest->staged_ready.staged_ready_generation + 1U
                          : 1U;
@@ -5987,7 +6395,7 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
     throw ManagerApplyJournalIntegrityError(
         "inserted runtime staged-ready set cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6015,7 +6423,8 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto intent = impl_->IntentLocked(
       private_materialization.apply_id, encoded.apply_generation);
   if (!intent.has_value() ||
@@ -6088,7 +6497,7 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
     throw ManagerApplyJournalIntegrityError(
         "inserted private materialization cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6122,7 +6531,8 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto materialization = impl_->PrivateMaterializationLocked(
       named->apply_id, encoded.apply_generation);
   if (!materialization.has_value() ||
@@ -6150,6 +6560,12 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
       "manager_apply_publication_receipts WHERE publication_generation=?");
   generation_owner.Bind(1, encoded.publication_generation);
   if (generation_owner.Step()) {
+    const ApplyId owner_id(generation_owner.Text(0));
+    const auto owner_generation = generation_owner.Integer(1);
+    if (owner_generation <= 0 || generation_owner.Step() ||
+        !impl_->PublicationReceiptLocked(owner_id, owner_generation))
+      throw ManagerApplyJournalIntegrityError(
+          "publication generation owner is invalid");
     throw ManagerApplyJournalConflictError(
         "publication generation already belongs to another Apply");
   }
@@ -6193,7 +6609,7 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
     throw ManagerApplyJournalIntegrityError(
         "inserted Apply publication receipt cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6222,7 +6638,8 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto acceptance =
       impl_->FenceAcceptanceLocked(owner.apply_id, encoded.apply_generation);
   const auto publication =
@@ -6296,7 +6713,7 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
     throw ManagerApplyJournalIntegrityError(
         "inserted fence-release intent cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6325,7 +6742,8 @@ SqliteManagerApplyJournal::EnsureFenceReleased(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto intent =
       impl_->FenceReleaseIntentLocked(owner.apply_id, encoded.apply_generation);
   if (!intent.has_value() ||
@@ -6373,7 +6791,7 @@ SqliteManagerApplyJournal::EnsureFenceReleased(
     throw ManagerApplyJournalIntegrityError(
         "inserted fence release receipt cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6400,7 +6818,8 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const bool succeeded =
       terminal_outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded;
   if (succeeded) {
@@ -6465,8 +6884,9 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
       "candidate_scene_id,candidate_scene_revision_id,"
       "candidate_scene_content_hash,intent_digest,failure_phase,failure_code,"
       "failure_message,effect_disposition,"
-      "outcome_state,terminal_outcome_digest) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      "outcome_state,terminal_outcome_digest,cause_code,cause_details,"
+      "producer,effect_boundary) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, terminal_outcome.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
   if (succeeded) {
@@ -6484,6 +6904,10 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
     insert.BindNull(13);
     insert.BindNull(14);
     insert.BindNull(15);
+    insert.BindNull(18);
+    insert.BindNull(19);
+    insert.BindNull(20);
+    insert.BindNull(21);
   } else {
     const auto &failure = *terminal_outcome.failure;
     insert.BindNull(3);
@@ -6499,6 +6923,10 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
     insert.Bind(13, failure.failure_code);
     insert.Bind(14, failure.failure_message);
     insert.Bind(15, ToString(failure.effect_disposition));
+    insert.Bind(18, failure.cause_code);
+    insert.Bind(19, EncodeCauseDetails(failure.cause_details));
+    insert.Bind(20, failure.producer);
+    insert.Bind(21, ToString(failure.effect_boundary));
   }
   insert.Bind(16, encoded.state);
   insert.Bind(17, encoded.digest);
@@ -6510,7 +6938,7 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
     throw ManagerApplyJournalIntegrityError(
         "inserted terminal Apply outcome cannot be verified");
   }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
   transaction.Commit();
   return {*stored, true};
 }
@@ -6526,6 +6954,121 @@ SqliteManagerApplyJournal::ReadTerminalOutcome(
   Transaction transaction(impl_->database_, "BEGIN");
   const auto verified_reads = impl_->UseVerifiedReadsLocked();
   const auto result = impl_->TerminalOutcomeLocked(apply_id, generation);
+  transaction.Commit();
+  return result;
+}
+
+void SqliteManagerApplyJournal::BeginFailedApplyRelease(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation,
+    const RequestId &acknowledgement_request_id,
+    const std::string &acknowledgement_source_label,
+    const ConfigurationFenceReleaseDTO &request) {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  ValidateBoundedIdentity(acknowledgement_request_id.value(), "request_id");
+  ValidateBoundedText(acknowledgement_source_label, kMaximumManagerApplySourceLabelBytes,
+                      "source_label");
+  const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
+  const auto encoded = EncodeFenceReleaseRequest(request);
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  const auto status = impl_->StatusLocked(apply_id, generation);
+  if (!status || !FailedApplyAcknowledgementEligible(*status) ||
+      impl_->FailedApplyReleaseLocked(apply_id, generation))
+    throw ManagerApplyJournalConflictError("failed Apply cannot start another release attempt");
+  Statement insert(impl_->database_,
+                   "INSERT INTO manager_apply_failed_release "
+                   "(apply_id,apply_generation,terminal_outcome_digest,fence_acceptance_digest,"
+                   "acknowledgement_request_id,acknowledgement_source_label,"
+                   "release_request_encoding,released_fence_encoding) VALUES (?,?,?,?,?,?,?,NULL)");
+  insert.Bind(1, apply_id.value());
+  insert.Bind(2, generation);
+  insert.Bind(3, status->terminal_outcome->terminal_outcome_digest.value());
+  insert.Bind(4, status->fence_acceptance->acceptance_digest.value());
+  insert.Bind(5, acknowledgement_request_id.value());
+  insert.Bind(6, acknowledgement_source_label);
+  insert.Bind(7, encoded);
+  static_cast<void>(insert.Step());
+  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  transaction.Commit();
+}
+
+void SqliteManagerApplyJournal::CompleteFailedApplyRelease(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation,
+    const ConfigurationFenceReleasedDTO &released) {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
+  const auto encoded = EncodeFenceReleased(released);
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  const auto existing = impl_->FailedApplyReleaseLocked(apply_id, generation);
+  if (!existing || existing->request != released.request)
+    throw ManagerApplyJournalConflictError("failed Apply release receipt does not match its attempt");
+  if (existing->released) {
+    if (*existing->released != released)
+      throw ManagerApplyJournalConflictError("failed Apply release already has another receipt");
+    transaction.Commit();
+    return;
+  }
+  Statement update(impl_->database_,
+                   "UPDATE manager_apply_failed_release SET released_fence_encoding=? "
+                   "WHERE apply_id=? AND apply_generation=? AND released_fence_encoding IS NULL");
+  update.Bind(1, encoded);
+  update.Bind(2, apply_id.value());
+  update.Bind(3, generation);
+  static_cast<void>(update.Step());
+  if (sqlite3_changes(impl_->database_) != 1)
+    throw ManagerApplyJournalConflictError("failed Apply release completion changed concurrently");
+  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  transaction.Commit();
+}
+
+void SqliteManagerApplyJournal::CompleteFailedApplyAcknowledgement(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation) {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
+  Impl::WriteVerificationScope write_verification(*impl_);
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  const auto existing = impl_->FailedApplyReleaseLocked(apply_id, generation);
+  if (!existing || !existing->released)
+    throw ManagerApplyJournalConflictError("failed Apply has no completed fence release");
+  if (existing->acknowledged) {
+    transaction.Commit();
+    return;
+  }
+  Statement update(impl_->database_,
+                   "UPDATE manager_apply_failed_release SET acknowledged=1 "
+                   "WHERE apply_id=? AND apply_generation=? AND acknowledged=0 "
+                   "AND released_fence_encoding IS NOT NULL");
+  update.Bind(1, apply_id.value());
+  update.Bind(2, generation);
+  static_cast<void>(update.Step());
+  if (sqlite3_changes(impl_->database_) != 1)
+    throw ManagerApplyJournalConflictError("failed Apply acknowledgement changed concurrently");
+  static_cast<void>(impl_->FailedApplyReleaseLocked(apply_id, generation));
+  static_cast<void>(impl_->VerifyWriteLimitsLocked());
+  transaction.Commit();
+}
+
+std::optional<PersistedFailedApplyRelease>
+SqliteManagerApplyJournal::ReadFailedApplyRelease(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation = CheckedSigned(apply_generation.value(), "apply_generation");
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN");
+  const auto result = impl_->FailedApplyReleaseLocked(apply_id, generation);
   transaction.Commit();
   return result;
 }
@@ -6580,8 +7123,6 @@ void RequireExactManagerApplyClaim(const core::CellAdmissionClaimDTO &claim,
                                    const PersistedManagerApplyStatus &status) {
   if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
       !claim.claim_generation.nonzero() || claim.accepted_at_ns < 0 ||
-      claim.acquired_admission_generation !=
-          claim.intent.expected_admission_generation ||
       !status.intent.intent.expected_admission_generation ||
       status.intent.intent.parent_authoring_claim) {
     throw ManagerApplyJournalIntegrityError(
@@ -6627,14 +7168,13 @@ core::Result<void> ValidateTerminalManagerApplyClaimsReadOnly(
   return WithReadOnlyApplySnapshot(
       database_path, cell_id, [&](sqlite3 *database) {
         SqliteManagerApplyJournal::Impl view(database, cell_id);
-        static_cast<void>(view.VerifyIntegrityLocked());
         for (const auto &claim : old_claims) {
           const auto intent = view.RequestLocked(claim.intent.owner_epoch,
                                                  claim.intent.request_id);
           if (!intent)
             throw ManagerApplyJournalIntegrityError(
                 "configuration_apply_original_intent_missing");
-          const auto status = view.StatusLocked(
+          const auto status = view.StatusWithFailedReleaseLocked(
               intent->intent.apply_id,
               CheckedSigned(intent->intent.apply_generation.value(),
                             "apply_generation"));
@@ -6673,13 +7213,12 @@ core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
   return WithReadOnlyApplySnapshot(
       database_path, cell_id, [&](sqlite3 *database) {
         SqliteManagerApplyJournal::Impl view(database, cell_id);
-        static_cast<void>(view.VerifyIntegrityLocked());
         const auto intent = view.RequestLocked(fresh_claim.intent.owner_epoch,
                                                fresh_claim.intent.request_id);
         if (!intent)
           throw ManagerApplyJournalIntegrityError(
               "fresh_apply_original_intent_missing");
-        const auto status = view.StatusLocked(
+        const auto status = view.StatusWithFailedReleaseLocked(
             intent->intent.apply_id,
             CheckedSigned(intent->intent.apply_generation.value(),
                           "apply_generation"));
@@ -6738,37 +7277,56 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
     Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
           "configure read-only settlement timeout");
     Exec(database, "PRAGMA query_only=ON");
-    Transaction snapshot(database, "BEGIN");
-    ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-    Statement row(
-        database,
-        "SELECT t.terminal_outcome_digest FROM manager_apply_intents i "
-        "JOIN manager_apply_terminal_outcomes t "
-        "ON t.apply_id=i.apply_id AND "
-        "t.apply_generation=i.apply_generation "
-        // A published success or a known refusal before any fence effect
-        // settles this exact Manager claim. Later failures remain contained.
-        "AND (t.outcome_state='succeeded' OR "
-        "(t.outcome_state='failed' AND t.effect_disposition='known' "
-        "AND t.failure_phase='accepted')) "
-        "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
-        "AND i.intent_digest=? AND i.expected_admission_generation=? "
-        "AND i.parent_authoring_claim IS NULL "
-        "AND NOT EXISTS (SELECT 1 FROM manager_apply_bring_up_plans p "
-        "WHERE p.apply_id=i.apply_id AND "
-        "p.apply_generation=i.apply_generation)");
-    row.Bind(1, claim.intent.owner_transaction_id);
-    row.Bind(2, claim.intent.owner_epoch.value());
-    row.Bind(3, claim.intent.request_id.value());
-    row.Bind(4, claim.intent.request_payload_digest.value());
-    row.Bind(5, CheckedSigned(claim.intent.expected_admission_generation.value(),
-                              "expected_admission_generation"));
-    const bool found = row.Step();
-    const auto digest = found ? std::optional<std::string>(row.Text(0))
-                              : std::nullopt;
-    const bool duplicate = found && row.Step();
-    snapshot.Commit();
-    sqlite3_close(database);
+    std::optional<std::string> digest;
+    bool duplicate = false;
+    {
+      Transaction snapshot(database, "BEGIN");
+      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
+      SqliteManagerApplyJournal::Impl view(database, cell_id);
+      Statement row(
+          database,
+          "SELECT t.terminal_outcome_digest,i.apply_generation,t.outcome_state,"
+          "t.failure_phase FROM manager_apply_intents i "
+          "JOIN manager_apply_terminal_outcomes t "
+          "ON t.apply_id=i.apply_id AND "
+          "t.apply_generation=i.apply_generation "
+          // A completed no-effect release also settles a held failed Apply.
+          // Its recorded request and receipt are verified below, not by this
+          // existence check alone.
+          "AND (t.outcome_state='succeeded' OR "
+          "(t.outcome_state='failed' AND t.effect_disposition='known' "
+          "AND (t.failure_phase='accepted' OR EXISTS "
+          "(SELECT 1 FROM manager_apply_failed_release f "
+          "WHERE f.apply_id=t.apply_id AND f.apply_generation=t.apply_generation "
+          "AND f.released_fence_encoding IS NOT NULL)))) "
+          "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
+          "AND i.intent_digest=? AND i.expected_admission_generation=? "
+          "AND i.parent_authoring_claim IS NULL "
+          "AND NOT EXISTS (SELECT 1 FROM manager_apply_bring_up_plans p "
+          "WHERE p.apply_id=i.apply_id AND "
+          "p.apply_generation=i.apply_generation)");
+      row.Bind(1, claim.intent.owner_transaction_id);
+      row.Bind(2, claim.intent.owner_epoch.value());
+      row.Bind(3, claim.intent.request_id.value());
+      row.Bind(4, claim.intent.request_payload_digest.value());
+      row.Bind(5, CheckedSigned(claim.intent.expected_admission_generation.value(),
+                                "expected_admission_generation"));
+      const bool found = row.Step();
+      digest = found ? std::optional<std::string>(row.Text(0)) : std::nullopt;
+      if (found && row.Text(2) == "failed" && row.Text(3) != "accepted") {
+        const auto acknowledged = view.FailedApplyReleaseLocked(
+            ApplyId(claim.intent.owner_transaction_id), row.Integer(1));
+        if (!acknowledged || !acknowledged->released ||
+            acknowledged->terminal_outcome_digest.value() != *digest)
+          throw ManagerApplyJournalIntegrityError(
+              "failed Apply has no completed before-effect release");
+      }
+      duplicate = found && row.Step();
+      snapshot.Commit();
+    }
+    const auto close_result = sqlite3_close(database);
+    if (close_result != SQLITE_OK)
+      ThrowSqlite(database, close_result, "close read-only settlement database");
     database = nullptr;
     if (!digest.has_value() || duplicate ||
         *digest != release.settlement.evidence_digest.value()) {
@@ -6776,14 +7334,15 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
     }
     return core::Result<void>::Ok();
   } catch (const std::exception &) {
-    sqlite3_close(database);
+    if (database != nullptr) sqlite3_close(database);
     return rejected("manager_apply_journal_read_failed");
   }
 }
 
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
+core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnlyForTesting(
     const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NamedApplyPublicationTransactionDTO &apply) {
+    const core::NamedApplyPublicationTransactionDTO &apply,
+    std::uint64_t *lookup_count) {
   using Reply = core::Result<PersistedManagerApplyStatus>;
   const auto rejected = [] {
     return Reply::Err({"manager_apply_read_unavailable",
@@ -6815,19 +7374,27 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
     ValidateApplyJournalIdentityAndSchema(database.get(), cell_id,
                                           database_path);
     SqliteManagerApplyJournal::Impl view(database.get(), cell_id);
-    static_cast<void>(view.VerifyIntegrityLocked());
-    auto status = view.StatusLocked(
+    auto status = view.StatusWithFailedReleaseLocked(
         apply.apply_id,
         CheckedSigned(apply.apply_generation.value(), "apply_generation"));
     if (!status)
       return rejected();
     snapshot.Commit();
+    if (lookup_count != nullptr)
+      *lookup_count = view.record_verifications_;
     return Reply::Ok(std::move(*status));
   } catch (const std::exception &) {
     if (raw)
       sqlite3_close(raw);
     return rejected();
   }
+}
+
+core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
+    const std::filesystem::path &database_path, const CellId &cell_id,
+    const core::NamedApplyPublicationTransactionDTO &apply) {
+  return ReadManagerApplyStatusReadOnlyForTesting(database_path, cell_id,
+                                                   apply, nullptr);
 }
 
 core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
@@ -6863,8 +7430,7 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
       Transaction snapshot(database, "BEGIN");
       ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
       SqliteManagerApplyJournal::Impl view(database, cell_id);
-      static_cast<void>(view.VerifyIntegrityLocked());
-      result = view.StatusLocked(parent.owner.apply_id,
+      result = view.StatusWithFailedReleaseLocked(parent.owner.apply_id,
           CheckedSigned(parent.owner.apply_generation.value(), "apply_generation"));
       if (!result || !result->bring_up_plan ||
           result->bring_up_plan->plan_digest != parent.plan_digest)
@@ -6916,7 +7482,6 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
       Transaction snapshot(database, "BEGIN");
       ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
       SqliteManagerApplyJournal::Impl view(database, cell_id);
-      static_cast<void>(view.VerifyIntegrityLocked());
       const auto intent = view.RequestLocked(parent_claim_intent.owner_epoch,
                                              parent_claim_intent.request_id);
       if (!intent ||
@@ -6925,7 +7490,7 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
               std::optional(parent_claim_intent.expected_admission_generation) ||
           intent->intent.parent_authoring_claim)
         throw ManagerApplyJournalIntegrityError("retained parent claim intent mismatch");
-      result = view.StatusLocked(intent->intent.apply_id,
+      result = view.StatusWithFailedReleaseLocked(intent->intent.apply_id,
           CheckedSigned(intent->intent.apply_generation.value(), "apply_generation"));
       if (!result)
         throw ManagerApplyJournalIntegrityError("retained parent status missing");
@@ -6991,8 +7556,7 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyConfigurationStatusRea
       Transaction snapshot(database, "BEGIN");
       ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
       SqliteManagerApplyJournal::Impl view(database, cell_id);
-      static_cast<void>(view.VerifyIntegrityLocked());
-      result = view.StatusLocked(apply.apply_id,
+      result = view.StatusWithFailedReleaseLocked(apply.apply_id,
           CheckedSigned(apply.apply_generation.value(), "apply_generation"));
       if (!result)
         throw ManagerApplyJournalIntegrityError("ordinary configuration parent missing");
@@ -7142,8 +7706,7 @@ core::Result<PersistedManagerApplyStatus> ReadNativeApplyParentStatusReadOnly(
       Transaction snapshot(database, "BEGIN");
       ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
       SqliteManagerApplyJournal::Impl view(database, cell_id);
-      static_cast<void>(view.VerifyIntegrityLocked());
-      auto status = view.StatusLocked(
+      auto status = view.StatusWithFailedReleaseLocked(
           native_plan.apply.apply_id,
           CheckedSigned(native_plan.apply.apply_generation.value(),
                         "apply_generation"));
@@ -7299,13 +7862,20 @@ ReadNativeApplyPreparationFailureReadOnly(
       return rejected("native_child_original_parent_claim_mismatch");
 
   const auto &terminal = status.terminal_outcome;
+  // The native host's typed composition refusal is the same early failure,
+  // retained as a known `failed`.
+  const auto early_disposition = [](const ManagerApplyTerminalOutcomeDTO &outcome) {
+    const auto &failure = *outcome.failure;
+    return outcome.state == ManagerApplyTerminalOutcomeState::kUnknownEffect
+               ? failure.effect_disposition == ManagerApplyEffectDisposition::kUnknown
+               : outcome.state == ManagerApplyTerminalOutcomeState::kFailed &&
+                     failure.effect_disposition == ManagerApplyEffectDisposition::kKnown &&
+                     failure.cause_code == kScenarioCompositionRefusedCode;
+  };
   const bool early =
       terminal &&
-      terminal->terminal_outcome.state ==
-          ManagerApplyTerminalOutcomeState::kUnknownEffect &&
       terminal->terminal_outcome.failure &&
-      terminal->terminal_outcome.failure->effect_disposition ==
-          ManagerApplyEffectDisposition::kUnknown &&
+      early_disposition(terminal->terminal_outcome) &&
       terminal->terminal_outcome.failure->failure_code ==
           "runtime_composition_preparation_failed" &&
       terminal->terminal_outcome.failure->intent_digest ==
@@ -7369,7 +7939,6 @@ core::Result<void> ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
       Transaction snapshot(database, "BEGIN");
       ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
       SqliteManagerApplyJournal::Impl view(database, cell_id);
-      static_cast<void>(view.VerifyIntegrityLocked());
       const auto parent =
           view.RequestLocked(claim.intent.owner_epoch, claim.intent.request_id);
       if (!parent.has_value() ||
@@ -7383,6 +7952,9 @@ core::Result<void> ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
       }
       const auto generation = CheckedSigned(
           parent->intent.apply_generation.value(), "apply_generation");
+      if (!view.StatusWithFailedReleaseLocked(parent->intent.apply_id, generation))
+        throw ManagerApplyJournalIntegrityError(
+            "bring-up settlement parent status missing");
       const auto plan =
           view.BringUpPlanLocked(parent->intent.apply_id, generation);
       const auto terminal =

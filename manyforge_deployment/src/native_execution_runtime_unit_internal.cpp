@@ -269,10 +269,27 @@ decode_execution_motion_target_limits(
   result.reserve(motion_target_limits.size());
   for (const auto &entry : motion_target_limits) {
     const auto *object = std::get_if<core::JsonObjectDTO>(&entry.value);
+    // `tcp_speed_check` is schema-materialized; absent keeps its default.
+    const bool has_speed_check =
+        object != nullptr && object->find("tcp_speed_check") != object->end();
     if (object == nullptr ||
-        object->size() != (include_ordinary_jerk ? 4U : 3U)) {
+        object->size() != (include_ordinary_jerk ? 4U : 3U) +
+                               (has_speed_check ? 1U : 0U)) {
       throw RetainedBundleError(
           "execution runtime configuration has an invalid motion target limit");
+    }
+    auto tcp_speed_check = core::TcpSpeedCheck::kActiveTcpAndFlange;
+    if (has_speed_check) {
+      const auto *value =
+          std::get_if<std::string>(&object->at("tcp_speed_check").value);
+      const auto parsed = value == nullptr
+                              ? std::nullopt
+                              : core::parse_tcp_speed_check(*value);
+      if (!parsed) {
+        throw RetainedBundleError(
+            "execution runtime configuration has an invalid tcp_speed_check");
+      }
+      tcp_speed_check = *parsed;
     }
     const auto component = object->find("controllable_component_id");
     const auto target = object->find("command_target_id");
@@ -300,7 +317,8 @@ decode_execution_motion_target_limits(
             ? detail::decode_ordinary_motion_jerk_settings(
                   std::get<core::JsonObjectDTO>(
                       object->at("ordinary_motion_jerk").value))
-            : execution_runtime_contract::OrdinaryMotionJerkSettings{}});
+            : execution_runtime_contract::OrdinaryMotionJerkSettings{},
+        tcp_speed_check});
   }
   std::sort(result.begin(), result.end(),
             [](const auto &left, const auto &right) {

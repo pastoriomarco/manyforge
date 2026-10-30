@@ -123,6 +123,81 @@ TEST(ManagedRuntimeDrainTest, MissedDrainRefusesRenewalButShutdownOnlyDoesNot) {
   EXPECT_EQ(renewed, 2U);
 }
 
+// The prepare builder stores a construction throw as the typed refusal. The
+// main loop keeps running for it (other stored failures stay fatal), and the
+// next Prepare poll replies with its code and cause over the actual RPC codec.
+TEST(ManagedRuntimeCompositionRefusal, BuilderThrowRefusesApplyKeepsRuntimeAndCarriesCause) {
+  namespace rpc = component_manager::detail;
+  const auto build = [](const auto &construct) {
+    std::exception_ptr stored;
+    std::jthread builder([&] {
+      try {
+        try {
+          construct();
+        } catch (const std::exception &error) {
+          throw host_detail::ScenarioCompositionRefusal(error, "arm.1");
+        }
+      } catch (...) {
+        stored = std::current_exception();
+      }
+    });
+    builder.join();
+    return stored;
+  };
+  const auto reply = [](const std::exception_ptr &stored) {
+    try {
+      std::rethrow_exception(stored);
+    } catch (const std::exception &error) {
+      const auto decoded = rpc::DecodeSelectedRuntimeCompositionRpcResponse(
+          rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+              rpc::SelectedRuntimeCompositionRpcFailure{
+                  host_detail::SelectedRuntimeCompositionRpcError(error)}));
+      return std::get<rpc::SelectedRuntimeCompositionRpcFailure>(decoded).error;
+    }
+  };
+
+  const auto refused = build([] {
+    throw std::invalid_argument("RoboPlan addressed planner construction is inconsistent");
+  });
+  EXPECT_TRUE(host_detail::IsScenarioCompositionRefusal(refused));
+  const auto error = reply(refused);
+  EXPECT_EQ(error.code, component_manager::kScenarioCompositionRefusedCode);
+  EXPECT_EQ(error.message,
+            "Scenario refused: RoboPlan addressed planner construction is inconsistent");
+  EXPECT_EQ(error.details,
+            (std::map<std::string, std::string>{
+                {"cause", "RoboPlan addressed planner construction is inconsistent"},
+                {"component_id", "arm.1"}}));
+
+  // A typed inner cause keeps its own code; a long cause fits the Manager's
+  // retained bounds on a UTF-8 boundary.
+  std::string utf8_cause = "x";
+  for (int index = 0; index < 400; ++index) utf8_cause += "\xC3\xA9";
+  const auto typed = build([&] {
+    throw core::TypedError("pneumatic_io_unsupported_on_isaac", utf8_cause);
+  });
+  const auto bounded = reply(typed);
+  EXPECT_EQ(bounded.details.at("cause_code"), "pneumatic_io_unsupported_on_isaac");
+  EXPECT_LE(bounded.details.at("cause").size(),
+            component_manager::kMaximumManagerApplyFailureCauseDetailValueBytes);
+  EXPECT_EQ(bounded.details.at("cause"),
+            utf8_cause.substr(0U, bounded.details.at("cause").size()));
+  EXPECT_EQ(bounded.details.at("cause").size() % 2U, 1U);
+  EXPECT_LE(bounded.message.size(),
+            component_manager::kMaximumManagerApplyFailureMessageBytes);
+
+  // Any other stored failure stays fatal and keeps the generic RPC code.
+  const auto fatal = std::make_exception_ptr(
+      std::runtime_error("actual_installed_state_unknown: restart the workbench container"));
+  EXPECT_FALSE(host_detail::IsScenarioCompositionRefusal(fatal));
+  EXPECT_FALSE(host_detail::IsScenarioCompositionRefusal(nullptr));
+  const auto generic = reply(fatal);
+  EXPECT_EQ(generic.code, "selected_runtime_composition_request_failed");
+  EXPECT_EQ(generic.message,
+            "actual_installed_state_unknown: restart the workbench container");
+  EXPECT_TRUE(generic.details.empty());
+}
+
 class FixedPlanningSceneSynchronizer final
     : public core::IPlanningSceneSynchronizer {
 public:
@@ -1161,8 +1236,11 @@ TEST(NativeExecutionRuntimeUnitAdmission,
                component_manager::NativeExecutionRuntimeUnitAdmissionError);
 }
 
-// F-5: the runtime-composition exchange waits 10 s per added or replaced
-// component, at least 10 s. Retained and removed rows install nothing.
+// F-5 / budget: the runtime-composition exchange waits for the sum of the
+// lifecycle time budgets of the added or replaced components (authored, else
+// the 10 s default; Manager passes one for every component). An exchange
+// that installs nothing (finalize, retain-only) waits one default budget.
+// Retained and removed rows install nothing.
 TEST(RetainedNativeRuntimeUnitAdapter,
      CompositionTimeoutGrowsWithComposedComponents) {
   using deployment::ApplyComponentDisposition;
@@ -1173,13 +1251,14 @@ TEST(RetainedNativeRuntimeUnitAdapter,
         std::nullopt, {}, {}, {}};
   };
   const auto timeout = [](const deployment::ApplyComponentDeltaDTO &delta) {
-    return component_manager::detail::SelectedRuntimeCompositionTimeout(delta);
+    return component_manager::detail::SelectedRuntimeCompositionTimeout(delta, {});
   };
   deployment::ApplyComponentDeltaDTO delta;
   EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
-  delta.components = {row("arm.1", ApplyComponentDisposition::kAdd),
-                      row("arm.2", ApplyComponentDisposition::kRetain),
+  delta.components = {row("arm.2", ApplyComponentDisposition::kRetain),
                       row("arm.3", ApplyComponentDisposition::kRemove)};
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
+  delta.components.push_back(row("arm.1", ApplyComponentDisposition::kAdd));
   EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
   delta.components.push_back(
       row("gripper.1", ApplyComponentDisposition::kReplace));
@@ -1187,6 +1266,48 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   delta.components.push_back(
       row("gripper.2", ApplyComponentDisposition::kAdd));
   EXPECT_EQ(timeout(delta), std::chrono::seconds(30));
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     CompositionTimeoutSumsInstalledComponentBudgets) {
+  using deployment::ApplyComponentDisposition;
+  const auto row = [](const std::string &id,
+                      const ApplyComponentDisposition disposition) {
+    return deployment::ApplyComponentChangeDTO{
+        core::ControllableComponentId(id), disposition, std::nullopt,
+        std::nullopt, {}, {}, {}};
+  };
+  // As component_composition_budgets_ns gives them: an authored 120 s
+  // robot, defaults (10 s) for a Real arm, an I/O device and a Mock robot,
+  // and an authored 2.5 s tool.
+  const std::map<std::string, std::int64_t, std::less<>> budgets{
+      {"arm", 120'000'000'000LL},
+      {"xarm", 10'000'000'000LL},
+      {"io", 10'000'000'000LL},
+      {"mock", 10'000'000'000LL},
+      {"kept", 600'000'000'000LL},
+      {"fast", 2'500'000'000LL}};
+  const auto timeout = [&](const deployment::ApplyComponentDeltaDTO &delta) {
+    return component_manager::detail::SelectedRuntimeCompositionTimeout(delta, budgets);
+  };
+  deployment::ApplyComponentDeltaDTO delta;
+  // A 120 s robot alone: not timed out at 10 or 30 s.
+  delta.components = {row("arm", ApplyComponentDisposition::kAdd)};
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(120));
+  // The sum: 120 + 10 + 10 + 10 s; a retained component's budget does not
+  // count.
+  delta.components = {row("arm", ApplyComponentDisposition::kReplace),
+                      row("xarm", ApplyComponentDisposition::kAdd),
+                      row("io", ApplyComponentDisposition::kAdd),
+                      row("kept", ApplyComponentDisposition::kRetain),
+                      row("mock", ApplyComponentDisposition::kAdd)};
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(150));
+  // No floor once something is installed: an authored 2.5 s waits 2.5 s,
+  // and with a default component 12.5 s.
+  delta.components = {row("fast", ApplyComponentDisposition::kAdd)};
+  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(2'500));
+  delta.components.push_back(row("io", ApplyComponentDisposition::kAdd));
+  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(12'500));
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
@@ -1962,6 +2083,14 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_EQ(TextMember(observed_target, "command_target_id"), "arm");
   EXPECT_EQ(TextMember(observed_target, "operation_capability_id"),
             "execution.trajectory.execute");
+  const auto *active_tcp = observed_target.find_object_member("active_tcp");
+  ASSERT_NE(active_tcp, nullptr);
+  ASSERT_TRUE(active_tcp->is_object());
+  EXPECT_EQ(TextMember(*active_tcp, "owner_epoch"), TextMember(*identity, "owner_epoch"));
+  EXPECT_NE(active_tcp->find_object_member("entry"), nullptr);
+  EXPECT_NE(active_tcp->find_object_member("display"), nullptr);
+  EXPECT_NE(active_tcp->find_object_member("registration_generation"), nullptr);
+  EXPECT_NE(active_tcp->find_object_member("sequence"), nullptr);
   const auto *observed = observed_target.find_object_member("observed");
   ASSERT_NE(observed, nullptr);
   EXPECT_FALSE(observed->is_null());
@@ -2507,11 +2636,12 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto replayed = adapter.AcquireCellAdmissionClaim(claim_intent);
   ASSERT_TRUE(replayed.ok()) << replayed.error().message;
   EXPECT_EQ(replayed.value(), claimed.value());
+  // The held claim, not the moved generation, refuses a second caller.
   auto stale_intent = claim_intent;
   stale_intent.request_id = core::RequestId("adapter-authoring-stale");
   const auto stale = adapter.AcquireCellAdmissionClaim(stale_intent);
   ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().code, "stale_generation");
+  EXPECT_EQ(stale.error().code, "authoring_not_ready");
   EXPECT_FALSE(stale.error().details.empty());
   const auto released_claim = adapter.ReleaseCellAdmissionClaim(
       {claim_intent.owner_role,
@@ -3629,11 +3759,12 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
       const auto request = rpc::DecodeNativeProjectionRpcRequest(packet);
       const auto *prepare =
           std::get_if<rpc::NativeProjectionPrepareRequest>(&request);
-      if (!prepare)
-        throw std::invalid_argument(
-            "managed packet fixture only acknowledges Prepare");
-      response = rpc::EncodeNativeProjectionRpcResponse(
-          rpc::NativeProjectionPrepareResult{*prepare});
+      if (prepare) {
+        response = rpc::EncodeNativeProjectionRpcResponse(
+            rpc::NativeProjectionPrepareResult{*prepare});
+      } else {
+        throw std::invalid_argument("unexpected packet fixture projection request");
+      }
     } else {
       const auto request =
           rpc::DecodeSelectedRuntimeCompositionRpcRequestVariant(packet);

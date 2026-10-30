@@ -351,9 +351,11 @@ CanonicalValue StateValue(const std::optional<AlarmLifecycleState> state) {
 } // namespace
 
 OperatorAlarmError::OperatorAlarmError(std::string code, std::string message)
-    : std::runtime_error(code + ": " + message), code_(std::move(code)) {}
+    : manyforge::core::TypedError(code, code + ": " + message) {}
 
-const std::string &OperatorAlarmError::code() const noexcept { return code_; }
+const std::string &OperatorAlarmError::code() const noexcept {
+  return manyforge::core::TypedError::code();
+}
 
 std::string_view ToString(const AlarmConditionQuality quality) noexcept {
   switch (quality) {

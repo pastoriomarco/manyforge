@@ -1441,6 +1441,339 @@ def test_interrupt_adapter_does_not_decide_on_an_unknown_execution_state_spellin
     assert adapter.failure_reason_code == "motion_interrupt_operation_retained"
 
 
+def _program_stop_assessment(*, pending: bool = False) -> dict[str, Any]:
+    """F-6a: the Kernel's Program-requested Stop class; while the engine's
+    terminal cleanup runs (W) the assessment is not yet decided."""
+
+    if not pending:
+        return _captured_stop_assessment(recovery_class="ordinary_program_stop")
+    return _captured_stop_assessment(
+        recovery_class="ordinary_program_stop", status="waiting",
+        reason_code="terminal_cleanup_pending", eligible_close=False,
+        retry_admissible=False, allowed_actions=["reset_cycle"],
+    )
+
+
+def _program_stop_trip(*, pending: bool) -> OwnerTaskSnapshot:
+    return _interrupt_task(
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        recovery_assessment=_program_stop_assessment(pending=pending),
+    )
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_f6a_on_signal_failure_default_policy_closes_then_fails_into_the_tree(pending) -> None:
+    """(c) stop and fail: the Program's own trip is a plain node failure; the
+    operation is closed first, so the Fallback's motion finds the engine free.
+    During terminal cleanup the node rereads instead of retaining it (W)."""
+
+    ready = _program_stop_trip(pending=False)
+    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    adapter, store, _ = _interrupt_motion(port, on_signal="failure")
+    statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
+    assert statuses[-1] is _FAILURE
+    assert statuses[:-1] == [_RUNNING] * (len(statuses) - 1)
+    assert len(port.closes) == 1
+    assert store.writes[0][1] == "signal_trip"
+    assert adapter.failure_reason_code != "motion_interrupt_operation_retained"
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_f6a_on_signal_failure_with_intervention_policy_holds_the_live_operation(pending) -> None:
+    """(d) stop and hold: with an intervention recovery_policy the node's
+    failure keeps its operation live (no close) for Retry / Continue / Reset,
+    on the decided assessment, never the cleanup wait."""
+
+    ready = _program_stop_trip(pending=False)
+    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    adapter, _, _ = _interrupt_motion(port, on_signal="failure")
+    adapter.hold_failures_for_intervention()
+    statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
+    assert statuses[-1] is _FAILURE
+    assert port.closes == []
+    context = adapter.owner_recovery_context
+    assert context is not None
+    assessment = context["owner_assessment"]
+    assert assessment["status"] == "retry_ready"
+    assert assessment["eligible_close"] is True
+    assert "replan_from_stopped_state" in assessment["allowed_actions"]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_f6a_on_signal_success_succeeds_after_the_stop(pending) -> None:
+    """(b) stop and succeed: the stopped operation is closed, then success."""
+
+    ready = _program_stop_trip(pending=False)
+    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    adapter, store, _ = _interrupt_motion(port, on_signal="success")
+    statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
+    assert statuses[-1] is _SUCCESS
+    assert len(port.closes) == 1
+    assert store.writes[0][1] == "signal_trip"
+
+
+def test_f6a_program_stop_cleanup_never_confirmed_holds_instead_of_advancing(monkeypatch) -> None:
+    """SX-519: when the bounded rereads are spent while the stopped operation
+    stays undecided (terminal cleanup never confirmed), the node never returns
+    FAILURE to the tree (a Fallback could move the same robot). It holds for
+    the operator with a typed reason; nothing is closed (Reset releases it)."""
+
+    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
+    stuck = OwnerTaskSnapshot(
+        task_id="task",
+        state=OwnerTaskState.INTERRUPTED,
+        metadata={
+            "operation_id": "op",
+            "operation_state": "stopped",
+            "recovery_assessment": _program_stop_assessment(pending=True),
+            "operation_failure": _FACT,
+        },
+        reason_code="interrupt_fault",
+        message="Global interrupt rule matched",
+    )
+    log = _Log()
+    port = _MotionPort([stuck], log=log)
+    interventions = _Interventions(log)
+    _time, clock = _clocked()
+    adapter = _motion(port, clock, log=log, intervention=interventions)
+
+    statuses = [_tick(adapter) for _ in range(8)]
+    assert _FAILURE not in statuses
+    assert statuses[-1] is _RUNNING
+    assert port.closes == []
+    assert len(interventions.required) == 1
+    held = interventions.required[0]
+    assert held["reason_code"] == "program_stop_settlement_unconfirmed"
+    assert held["policy_parameter"] == "recovery_policy"
+    assert held["owner_task_id"] == "task-1"
+    assert adapter.failure_reason_code == "program_stop_settlement_unconfirmed"
+    # The operator's choice is consumed from the hold; without one it stays held.
+    interventions.resolution = ("manual_failure", None)
+    assert _tick(adapter) is _FAILURE
+
+
+@pytest.mark.parametrize("read", ["raises", "another_task", "malformed_assessment"])
+def test_f6a_failed_read_of_a_stopped_operation_holds_instead_of_advancing(read) -> None:
+    """SX-556: an unexpected or malformed observation, or a changed task
+    identity, while the stopped operation is still undecided never returns
+    FAILURE to the tree while it stays retained: the same operator hold."""
+
+    stuck = OwnerTaskSnapshot(
+        task_id="task",
+        state=OwnerTaskState.INTERRUPTED,
+        metadata={
+            "operation_id": "op",
+            "operation_state": "stopped",
+            "recovery_assessment": _program_stop_assessment(pending=True),
+            "operation_failure": _FACT,
+        },
+        reason_code="interrupt_fault",
+        message="Global interrupt rule matched",
+    )
+    log = _Log()
+    port = _MotionPort([stuck], log=log)
+    if read == "raises":
+        def observe(task_id):
+            port.observations += 1
+            raise RuntimeError("owner reply was malformed")
+        port.observe = observe
+    elif read == "another_task":
+        def observe(task_id):
+            port.observations += 1
+            return replace(stuck, task_id="another-task")
+        port.observe = observe
+    else:
+        port._observes = [replace(stuck, metadata={
+            **stuck.metadata, "recovery_assessment_failure": _READ_FAILURE,
+        })] * 5
+    interventions = _Interventions(log)
+    _time, clock = _clocked()
+    adapter = _motion(port, clock, log=log, intervention=interventions)
+
+    statuses = [_tick(adapter) for _ in range(4)]
+    assert _FAILURE not in statuses
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert len(interventions.required) == 1
+    held = interventions.required[0]
+    assert held["reason_code"] == "program_stop_settlement_unconfirmed"
+    assert held["policy_parameter"] == "recovery_policy"
+    assert held["owner_task_id"] == "task-1"
+    cause = {
+        "raises": "owner reply was malformed",
+        "another_task": "owner observation selected another task",
+        "malformed_assessment": "operation is no longer resident",
+    }[read]
+    assert cause in held["message"]
+    assert adapter.failure_reason_code == "program_stop_settlement_unconfirmed"
+
+
+def _unconfirmed_trip_hold(monkeypatch, on_signal: str, observes=None):
+    """Item 11: a Program-requested Stop whose cleanup is never confirmed
+    within the bounded rereads (3 here) holds for the operator."""
+
+    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
+    port = _MotionPort([_program_stop_trip(pending=True)], observes=observes)
+    adapter, store, _ = _interrupt_motion(port, on_signal=on_signal)
+    log = _Log()
+    interventions = _Interventions(log)
+    adapter._intervention_port = interventions
+    assert [_tick(adapter) for _ in range(5)] == [_RUNNING] * 5
+    assert len(interventions.required) == 1
+    held = interventions.required[0]
+    assert held["reason_code"] == "program_stop_settlement_unconfirmed"
+    assert held["message"].startswith("Stop not confirmed: acknowledge to continue")
+    assert adapter.failure_reason_code == "program_stop_settlement_unconfirmed"
+    assert port.closes == []
+    return adapter, port, store, interventions
+
+
+@pytest.mark.parametrize("on_signal", ["success", "failure"])
+def test_item11_acknowledge_continues_with_the_stops_normal_outcome(
+    monkeypatch, on_signal
+) -> None:
+    """Item 11: Acknowledge (the Continue resolution, `manual_failure`) of an
+    unconfirmed Stop is not a failed node: the node goes on with what it
+    would have done had the cleanup been confirmed (the trip's outcome, or
+    the failure the tree's Fallback handles). The operation is not closable
+    yet, so it stays retained (Reset releases it); no second hold."""
+
+    adapter, port, store, interventions = _unconfirmed_trip_hold(monkeypatch, on_signal)
+    # The failure the same trip reports without the hold (no intervention port).
+    plain_port = _MotionPort([_program_stop_trip(pending=True)])
+    plain, _plain_store, _ = _interrupt_motion(plain_port, on_signal=on_signal)
+    [_tick(plain) for _ in range(3)]
+
+    interventions.resolution = ("manual_failure", "continue_with_failure")
+    status = _tick(adapter)
+    assert status is (_SUCCESS if on_signal == "success" else _FAILURE)
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert len(interventions.required) == 1
+    assert store.writes[0][1] == "signal_trip"
+    if on_signal == "failure":
+        assert adapter.failure_reason_code == plain.failure_reason_code
+        assert adapter.failure_reason_code not in {
+            "program_stop_settlement_unconfirmed",
+            "motion_interrupt_operation_retained",
+            "manual_recovery_failure",
+        }
+
+
+def test_item11_acknowledge_closes_a_stop_that_settled_meanwhile(monkeypatch) -> None:
+    """Item 11: Acknowledge rereads the stopped operation once; when its
+    cleanup has settled meanwhile it is closed as usual before the outcome."""
+
+    stuck = _program_stop_trip(pending=True)
+    ready = _program_stop_trip(pending=False)
+    adapter, port, store, interventions = _unconfirmed_trip_hold(
+        monkeypatch, "success", observes=[stuck] * 4 + [ready]
+    )
+    interventions.resolution = ("manual_failure", "continue_with_failure")
+    assert _tick(adapter) is _SUCCESS
+    assert len(port.closes) == 1
+    assert store.writes[0][1] == "signal_trip"
+
+
+@pytest.mark.parametrize("output", [None, {"part": "a"}])
+def test_item11_a_staged_failed_manual_result_still_fails_the_node(monkeypatch, output) -> None:
+    """SX-610: only Continue's resolution is the Acknowledge. An explicitly
+    staged failed manual result keeps its meaning on this hold: the node
+    fails (`manual_recovery_failure`), never the Stop's normal outcome
+    (here a success trip), and nothing is closed."""
+
+    adapter, port, store, interventions = _unconfirmed_trip_hold(monkeypatch, "success")
+    interventions.resolution = ("manual_failure", output)
+    assert _tick(adapter) is _FAILURE
+    assert adapter.failure_reason_code == "manual_recovery_failure"
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert len(interventions.required) == 1
+
+
+def test_item11_reset_still_releases_an_unconfirmed_stop_hold(monkeypatch) -> None:
+    """Item 11: Reset stays available and is unchanged: its halt ends the held
+    attempt without the Acknowledge outcome, starts nothing and closes
+    nothing; the retained operation is left to Reset's own release."""
+
+    adapter, port, store, interventions = _unconfirmed_trip_hold(monkeypatch, "success")
+    adapter.stop(_INVALID)
+    assert adapter.status is _INVALID
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert len(interventions.required) == 1
+    assert store.writes == []  # No trip outcome: the node never finished.
+    assert adapter.has_pending_drain()  # Retained, as for any halted attempt.
+
+
+@pytest.mark.parametrize("read", ["raises", "another_task", "malformed_assessment"])
+def test_item11_acknowledge_after_a_failed_read_hold_returns_the_failure(read) -> None:
+    """Item 11 with F6A-FIX3: after the operator acknowledges a hold caused
+    by a failed read of the stopped operation (it raises, names another task,
+    or is malformed), the node goes on with its normal outcome: the failure,
+    for the tree's Fallback. A repeated read problem does not hold again."""
+
+    stuck = OwnerTaskSnapshot(
+        task_id="task",
+        state=OwnerTaskState.INTERRUPTED,
+        metadata={
+            "operation_id": "op",
+            "operation_state": "stopped",
+            "recovery_assessment": _program_stop_assessment(pending=True),
+            "operation_failure": _FACT,
+        },
+        reason_code="interrupt_fault",
+        message="Global interrupt rule matched",
+    )
+    log = _Log()
+    port = _MotionPort([stuck], log=log)
+    if read == "raises":
+        def observe(task_id):
+            port.observations += 1
+            raise RuntimeError("owner reply was malformed")
+        port.observe = observe
+    elif read == "another_task":
+        def observe(task_id):
+            port.observations += 1
+            return replace(stuck, task_id="another-task")
+        port.observe = observe
+    else:
+        port._observes = [replace(stuck, metadata={
+            **stuck.metadata, "recovery_assessment_failure": _READ_FAILURE,
+        })] * 10
+    interventions = _Interventions(log)
+    _time, clock = _clocked()
+    adapter = _motion(port, clock, log=log, intervention=interventions)
+
+    assert [_tick(adapter) for _ in range(3)] == [_RUNNING] * 3
+    assert len(interventions.required) == 1
+    interventions.resolution = ("manual_failure", "continue_with_failure")
+    assert _tick(adapter) is _FAILURE
+    assert len(interventions.required) == 1
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert adapter.failure_reason_code == {
+        "raises": "owner_request_failed",
+        "another_task": "owner_task_identity_changed",
+        "malformed_assessment": "interrupt_fault",
+    }[read]
+
+
+def test_f6a_unconfirmed_cleanup_without_an_intervention_port_stays_retained(
+    monkeypatch,
+) -> None:
+    """Without the intervention port the existing fail-closed retention applies."""
+
+    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
+    stuck = _program_stop_trip(pending=True)
+    port = _MotionPort([stuck])
+    adapter, _store, _ = _interrupt_motion(port, on_signal="failure")
+    statuses = [_tick(adapter) for _ in range(3)]
+    assert statuses == [_RUNNING, _RUNNING, _FAILURE]
+    assert port.closes == []
+    assert len(port.starts) == 1
+
+
 def test_interrupt_adapter_maps_no_signal_per_node_default() -> None:
     # move_until_signal: natural completion is success.
     port = _MotionPort([_interrupt_task(OwnerTaskState.SUCCEEDED, _rule_row("no_signal_trip", None, trip=False))])
@@ -1573,7 +1906,7 @@ def test_interrupt_nodes_are_qualified_and_build_the_interrupt_adapter() -> None
         ports=SimpleNamespace(kernel_operations=_MotionPort([]), program_interventions=None),
         program_clock=_clocked()[1], operator_stop_hold_scope=None, motion_attention=None,
         audit_sink=None, name="probe", node_instance_id="probe", attempt_source=_Attempts(),
-        parameters={}, value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,
+        parameters={"target_role": "arm"}, value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,  # TCP migration: build context needs target role
     )
     assert type(build(context)) is v2_owner.InterruptMotionTaskAdapter
 
@@ -1756,6 +2089,7 @@ class _GateStore(_Store):
         super().__init__()
         self.readings = 0
         self.state: str | None = "latched"
+        self.notify_rule_ids: frozenset[str] = frozenset()
 
     def read(self, state: str | None) -> None:
         self.readings += 1
@@ -1764,6 +2098,9 @@ class _GateStore(_Store):
     def interrupt_state_reading(self, rule_id: str) -> tuple[int, str | None]:
         assert rule_id == "curtain"
         return self.readings, self.state
+
+    def interrupt_rule_is_notify(self, rule_id: str) -> bool:
+        return rule_id in self.notify_rule_ids
 
 
 def _gated() -> OwnerInvocationGatedError:
@@ -1807,12 +2144,34 @@ def test_a_gated_motion_waits_then_is_admitted_after_a_clear_reading() -> None:
     ]
 
 
+def test_a_gated_notify_motion_retries_after_a_newer_tripped_reading() -> None:
+    port, _time, store, adapter = _gate_motion([_gated(), _succeeded()])
+    store.state = None  # The source was stale when admission was refused.
+    store.notify_rule_ids = frozenset({"curtain"})
+
+    assert _tick(adapter) is _RUNNING
+    store.read("unknown")
+    assert _tick(adapter) is _RUNNING  # Unknown never releases the gate.
+    assert len(port.starts) == 1
+
+    store.read("tripped")  # The source recovers straight into notify-tripped.
+    assert _tick(adapter) is _SUCCESS
+    assert len(port.starts) == 2
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+    assert [(event["kind"], event["rule_id"]) for event in adapter.audit_events] == [
+        ("program_node_motion_gated", "curtain"),
+        ("program_node_motion_gate_released", "curtain"),
+    ]
+
+
 def test_a_gate_refused_again_keeps_waiting_and_its_timeout_fails_the_node() -> None:
     port, time, store, adapter = _gate_motion([_gated()])
 
     assert _tick(adapter) is _RUNNING
+    store.read("tripped")  # A non-notify gate still retries only on clear.
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1
     time.now = 3.0
-    store.read("clear")  # Cleared, but tripped again before admission.
+    store.read("clear")  # Clear caused one retry; that attempt is refused again.
     assert _tick(adapter) is _RUNNING
     assert len(port.starts) == 2
     assert _tick(adapter) is _RUNNING and len(port.starts) == 2  # No blind retry.

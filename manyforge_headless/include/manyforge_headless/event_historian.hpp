@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
 #include <manyforge_headless/operator_alarm_owner.hpp>
 
@@ -58,13 +59,10 @@ inline constexpr std::size_t kDefaultHistorianRecordRetention = 100000U;
 inline constexpr std::size_t kMaximumHistorianPageSize = 10000U;
 inline constexpr std::size_t kMaximumHistorianPayloadBytes = 256U * 1024U;
 
-class EventHistorianError : public std::runtime_error {
+class EventHistorianError : public manyforge::core::TypedError {
 public:
   EventHistorianError(std::string code, std::string message);
   [[nodiscard]] const std::string &code() const noexcept;
-
-private:
-  std::string code_;
 };
 
 struct HistorianEvent final {

@@ -296,6 +296,17 @@ TEST(BuildOwnedLifecyclePlanCatalogSource, RejectsAmbiguityAndRequiresExactTripl
                    .ok());
 }
 
+// C8: composition is where a catalog is verified; the evaluator no longer
+// re-verifies it per pass, so a catalog whose content no longer matches its
+// digest must be refused here.
+TEST(BuildOwnedLifecyclePlanCatalogSource, RefusesAWrongCatalogAtComposition) {
+  auto entry = EntryFor(Catalog());
+  std::get<std::int64_t>(entry.catalog.plans.front().timeout_policy) += 1;
+  const auto source = BuildOwnedLifecyclePlanCatalogSource::Make({std::move(entry)});
+  ASSERT_FALSE(source.ok());
+  EXPECT_EQ(source.error().code, "brand_lifecycle_plan_catalog_digest_mismatch");
+}
+
 TEST(BuildOwnedLifecyclePlanCatalogSource, ImmutableReadsAreConcurrent) {
   const auto catalog = Catalog();
   auto source = BuildOwnedLifecyclePlanCatalogSource::Make({EntryFor(catalog)});

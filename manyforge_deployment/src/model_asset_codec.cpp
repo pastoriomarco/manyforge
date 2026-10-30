@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "catalog_record_referent_internal.hpp"
+#include "compiler_semantic_limits_internal.hpp"
 #include "content_identity_internal.hpp"
 
 namespace manyforge::deployment {
@@ -239,6 +241,41 @@ void validate_source_symbol(std::string_view symbol,
       decode_artifacts(require_member(value, "artifacts"), model_asset_id)};
 }
 
+// An offset frame's pose: finite, with a unit quaternion (the spec 420
+// tolerance shared with every other placement pose).
+[[nodiscard]] core::PlacementPoseDTO decode_offset_pose(
+    const CanonicalValue& value) {
+  const auto& position =
+      require_array(require_member(value, "position_m"), "position_m");
+  const auto& orientation = require_array(
+      require_member(value, "orientation_xyzw"), "orientation_xyzw");
+  if (position.size() != 3U || orientation.size() != 4U) {
+    fail("tcp_definition_invalid: pose_in_source_link has invalid "
+         "dimensions");
+  }
+  const auto number = [](const CanonicalValue& item) {
+    const auto* found = std::get_if<double>(&item.storage());
+    if (found == nullptr || !std::isfinite(*found)) {
+      fail("tcp_definition_invalid: pose_in_source_link must be finite");
+    }
+    return *found;
+  };
+  core::PlacementPoseDTO pose;
+  for (std::size_t index = 0U; index < 3U; ++index) {
+    pose.position_m[index] = number(position[index]);
+  }
+  double norm_squared = 0.0;
+  for (std::size_t index = 0U; index < 4U; ++index) {
+    pose.orientation_xyzw[index] = number(orientation[index]);
+    norm_squared += pose.orientation_xyzw[index] * pose.orientation_xyzw[index];
+  }
+  if (std::abs(norm_squared - 1.0) > detail::kQuaternionNormSquaredTolerance) {
+    fail("tcp_definition_invalid: pose_in_source_link quaternion norm squared "
+         "must be within 1e-6 of one");
+  }
+  return pose;
+}
+
 [[nodiscard]] std::vector<core::ModelFrameRoleBindingDTO>
 decode_frame_bindings(const CanonicalValue& value) {
   const auto& source = require_array(value, "frame_role_bindings");
@@ -248,10 +285,15 @@ decode_frame_bindings(const CanonicalValue& value) {
     const auto& source_link_name = require_string(
         require_member(item, "source_link_name"), "source_link_name");
     validate_source_symbol(source_link_name, "source_link_name");
+    std::optional<core::PlacementPoseDTO> pose;
+    if (const auto* offset = item.find_object_member("pose_in_source_link");
+        offset != nullptr) {
+      pose = decode_offset_pose(*offset);
+    }
     bindings.push_back(core::ModelFrameRoleBindingDTO{
         core::FrameRoleId(require_string(
             require_member(item, "frame_role_id"), "frame_role_id")),
-        source_link_name});
+        source_link_name, std::move(pose)});
   }
   return bindings;
 }
@@ -324,6 +366,34 @@ decode_collision_bindings(const CanonicalValue& value) {
   return bindings;
 }
 
+// A model's own payload: the bounds of the old D11 Deployment
+// `tool_payload` (mass in [0, 100] kg, centre within [-2, 2] m per axis).
+[[nodiscard]] core::ModelAssetPayloadDTO decode_payload(
+    const CanonicalValue& value) {
+  const auto number = [](const CanonicalValue& item, double bound_low,
+                         double bound_high) {
+    const auto* found = std::get_if<double>(&item.storage());
+    if (found == nullptr || !std::isfinite(*found) || *found < bound_low ||
+        *found > bound_high) {
+      fail("model_asset_payload_invalid: payload mass must be finite in "
+           "[0, 100] kg and center_of_mass_m finite in [-2, 2] m");
+    }
+    return *found;
+  };
+  const auto& center = require_array(require_member(value, "center_of_mass_m"),
+                                     "center_of_mass_m");
+  if (center.size() != 3U) {
+    fail("model_asset_payload_invalid: payload center_of_mass_m must hold 3 "
+         "values");
+  }
+  core::ModelAssetPayloadDTO payload;
+  payload.mass_kg = number(require_member(value, "mass_kg"), 0.0, 100.0);
+  for (std::size_t index = 0U; index < 3U; ++index) {
+    payload.center_of_mass_m[index] = number(center[index], -2.0, 2.0);
+  }
+  return payload;
+}
+
 [[nodiscard]] const core::ModelSourceArtifactDTO* find_artifact(
     const core::ExpandedModelSourceDTO& source, std::string_view logical_uri) {
   const auto found = std::lower_bound(
@@ -370,6 +440,13 @@ void validate_semantics(const core::ModelAssetDTO& asset) {
   if (root_matches != 1) {
     fail("root_frame_role_id must resolve exactly once in frame bindings");
   }
+  for (const auto& binding : asset.frame_role_bindings) {
+    if (binding.pose_in_source_link.has_value() &&
+        binding.frame_role_id == asset.root_frame_role_id) {
+      fail("tcp_definition_invalid: the root frame role cannot be an offset "
+           "frame");
+    }
+  }
 }
 
 [[nodiscard]] core::ModelAssetDTO decode_normalized(
@@ -397,6 +474,10 @@ void validate_semantics(const core::ModelAssetDTO& asset) {
       decode_collision_bindings(
           require_member(normalized, "collision_body_role_bindings")),
   };
+  if (const auto* payload = normalized.find_object_member("payload");
+      payload != nullptr) {
+    decoded.payload = decode_payload(*payload);
+  }
   validate_semantics(decoded);
   return decoded;
 }

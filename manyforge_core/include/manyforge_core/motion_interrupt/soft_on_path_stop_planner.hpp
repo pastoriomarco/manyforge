@@ -49,6 +49,13 @@ struct SoftOnPathPlannerConfig {
   /// Optional best-effort drift limit. When absent, drift is measured and
   /// reported but not a planner failure.
   std::optional<double> max_initial_path_deviation_rad;
+  /// Where the lead-in starts when the trip state carries measured velocity
+  /// and the active command cursor (`trajectory_time_from_start_s`) is known.
+  /// kCommanded: at the command cursor, at the frozen runtime factor, the
+  /// measured state staying the drift/velocity guard. kMeasured: at the
+  /// measured position's projection, at its projected path rate. Model-derived
+  /// trip state always starts at the command cursor.
+  StopLeadInAnchor lead_in_anchor = StopLeadInAnchor::kCommanded;
   /// Optional measured-velocity coherence limit. When absent, off-path
   /// velocity is preserved in the anchor waypoint and measured in diagnostics
   /// but does not reject the plan.

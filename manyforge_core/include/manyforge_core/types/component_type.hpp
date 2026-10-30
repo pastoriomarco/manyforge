@@ -140,6 +140,8 @@ struct ComponentTypeFrameRoleDTO {
   // Portable collision-body roles associated with this exposed endpoint.
   // Empty preserves a motion-only frame role.
   std::vector<CollisionBodyRoleId> contact_body_role_ids{};
+  // Selectable as a TCP (tool centre point) of this command target.
+  bool tcp = false;
 
   friend bool operator==(const ComponentTypeFrameRoleDTO&,
                          const ComponentTypeFrameRoleDTO&) = default;
@@ -169,6 +171,9 @@ struct ComponentTypeCommandTargetDTO {
   std::vector<ComponentTypeFrameRoleDTO> frame_roles;
   std::vector<ComponentTypeCollisionBodyRoleDTO> collision_body_roles;
   std::vector<ComponentTypeCapabilityDTO> capabilities;
+  // The target's default TCP: one of its frame roles tagged `tcp`. Required
+  // exactly when the target tags any TCP.
+  std::optional<FrameRoleId> default_tcp_frame_role_id{};
 
   friend bool operator==(const ComponentTypeCommandTargetDTO&,
                          const ComponentTypeCommandTargetDTO&) = default;

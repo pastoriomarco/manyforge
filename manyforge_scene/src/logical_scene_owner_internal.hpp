@@ -14,6 +14,7 @@
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
@@ -510,22 +511,11 @@ FailedSceneResult(const RequestId &request_id,
 bool SamePose(const core::Pose3DTO &left,
               const core::Pose3DTO &right) noexcept;
 
-class SceneRequestRejectionError final : public std::runtime_error {
+class SceneRequestRejectionError final : public core::TypedError {
 public:
   SceneRequestRejectionError(std::string code, std::string message,
                              std::map<std::string, std::string> details = {})
-      : std::runtime_error(std::move(message)), code_(std::move(code)),
-        details_(std::move(details)) {}
-
-  [[nodiscard]] const std::string &code() const noexcept { return code_; }
-  [[nodiscard]] const std::map<std::string, std::string> &
-  details() const noexcept {
-    return details_;
-  }
-
-private:
-  std::string code_;
-  std::map<std::string, std::string> details_;
+      : core::TypedError(std::move(code), message, std::move(details)) {}
 };
 
 std::vector<core::SupportContactDTO>

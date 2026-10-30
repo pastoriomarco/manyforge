@@ -3,3 +3,4 @@
 aab3c280517c7759ab28f094a87cb3aa6bd261f8ec7e727ff12d9adfc7db980a  patches/0012-initialize-roboplan-070-dynotree-variant-state.patch
 db7acbac01e3868495966bc79fa0fbc0f0d37f0a3af88596a5a76b66a29998ce  patches/0013-direct-initialize-roboplan-070-pose-constraint-scratch.patch
 f8c679e03d2a7387247906e09b82bd828b84b7217cce3ac898c78bf37a4a6b07  patches/0014-describe-image-owned-native-dependencies.patch
+fdcb0fb10d84f2df9f3f33bb7c37c8c9a5e4ddd9cd9767595894e06a63f93fb1  patches/0015-roboplan-070-scene-collision-pair-margins.patch

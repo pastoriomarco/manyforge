@@ -14,6 +14,7 @@
 
 #include <manyforge_xarm_control/lifecycle_profile.hpp>
 
+#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 
 #include <algorithm>
@@ -35,10 +36,11 @@ using core::LifecycleIntentPlanDTO;
 using core::LifecyclePredicateDTO;
 using core::LifecyclePrimitiveId;
 
-constexpr std::int64_t kPlanTimeoutNs = 30'000'000'000LL;
-// m5.5: every Real xArm arm lifecycle step (Prepare, Enable, Disable,
-// Recover) is bounded at 10 s: arming takes 3-4 s, the rest covers a clear.
-constexpr std::int64_t kRealArmPlanTimeoutNs = 10'000'000'000LL;
+constexpr std::int64_t kPlanTimeoutNs = core::kDefaultLifecycleBudgetNs;
+// Every Real xArm arm lifecycle step (Prepare, Enable, Disable, Recover) is
+// bounded by the default component lifecycle budget (10 s): arming takes
+// 3-4 s, the rest covers a clear.
+constexpr std::int64_t kRealArmPlanTimeoutNs = core::kDefaultLifecycleBudgetNs;
 
 [[nodiscard]] LifecycleFactValueDTO boolean_value(const bool value) {
   return {LifecycleFactValueKindDTO::kBoolean, value, std::nullopt,
@@ -59,28 +61,6 @@ predicate(std::vector<ComponentLifecycleStateDTO> states,
               return left.lifecycle_fact_id < right.lifecycle_fact_id;
             });
   return {std::move(states), std::move(facts)};
-}
-
-[[nodiscard]] std::vector<LifecycleIntentPlanDTO> xarm_arm_plans() {
-  constexpr std::string_view kError = core::kDeviceErrorPresentFactId;
-  constexpr std::string_view kWarning = core::kDeviceWarningPresentFactId;
-  const auto recoverable = std::vector<ComponentLifecycleStateDTO>{
-      ComponentLifecycleStateDTO::kDisabled, ComponentLifecycleStateDTO::kFaulted};
-  const auto recovered =
-      predicate({ComponentLifecycleStateDTO::kDisabled},
-                {boolean_fact(kError, false), boolean_fact(kWarning, false)});
-  return {{ComponentLifecycleIntentKindDTO::kRecover,
-           ComponentLifecycleStateDTO::kDisabled,
-           predicate(recoverable, {}),
-           recovered,
-           kPlanTimeoutNs,
-           {{LifecyclePrimitiveId(std::string(kXArmClearErrorPrimitiveId)),
-             predicate(recoverable, {boolean_fact(kError, true)}),
-             predicate(recoverable, {boolean_fact(kError, false)})},
-            {LifecyclePrimitiveId(std::string(kXArmClearWarningPrimitiveId)),
-             predicate(recoverable, {boolean_fact(kError, false),
-                                     boolean_fact(kWarning, true)}),
-             recovered}}}};
 }
 
 // Facts of the ros2_control motion domain (RetainedRos2ControlRuntimeHandle):
@@ -113,6 +93,10 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
   const std::vector<State> any{State::kDeclared, State::kPrepared,
                                State::kActive,   State::kDegraded,
                                State::kFaulted,  State::kDisabled};
+  // M6 XADAPT: every state but Faulted (a Recover step's postcondition).
+  const std::vector<State> settled{State::kDeclared, State::kPrepared,
+                                   State::kActive, State::kDegraded,
+                                   State::kDisabled};
 
   // Prepared: armed, ready, broadcasting valid joints, controller inactive.
   const auto prepared = predicate(
@@ -152,6 +136,7 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
       "ros2_control.controller.deactivate";
   constexpr std::string_view kBroadcasterActivate =
       "ros2_control.broadcaster.activate";
+  constexpr std::string_view kControllerRecover = "ros2_control.controller.recover";
   return {
       {Intent::kPrepare,
        State::kPrepared,
@@ -160,8 +145,9 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        kRealArmPlanTimeoutNs,
        {// m5.5: a vendor error left on the unarmed robot (C2 after an
         // emergency stop) is cleared first; the clear is verified by the
-        // adapter (an error still reported afterwards is an incident).
-        {primitive(kXArmClearErrorPrimitiveId),
+        // adapter's on-demand error reads (M6 XADAPT D11): an error still
+        // read fails the step typed, never an incident.
+        {primitive(core::kDeviceClearErrorPrimitiveId),
          predicate(unarmed, {b(kError, true), b(kControllerActive, false),
                              b(kFaultPresent, false), b(kHardwareActive, false),
                              b(kTransportReady, true)}),
@@ -237,26 +223,42 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        recovered,
        kRealArmPlanTimeoutNs,
        {// Each step only while its precondition holds (§3.1, D10).
+        // M6 XADAPT: the latched vendor error (C2 after an emergency stop)
+        // is cleared first, armed or not, before any other effect: a clear
+        // that leaves the error reported (the emergency stop still engaged)
+        // fails the Recover with no effect. While the robot is not ready
+        // the plugin's write() keeps its controllers off, and per the SDK a
+        // clear alone leaves it not ready (`motion_enable`, `set_state(0)`
+        // follow at Prepare). Each step's postcondition excludes Faulted:
+        // a component fault (a controller manager or robot that did not
+        // answer in time) ends the step at once, never an open wait.
+        {primitive(core::kDeviceClearErrorPrimitiveId),
+         predicate(any, {b(kError, true), b(kTransportReady, true)}),
+         predicate(settled, {b(kError, false), b(kTransportReady, true)})},
         {primitive(kControllerDeactivate),
-         predicate(any, {b(kControllerActive, true), b(kTransportReady, true)}),
-         predicate(any, {b(kControllerActive, false), b(kTransportReady, true)})},
-        {primitive(kHardwareDeactivate),
-         predicate(any, {b(kControllerActive, false), b(kHardwareActive, true),
+         predicate(any, {b(kError, false), b(kControllerActive, true),
                          b(kTransportReady, true)}),
-         predicate(any, {b(kControllerActive, false), b(kHardwareActive, false),
-                         b(kTransportReady, true)})},
-        {primitive(kXArmClearErrorPrimitiveId),
-         predicate(any, {b(kError, true), b(kControllerActive, false),
-                         b(kHardwareActive, false), b(kTransportReady, true)}),
+         predicate(settled, {b(kControllerActive, false), b(kTransportReady, true)})},
+        {primitive(kHardwareDeactivate),
          predicate(any, {b(kError, false), b(kControllerActive, false),
-                         b(kHardwareActive, false), b(kTransportReady, true)})},
+                         b(kHardwareActive, true), b(kTransportReady, true)}),
+         predicate(settled, {b(kControllerActive, false), b(kHardwareActive, false),
+                             b(kTransportReady, true)})},
         {primitive(kXArmClearWarningPrimitiveId),
          predicate(any, {b(kError, false), b(kWarning, true),
-                         b(kControllerActive, false), b(kHardwareActive, false),
+                         b(kControllerActive, false), b(kFaultPresent, false),
+                         b(kHardwareActive, false), b(kTransportReady, true)}),
+         predicate(settled, {b(kError, false), b(kWarning, false),
+                             b(kControllerActive, false), b(kHardwareActive, false),
+                             b(kTransportReady, true)})},
+        // M6 XADAPT: the controller manager or the robot did not answer in
+        // time (a component fault). Disarmed and error-free, the handle's
+        // status queries are the step: both answered end the fault.
+        {primitive(kControllerRecover),
+         predicate(any, {b(kError, false), b(kControllerActive, false),
+                         b(kFaultPresent, true), b(kHardwareActive, false),
                          b(kTransportReady, true)}),
-         predicate(any, {b(kError, false), b(kWarning, false),
-                         b(kControllerActive, false), b(kHardwareActive, false),
-                         b(kTransportReady, true)})}}},
+         predicate(settled, {b(kFaultPresent, false), b(kTransportReady, true)})}}},
   };
 }
 
@@ -286,85 +288,7 @@ anchored_catalog(const std::string_view provider_id,
   return catalog;
 }
 
-[[nodiscard]] LifecyclePredicateDTO gripper_predicate(
-    const core::ComponentLifecycleStateDTO state, const bool enabled,
-    const bool fault_present) {
-  return predicate(
-      {state},
-      {boolean_fact("native.gripper.command_admission_enabled", enabled),
-       boolean_fact("native.gripper.fault_present", fault_present)});
-}
-
-[[nodiscard]] std::vector<LifecycleIntentPlanDTO> gripper_plans() {
-  auto prepare_eligible =
-      gripper_predicate(ComponentLifecycleStateDTO::kDeclared, false, false);
-  prepare_eligible.allowed_states.push_back(
-      ComponentLifecycleStateDTO::kDisabled);
-  const auto prepared = gripper_predicate(
-      ComponentLifecycleStateDTO::kPrepared, false, false);
-  const auto active = gripper_predicate(
-      ComponentLifecycleStateDTO::kActive, true, false);
-  const auto disabled = gripper_predicate(
-      ComponentLifecycleStateDTO::kDisabled, false, false);
-  return {
-      {ComponentLifecycleIntentKindDTO::kPrepare,
-       ComponentLifecycleStateDTO::kPrepared,
-       std::nullopt,
-       prepared,
-       kPlanTimeoutNs,
-       {{LifecyclePrimitiveId("native.gripper.prepare"), prepare_eligible,
-         prepared}}},
-      {ComponentLifecycleIntentKindDTO::kEnable,
-       ComponentLifecycleStateDTO::kActive,
-       std::nullopt,
-       active,
-       kPlanTimeoutNs,
-       {{LifecyclePrimitiveId("native.gripper.enable"), prepared, active}}},
-      {ComponentLifecycleIntentKindDTO::kDisable,
-       ComponentLifecycleStateDTO::kDisabled,
-       std::nullopt,
-       disabled,
-       kPlanTimeoutNs,
-       {{LifecyclePrimitiveId("native.gripper.disable"),
-         predicate({ComponentLifecycleStateDTO::kPrepared,
-                    ComponentLifecycleStateDTO::kActive,
-                    ComponentLifecycleStateDTO::kDegraded,
-                    ComponentLifecycleStateDTO::kFaulted},
-                   {}),
-         disabled}}},
-      {ComponentLifecycleIntentKindDTO::kRecover,
-       ComponentLifecycleStateDTO::kDisabled,
-       gripper_predicate(ComponentLifecycleStateDTO::kDisabled, false, true),
-       disabled,
-       kPlanTimeoutNs,
-       {{LifecyclePrimitiveId("native.gripper.clear_fault"),
-         gripper_predicate(ComponentLifecycleStateDTO::kDisabled, false, true),
-         disabled}}},
-  };
-}
-
 } // namespace
-
-std::vector<core::LifecycleIntentPlanDTO>
-make_lite6_gripper_lifecycle_plans() {
-  return gripper_plans();
-}
-
-core::Result<core::ContentDigest>
-compute_lite6_gripper_lifecycle_catalog_semantic_digest() {
-  return core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId(
-          std::string(kXArmGripperLifecycleProviderManifestId)),
-      make_lite6_gripper_lifecycle_plans());
-}
-
-core::Result<core::BrandLifecyclePlanCatalogDTO>
-make_lite6_gripper_lifecycle_catalog(
-    const core::ProviderManifestDTO &provider_manifest) {
-  return anchored_catalog(kXArmGripperLifecycleProviderManifestId,
-                          provider_manifest,
-                          make_lite6_gripper_lifecycle_plans());
-}
 
 std::vector<core::LifecycleIntentPlanDTO>
 make_xarm_ros2_control_lifecycle_plans() {
@@ -385,24 +309,6 @@ make_xarm_ros2_control_lifecycle_catalog(
   return anchored_catalog(kXArmRos2ControlLifecycleProviderManifestId,
                           provider_manifest,
                           make_xarm_ros2_control_lifecycle_plans());
-}
-
-std::vector<core::LifecycleIntentPlanDTO> make_xarm_arm_lifecycle_plans() {
-  return xarm_arm_plans();
-}
-
-core::Result<core::ContentDigest>
-compute_xarm_arm_lifecycle_catalog_semantic_digest() {
-  return core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId(std::string(kXArmArmLifecycleProviderManifestId)),
-      make_xarm_arm_lifecycle_plans());
-}
-
-core::Result<core::BrandLifecyclePlanCatalogDTO>
-make_xarm_arm_lifecycle_catalog(
-    const core::ProviderManifestDTO &provider_manifest) {
-  return anchored_catalog(kXArmArmLifecycleProviderManifestId,
-                          provider_manifest, make_xarm_arm_lifecycle_plans());
 }
 
 } // namespace manyforge::xarm_control

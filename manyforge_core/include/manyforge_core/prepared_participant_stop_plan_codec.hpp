@@ -48,10 +48,4 @@ struct PreparedParticipantStopPlanContextDTO final {
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category);
 
-[[nodiscard]] Result<PreparedParticipantStopPlanDTO> DecodePreparedParticipantStopPlan(
-    std::string_view canonical_bytes, const ResolvedStopBasePlanDTO& verified_base_plan,
-    std::span<const RuntimeResourceBindingDTO> resources,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits,
-    MotionInterruptNodeCategory node_category);
-
 }  // namespace manyforge::core

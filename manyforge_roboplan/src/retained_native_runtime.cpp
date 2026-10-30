@@ -10,6 +10,7 @@
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
+#include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
@@ -30,6 +31,9 @@ std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
     const deployment::VerifiedRetainedModelMap *model_map) {
   const auto &value = runtime.value();
   std::vector<core::ResolvedFrameDTO> frames;
+  // B7: every frame is stamped with its owner. A target's frames belong to its
+  // own component (no alias rows since B2), so the participant's frames carry
+  // the motion component; mounted tools' frames carry the tool (below).
   for (const auto &frame : value.frame_bindings)
     frames.emplace_back(core::ResolvedComponentModelFrameDTO{
         value.controllable_component_id, frame.model_instance_id,
@@ -49,17 +53,28 @@ std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
   if (model == value.model_bindings.end())
     throw std::invalid_argument(
         "planner frame inventory has no exact motion model");
+  // A tool mounted on the motion component moves with it in the one composed
+  // cell model, so its frames (its TCPs) are planner frames too, each once and
+  // owner-stamped (B4: the mounts and model owners come from the cell
+  // kinematic index).
+  const auto &index = model_map->kinematic_index();
+  const auto mounted = index.self_and_mounted(value.controllable_component_id);
+  const auto on_mounted_component = [&](const core::ModelInstanceId &instance) {
+    const auto *owner = index.owner_of(instance);
+    return owner != nullptr && *owner != value.controllable_component_id &&
+           mounted.contains(*owner);
+  };
   for (const auto &target : model_map->targets()) {
-    if (target.controllable_component_id != value.controllable_component_id)
+    if (!mounted.contains(target.controllable_component_id))
       continue;
     for (const auto &exposed : target.frames) {
       const auto *frame =
           std::get_if<deployment::CompositionComponentModelFrame>(
               &exposed.frame);
-      if (!frame ||
-          frame->controllable_component_id != value.controllable_component_id ||
-          frame->model_instance_id != group.model_instance_id ||
-          frame->model_revision != model->model_revision)
+      if (!frame || !mounted.contains(frame->controllable_component_id) ||
+          (frame->model_instance_id == group.model_instance_id
+               ? frame->model_revision != model->model_revision
+               : !on_mounted_component(frame->model_instance_id)))
         continue;
       core::ResolvedFrameDTO resolved = core::ResolvedComponentModelFrameDTO{
           frame->controllable_component_id, frame->model_instance_id,
@@ -73,6 +88,15 @@ std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
     throw std::invalid_argument(
         "planner frame inventory exceeds its fixed bound");
   return frames;
+}
+
+std::vector<std::string> retained_motion_planner_frame_names(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map) {
+  std::vector<std::string> names;
+  for (const auto &frame : retained_motion_planner_frames(runtime, model_map))
+    names.push_back(core::compiled_frame_name(frame));
+  return names;
 }
 
 RetainedPlanningSceneSynchronizer::RetainedPlanningSceneSynchronizer(
@@ -577,7 +601,9 @@ runtime_registration(
         default_fault_stop_profile = std::nullopt,
     std::optional<double> deployment_maximum_tcp_linear_speed_mps =
         std::nullopt,
-    const bool fault_stop_profile_from_deployment = false) {
+    const bool fault_stop_profile_from_deployment = false,
+    std::optional<core::ResolvedFrameDTO> speed_check_flange_frame =
+        std::nullopt) {
   if (participant_policy.has_value() &&
       (participant_policy->value().controllable_component_id !=
            binding.value().controllable_component_id ||
@@ -618,7 +644,15 @@ runtime_registration(
       dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(engine),
       std::move(default_operator_stop_profile),
       std::move(default_fault_stop_profile),
-      deployment_maximum_tcp_linear_speed_mps};
+      deployment_maximum_tcp_linear_speed_mps,
+      std::move(speed_check_flange_frame)};
+}
+
+// Active TCP (M7): Set TCP rides on the robot's motion-engine registrations.
+void attach_set_tcp(const RetainedNativeRuntime &runtime,
+                    core::RuntimeParticipantExecutionRegistration &registration) {
+  if (runtime.set_tcp && registration.engine == runtime.participant_engine_for(true))
+    registration.set_tcp = runtime.set_tcp;
 }
 
 // Rebuilding route/readiness facts must retain the active cell's motion
@@ -637,6 +671,7 @@ runtime_registration(const RetainedNativeRuntime &owner, Args &&...args) {
       cell, registration.binding,
       &core::RuntimeParticipantExecutionRegistration::
           motion_takeover_planning_budget_s);
+  attach_set_tcp(owner, registration);
   return registration;
 }
 
@@ -818,7 +853,8 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
 [[nodiscard]] bool same_physical_binding_except_collision_bodies(
     const core::RuntimeParticipantBinding &primary,
     const core::RuntimeParticipantBinding &alias,
-    const bool permit_supporting_capability_expansion) noexcept {
+    const bool permit_supporting_capability_expansion,
+    const bool compare_frames = true) noexcept {
   const auto &left = primary.value();
   const auto &right = alias.value();
   // Contact policies belong to the verified Program view, not the physical
@@ -835,7 +871,7 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          left.command_schema == right.command_schema &&
          left.model_bindings == right.model_bindings &&
          left.model_groups == right.model_groups &&
-         left.frame_bindings == right.frame_bindings &&
+         (!compare_frames || left.frame_bindings == right.frame_bindings) &&
          left.resources == right.resources &&
          left.io_output_binding == right.io_output_binding &&
          left.control_path == right.control_path &&
@@ -861,15 +897,27 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
 
 // Locates the physical owner of a resolved Program participant. A Program may
 // declare fewer collision bodies than its physical owner (each selected body
-// must match exactly one owner body, as the participant resolver checks); every
-// other field matches as in same_physical_binding.
+// must match exactly one owner body, as the participant resolver checks), and
+// fewer frames: a robot's direct-control binding holds every TCP of its target
+// (its flange and a mounted tool's default TCP), a Program only the frames it
+// names. Every other field matches as in same_physical_binding.
 [[nodiscard]] bool program_view_within_physical_owner(
     const core::RuntimeParticipantBinding &physical,
     const core::RuntimeParticipantBinding &selected) noexcept {
   const auto &available = physical.value().collision_body_bindings;
   const auto &bodies = selected.value().collision_body_bindings;
+  const auto &owner_frames = physical.value().frame_bindings;
+  const auto &frames = selected.value().frame_bindings;
   return same_physical_binding_except_collision_bodies(physical, selected,
-                                                       true) &&
+                                                       true, false) &&
+         std::all_of(frames.begin(), frames.end(), [&](const auto &frame) {
+           // Contact body roles on a frame belong to the Program view.
+           return std::any_of(
+               owner_frames.begin(), owner_frames.end(),
+               [&](const auto &candidate) {
+                 return core::same_program_frame(candidate, frame);
+               });
+         }) &&
          std::all_of(bodies.begin(), bodies.end(), [&](const auto &body) {
            return std::count_if(
                       available.begin(), available.end(),
@@ -1070,9 +1118,13 @@ make_kernel_participant_resolver(
           physical->deployment_maximum_tcp_linear_speed_mps,
           // The physical registration already settled the fault profile from
           // the same readiness (derived or Deployment-authored); keep it.
-          true);
+          true, physical->speed_check_flange_frame);
       registration.intrinsic_direct_control =
           binding.value().intrinsic_direct_control;
+      registration.motion_endpoint_owner =
+          binding.value().motion_endpoint_owner;
+      // Active TCP (M7): the robot's Set TCP, from its physical registration.
+      registration.set_tcp = physical->set_tcp;
       registration.direct_control_joint_limits =
           physical->direct_control_joint_limits;
       registration.motion_takeover_preparation_budget_s =
@@ -1138,6 +1190,8 @@ make_kernel_participant_resolver(
              candidate.default_fault_stop_profile &&
          predecessor.deployment_maximum_tcp_linear_speed_mps ==
              candidate.deployment_maximum_tcp_linear_speed_mps &&
+         predecessor.speed_check_flange_frame ==
+             candidate.speed_check_flange_frame &&
          predecessor.intrinsic_direct_control ==
              candidate.intrinsic_direct_control &&
          predecessor.direct_control_joint_limits ==
@@ -1504,15 +1558,21 @@ create_retained_native_runtime_participants(
   runtime->motion_participant_policy = motion_participant_policy;
   runtime->deployment_maximum_tcp_linear_speed_mps =
       input.deployment_maximum_tcp_linear_speed_mps;
+  runtime->speed_check_flange_frame = input.speed_check_flange_frame;
   runtime->direct_control_joint_limits =
       std::move(input.direct_control_joint_limits);
   runtime->participant_resolver_factory =
       std::move(input.participant_resolver_factory);
   runtime->prepare_measured_sources = std::move(input.prepare_measured_sources);
+  // TCP-C: FK of every listed TCP, a mounted tool's included (planner frames).
+  auto mounted_frame_names = retained_motion_planner_frame_names(
+      runtime->motion_binding,
+      input.planner_model_map ? &*input.planner_model_map : nullptr);
   runtime->kinematic_model = std::make_shared<RetainedKinematicModelProxy>(
       make_retained_motion_model_generation(
           runtime->motion_binding, std::move(input.scene),
-          std::move(input.scene_mutex), std::move(input.state_projector)));
+          std::move(input.scene_mutex), std::move(input.state_projector),
+          std::move(mounted_frame_names)));
   const auto model_generation = runtime->kinematic_model->current_generation();
   runtime->collision_publisher = std::move(input.collision_publisher);
 
@@ -1646,6 +1706,7 @@ create_retained_native_runtime_participants(
     runtime->gripper_stop_execution_port = selected.gripper_stop_execution_port;
     runtime->rebind_motion_route = std::move(selected.rebind_motion_route);
     runtime->rebind_gripper_route = std::move(selected.rebind_gripper_route);
+    runtime->set_tcp = std::move(selected.set_tcp);
   }
   if (!runtime->execution || !runtime->rebind_motion_route ||
       runtime->execution->observed_robot_state_publication() !=
@@ -1787,7 +1848,8 @@ create_retained_native_runtime_participants(
                                             motion_participant_policy),
           motion_operator_stop_profile, motion_fault_stop_profile,
           input.deployment_maximum_tcp_linear_speed_mps,
-          input.fault_stop_profile_from_deployment));
+          input.fault_stop_profile_from_deployment,
+          input.speed_check_flange_frame));
     } else {
       registrations.push_back(gripper_runtime_registration(
           representative,
@@ -1802,7 +1864,8 @@ create_retained_native_runtime_participants(
         runtime->execution.get(), motion_participant_policy,
         motion_operator_stop_profile, motion_fault_stop_profile,
         input.deployment_maximum_tcp_linear_speed_mps,
-        input.fault_stop_profile_from_deployment));
+        input.fault_stop_profile_from_deployment,
+        input.speed_check_flange_frame));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(gripper_runtime_registration(
@@ -1818,9 +1881,12 @@ create_retained_native_runtime_participants(
       motion_participant_policy, motion_operator_stop_profile,
       motion_fault_stop_profile,
       input.deployment_maximum_tcp_linear_speed_mps,
-      input.fault_stop_profile_from_deployment));
+      input.fault_stop_profile_from_deployment,
+      input.speed_check_flange_frame));
   physical_registrations.back().direct_control_joint_limits =
       runtime->direct_control_joint_limits;
+  for (auto &registration : registrations) attach_set_tcp(*runtime, registration);
+  attach_set_tcp(*runtime, physical_registrations.back());
   if (runtime->gripper_binding.has_value()) {
     physical_registrations.push_back(gripper_runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
@@ -1922,10 +1988,13 @@ void join_retained_native_runtime_participants(
     const std::shared_ptr<RetainedNativeRuntime> &primary,
     std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
     RetainedRuntimeParticipantResolverFactory participant_resolver_factory) {
+  // A robot whose other components are tools (gripper-only owners, not
+  // runtimes) joins with no peers, as a rejoin may.
   if (primary == nullptr || primary->addressed_kernel != nullptr ||
       primary->operation_journal != nullptr || primary->clock == nullptr ||
       primary->scheduler == nullptr || !participant_resolver_factory ||
-      peers.empty() || !primary->participant_peers.empty()) {
+      primary->cell_runtime_root != nullptr ||
+      !primary->participant_peers.empty()) {
     throw std::invalid_argument("native participant join is incomplete or duplicated");
   }
   std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes{primary};
@@ -2550,6 +2619,8 @@ core::Result<void> reseal_retained_native_runtime_for_apply(
       runtime.motion_participant_policy = registration->participant_policy;
       runtime.deployment_maximum_tcp_linear_speed_mps =
           registration->deployment_maximum_tcp_linear_speed_mps;
+      runtime.speed_check_flange_frame =
+          registration->speed_check_flange_frame;
       runtime.direct_control_joint_limits =
           registration->direct_control_joint_limits;
     }
@@ -3923,7 +3994,9 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? deployment_maximum_tcp_linear_speed_mps
                        : std::optional<double>{},
-          motion_owner && motion_fault_stop_profile_from_deployment));
+          motion_owner && motion_fault_stop_profile_from_deployment,
+          motion_owner ? speed_check_flange_frame
+                       : std::optional<core::ResolvedFrameDTO>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
@@ -3931,7 +4004,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           execution.get(), motion_participant_policy,
           motion_operator_stop_profile, motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps,
-          motion_fault_stop_profile_from_deployment));
+          motion_fault_stop_profile_from_deployment,
+          speed_check_flange_frame));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -4797,7 +4871,9 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? deployment_maximum_tcp_linear_speed_mps
                        : std::optional<double>{},
-          motion_owner && motion_fault_stop_profile_from_deployment));
+          motion_owner && motion_fault_stop_profile_from_deployment,
+          motion_owner ? speed_check_flange_frame
+                       : std::optional<core::ResolvedFrameDTO>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
@@ -4805,7 +4881,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           execution.get(), motion_participant_policy,
           motion_operator_stop_profile, motion_fault_stop_profile,
           deployment_maximum_tcp_linear_speed_mps,
-          motion_fault_stop_profile_from_deployment));
+          motion_fault_stop_profile_from_deployment,
+          speed_check_flange_frame));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(

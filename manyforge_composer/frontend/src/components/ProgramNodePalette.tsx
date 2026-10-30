@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Ref } from 'react';
+import type { ManualControlMotionDescriptor } from '../types/robotControl';
+import type { ResolvedTargetRole } from '../utils/targetRoleResolution';
 
 import type {
   CatalogEntry,
@@ -15,6 +17,7 @@ import {
   type ProgramPaletteActivation,
 } from '../utils/programCanvasInteraction';
 import { NodePaletteItem } from './NodePaletteItem';
+import { errorCatalogRow } from '../state/commandRefusal';
 import { programCategoryFamily } from '../styles/tokens';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramAuthoringTemplate } from './ProgramAuthoringTemplate';
@@ -29,6 +32,8 @@ interface ProgramCatalogIdentity {
 interface ProgramNodePaletteProps {
   roots: ProgramTreeNode[];
   program?: ProgramAuthoringDocument;
+  boundTargets?: readonly ResolvedTargetRole[];
+  motionDescriptors?: readonly ManualControlMotionDescriptor[];
   catalogEntries: CatalogEntry[];
   catalogIdentity: ProgramCatalogIdentity | null;
   environment: NodeEnvironmentResponse | null;
@@ -48,7 +53,7 @@ interface NodeExecutionAvailability {
   note: string;
 }
 
-function executionAvailability(
+export function executionAvailability(
   entry: CatalogEntry,
   environment: NodeEnvironmentResponse | null,
 ): NodeExecutionAvailability {
@@ -62,6 +67,13 @@ function executionAvailability(
       note: requiredInputs > 0
         ? `Executable when configured · ${requiredInputs} required input${requiredInputs === 1 ? '' : 's'}`
         : 'Execution available for the current binding',
+    };
+  }
+  const typedReason = rows.flatMap((row) => row.reasons)[0];
+  if (typedReason !== undefined) {
+    return {
+      available: false,
+      note: `Authorable · unavailable · ${errorCatalogRow(typedReason.code)?.[0] ?? typedReason.message}${typeof typedReason.details?.capability === 'string' ? ` (${typedReason.details.capability})` : ''}`,
     };
   }
   const gates = [...new Set(rows.flatMap((row) => row.restorationGates))];
@@ -135,6 +147,8 @@ function PaletteChevron({ up, double = false }: { up: boolean; double?: boolean 
 export const ProgramNodePalette = memo(function ProgramNodePalette({
   roots,
   program,
+  boundTargets,
+  motionDescriptors,
   catalogEntries,
   catalogIdentity,
   environment,
@@ -313,6 +327,8 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
       {program && (
         <ProgramAuthoringTemplate
           program={program}
+          boundTargets={boundTargets}
+          motionDescriptors={motionDescriptors}
           busy={busy}
           onMutate={onMutate}
           collapsed={templatesCollapsed}

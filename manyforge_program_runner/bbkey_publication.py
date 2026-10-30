@@ -5,7 +5,7 @@ atomic baseline is message 1, and every later committed change of a subscribed
 key records a pending publication obligation in the same store critical
 section. The baseline carries every key of the union (null when unset);
 an update carries only its changed keys (bb-wire-shapes03). One request is in
-flight; only the exact-sequence success reply clears an obligation. An
+flight; only an accepted success reply clears an obligation. An
 explicit `superseded` reply (the frame's occurrence was retired by an
 authoritative replacement) retires only that exact obligation, with no fault.
 A source the Runner itself retired (its own Reset, a new Run or a new Applied
@@ -338,19 +338,11 @@ class ProgramBlackboardKeyPublisher:
                 if response.get("command") != COMMAND or status not in {
                     "accepted", "superseded"
                 }:
-                    raise ValueError("BB publication reply does not answer this frame")
+                    raise ValueError("BB publication reply has the wrong kind or status")
                 if status == "accepted" and (
-                    response.get("program_run_id") != self._scope.program_run_id
-                    or response.get("owner_epoch") != self._scope.owner_epoch
-                    or response.get("program_binding_id") != self._scope.program_binding_id
-                    or response.get("active_publication_generation")
-                    != self._scope.active_publication_generation
-                    or response.get("cycle_generation") != self._scope.cycle_generation
-                    or response.get("accepted_sequence") != str(frame.sequence)
-                    or not isinstance(source_epoch, str)
-                    or not source_epoch
+                    not isinstance(source_epoch, str) or not source_epoch
                 ):
-                    raise ValueError("BB publication reply does not ACK this frame")
+                    raise ValueError("BB publication reply has no source epoch")
             except Exception as error:
                 with self._lock:
                     retired = self._retired

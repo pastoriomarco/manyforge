@@ -590,8 +590,10 @@ void verify_tree(const CanonicalValue &value, std::string_view path,
       try {
         paths.insert(parse_value_path(key));
       } catch (const ValuePathError &error) {
-        fail(child_path(path, "value_sources") + " key '" + key +
-             "': " + error.code() + ": " + error.what());
+        throw ProgramContractError(
+            child_path(path, "value_sources") + " key '" + key +
+                "': " + error.code() + ": " + error.what(),
+            error.code());
       }
       verify_value_source(source,
                           child_path(child_path(path, "value_sources"), key));
@@ -2471,6 +2473,23 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
     verify_node_outcome_writes(node, entry, path);
     verify_key_typed_parameters(node, entry, root, frames, path);
     verify_node_value_sources(node, entry, root, expressions, path);
+    if (node_id == "scene.attach_carried_object") {
+      const auto &parameters = require_object(require_member(node, "parameters", path), path);
+      bool literal_frame = find_member(parameters, "carrier_frame_role") != nullptr;
+      bool active_frame = find_member(parameters, "carrier_frame") != nullptr;
+      if (const auto *sources = find_member(node, "value_sources")) {
+        for (const auto &[key, unused] : require_object(*sources, path)) {
+          (void)unused;
+          const auto parts = parse_value_path(key);
+          const auto &name = std::get<std::string>(parts.front());
+          literal_frame = literal_frame || name == "carrier_frame_role";
+          active_frame = active_frame || name == "carrier_frame";
+        }
+      }
+      if (literal_frame == active_frame)
+        fail(path + ": requires exactly one carrier frame selector");
+    }
+
     validate_automatic_motion_retry_policy(node, entry, node_id, path);
     selected->preemption_priority = capture_preemption_priority(node, entry, node_id, path);
     selected->target_effects = node_target_effects(node, entry, targets, path);

@@ -5,6 +5,7 @@
 #include <manyforge_core/types/strong_id.hpp>
 
 #include <cstddef>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -75,10 +76,35 @@ enum class ManagerApplyEffectDisposition {
 
 [[nodiscard]] const char *ToString(ManagerApplyEffectDisposition disposition) noexcept;
 
+/// Whether a retained failure happened before any configuration change.
+///
+/// Stated by the failure's source, never inferred from codes or phases.
+enum class ManagerApplyEffectBoundary {
+  /// The Apply made no configuration, runtime, component or Scene change. An
+  /// admission claim, a Kernel fence and fail-closed readiness may still
+  /// exist; whoever releases them must check those facts directly. The effect
+  /// disposition is then `kKnown`.
+  kBeforeEffect,
+  /// The source cannot prove the Apply made no such change.
+  kUnknown,
+};
+
+[[nodiscard]] const char *ToString(ManagerApplyEffectBoundary boundary) noexcept;
+
 inline constexpr std::size_t kMaximumManagerApplyFailureCodeBytes = 128U;
 inline constexpr std::size_t kMaximumManagerApplyFailureMessageBytes = 1024U;
+inline constexpr std::size_t kMaximumManagerApplyFailureProducerBytes = 64U;
+inline constexpr std::size_t kMaximumManagerApplyFailureCauseDetails = 16U;
+inline constexpr std::size_t kMaximumManagerApplyFailureCauseDetailKeyBytes = 64U;
+inline constexpr std::size_t kMaximumManagerApplyFailureCauseDetailValueBytes = 256U;
 
 /// The first meaningful failure retained by one terminal Apply operation.
+///
+/// `failure_code` names the Apply phase that failed. The inner cause keeps its
+/// own typed code and details: `cause_code` equals `failure_code` when the
+/// inner failure carried no code. `failure_message` is the producer's message
+/// and `producer` the owner that produced the cause (`component_manager`,
+/// `kernel`, ...).
 struct ManagerApplyFailureEvidenceDTO final {
   /// Exact intent of the operation that retained this failure.
   manyforge::core::ContentDigest intent_digest;
@@ -87,6 +113,10 @@ struct ManagerApplyFailureEvidenceDTO final {
   std::string failure_code;
   std::string failure_message;
   ManagerApplyEffectDisposition effect_disposition;
+  std::string cause_code;
+  std::map<std::string, std::string> cause_details;
+  std::string producer;
+  ManagerApplyEffectBoundary effect_boundary;
 
   [[nodiscard]] bool valid() const noexcept;
 

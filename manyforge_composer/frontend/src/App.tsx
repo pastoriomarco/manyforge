@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
@@ -8,6 +8,7 @@ import {
   NO_AI_MODEL_COMPONENT,
   assistantAvailability,
 } from './components/AssistantOverlay';
+import { ComponentsWorkspace } from './components/ComponentsWorkspace';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
@@ -36,6 +37,9 @@ import {
 } from './hooks/useHeadlessState';
 import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
+import { useComponentCatalog } from './hooks/useComponentCatalog';
+import { requestOpenSettings } from './state/settingsNavigation';
+import type { ComponentManagerTab } from './utils/componentManager';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
 import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
@@ -49,8 +53,7 @@ import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
-import { REARM_CANCEL_TITLE } from './state/robotRearm';
-import { closeScenario as closeCurrentScenario, resetCloseSnapshot, type ClosePreparationInputs } from './state/scenarioClose';
+import { closeScenario as closeCurrentScenario, forceCloseScenario, type ClosePreparationInputs } from './state/scenarioClose';
 import { useCCLC, waitForObservation } from './hooks/useCCLC';
 import type { ManagerActiveProjection } from './types/api';
 import {
@@ -104,6 +107,10 @@ import {
   type WorkbenchNotice,
 } from './state/workbenchNotices';
 import { startupScenarioNotices } from './state/startupScenarioNotice';
+import {
+  onOpenGlobalRulesRequest,
+  takeOpenGlobalRulesRequest,
+} from './state/globalRulesNavigation';
 import {
   alarmWarningNotices,
   composerWarningNotices,
@@ -189,7 +196,11 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 export default function App() {
-  const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'deployment'>('program');
+  const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'components' | 'deployment'>('program');
+  const [deploymentTabRequest, setDeploymentTabRequest] = useState<{
+    tab: ComponentManagerTab;
+    sequence: number;
+  } | null>(null);
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => (
     typeof window === 'undefined' ? 1440 : window.innerWidth
@@ -295,11 +306,6 @@ export default function App() {
   const assistant = assistantAvailability(assistantModes);
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
-  const rearmStatus = useSyncExternalStore(
-    headlessStateSource.subscribeRearmStatus,
-    headlessStateSource.getRearmStatus,
-    headlessStateSource.getRearmStatus,
-  );
   const headlessSnapshot = headlessState.snapshot;
   // One shared authoring publication for the whole workbench: Program,
   // Deployment and Scenario authoring all read this single snapshot, so no
@@ -409,7 +415,7 @@ export default function App() {
     deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? []
   ), [deploymentController.workspace?.managerApplied.activationOrder]);
   const cclc = useCCLC(headlessEnabled,
-    headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, configuredComponentIds);
+    headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, appliedDeploymentIdentity?.componentIds);
   const { controllableComponentId: cclcComponentId, setControllableComponentId: selectCCLCComponent, refresh: refreshCCLC } = cclc;
   useOperationalErrorMirror({
     source: 'composer.cclc',
@@ -418,9 +424,10 @@ export default function App() {
     onDismiss: cclc.dismissError,
   });
   useEffect(() => {
+    if (appliedDeploymentIdentity === null) return;
     const next = configuredComponentIds.includes(cclcComponentId) ? cclcComponentId : configuredComponentIds[0] ?? '';
     if (next !== cclcComponentId) selectCCLCComponent(next);
-  }, [cclcComponentId, configuredComponentIds, selectCCLCComponent]);
+  }, [appliedDeploymentIdentity, cclcComponentId, configuredComponentIds, selectCCLCComponent]);
   useEffect(() => {
     if (headlessEnabled && configuredComponentIds.includes(cclcComponentId)) void refreshCCLC();
   }, [cclcComponentId, configuredComponentIds, headlessEnabled, refreshCCLC]);
@@ -450,6 +457,8 @@ export default function App() {
       ? null
       : defaults({ parameters: appliedProgram.program.parameters, forest: [appliedProgram.program.tree] }));
   }, [appliedProgram, catalog]);
+  const componentCatalog = useComponentCatalog(
+    headlessEnabled, deploymentController.workspace?.draft.id ?? null);
   const robotControl = useRobotControl(
     headlessEnabled,
     programRuntime.cycleState !== null
@@ -511,7 +520,7 @@ export default function App() {
   // refusal it is a warning until acknowledged, titled as the wait it is.
   useOperationalErrorMirror({
     source: 'composer.program_runtime',
-    title: isMotionWaitRefusal(programRuntime.state.error)
+    title: isMotionWaitRefusal(programRuntime.state.errorRefusal)
       ? 'Motion waiting' : 'Program Run, Stop, or Reset failed',
     message: programRuntime.state.error,
     onDismiss: programRuntime.dismissError,
@@ -522,14 +531,11 @@ export default function App() {
     message: robotControl.runtimeScaleError,
     onDismiss: robotControl.dismissRuntimeScaleError,
   });
-  const robotOperationalError = robotControl.state.error !== null
-    && !robotControl.state.error.startsWith('The authored ')
-    && !robotControl.state.error.startsWith('The stored ')
-    ? robotControl.state.error
-    : null;
+  // The panel's own target validation stays in the panel (typed, not by text).
+  const robotOperationalError = robotControl.state.errorLocal ? null : robotControl.state.error;
   useOperationalErrorMirror({
     source: 'composer.robot_control',
-    title: isMotionWaitRefusal(robotOperationalError)
+    title: isMotionWaitRefusal(robotControl.state.errorRefusal)
       ? 'Motion waiting' : 'Robot control request failed',
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
@@ -601,6 +607,14 @@ export default function App() {
   // a lost reply's exact request id. A different or older operation's status
   // never clears it.
   const [trackedApply, setTrackedApply] = useState<ManagerApplyIdentity | null>(null);
+  const [applyAcknowledgement, setApplyAcknowledgement] = useState<{
+    key: string;
+    busy: boolean;
+    message: string | null;
+  } | null>(null);
+  // The failed-Apply notice hidden here on positive evidence that nothing is
+  // held: a refusal before the fence, or a re-read showing no failed Apply.
+  const [dismissedActivationNotice, setDismissedActivationNotice] = useState<string | null>(null);
   const closeAbort = useRef<AbortController | null>(null);
   const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
   // Bumped by Reset reaching Idle and by Scenario Close: clears every warning.
@@ -608,49 +622,66 @@ export default function App() {
   useEffect(() => () => closeAbort.current?.abort(), []);
   const latestProgramRuntime = useRef(programRuntime);
   latestProgramRuntime.current = programRuntime;
-  const closeCurrent = useCallback(async (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => {
+  // SX-679 (maintainer): Close and Recover cell exclude each other in the GUI;
+  // Headless also refuses Close's retirement while a press runs.
+  const latestRobotControl = useRef(robotControl);
+  latestRobotControl.current = robotControl;
+  const [closeRunning, setCloseRunning] = useState(false);
+  const { setCellRecoverBlockedReason } = robotControl;
+  useEffect(() => {
+    setCellRecoverBlockedReason(closeRunning
+      ? 'Scenario Close is in progress; Recover cell waits until it ends.' : null);
+  }, [closeRunning, setCellRecoverBlockedReason]);
+  const runClose = useCallback(async (force: boolean, expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => {
     if (closeAbort.current !== null) throw new Error('Scenario Close is already in progress.');
-    // m5.5: Close cancels a motion command waiting for its robot re-arm.
-    headlessStateSource.cancelPendingMotionIntent();
     const abort = new AbortController();
     closeAbort.current = abort;
+    setCloseRunning(true);
     const abortFromCaller = () => abort.abort(callerSignal?.reason);
     callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
     if (callerSignal?.aborted) abortFromCaller();
     try {
+      let lastAdmissionGeneration = headlessStateSource.getLatestSnapshot()?.authoringAdmission.admissionGeneration;
+      const readCloseSnapshot = () => {
+        const latest = headlessStateSource.getLatestSnapshot();
+        if (latest === null) throw new Error('Control source is unavailable; Close is unresolved.');
+        lastAdmissionGeneration = latest.authoringAdmission.admissionGeneration;
+        return latest;
+      };
       const preparation: ClosePreparationInputs | undefined = confirmed === undefined ? undefined : { confirmed,
         reset: (options) => latestProgramRuntime.current.reset(options),
         // Close detaches with the latest attachment and Scene revisions; the
         // shell snapshot does not follow pose-only Scene commits.
-        readResetSnapshot: () => resetCloseSnapshot({
+        readResetSnapshot: () => ({
           ...headlessStateSource.getShellSnapshot(), snapshot: headlessStateSource.getLatestSnapshot(),
         }),
-        readSnapshot: () => {
-          const current = headlessStateSource.getShellSnapshot();
-          const latest = headlessStateSource.getLatestSnapshot();
-          if (latest === null || current.transportStatus !== 'connected' || current.semanticStatus !== 'current')
-            throw new Error('Control source is unavailable; Close is unresolved.');
-          return latest;
-        },
+        readSnapshot: readCloseSnapshot,
       };
-      const closed = await closeCurrentScenario({ expected, signal: abort.signal,
+      // Item 37: Force close is the operator's explicit action after a refused Close.
+      const closed = await (force ? forceCloseScenario : closeCurrentScenario)({ expected, signal: abort.signal,
         preparation,
         admissionGeneration: () => {
-          const state = headlessStateSource.getShellSnapshot();
-          if (state.snapshot === null || state.transportStatus !== 'connected'
-            || state.semanticStatus !== 'current') throw new Error('Control source is unavailable; Close is unresolved.');
-          return state.snapshot.authoringAdmission.admissionGeneration;
+          lastAdmissionGeneration = headlessStateSource.getLatestSnapshot()?.authoringAdmission.admissionGeneration
+            ?? lastAdmissionGeneration;
+          if (lastAdmissionGeneration === undefined)
+            throw new Error('Control source is unavailable; Close is unresolved.');
+          return lastAdmissionGeneration;
         },
-        waitForObservation: () => waitForObservation(abort.signal),
+        waitForObservation: (signal) => waitForObservation(signal),
         trackApply: setTrackedApply, progress: setScenarioCloseProgress,
+        cellRecoverRunning: () => latestRobotControl.current.stopFaultRecoveryPending,
       });
       if (closed !== null) setWarningClearEpoch((epoch) => epoch + 1);
       return closed;
     } finally {
       callerSignal?.removeEventListener('abort', abortFromCaller);
-      closeAbort.current = null; setScenarioCloseProgress(null);
+      closeAbort.current = null; setScenarioCloseProgress(null); setCloseRunning(false);
     }
   }, [headlessStateSource]);
+  const closeCurrent = useCallback((expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity,
+    callerSignal?: AbortSignal) => runClose(false, expected, confirmed, callerSignal), [runClose]);
+  const forceCloseCurrent = useCallback((expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity,
+    callerSignal?: AbortSignal) => runClose(true, expected, confirmed, callerSignal), [runClose]);
   useEffect(() => {
     if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
   }, [programController.acceptedApply]);
@@ -674,6 +705,46 @@ export default function App() {
   const activationStatus = activation.status !== null
     && sameManagerApply(activation.status, observedApply)
     ? activation.status
+    : null;
+  const acknowledgementKey = observedApply === null
+    ? null
+    : `${observedApply.applyId}:${observedApply.applyGeneration}`;
+  // Acknowledge sends the durable acknowledgement while it is offered, else
+  // re-reads the status; only positive evidence that no failed Apply remains
+  // hides the notice here.
+  const applyAcknowledgementOutcomeUnknown = activation.acknowledgementOutcomeUnknown;
+  const acknowledgeFailedApply = useCallback(async () => {
+    if (applyAcknowledgement?.busy === true || acknowledgementKey === null
+      || activationStatus?.state !== 'failed') return;
+    setApplyAcknowledgement({ key: acknowledgementKey, busy: true, message: null });
+    try {
+      const result = await activation.acknowledgeFailure();
+      if (result.noFailedApply) {
+        setDismissedActivationNotice(`activation.${acknowledgementKey}`);
+      } else if (!result.confirmed && result.message !== null) {
+        setApplyAcknowledgement((current) => current?.key === acknowledgementKey
+          ? { ...current, message: result.message } : current);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? ` (${error.message})` : '';
+      setApplyAcknowledgement((current) => current?.key === acknowledgementKey
+        ? {
+          ...current,
+          message: `Acknowledgement was not confirmed${reason}. The failed Apply remains recorded; no request was retried.`,
+        } : current);
+    } finally {
+      setApplyAcknowledgement((current) => current?.key === acknowledgementKey
+        ? { ...current, busy: false } : current);
+    }
+  }, [
+    acknowledgementKey,
+    applyAcknowledgement?.busy,
+    activation.acknowledgeFailure,
+    activationStatus,
+  ]);
+  const acknowledgingApply = applyAcknowledgement?.busy === true;
+  const currentApplyAcknowledgementError = applyAcknowledgement?.key === acknowledgementKey
+    ? applyAcknowledgement.message
     : null;
   const activationUnobservable = activation.unavailable;
   // A settled Apply re-reads both Applied views (event-driven).
@@ -722,13 +793,26 @@ export default function App() {
     if (observedApply === null) return [];
     const id = `activation.${observedApply.applyId}:${observedApply.applyGeneration}`;
     if (activationStatus?.state === 'failed' || activationStatus?.state === 'unknown_effect') {
-      return [activationFailureNotice(
+      if (dismissedActivationNotice === id) return [];
+      const notice = activationFailureNotice(
         id,
         observedApply.applyId,
-        { state: activationStatus.state, failure: activationStatus.failure },
+        {
+          state: activationStatus.state,
+          failure: activationStatus.failure,
+          failureAcknowledgement: activationStatus.failureAcknowledgement,
+        },
         savedScenarioPath,
         authoringAdmissionOpen,
-      )];
+        {
+          busy: acknowledgingApply,
+          error: currentApplyAcknowledgementError,
+          outcomeUnknown: applyAcknowledgementOutcomeUnknown,
+          run: () => { void acknowledgeFailedApply(); },
+          dismiss: () => setDismissedActivationNotice(id),
+        },
+      );
+      return notice === null ? [] : [notice];
     }
     if (activationStatus?.state === 'succeeded') return [];
     if (activationUnobservable) {
@@ -749,7 +833,9 @@ export default function App() {
       message: `Manager phase: ${String(phase).replaceAll('_', ' ')} (${observedApply.applyId}). Motion does not start automatically.`,
       busy: true,
     }];
-  }, [activationStatus, activationUnobservable, authoringAdmissionOpen, maintenance, observedApply, savedScenarioPath]);
+  }, [acknowledgeFailedApply, acknowledgingApply, activationStatus, activationUnobservable,
+    authoringAdmissionOpen, currentApplyAcknowledgementError, dismissedActivationNotice,
+    maintenance, observedApply, applyAcknowledgementOutcomeUnknown, savedScenarioPath]);
   const activationCompleted = useBriefNotice(
     observedApply !== null && activationStatus?.state === 'succeeded'
       ? {
@@ -794,22 +880,6 @@ export default function App() {
       ...authoringContainmentNotices(headlessSnapshot),
       ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
     ];
-    if (rearmStatus !== null) {
-      notices.push({
-        id: 'robot.rearm',
-        severity: 'info',
-        domain: 'runtime',
-        title: rearmStatus,
-        message: 'The robot was moved outside ManyForge; Composer re-arms it, then sends the command.',
-        busy: true,
-        actions: [{
-          id: 'cancel',
-          label: 'Cancel',
-          title: REARM_CANCEL_TITLE,
-          run: headlessStateSource.cancelPendingMotionIntent,
-        }],
-      });
-    }
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];
@@ -866,8 +936,6 @@ export default function App() {
     }
     return notices;
   }, [
-    rearmStatus,
-    headlessStateSource.cancelPendingMotionIntent,
     authoringCause,
     authoringWorkspace.unavailableReason,
     controlNotices.length,
@@ -1179,6 +1247,35 @@ export default function App() {
       setProgramInspectorMinimized(!alreadyMaximized);
     }
   }, [programInspectorMinimized, programInspectorState.active, viewerInspectorMinimized]);
+  // Components page links: Robot Control (in the viewer) and a Deployment tab.
+  const { selectRobot, selectMode, motionTargets: robotMotionTargets } = robotControl;
+  const robotControlApproving = robotControl.state.phase === 'approving';
+  const openRobotControl = useCallback((componentId: string) => {
+    if (!robotControlApproving) {
+      const motion = robotMotionTargets.find(
+        (target) => target.targetDescriptor.controllableComponentId === componentId,
+      );
+      selectRobot(componentId, motion?.targetDescriptor.commandTargetId ?? '');
+      // A tool has only its gripper target.
+      if (motion === undefined) selectMode('gripper');
+    }
+    requestOpenSettings('robot');
+  }, [robotControlApproving, robotMotionTargets, selectMode, selectRobot]);
+  const openDeploymentTab = useCallback((tab: ComponentManagerTab) => {
+    setActiveWorkspace('deployment');
+    setDeploymentTabRequest((current) => ({ tab, sequence: (current?.sequence ?? 0) + 1 }));
+  }, []);
+  // "Open global rules" from the Program node editor: the rules are on Cell
+  // settings. Refused like the Deployment button while a Program field edit is invalid.
+  useEffect(() => onOpenGlobalRulesRequest(() => {
+    if (programInvalidEdit) takeOpenGlobalRulesRequest();
+    else openDeploymentTab('cell');
+  }), [openDeploymentTab, programInvalidEdit]);
+  const robotControlIds = useMemo(() => [...new Set([
+    ...robotControl.motionTargets, ...robotControl.gripperTargets,
+  ].map((target) => target.targetDescriptor.controllableComponentId))], [
+    robotControl.gripperTargets, robotControl.motionTargets,
+  ]);
   const openRuntimeDetails = useCallback(() => {
     setRuntimePanelExpanded(true);
     setRuntimePanelAutomatic(false);
@@ -1243,6 +1340,9 @@ export default function App() {
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
       localInvalidEdit={programInvalidEdit}
       closeScenario={closeCurrent}
+      forceCloseScenario={forceCloseCurrent}
+      closeUnavailableReason={robotControl.stopFaultRecoveryPending
+        ? 'Recover cell is in progress; wait for it to finish or abort it.' : null}
       closeProgress={scenarioCloseProgress}
       motionActive={documentMotionActive}
     />
@@ -1291,6 +1391,19 @@ export default function App() {
           </button>
           <button
             type="button"
+            data-workspace="components"
+            className={activeWorkspace === 'components' ? 'active' : ''}
+            aria-pressed={activeWorkspace === 'components'}
+            disabled={programInvalidEdit}
+            title={programInvalidEdit
+              ? 'Review or discard the invalid Program field edit first.'
+              : 'Each component: status, settings, frames and I/O.'}
+            onClick={() => setActiveWorkspace('components')}
+          >
+            Components
+          </button>
+          <button
+            type="button"
             data-workspace="deployment"
             className={`deployment-status-button readiness-${deploymentStatus.readiness}${
               activeWorkspace === 'deployment' ? ' active' : ''
@@ -1308,6 +1421,7 @@ export default function App() {
             title={deploymentTitle}
             onClick={() => {
               setActiveWorkspace('deployment');
+              setDeploymentTabRequest(null);
               setComponentOverviewRequest((current) => current + 1);
             }}
           >
@@ -1333,7 +1447,7 @@ export default function App() {
           <DocumentStateLetters states={deploymentStates} owner="Deployment" side="right" />
         </nav>
         <DocumentControls
-          {...(activeWorkspace === 'deployment'
+          {...(activeWorkspace === 'deployment' || activeWorkspace === 'components'
             ? deploymentDocumentHeader(deploymentController)
             : programDocumentHeader(programController))}
           scenarioCommands={scenarioCommands}
@@ -1420,11 +1534,37 @@ export default function App() {
               className="scene-workspace-host"
               aria-label="Scene authoring workspace"
             />
+          ) : activeWorkspace === 'components' ? (
+            <div className="deployment-workspace">
+              <ComponentsWorkspace
+                enabled={headlessEnabled}
+                controller={deploymentController}
+                cclc={cclc}
+                lifecycleIds={configuredComponentIds}
+                snapshot={headlessSnapshot}
+                catalog={componentCatalog}
+                sourceModel={sourceModel}
+                motionDescriptors={robotControl.motionTargets.map(
+                  (target) => target.targetDescriptor,
+                )}
+                gripperDescriptors={robotControl.gripperTargets.map(
+                  (target) => target.targetDescriptor,
+                )}
+                programSceneIds={programSceneIds}
+                programComponentRoles={programDraftAuthoring?.component_roles ?? null}
+                programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
+                robotControlIds={robotControlIds}
+                onOpenRobotControl={openRobotControl}
+                onOpenDeployment={openDeploymentTab}
+              />
+            </div>
           ) : (
             <div className="deployment-workspace">
               <DeploymentCompositionPanel
-                cclc={cclc}
                 controller={deploymentController}
+                componentCatalog={componentCatalog}
+                tabRequest={deploymentTabRequest}
+                onOpenComponents={() => setActiveWorkspace('components')}
                 enabled={headlessEnabled}
                 snapshot={headlessSnapshot}
                 transportStatus={headlessState.transportStatus}
@@ -1442,6 +1582,8 @@ export default function App() {
                 systemSignalChoices={systemSignalChoices}
                 systemSignalsNeedApply={systemSignalsNeedApply}
                 maintenanceStatus={activation}
+                programComponentRoles={programDraftAuthoring?.component_roles ?? null}
+                programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
                 componentOverview={{
                   request: componentOverviewRequest,
                   status: runtimeView,

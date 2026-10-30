@@ -11,6 +11,7 @@
 #include <manyforge_core/types/io_rule_recovery.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <manyforge_core/types/prepared_operation_diagnostics.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -228,6 +229,17 @@ class IOperationJournal {
     return Result<std::uint64_t>::Err({"unsupported_capability",
                                        "Global rule-state journal projection is not installed",
                                        {{"reason", "io_rule_state_journal_unsupported"}}});
+  }
+
+  /// Active TCP (M7, design 4, A2a-2): one confirmed Active TCP change, the
+  /// operational `active_tcp_changed` row (the Runner's mirror and History
+  /// read it). The robot owner appends it under its own lock; the returned
+  /// sequence is its place in the stream.
+  [[nodiscard]] virtual Result<std::uint64_t> RecordActiveTcpChanged(
+      const RequestOwnerEpoch&, const ActiveTcpChangeDTO&) {
+    return Result<std::uint64_t>::Err({"unsupported_capability",
+                                       "Active TCP journal projection is not installed",
+                                       {{"reason", "active_tcp_journal_unsupported"}}});
   }
 
   [[nodiscard]] virtual Result<std::uint64_t> RecordCellAdmissionClaimAcquired(

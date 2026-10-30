@@ -17,7 +17,12 @@ from manyforge_behavior.pick_place_templates import (
     PickPlaceTemplateError,
     build_pick_place_subtree,
 )
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import (
+    Program,
+    ProgramValidationError,
+    TcpEndpointAliasAmbiguous,
+)
+from manyforge_behavior.tcp_migration import migrate_tcp_selectors
 
 
 _PROGRAM_API_VERSION = "manyforge.program.v2"
@@ -181,6 +186,17 @@ def migrate_composite_pick_place_program(
         )
 
     occupied_ids = _collect_instance_ids(source.get("tree"))
+    # The old aliases must be compared across the entire original tree before
+    # a composite is expanded into several ordinary nodes.
+    pending = [source["tree"]]
+    nodes = []
+    while pending:
+        node = pending.pop()
+        nodes.append(node)
+        pending.extend(reversed(node["children"]))
+    ambiguous = migrate_tcp_selectors(nodes)
+    if ambiguous:
+        raise TcpEndpointAliasAmbiguous(ambiguous)
     blackboard = _mapping(source.get("blackboard"), field="blackboard")
     namespaces = _list(blackboard.get("namespaces"), field="blackboard.namespaces")
     keys = _list(blackboard.get("keys"), field="blackboard.keys")

@@ -528,6 +528,11 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
 
 Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     const OperationIntentDTO& intent) {
+  if (std::any_of(intent.participants.begin(), intent.participants.end(), [](const auto& row) {
+        return std::holds_alternative<SetTcpParticipantIntentDTO>(row.payload);
+      })) {
+    return execute_set_tcp(intent);
+  }
   std::lock_guard submit_lock(submission_mutex_);
   bool manual_claim_acquired = false;
   // Declared before the pending-admission guard: it runs after pending work
@@ -1164,9 +1169,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
           error("request_id_conflict", "operation request ID became retained by emergency Stop",
                 "request_id_conflict"));
     }
-    const bool engine_in_use = std::any_of(
-        active_operations_.begin(), active_operations_.end(),
-        [&](const auto& item) { return item.second->participant_for(engine) != nullptr; });
+    const bool engine_in_use =
+        immediate_step_engines_.contains(engine) ||
+        std::any_of(active_operations_.begin(), active_operations_.end(),
+                    [&](const auto& item) { return item.second->participant_for(engine) != nullptr; });
     const bool request_id_used =
         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                     [&](const ReplayEntry& entry) {
@@ -1255,6 +1261,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return reject<OperationAcceptedDTO>("operation identity is already resident",
                                           "operation_id_conflict", ErrorCode::kInvariantViolation);
     }
+    // Item 37: a new operation ends the operator's Force close arm.
+    force_close_stop_generation_.reset();
     protected_operation_ids = durable_operation_retention_ids_locked();
   }
 
@@ -1983,6 +1991,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                 "request_id_conflict"));
     }
     const bool engine_in_use =
+        std::any_of(selected_engines.begin(), selected_engines.end(),
+                    [&](auto* engine) { return immediate_step_engines_.contains(engine); }) ||
         std::any_of(active_operations_.begin(), active_operations_.end(), [&](const auto& item) {
           return std::any_of(
               selected_engines.begin(), selected_engines.end(),
@@ -2045,6 +2055,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return reject<OperationAcceptedDTO>("operation identity is already resident",
                                           "operation_id_conflict", ErrorCode::kInvariantViolation);
     }
+    // Item 37: a new operation ends the operator's Force close arm.
+    force_close_stop_generation_.reset();
     ++next_operation_id_;
     protected_operation_ids = durable_operation_retention_ids_locked();
   }
@@ -2546,18 +2558,18 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
          (active_operation->state.state != OperationStateKind::kCompleted &&
           active_operation->state.state != OperationStateKind::kStopped &&
           active_operation->state.state != OperationStateKind::kCancelledPreDispatch) ||
-         std::any_of(active_operation->state.participants.begin(),
-                     active_operation->state.participants.end(),
-                     [](const auto& row) { return row.terminal_error.has_value(); }))) {
+         // The Program-requested Stop's typed cause is no fault to hold.
+         (!active_operation->ordinary_program_stop() &&
+          std::any_of(active_operation->state.participants.begin(),
+                      active_operation->state.participants.end(),
+                      [](const auto& row) { return row.terminal_error.has_value(); })))) {
       return reject<OperationControlAcceptedDTO>(
           "automatic retirement requires current clean manual settlement",
           "manual_operation_not_clean_terminal");
     }
+    // Like Stop, control resolves to the operation's current revision; the
+    // caller's expected revision is informational.
     const auto current_revision = active_operation->state.operation_revision;
-    if (current_revision != request.expected_operation_revision) {
-      return reject<OperationControlAcceptedDTO>("operation control expected revision is stale",
-                                                 "operation_revision_stale");
-    }
     const auto unknown_count = static_cast<std::size_t>(std::count_if(
         active_operation->state.participants.begin(), active_operation->state.participants.end(),
         [&](const auto& state) {
@@ -3079,27 +3091,34 @@ Result<void> ResourceAddressedExecutionKernel::settle_control_operation_locked(
 
 Result<void> ResourceAddressedExecutionKernel::retire_operation_ownership_locked(
     const OperationId& operation_id, const bool clear_continuation,
-    const bool discard_node_continuations) {
+    const bool discard_node_continuations, const bool force) {
   auto* operation = find_active_operation_locked(operation_id);
   if (!operation)
     return reject<void>("operation retirement has no resident owner", "operation_not_resident",
                         ErrorCode::kMissingReference);
-  if (operation->has_pending_io_rule_response() ||
-      operation->takeover_advance_in_flight || !operation->pending_motion_takeover.empty() ||
-      !operation->next_motion_takeover.empty())
-    return reject<void>("accepted motion takeover ownership has not drained",
-                        "operation_effect_in_flight", ErrorCode::kInvalidStateTransition);
-  const auto rules_retired = retire_io_rules_locked(*operation);
-  if (!rules_retired.ok()) return rules_retired;
-  auto owner_rows =
-      retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
-  if (!owner_rows.ok()) {
-    return Result<void>::Err(owner_rows.error());
-  }
-  if (!owner_rows.value().empty()) {
-    auto released = resource_slots_->release_batch(owner_rows.value());
-    if (!released.ok()) {
-      return released;
+  if (force) {
+    // Item 37: the operation's I/O rules and its takeovers' end with it.
+    static_cast<void>(retire_io_rules_locked(*operation));
+    for (auto* takeover : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
+      if (!takeover->empty()) static_cast<void>(retire_io_rules_locked(*takeover->mapped()));
+  } else {
+    if (operation->has_pending_io_rule_response() ||
+        operation->takeover_advance_in_flight || !operation->pending_motion_takeover.empty() ||
+        !operation->next_motion_takeover.empty())
+      return reject<void>("accepted motion takeover ownership has not drained",
+                          "operation_effect_in_flight", ErrorCode::kInvalidStateTransition);
+    const auto rules_retired = retire_io_rules_locked(*operation);
+    if (!rules_retired.ok()) return rules_retired;
+    auto owner_rows =
+        retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
+    if (!owner_rows.ok()) {
+      return Result<void>::Err(owner_rows.error());
+    }
+    if (!owner_rows.value().empty()) {
+      auto released = resource_slots_->release_batch(owner_rows.value());
+      if (!released.ok()) {
+        return released;
+      }
     }
   }
   operation->pending_control.reset();
@@ -4732,10 +4751,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                                              "operation_not_resident",
                                              ErrorCode::kMissingReference);
     }
-    if (active_operation->state.operation_revision != request.expected_operation_revision) {
-      return reject<RuntimeScaleAcceptedDTO>("runtime scale expected operation revision is stale",
-                                             "operation_revision_stale");
-    }
+    // Like Stop, runtime scale resolves to the operation's current revision;
+    // the caller's expected revision is informational.
     // Shared-start execution is removed (Q8a): no coordinated operation has a
     // shared execution clock, so its runtime scaling stays refused.
     if (active_operation->participants.size() != 1U)
@@ -4783,7 +4800,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     accepted = RuntimeScaleAcceptedDTO{request.request_context.request_id,
                                        RequestReplayStatusDTO::kAcceptedNew,
                                        request.operation_id,
-                                       request.expected_operation_revision,
+                                       active_operation->state.operation_revision,
                                        request.scale,
                                        next_generation,
                                        clock_.now()};
@@ -4839,7 +4856,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       effect_targets.push_back(ScaleEffectTarget{
           current_participant.engine,
           ResolvedRuntimeScaleCommandDTO{request.operation_id,
-                                         request.expected_operation_revision,
+                                         accepted.operation_revision,
                                          operation_participant.participant_id,
                                          binding.controllable_component_id,
                                          binding.command_target_id,
@@ -4871,7 +4888,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     std::unique_lock state_lock(state_mutex_);
     auto* active_operation = find_active_operation_locked(request.operation_id);
     if (active_operation == nullptr || !active_operation->runtime_scale_status.has_value() ||
-        active_operation->state.operation_revision != request.expected_operation_revision ||
+        active_operation->state.operation_revision != accepted.operation_revision ||
         active_operation->runtime_scale_status->runtime_scale_generation !=
             accepted.runtime_scale_generation)
       return;

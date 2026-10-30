@@ -9,7 +9,7 @@
 
 namespace manyforge::core {
 
-enum class IoGlobalRuleState { kClear, kTripped, kLatched };
+enum class IoGlobalRuleState { kClear, kTripped, kLatched, kUnknown };
 
 /// Exact installed activation, independent of a Run or operation token. These
 /// are existing owner/catalog/publication identities, never a new cursor.
@@ -28,6 +28,8 @@ struct IoRuleStateDTO final {
   /// Actual retained causal acquisition only. Baseline matches and clear
   /// transitions do not manufacture a source event.
   std::optional<IoRuleAcquisitionKeyDTO> triggering_acquisition{};
+  /// Typed cause of an unavailable notify observation; absent for known states.
+  std::optional<ErrorDTO> unavailable_reason{};
   friend bool operator==(const IoRuleStateDTO&, const IoRuleStateDTO&) = default;
 };
 
@@ -56,6 +58,8 @@ inline std::string_view io_global_rule_state_token(IoGlobalRuleState state) noex
       return "tripped";
     case IoGlobalRuleState::kLatched:
       return "latched";
+    case IoGlobalRuleState::kUnknown:
+      return "unknown";
   }
   return {};
 }
@@ -78,7 +82,10 @@ inline std::optional<std::string_view> io_rule_state_field_error(
   if (const auto error = io_rule_state_context_field_error(context)) return error;
   if (row.rule_id.empty() || row.rule_id.value().find('\0') != std::string::npos ||
       io_global_rule_state_token(row.state).empty() ||
-      (row.state == IoGlobalRuleState::kClear && row.triggering_acquisition))
+      ((row.state == IoGlobalRuleState::kClear || row.state == IoGlobalRuleState::kUnknown) &&
+       row.triggering_acquisition) ||
+      (row.state == IoGlobalRuleState::kUnknown) != row.unavailable_reason.has_value() ||
+      (row.unavailable_reason && row.unavailable_reason->code.empty()))
     return "io_rule_state_row_invalid";
   if (row.triggering_acquisition) {
     const auto& acquired = *row.triggering_acquisition;

@@ -55,7 +55,7 @@ export function trialEDeployment(
         component_id: 'station_io',
         component_profile_id: 'io_device_v0',
         configuration: { runtime_kind: 'io_provider', runtime_configuration: {
-          io_provider_devices: [{ controllable_component_id: 'station_io', lifecycle_command_timeout_s: 30 }],
+          io_provider_devices: [{ controllable_component_id: 'station_io' }],
           io_signals: [
             {
               command_target_id: 'io', controllable_component_id: 'station_io', direction: 'output',

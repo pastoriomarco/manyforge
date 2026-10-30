@@ -78,6 +78,15 @@ ExecutionProduct::ExecutionProduct(
 // Physical Composition preserves its explicit shutdown ordering below.
 ExecutionProduct::~ExecutionProduct() = default;
 
+void Composition::StageRobotTcpReader() {
+  staged_robot_tcp_reader =
+      [owner = std::weak_ptr(ros2_control_runtime_handle)]() -> std::optional<ActiveTcp> {
+        const auto handle = owner.lock();
+        if (!handle) return std::nullopt;
+        return handle->ReadRobotTcps();
+      };
+}
+
 Composition::~Composition() {
     if (io_signal_runtime) io_signal_runtime->Shutdown();
     if (prepared_controller_launch && !controller_launch_adopted)
@@ -262,6 +271,17 @@ void ExecutionCompositionAccess::detach_addressed_owner() {
 }
 
 void ExecutionCompositionAccess::replace_current(Composition *replacement) {
+    HostRobotTcpReaders readers;
+    const auto stage = [&](const Composition &composition) {
+      if (composition.staged_robot_tcp_reader)
+        readers.emplace(composition.controllable_component_id,
+                        composition.staged_robot_tcp_reader);
+    };
+    if (replacement != nullptr) {
+      stage(*replacement);
+      for (const auto &participant : replacement->participant_compositions)
+        stage(*participant);
+    }
     // Caller holds mutex exclusively and keeps the predecessor alive. A new
     // Program/Scene publication may still use the same physical controllers;
     // only a controller actually retired by the component delta loses its
@@ -302,7 +322,7 @@ void ExecutionCompositionAccess::replace_current(Composition *replacement) {
       for (const auto &participant : current->participant_compositions)
         wake_if_retired(*participant);
     }
-    current = replacement;
+    SelectHostRobotTcps(std::move(readers), [&] { current = replacement; });
     logical_product.reset();
   }
 

@@ -39,6 +39,8 @@ class BoundedStopControlExecutor final : public IStopControlExecutor {
   [[nodiscard]] bool DrainFor(std::chrono::nanoseconds timeout) noexcept override;
 
  private:
+  friend class StopControlExecutorTestAccess;
+  void WakeForClockAdvanceTest() noexcept;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

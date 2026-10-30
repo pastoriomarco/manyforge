@@ -78,17 +78,42 @@ export function cellRecoverMessage(result: CellRecoverResult): string | null {
   const acknowledged = result.acknowledgedIncidents.length;
   const waitingFor = WAITING_FOR[reason.code];
   let text: string;
-  if (reason.code === 'incident_open') {
+  if (programCycleBlocksRecovery(reason.code)) {
+    text = 'The cell latch stays while a Program run is active. '
+      + 'Reset the Program first, then press Recover cell again.';
+  } else if (reason.code === 'incident_open') {
     const component = reason.details.controllable_component_id ?? 'a component';
     const cause = reason.details.cause_class?.replaceAll('_', ' ') ?? 'unknown cause';
     text = `The ${component} incident is open again (${cause}): its cause is still present, `
       + 'for example an e-stop still pressed. Clear the cause, then press Recover cell again.';
+  } else if (reason.code === 'cclc_incident_changed') {
+    // M6 (item 36): nothing was acknowledged; the incident list refreshes.
+    const component = reason.details.controllable_component_id ?? 'a component';
+    const cause = reason.details.cause_class?.replaceAll('_', ' ');
+    text = `An incident on ${component}${cause === undefined ? '' : ` (${cause})`} appeared that `
+      + 'this press had not shown. Nothing was acknowledged: review it, then press Recover cell again.';
   } else if (waitingFor !== undefined) {
     text = `Cell recovery is not ready yet: waiting for ${waitingFor}. `
       + 'Press Recover cell again when it is ready.';
+  } else if (reason.code === 'cell_recover_outcome_unknown'
+    && reason.details.replay === 'request_id_unknown') {
+    // RECTIME: an automatic resend found its press gone (Headless restarted).
+    text = 'Recovery outcome unknown after a restart: check the cell state '
+      + 'and press Recover cell again.';
   } else if (reason.code === 'cell_recover_outcome_unknown') {
     text = 'Recover cell outcome not confirmed — check the cell state. '
       + 'Steps not listed here may or may not have run.';
+  } else if (reason.code === 'cell_recover_aborted') {
+    // SX-679: the operator's abort; the steps listed here are all that ran.
+    const steps = reason.details.reenable_steps;
+    const notEnabled = reason.details.not_reenabled;
+    text = [
+      `Recover cell was aborted before its ${
+        (reason.details.before_step ?? 'next').replaceAll('_', ' ')} step; no later step started.`,
+      steps ? `Re-enable steps done: ${steps.replaceAll(';', '; ').replaceAll('+', ', ')}.` : null,
+      notEnabled ? `Not enabled again: ${notEnabled.replaceAll(',', ', ')}.` : null,
+      'Press Recover cell again to continue.',
+    ].filter((part): part is string => part !== null).join(' ');
   } else if (reason.code === 'stop_fault_latch_replaced') {
     text = 'A newer cell stop replaced the one this press saw. Press Recover cell again.';
   } else if (reason.code === 'stop_fault_recovery_unavailable') {
@@ -103,7 +128,15 @@ export function cellRecoverMessage(result: CellRecoverResult): string | null {
     result.recoveredComponents.length === 0
       ? null : `Recover started for ${result.recoveredComponents.join(', ')}.`,
     text,
+    // SX-689: a step that failed after the abort keeps its own reason.
+    reason.code !== 'cell_recover_aborted' && reason.details.aborted === 'true'
+      ? 'Recover cell was aborted: no later step started.' : null,
   ].filter((part): part is string => part !== null).join(' ');
+}
+
+/** Reasons for the latch clear refused because a Program cycle is still active. */
+export function programCycleBlocksRecovery(code: string): boolean {
+  return code.startsWith('program_cycle_state_');
 }
 
 export interface ComponentIncidentsController {

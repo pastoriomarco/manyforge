@@ -1,4 +1,5 @@
 import type {
+  ErrorDTO,
   JsonValue,
   NodeEnvironmentResponse,
   NodeImplementationAvailability,
@@ -43,7 +44,6 @@ import {
   jsonValueAt,
   monotonicNanosecondsAt,
   nonEmptyStringAt,
-  nullableMonotonicNanosecondsAt,
   nullableNumberAt,
   nullablePositiveUint64TextAt,
   nullableStringAt,
@@ -418,6 +418,7 @@ export function parseApiErrorDto(payload: unknown): StructuredError | null {
     message: typeof dto.message === 'string' ? dto.message : '',
     details,
     origin: null,
+    ...(typeof dto.producer === 'string' && dto.producer !== '' ? { producer: dto.producer } : {}),
   };
 }
 
@@ -427,7 +428,7 @@ export function parseKnownProgramRunOutcome(payload: unknown, status: number): S
   const envelope = objectAt(payload, path);
   exactKeysAt(envelope, ['detail'], path);
   const dto = objectAt(envelope.detail, `${path}.detail`);
-  allowedKeysAt(dto, ['code', 'message', 'details'], ['request_id'], `${path}.detail`);
+  allowedKeysAt(dto, ['code', 'message', 'details'], ['request_id', 'producer'], `${path}.detail`);
   const code = stringAt(dto.code, `${path}.code`);
   const beforeStart = code === 'program_run_stopped_before_start';
   const stopped = beforeStart || code === 'program_run_superseded_by_stop';
@@ -980,7 +981,7 @@ function parseCycleRecoveryOffer(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schema_version', 'offer_id', 'offer_revision', 'generated_at_ns',
-    'valid_until_ns', 'kernel_assessment_revision', 'control_command_epoch',
+    'kernel_assessment_revision', 'control_command_epoch',
     'operation_id', 'operation_revision', 'program_run_id',
     'program_binding_id', 'node_instance_id', 'node_attempt_id',
     'participants', 'graph_revision', 'retained_bundle_id', 'cycle_generation',
@@ -992,8 +993,8 @@ function parseCycleRecoveryOffer(
     'retries_used',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v4') {
-    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v4');
+  if (schemaVersion !== 'manyforge.cycle_recovery_offer.v5') {
+    return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v5');
   }
   const policy = objectAt(record.policy, `${path}.policy`);
   allowedKeysAt(policy, ['allow_intervention', 'max_retries'], ['intervention_stop_scope'], `${path}.policy`);
@@ -1047,10 +1048,6 @@ function parseCycleRecoveryOffer(
     generatedAtNs: monotonicNanosecondsAt(
       record.generated_at_ns,
       `${path}.generated_at_ns`,
-    ),
-    validUntilNs: nullableMonotonicNanosecondsAt(
-      record.valid_until_ns,
-      `${path}.valid_until_ns`,
     ),
     kernelAssessmentRevision: integerAt(
       record.kernel_assessment_revision,
@@ -1148,11 +1145,11 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
   const groups = boundedArrayAt(record.groups, `${path}.groups`, 4097).map((raw, index) => {
     const key = `${path}.groups[${index}]`;
     const row = objectAt(raw, key);
-    exactKeysAt(row, ['group_id', 'node_count', 'held_node_count', 'state',
+    allowedKeysAt(row, ['group_id', 'node_count', 'held_node_count', 'state',
       'stop_allowed', 'start_allowed', 'start_unavailable_reason',
       'resume_allowed', 'resume_unavailable_reason',
       'runtime_scale_selector', 'runtime_scale_unavailable_reason',
-      'resource_ids'], key);
+      'resource_ids'], ['ordinary_held_node_count'], key);
     const groupId = stringAt(row.group_id, `${key}.group_id`);
     if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(groupId) || groupId === 'inherit' || groupId <= previous) {
       return fail(key, 'canonical unique captured group IDs');
@@ -1160,6 +1157,8 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     previous = groupId;
     const nodeCount = positiveIntegerAt(row.node_count, `${key}.node_count`);
     const heldNodeCount = integerAt(row.held_node_count, `${key}.held_node_count`);
+    const ordinaryHeldNodeCount = row.ordinary_held_node_count == null ? null
+      : integerAt(row.ordinary_held_node_count, `${key}.ordinary_held_node_count`);
     const state = stringAt(row.state, `${key}.state`);
     if (!['ready', 'running', 'held', 'mixed', 'stopping', 'faulted', 'unavailable'].includes(state)) {
       return fail(key, 'an owner selection state');
@@ -1197,6 +1196,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       return fail(`${key}.resource_ids`, 'sorted unique resource IDs');
     }
     if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
+      || (ordinaryHeldNodeCount !== null && (ordinaryHeldNodeCount < 0 || ordinaryHeldNodeCount > heldNodeCount))
       || (state === 'running' && heldNodeCount !== 0)
       || (state === 'held' && heldNodeCount !== nodeCount)
       // Ready and stopped nodes may be mixed even when every node is held.
@@ -1210,6 +1210,7 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       return fail(key, 'coherent bounded selection status and eligibility');
     }
     return { groupId, nodeCount, heldNodeCount,
+      ...(row.ordinary_held_node_count === undefined ? {} : { ordinaryHeldNodeCount }),
       state: state as ProgramExecutionSelectionControls['groups'][number]['state'],
       stopAllowed, startAllowed, startUnavailableReason,
       resumeAllowed, resumeUnavailableReason,
@@ -1529,6 +1530,7 @@ function parseImplementationAvailability(
       'implementation_identity_resolved',
       'node_id',
       'owner_health_available',
+      'reasons',
       'reason_codes',
       'restoration_gates',
     ],
@@ -1552,9 +1554,58 @@ function parseImplementationAvailability(
     ),
     authoringAvailable: booleanAt(record.authoring_available, `${path}.authoring_available`),
     executionAvailable: booleanAt(record.execution_available, `${path}.execution_available`),
+    reasons: arrayAt(record.reasons, `${path}.reasons`).map((reason, index) => (
+      parseNodeAvailabilityErrorDTO(reason, `${path}.reasons[${index}]`)
+    )),
     reasonCodes: stringArrayAt(record.reason_codes, `${path}.reason_codes`),
     restorationGates: stringArrayAt(record.restoration_gates, `${path}.restoration_gates`),
   };
+}
+
+function availabilityErrorDetailsAt(
+  value: unknown,
+  path: string,
+): FailureDetails | null {
+  if (value === null) return null;
+  const record = objectAt(value, path);
+  const entries = Object.entries(record);
+  if (entries.length > FAILURE_DETAIL_MAX_ENTRIES) {
+    return fail(path, `at most ${FAILURE_DETAIL_MAX_ENTRIES} error details`);
+  }
+  const details: FailureDetails = {};
+  for (const [key, item] of entries) {
+    if (key.length === 0 || utf8Length(key) > 64) {
+      return fail(`${path}.${key}`, 'a bounded detail key');
+    }
+    if (
+      !(item === null || typeof item === 'boolean'
+        || (typeof item === 'number' && Number.isFinite(item)
+          && (!Number.isInteger(item) || Number.isSafeInteger(item)))
+        || (typeof item === 'string' && utf8Length(item) <= FAILURE_TEXT_MAX_BYTES))
+    ) {
+      return fail(`${path}.${key}`, 'a bounded scalar error detail');
+    }
+    details[key] = item;
+  }
+  if (utf8Length(JSON.stringify(details)) > FAILURE_DETAIL_MAX_CANONICAL_BYTES) {
+    return fail(path, `error details of at most ${FAILURE_DETAIL_MAX_CANONICAL_BYTES} bytes`);
+  }
+  return details;
+}
+
+function parseNodeAvailabilityErrorDTO(value: unknown, path: string): ErrorDTO {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'message', 'details'], path);
+  const code = nonEmptyStringAt(record.code, `${path}.code`);
+  const message = failureMessageAt(record.message, `${path}.message`);
+  if (message.length === 0) return fail(`${path}.message`, 'a non-empty message');
+  const details = availabilityErrorDetailsAt(record.details, `${path}.details`);
+  if (code === 'capability_not_offered' && (
+    details === null || typeof details.capability !== 'string' || details.capability.length === 0
+  )) {
+    return fail(`${path}.details.capability`, 'the missing non-empty capability ID');
+  }
+  return { code, message, details };
 }
 
 export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentResponse {
@@ -1593,6 +1644,7 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
       ),
       authoringAvailable: true,
       executionAvailable: false,
+      reasons: [],
       reasonCodes: ['active_node_environment_unavailable'],
       restorationGates: [],
     };

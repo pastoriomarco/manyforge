@@ -65,6 +65,7 @@ struct GeometricContactInputProvider::State final
     std::vector<std::string> joint_names;
     std::vector<double> positions;
     std::vector<core::CollisionPairId> endpoint_pairs;
+    std::vector<core::CollisionBodyId> endpoint_bodies;
     core::RuntimeCollisionQueryBundlePtr prepared_bundle;
     // Resume can overlap the previous generation's callback. Keep lifecycle
     // nonblocking: a newer overlapping acquisition becomes unavailable while
@@ -84,7 +85,10 @@ struct GeometricContactInputProvider::State final
         generation(generation.value_or(0U)), enabled(!generation) {}
 
   bool Prepare(RuntimeBinding &selected,
-               const core::RuntimeCollisionQueryBundlePtr &bundle) {
+               const core::RuntimeCollisionQueryBundlePtr &bundle,
+               std::vector<core::CollisionBodyId> endpoint_bodies) {
+    selected.prepared_bundle.reset();
+    selected.endpoint_pairs.clear();
     if (!bundle || !bundle->world || !bundle->lookup_order_valid)
       return false;
     const auto &capability = selected.value.collision_engine->capability();
@@ -94,11 +98,6 @@ struct GeometricContactInputProvider::State final
         core::RuntimeCollisionQueryPrepareStatus::kReady)
       return false;
 
-    std::vector<core::CollisionBodyId> endpoint_bodies;
-    for (const auto &binding : selected.value.endpoint.contact_body_bindings)
-      endpoint_bodies.insert(endpoint_bodies.end(),
-                             binding.collision_body_ids.begin(),
-                             binding.collision_body_ids.end());
     std::sort(endpoint_bodies.begin(), endpoint_bodies.end());
     endpoint_bodies.erase(
         std::unique(endpoint_bodies.begin(), endpoint_bodies.end()),
@@ -122,7 +121,6 @@ struct GeometricContactInputProvider::State final
                        }))
         return false;
 
-    selected.endpoint_pairs.clear();
     if (endpoint_bodies.size() >
         capability.runtime_query_max_collision_pairs / target_bodies.size())
       return false;
@@ -134,6 +132,7 @@ struct GeometricContactInputProvider::State final
     selected.endpoint_pairs.erase(
         std::unique(selected.endpoint_pairs.begin(), selected.endpoint_pairs.end()),
         selected.endpoint_pairs.end());
+    selected.endpoint_bodies = std::move(endpoint_bodies);
     selected.prepared_bundle = bundle;
     return !selected.endpoint_pairs.empty();
   }
@@ -166,6 +165,11 @@ struct GeometricContactInputProvider::State final
         sender.CaptureAcquisition(incarnation, expected_generation);
     const auto now = receipt.received_at_ns;
     const auto cadence_anchor = scheduled_deadline.value_or(now);
+    if (selected->value.model_coordinate_unavailable) {
+      PublishUnavailable(selected, receipt, "observed_state_missing_or_stale");
+      ScheduleNext(expected_generation, cadence_anchor, clock.now());
+      return;
+    }
     if (selected->query_active.test_and_set(std::memory_order_acquire)) {
       PublishUnavailable(selected, receipt, "collision_query_busy");
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
@@ -175,6 +179,22 @@ struct GeometricContactInputProvider::State final
       std::atomic_flag &active;
       ~QueryLease() { active.clear(std::memory_order_release); }
     } query_lease{selected->query_active};
+    const auto bodies = selected->value.read_contact_bodies();
+    if (!bodies.ok() || bodies.value().empty()) {
+      std::string reason = "active_tcp_contact_bodies_unavailable";
+      if (!bodies.ok()) {
+        const auto found = bodies.error().details.find("reason");
+        if (found != bodies.error().details.end())
+          reason = found->second;
+      }
+      PublishUnavailable(selected, receipt, std::move(reason));
+      ScheduleNext(expected_generation, cadence_anchor, clock.now());
+      return;
+    }
+    auto endpoint_bodies = bodies.value();
+    std::sort(endpoint_bodies.begin(), endpoint_bodies.end());
+    endpoint_bodies.erase(std::unique(endpoint_bodies.begin(), endpoint_bodies.end()),
+                          endpoint_bodies.end());
     std::size_t position_index = 0U;
     auto state_time = now;
     for (const auto &publication : selected->value.observed_states) {
@@ -218,10 +238,22 @@ struct GeometricContactInputProvider::State final
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
       return;
     }
-    if (selected->prepared_bundle != bundle && !Prepare(*selected, bundle)) {
+    if ((selected->prepared_bundle != bundle ||
+         selected->endpoint_bodies != endpoint_bodies) &&
+        !Prepare(*selected, bundle, std::move(endpoint_bodies))) {
       PublishUnavailable(selected, receipt, "collision_geometry_unresolved");
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
       return;
+    }
+
+    for (const auto &body : selected->endpoint_bodies) {
+      const auto is_static = selected->value.body_static_wrt_group(*bundle->world, body);
+      if (!is_static || *is_static) {
+        PublishUnavailable(selected, receipt,
+                           is_static ? "contact_bodies_static" : "collision_geometry_unresolved");
+        ScheduleNext(expected_generation, cadence_anchor, clock.now());
+        return;
+      }
     }
 
     const auto result = selected->value.collision_engine->check_runtime(
@@ -312,8 +344,7 @@ GeometricContactInputProvider::Create(
       core::Result<std::unique_ptr<GeometricContactInputProvider>>;
   if (!ingress || binding.source_id.value().empty() ||
       binding.incarnation.empty() || binding.signals.empty() ||
-      binding.endpoint.frame.contact_body_role_ids.empty() ||
-      binding.endpoint.contact_body_bindings.empty() ||
+      !binding.read_contact_bodies || !binding.body_static_wrt_group ||
       binding.target_scene_resource_id.value().empty() ||
       binding.observed_states.empty() || !binding.collision_publisher ||
       !binding.collision_engine || binding.sample_period_ns <= 0 ||
@@ -435,8 +466,8 @@ core::Result<void> GeometricContactInputProvider::RebindIngress(
     std::shared_ptr<core::IIoSignalIngress> ingress,
     GeometricContactInputBinding binding, std::uint64_t generation) {
   if (!ingress || generation == 0U || binding.incarnation.empty() ||
-      binding.observed_states.empty() || !binding.collision_publisher ||
-      !binding.collision_engine)
+      !binding.read_contact_bodies || !binding.body_static_wrt_group || binding.observed_states.empty() ||
+      !binding.collision_publisher || !binding.collision_engine)
     return core::Result<void>::Err(unavailable("rebind_invalid"));
   auto joint_names = query_joint_names(binding);
   if (!joint_names || binding.collision_engine->prepare_runtime_query(

@@ -61,6 +61,11 @@ namespace manyforge::core {
 inline constexpr std::string_view kExecutionKernelValidationRevision =
     "manyforge.core.trajectory-validation.v1";
 
+/// A move that starts within the clearance of an obstacle may not come
+/// closer to it than its start clearance less this tolerance, which covers
+/// the planner model and the start-state match tolerance.
+inline constexpr double kClearanceStartReleaseToleranceM = 0.0005;
+
 struct ExecutionKernelConfig {
   Duration collision_monitor_period_ns = 50'000'000;  // 50 ms / 20 Hz
 
@@ -134,6 +139,21 @@ struct ExecutionKernelConfig {
   // value was declared.
   int validation_collision_workers = 4;
   bool validation_collision_workers_declared = false;
+
+  // Cell collision clearance (coal security margin) for validation and
+  // planning, in [0, kMaxCollisionClearanceM] m (Deployment
+  // `collision_clearance_m`). A move keeps at least this from every
+  // environment body; pairs the collision policy allows to touch (static,
+  // touch-link, support-contact and the active contact-grasp pairs) and
+  // self pairs keep 0. A motion's `clearance_m` replaces it for that move.
+  // The runtime monitor and lookahead keep 0. 0 (the default) disables it.
+  double collision_clearance_m = kDefaultCollisionClearanceM;
+  // Joint-space step between collision-checked configurations when
+  // validating the executed curve, in (0, kMaxCollisionCheckStepRad] rad
+  // (Deployment `collision_check_step_rad`). The host gives the planner the
+  // same value as its `collision_check_step_size`; a retry attempt plans and
+  // is validated at min(step, 0.01) (collision_check_step_for_attempt).
+  double collision_check_step_rad = kDefaultCollisionCheckStepRad;
   int validation_collision_min_waypoints_for_parallel = 8;
 
   // Deployment-configured RRT planning budget ceiling. Per-request
@@ -310,9 +330,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   KernelRecoveryActionResultDTO apply_recovery_action(
       const KernelRecoveryActionRequestDTO& request);
 
-  /// Bounded copy of the stop-certificate evidence ring (tests/diagnostics).
-  std::vector<KernelStopCertificateDTO> stop_certificate_evidence() const;
-
   Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) override;
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
@@ -458,6 +475,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<std::size_t> discover_dynamic_carried_start_contacts(
       CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,
       std::uint64_t execution_id);
+  void install_collision_clearance(const ExecuteRequestDTO& request,
+                                   CollisionWorldLeaseInventory& projection_inventory,
+                                   const RobotStateDTO& observed_start,
+                                   std::uint64_t execution_id);
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -500,7 +521,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const RobotStateDTO* start_state_override = nullptr, std::stop_token external_stop_token = {},
       bool* conclusive_collision_failure = nullptr,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
-      const MovingReplacementInputDTO* replacement = nullptr);
+      const MovingReplacementInputDTO* replacement = nullptr,
+      std::uint32_t planning_attempt_index = 0U);
 
   /// Shared computation only. The caller owns planner serialization, the
   /// deadline/cancellation registration, projection lifetime and admission.
@@ -516,6 +538,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
                             std::optional<TrajectoryDTO> cached_trajectory,
+                            std::uint32_t cached_planning_attempt_index,
                             RetainedSceneSnapshotLease retained_scene,
                             std::shared_ptr<PreparedMotionSession> prepared_session = {});
 
@@ -714,7 +737,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st, ExecuteRequestDTO& request,
       const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
-      std::optional<TrajectoryDTO> cached_trajectory, ActiveMotionExecution& motion_state,
+      std::optional<TrajectoryDTO> cached_trajectory, std::uint32_t cached_planning_attempt_index,
+      ActiveMotionExecution& motion_state,
       const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
@@ -731,10 +755,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
       std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant,
-      ActiveMotionExecution& motion_state);
+      ActiveMotionExecution& motion_state, std::uint32_t planning_attempt_index);
 
   void store_validated_trajectory(const ExecuteRequestDTO& request,
-                                  const TrajectoryDTO& trajectory);
+                                  const TrajectoryDTO& trajectory,
+                                  std::uint32_t planning_attempt_index);
 
   void execute_worker_finalize_phase(const ExecuteRequestDTO& request, std::uint64_t exec_id,
                                      ExecutionHandle& execution_handle,

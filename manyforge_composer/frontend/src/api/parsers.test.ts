@@ -540,12 +540,16 @@ function structuralManifestFixture(): Record<string, unknown> {
 
 function sourceModelFixture(): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.source_model_projection.v2',
+    schema_version: 'manyforge.source_model_projection.v3',
     cell_id: 'cell-a',
     retained_bundle_id: 'bundle-1',
     graph_revision: 'graph-1',
     model_map_contract: null,
     model_map_product_id: null,
+    components: [
+      { component_id: 'lite6_robot', mounted_on: null },
+      { component_id: 'lite_gripper', mounted_on: { component_id: 'lite6_robot', interface_id: 'flange' } },
+    ],
     occurrences: [],
     targets: [],
     source: {
@@ -867,11 +871,10 @@ describe('Program product projections', () => {
 
   function recoveryOffer(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.cycle_recovery_offer.v4',
+      schema_version: 'manyforge.cycle_recovery_offer.v5',
       offer_id: digestA,
       offer_revision: 1,
       generated_at_ns: 10,
-      valid_until_ns: null,
       kernel_assessment_revision: 0,
       control_command_epoch: 0,
       operation_id: null,
@@ -1384,8 +1387,8 @@ describe('Program product projections', () => {
     }).recoveryOffer?.reason.message).toBe('é'.repeat(2048));
     expect(() => parseProgramRuntimeControlProjection({
       ...runtimeControlsProjection(),
-      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v3' },
-    })).toThrow(/cycle_recovery_offer.v4/);
+      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v4' },
+    })).toThrow(/cycle_recovery_offer.v5/);
     // Omitted stop scope stays omitted: zero is Unlimited and the used count
     // may exceed the finite configured range.
     expect(offer?.policy).toEqual({ allowIntervention: true, maxRetries: 0 });
@@ -2878,6 +2881,7 @@ describe('Program workspace parsers', () => {
           implementation_identity_resolved: true,
           node_id: 'timer',
           owner_health_available: true,
+          reasons: [],
           reason_codes: ['program_binding_unselected'],
           restoration_gates: [],
         }],
@@ -2894,8 +2898,72 @@ describe('Program workspace parsers', () => {
     expect(environment.implementations[0]).toMatchObject({
       authoringAvailable: true,
       executionAvailable: false,
+      reasons: [],
+      reasonCodes: ['program_binding_unselected'],
     });
     expect(environment.executionAvailable).toBe(false);
+
+    const capabilityPayload = {
+      ...payload,
+      availability: {
+        ...payload.availability,
+        implementations: payload.availability.implementations.map((row) => ({
+          ...row,
+          binding_available: false,
+          execution_available: false,
+          reason_codes: ['capability_not_offered'],
+          reasons: [{
+            code: 'capability_not_offered',
+            message: 'No component offers assistant.model.invoke',
+            details: { capability: 'assistant.model.invoke' },
+          }],
+        })),
+      },
+    };
+    expect(parseNodeEnvironmentResponse(capabilityPayload).implementations[0]?.reasons)
+      .toEqual([{
+        code: 'capability_not_offered',
+        message: 'No component offers assistant.model.invoke',
+        details: { capability: 'assistant.model.invoke' },
+      }]);
+    const modelPayload = {
+      ...capabilityPayload,
+      availability: {
+        ...capabilityPayload.availability,
+        implementations: capabilityPayload.availability.implementations.map((row) => ({
+          ...row,
+          reason_codes: ['model_not_configured'],
+          reasons: [{
+            code: 'model_not_configured',
+            message: 'No model is configured',
+            details: {},
+          }],
+        })),
+      },
+    };
+    expect(parseNodeEnvironmentResponse(modelPayload).implementations[0]?.reasons)
+      .toEqual([{
+        code: 'model_not_configured',
+        message: 'No model is configured',
+        details: {},
+      }]);
+    const malformedCapability = {
+      ...capabilityPayload,
+      availability: {
+        ...capabilityPayload.availability,
+        implementations: capabilityPayload.availability.implementations.map((row) => ({
+          ...row,
+          reasons: [{
+            code: 'capability_not_offered',
+            message: 'No component offers assistant.model.invoke',
+            details: { capability: 12 },
+          }],
+        })),
+      },
+    };
+    expect(() => parseNodeEnvironmentResponse(malformedCapability)).toThrow(
+      'nodeEnvironment.availability.implementations[0].reasons[0].details.capability must be the missing non-empty capability ID',
+    );
 
     payload.availability.implementations[0].owner_health_available = 'yes' as never;
     expect(() => parseNodeEnvironmentResponse(payload)).toThrow(
@@ -2910,6 +2978,19 @@ describe('headless projection parsers', () => {
     expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
       ?.scene_resource_id).toBe('part');
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('accepts an optional positive scene object mass', () => {
+    const objectOf = (fixture: Record<string, unknown>) =>
+      ((fixture.snapshot as Record<string, unknown>).objects as Array<Record<string, unknown>>)[0]!;
+    expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]?.mass_kg)
+      .toBeUndefined();
+    const heavy = logicalSceneFixture();
+    objectOf(heavy).mass_kg = 1.5;
+    expect(parseLogicalSceneProjection(heavy).snapshot?.objects[0]?.mass_kg).toBe(1.5);
+    const zero = logicalSceneFixture();
+    objectOf(zero).mass_kg = 0;
+    expect(() => parseLogicalSceneProjection(zero)).toThrow();
   });
 
   it('accepts the closed configured_joint_states member and keeps the legacy shape valid', () => {
@@ -3368,15 +3449,31 @@ describe('headless projection parsers', () => {
       /baseline_offset and drift to be present together/,
     );
 
-    const wrongPolicy = sceneRuntimeFixture();
-    (wrongPolicy.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+    // Night change 9: the live row carries its observer binding id ("scene").
+    const binding = sceneRuntimeFixture();
+    (binding.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
       ...full,
       eligible: true,
       object_id: 'isaac_cheese_box',
-      policy_id: 'continuous_unattached',
+      policy_id: 'scene',
     })];
-    expect(() => parseSceneRuntimeProjection(wrongPolicy)).toThrow(
-      /gripper-relative pose measurements only on continuous_relative_to_attached referenced-pose rows/,
+    expect(parseSceneRuntimeProjection(binding).state.pose_sources[0])
+      .toMatchObject({ ...full, policy_id: 'scene' });
+
+    const unreferenced = sceneRuntimeFixture();
+    (unreferenced.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      api_version: payload.api_version,
+      kind: 'simulation_entity_pose',
+      pose: payload.pose,
+      source: payload.source,
+    }, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'scene',
+    })];
+    expect(() => parseSceneRuntimeProjection(unreferenced)).toThrow(
+      /gripper-relative pose measurements only on referenced-pose rows/,
     );
 
     const wrongReference = sceneRuntimeFixture();
@@ -3452,11 +3549,12 @@ describe('headless projection parsers', () => {
     expect(parsed).not.toHaveProperty('holder');
     expect(parsed).not.toHaveProperty('source_header_frame_id');
 
-    const wrongPolicy = sceneRuntimeFixture();
-    (wrongPolicy.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+    // Night change 9: the live row carries its observer binding id ("scene").
+    const binding = sceneRuntimeFixture();
+    (binding.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
       eligible: true,
       object_id: 'part',
-      policy_id: 'continuous_relative_to_attached',
+      policy_id: 'scene',
       measured_against: 'cell frame',
       frame: {
         kind: 'component',
@@ -3469,9 +3567,10 @@ describe('headless projection parsers', () => {
         orientation_xyzw: [0, 0, 0, 1],
       },
     })];
-    expect(() => parseSceneRuntimeProjection(wrongPolicy)).toThrow(
-      /cell-frame pose measurements only on continuous rows/,
-    );
+    expect(parseSceneRuntimeProjection(binding).state.pose_sources[0]).toMatchObject({
+      policy_id: 'scene',
+      measured_against: 'cell frame',
+    });
   });
 
   it('rejects ambiguous or dishonest ROS observation shapes', () => {
@@ -3538,6 +3637,37 @@ describe('headless projection parsers', () => {
     expect(parseSceneRuntimeProjection(superseded).state.pose_sources).toHaveLength(1);
     (superseded.state as Record<string, unknown>).api_version = 'manyforge.scene_runtime_state.v1';
     expect(() => parseSceneRuntimeProjection(superseded)).toThrow('manyforge.scene_runtime_state.v2');
+  });
+
+  it('parses the v3 component rows and refuses v2 or crossed mounts', () => {
+    expect(parseSourceModelProjection(sourceModelFixture()).components).toEqual([
+      { component_id: 'lite6_robot', mounted_on: null },
+      { component_id: 'lite_gripper', mounted_on: { component_id: 'lite6_robot', interface_id: 'flange' } },
+    ]);
+
+    const v2 = sourceModelFixture();
+    v2.schema_version = 'manyforge.source_model_projection.v2';
+    expect(() => parseSourceModelProjection(v2)).toThrow('manyforge.source_model_projection.v3');
+
+    const withoutComponents = sourceModelFixture();
+    delete withoutComponents.components;
+    expect(() => parseSourceModelProjection(withoutComponents)).toThrow();
+
+    const extraMountField = sourceModelFixture();
+    (extraMountField.components as Array<Record<string, unknown>>)[1].mounted_on = {
+      component_id: 'lite6_robot', interface_id: 'flange', primary: true,
+    };
+    expect(() => parseSourceModelProjection(extraMountField)).toThrow();
+
+    const unknownParent = sourceModelFixture();
+    (unknownParent.components as Array<Record<string, unknown>>)[1].mounted_on = {
+      component_id: 'ur10e_robot', interface_id: 'flange',
+    };
+    expect(() => parseSourceModelProjection(unknownParent)).toThrow('mounts on listed components');
+
+    const duplicate = sourceModelFixture();
+    (duplicate.components as unknown[]).push({ component_id: 'lite6_robot', mounted_on: null });
+    expect(() => parseSourceModelProjection(duplicate)).toThrow('unique component_id values');
   });
 
   it('rejects stale shapes and cross-owner scene revisions', () => {
@@ -3668,6 +3798,7 @@ describe('headless projection parsers', () => {
       apply_generation: 4,
       apply_id: 'apply-4',
       candidate_projection_revision: null,
+      failure_acknowledgement: 'unavailable',
       error: null,
       failure: null,
       last_progress: {
@@ -3689,6 +3820,39 @@ describe('headless projection parsers', () => {
       state: 'pending',
     };
     expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
+    expect(parseManagerApplyStatus(base).failureAcknowledgement).toBe('unavailable');
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'available',
+    })).toThrow(/before-effect failure/);
+    const failedBeforeEffectRecord = {
+      ...base,
+      failure_acknowledgement: 'available',
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'apply_admission_failed',
+        effect_boundary: 'before_effect',
+        effect_disposition: 'known',
+        message: 'Apply refused before effects began.',
+        phase: 'runtime_converged',
+        producer: 'kernel',
+      },
+      state: 'failed',
+    };
+    const failedBeforeEffect = parseManagerApplyStatus(failedBeforeEffectRecord);
+    expect(failedBeforeEffect.failureAcknowledgement).toBe('available');
+    expect(parseManagerApplyStatus({
+      ...failedBeforeEffectRecord,
+      failure_acknowledgement: 'acknowledged',
+    }).failureAcknowledgement).toBe('acknowledged');
+    const missingAcknowledgementState = { ...base } as Record<string, unknown>;
+    delete missingAcknowledgementState.failure_acknowledgement;
+    expect(() => parseManagerApplyStatus(missingAcknowledgementState)).toThrow(/exactly/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'maybe',
+    })).toThrow(/available, acknowledged, or unavailable/);
     expect(parseManagerApplyStatus({ ...base, scene_initialization: 'initialize' }).sceneInitialization).toBe('initialize');
     for (const purpose of [undefined, true, 'initialize_once']) {
       expect(() => parseManagerApplyStatus({ ...base, scene_initialization: purpose })).toThrow();
@@ -3702,23 +3866,93 @@ describe('headless projection parsers', () => {
     const failed = parseManagerApplyStatus({
       ...base,
       failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
         code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
         effect_disposition: 'unknown',
         message: 'replacement state could not be established',
         phase: 'runtime_converged',
+        producer: 'kernel',
       },
       state: 'unknown_effect',
     });
     expect(failed.state).toBe('unknown_effect');
     expect(failed.failure?.effectDisposition).toBe('unknown');
-
+    expect(failed.failure).toMatchObject({
+      causeCode: 'stale_generation',
+      causeDetails: { reason: 'expected_generation_stale' },
+      producer: 'kernel',
+      effectBoundary: 'unknown',
+    });
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'acknowledged',
+      failure: {
+        cause_code: 'stale_generation',
+        cause_details: { reason: 'expected_generation_stale' },
+        code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'unknown',
+        message: 'replacement state could not be established',
+        phase: 'runtime_converged',
+        producer: 'kernel',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/available or acknowledged only/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'available',
+      failure: {
+        cause_code: 'runtime_convergence_failed',
+        cause_details: {},
+        code: 'runtime_convergence_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'known',
+        message: 'Runtime convergence failed.',
+        phase: 'runtime_converged',
+        producer: 'component_manager',
+      },
+      state: 'failed',
+    })).toThrow(/available or acknowledged only/);
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure_acknowledgement: 'acknowledged',
+      failure: {
+        cause_code: 'runtime_convergence_failed',
+        cause_details: {},
+        code: 'runtime_convergence_failed',
+        effect_boundary: 'unknown',
+        effect_disposition: 'known',
+        message: 'Runtime convergence failed.',
+        phase: 'runtime_converged',
+        producer: 'component_manager',
+      },
+      state: 'failed',
+    })).toThrow(/available or acknowledged only/);
+    // The typed cause is part of the closed failure record.
     expect(() => parseManagerApplyStatus({
       ...base,
       failure: {
         code: 'runtime_initialization_failed',
+        effect_disposition: 'unknown',
+        message: 'no typed cause',
+        phase: 'runtime_converged',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/failure/);
+
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure: {
+        cause_code: 'runtime_initialization_failed',
+        cause_details: {},
+        code: 'runtime_initialization_failed',
+        effect_boundary: 'unknown',
         effect_disposition: 'known',
         message: 'mismatched disposition',
         phase: 'runtime_converged',
+        producer: 'component_manager',
       },
       state: 'unknown_effect',
     })).toThrow(/unknown/);
@@ -4356,6 +4590,8 @@ describe('addressed Robot Control parsers', () => {
           target_role_id: 'command_target',
           base_frame_role_id: 'base',
           tcp_frame_role_id: 'tcp',
+          active_tcp: { entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' }, display: 'robot-a.tcp',
+            owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
           operation_capability_id: 'execution.trajectory.execute',
           planning_capability_ids: ['planning.motion.joint_goal'],
           frame_role_ids: ['base', 'tcp'],
@@ -4373,6 +4609,13 @@ describe('addressed Robot Control parsers', () => {
             sequence: 7,
             source_epoch: 'source-1',
             source_joint_names: ['joint1'],
+            tcp_poses: [{
+              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
+              pose: {
+                position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
+                orientation: { x: 0, y: 0, z: 0, w: 1 },
+              },
+            }],
           },
           joints: [{
             source_joint_name: 'joint1',
@@ -4382,9 +4625,10 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_motion_descriptor.v5',
+            schema_version: 'manyforge.manual_control_motion_descriptor.v6',
             ordinary_jerk: null,
             controllable_component_id: 'robot-a',
+            end_effector_component_id: null,
             command_target_id: 'arm',
             component_role_id: 'controlled_component',
             target_role_id: 'command_target',
@@ -4392,6 +4636,14 @@ describe('addressed Robot Control parsers', () => {
               { frame_role_id: 'base', compiled_frame_name: 'base_link', model_instance_id: 'robot-model', model_revision: exactRevision },
               { frame_role_id: 'tcp', compiled_frame_name: 'tool0', model_instance_id: 'robot-model', model_revision: exactRevision },
             ],
+            tcps: [{
+              entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'tcp' },
+              display: 'robot-a.tcp', target_role_id: 'command_target', default: true,
+              mounted_here: true, mounted_elsewhere: false,
+              frame: { frame_role_id: 'tcp', compiled_frame_name: 'tool0',
+                model_instance_id: 'robot-model', model_revision: exactRevision,
+                contact_body_role_ids: [] },
+            }],
             joints: [{
               compiled_joint_name: 'robot-a__joint1',
               source_joint_name: 'joint1',
@@ -4541,6 +4793,7 @@ describe('addressed Robot Control parsers', () => {
     const wireTarget = (target: Record<string, unknown>, presentation: string) => {
       const fields = { ...target };
       delete fields.controllable_component_id;
+      delete fields.active_tcp;
       const {
         command_target_id: commandTargetId,
         operation_capability_id: operationCapabilityId,
@@ -4585,6 +4838,7 @@ describe('addressed Robot Control parsers', () => {
       controllable_component_id: target.controllable_component_id,
       observed: observed === null ? null : { kind, ...(observed as Record<string, unknown>) },
       operation_capability_id: target.operation_capability_id,
+      ...(kind === 'joint_positions' ? { active_tcp: target.active_tcp } : {}),
     });
     const runtimeScale = {
       active_control_configuration_generation: 1,
@@ -4642,6 +4896,7 @@ describe('addressed Robot Control parsers', () => {
       const withoutObservation = (source: WireRow) => {
         const row = { ...source };
         delete row.observed_state;
+        delete row.active_tcp;
         return row;
       };
       const componentIds = [...new Set([...motions, ...grippers]
@@ -4683,9 +4938,21 @@ describe('addressed Robot Control parsers', () => {
     };
     const status = parseExecutionOwnerStatus(composed(response));
     expect(status.directControl!.baseFrameRoleId).toBe('base');
+    expect(status.directControl!.targetDescriptor.endEffectorComponentId).toBeNull();
+    const selectedTool = structuredClone(response);
+    Object.assign(selectedTool.status.direct_control, {
+      tcp_frame_role_id: null,
+      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
+    });
+    Object.assign(selectedTool.status.direct_control.observed_state, { current_tcp_pose: null });
+    selectedTool.status.direct_control.target_descriptor.tcps[0].default = false;
+    // The fixture's inferred row type has a null End-effector component.
+    Object.assign(selectedTool.status.direct_control.target_descriptor, { end_effector_component_id: 'lite_gripper' });
+    expect(parseExecutionOwnerStatus(composed(selectedTool)).directControl!
+      .targetDescriptor.endEffectorComponentId).toBe('lite_gripper');
     expect(status.observedMotion!.sourceJointNames).toEqual(['joint1']);
     expect(status.observedMotion!.positionsRad).toEqual([0.2]);
-    expect(status.observedMotion!.currentTcpPose.position_m.z_m).toBe(0.4);
+    expect(status.observedMotion!.currentTcpPose!.position_m.z_m).toBe(0.4);
     expect(status.observedGripper?.position).toBe(0.02);
     expect(status.cellStopAction.expectedStopGeneration).toBe(4);
     expect(status.directControl!.targetDescriptor.operationalJointLimits[0])
@@ -4695,6 +4962,73 @@ describe('addressed Robot Control parsers', () => {
         effectiveMaxAccelerationRadS2: 2.5,
         effectiveMaxJerkRadS3: 10,
       });
+    // A missing Active TCP owner stays unavailable even if the descriptor
+    // contains an End-effector TCP; it is not a fabricated active value.
+    const unavailableTcp = structuredClone(response);
+    Object.assign(unavailableTcp.status.direct_control, { active_tcp: null });
+    expect(parseExecutionOwnerStatus(composed(unavailableTcp)).directControl!.activeTcp).toBeNull();
+    // B1: a robot without an end-effector TCP has null TCP fields and no
+    // default row; joint jog still works.
+    const noTcp = structuredClone(response);
+    Object.assign(noTcp.status.direct_control, { tcp_frame_role_id: null,
+      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 } });
+    Object.assign(noTcp.status.direct_control.observed_state, { current_tcp_pose: null });
+    noTcp.status.direct_control.target_descriptor.tcps[0].default = false;
+    const withoutTcp = parseExecutionOwnerStatus(composed(noTcp));
+    expect(withoutTcp.directControl!.activeTcp).toMatchObject({ entry: null, display: null,
+      ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 });
+    expect(withoutTcp.directControl!.tcpFrameRoleId).toBeNull();
+    expect(withoutTcp.observedMotion!.currentTcpPose).toBeNull();
+    expect(withoutTcp.directControl!.targetDescriptor.tcps.map((tcp) => tcp.isDefault)).toEqual([false]);
+    // A default, when there is one, still leads.
+    const trailingDefault = structuredClone(noTcp);
+    const trailingTcps = trailingDefault.status.direct_control.target_descriptor.tcps;
+    trailingTcps.push({ ...trailingTcps[0],
+      entry: { ...trailingTcps[0].entry, frame_role_id: 'base' }, display: 'robot-a.base',
+      frame: { ...trailingTcps[0].frame, frame_role_id: 'base', compiled_frame_name: 'base_link' },
+      default: true });
+    trailingDefault.status.direct_control.observed_state.tcp_poses.push({
+      entry: { component_id: 'robot-a', target_id: 'arm', frame_role_id: 'base' },
+      pose: trailingDefault.status.direct_control.observed_state.tcp_poses[0].pose,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(trailingDefault))).toThrow(/tcps/);
+
+    // TCP-C: a full Deployment list may exceed the old 256-row GUI cap.
+    // Unmounted rows have no pose entry, while the carried row still does.
+    const fullDeploymentList = structuredClone(response);
+    const baseRow = fullDeploymentList.status.direct_control.target_descriptor.tcps[0];
+    const { target_role_id: _legacyTargetRole, ...unmountedTemplate } = baseRow;
+    for (let index = 0; index < 256; index += 1) {
+      const componentId = `tool_component_${index}`;
+      const entry = { component_id: componentId, target_id: 'tool', frame_role_id: 'tcp' };
+      // The wire row omits the optional legacy target_role_id; the fixture's
+      // inferred row type still lists it.
+      fullDeploymentList.status.direct_control.target_descriptor.tcps.push({
+        ...unmountedTemplate,
+        entry,
+        display: `${componentId}.tcp`,
+        default: false,
+        mounted_here: false,
+        mounted_elsewhere: true,
+      } as typeof baseRow);
+    }
+    const manyTcpStatus = parseExecutionOwnerStatus(composed(fullDeploymentList));
+    expect(manyTcpStatus.directControl!.targetDescriptor.tcps).toHaveLength(257);
+    expect(Object.keys(manyTcpStatus.observedMotion!.tcpPoses)).toHaveLength(1);
+
+    const missingCarriedPose = structuredClone(response);
+    missingCarriedPose.status.direct_control.observed_state.tcp_poses = [];
+    expect(() => parseExecutionOwnerStatus(composed(missingCarriedPose)))
+      .toThrow(/a pose for every carried TCP/);
+
+    const poseForUnmounted = structuredClone(fullDeploymentList);
+    poseForUnmounted.status.direct_control.observed_state.tcp_poses.push({
+      entry: poseForUnmounted.status.direct_control.target_descriptor.tcps[1].entry,
+      pose: poseForUnmounted.status.direct_control.observed_state.tcp_poses[0].pose,
+    });
+    expect(() => parseExecutionOwnerStatus(composed(poseForUnmounted)))
+      .toThrow(/one unique pose row for a carried TCP entry/);
+
     // Status is the composition only: no primary aliases, no old version.
     const aliased = composed(response) as { status: WireRow };
     aliased.status.direct_control = response.status.direct_control;
@@ -4875,6 +5209,18 @@ describe('addressed Robot Control parsers', () => {
           expect(parse).toThrow(StructuralContractError);
         }
       }
+    }
+    // Opt-in grasp confirmation: absent by default, `required` when present.
+    expect(parseExecutionOwnerStatus(composed(response)).directControlGripper!.targetDescriptor)
+      .not.toHaveProperty('graspConfirmation');
+    for (const [grasp, valid] of [['required', true], ['not_required', false], [true, false]] as const) {
+      const graspFixture = structuredClone(response);
+      Object.assign(graspFixture.status.direct_control_gripper.target_descriptor, {
+        grasp_confirmation: grasp,
+      });
+      const parse = () => parseExecutionOwnerStatus(composed(graspFixture));
+      if (valid) expect(parse().directControlGripper!.targetDescriptor.graspConfirmation).toBe('required');
+      else expect(parse).toThrow(StructuralContractError);
     }
     const missingOutput = structuredClone(response);
     delete (missingOutput.status.direct_control_gripper.target_descriptor as Record<string, unknown>).output_mode;

@@ -71,6 +71,8 @@ LoadMaintainedInterruptProgram(
   options.catalog_content_version =
       bundle->value().catalogs.node_environment.content_version;
   options.resource_roles = {"arm_joints"};
+  // The Lite6 arm declares no `tcp` frame role: use the current TCP (B-DEP).
+  options.frame_roles = {"base"};
   options.capability_ids = {"execution.feedback.phase_events",
                             "execution.trajectory.execute",
                             "planning.motion.pose_goal",
@@ -94,7 +96,7 @@ LoadMaintainedInterruptProgram(
                             .root());
   replace("tree", d::parse_strict_json_model_yaml(R"({
     "node_id":"motion.move_until_signal","instance_id":"move","children":[],
-    "parameters":{"target_role":"arm","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"stop_mode":"soft_on_path","priority":0,
+    "parameters":{"target_role":"arm","tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
       "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
       "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
         "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},

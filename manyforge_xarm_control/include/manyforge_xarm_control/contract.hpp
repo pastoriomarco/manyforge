@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace manyforge::xarm_control {
@@ -38,6 +39,9 @@ struct XArmObservedState {
   int motion_enable_mask = -1;
   /// `angle`, in axis order (radians); compared with the measured joints only.
   std::vector<double> joint_angles_rad;
+  /// M6 ADAPTERM (item 44): the controller's TCP offset (`offset`: x, y, z
+  /// in mm, then roll, pitch, yaw in radians), as `set_tcp_offset` takes it.
+  std::vector<double> tcp_offset{};
 };
 
 /// ManyForge's own vendor operations whose expected effect explains the
@@ -51,5 +55,18 @@ enum class XArmLifecycleCommand : std::uint8_t {
   kArm = 3,
   kDisarm = 4,
 };
+
+/// M6 XADAPT: the vendor-neutral, user-facing code of a robot controller
+/// that did not answer within a call's bound. The arm then reports a
+/// component fault (an incident) until a later query is answered.
+inline constexpr std::string_view kRobotControllerUnresponsiveCode =
+    "robot_controller_unresponsive";
+
+/// M6 XADAPT: a sent vendor call that got no answer within its bound (the
+/// driver services' `xarm_service_timeout`, `xarm_service_no_response`), as
+/// opposed to an answer that refused or failed.
+[[nodiscard]] inline bool XArmCallUnanswered(const std::string_view reason) {
+  return reason == "xarm_service_timeout" || reason == "xarm_service_no_response";
+}
 
 } // namespace manyforge::xarm_control

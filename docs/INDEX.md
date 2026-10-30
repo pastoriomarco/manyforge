@@ -12,7 +12,8 @@ workbench.
 | Use Program data | [Blackboard keys](authoring/BLACKBOARD_KEYS.md) and [Expressions](authoring/EXPRESSIONS.md) |
 | Author signal and interrupt rules | [Interrupts](authoring/INTERRUPTS.md) |
 | Understand gripper position without feedback | [Grippers](authoring/GRIPPERS.md) |
-| Add a robot to the Mock lane | [Adding a robot](authoring/ADDING_A_ROBOT.md) |
+| Choose TCPs in Programs and Robot Control | [TCPs](authoring/TCPS.md) |
+| Add a robot (Mock), tool or I/O device | [Adding a component](authoring/ADDING_A_COMPONENT.md) |
 | Choose a controlled Stop profile | [Controlled Stop profiles](operations/STOP_PROFILES.md) |
 | Set up the AI assistant | [Assistant cookbook](operations/ASSISTANT_E2E_COOKBOOK.md) |
 | Review the model-server interface | [Assistant provider contract](reference/ASSISTANT_PROVIDER_CONTRACT.md) |

@@ -114,7 +114,6 @@ launch_arguments=(
     "runtime_namespace:=${runtime_namespace}"
     "controller_manager_lock_memory:=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}"
     "controller_manager_thread_priority:=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}"
-    "gripper_state_freshness_timeout_s:=${ISAAC_GRIPPER_STATE_FRESHNESS_TIMEOUT_S:-1.0}"
 )
 if [[ -n "${ISAAC_JOINT_COMMANDS_TOPIC:-}" ]]; then
     launch_arguments+=("joint_commands_topic:=${ISAAC_JOINT_COMMANDS_TOPIC}")

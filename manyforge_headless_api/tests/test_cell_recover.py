@@ -19,6 +19,7 @@ from manyforge_headless_api.cclc import (
     CCLC_OPEN_RESPONSE_VERSION,
     CCLC_SOCKET_FILE,
     CCLCOpenRequestClient,
+    CCLCOwnerRefusal,
 )
 from manyforge_headless_api.cell_recover import (
     CellRecoverLedger,
@@ -244,12 +245,15 @@ class World:
         )
 
 
-def run(world: World, **overrides: Any) -> dict[str, Any]:
+def run(
+    world: World, expected_incident_ids: frozenset[str] | None = None, **overrides: Any
+) -> dict[str, Any]:
     return asyncio.run(
         recover_cell(
             dataclasses.replace(world.ports(), **overrides),
             request_id="press.1",
             source_label="composer_ui",
+            expected_incident_ids=expected_incident_ids,
         )
     )
 
@@ -552,6 +556,120 @@ def test_sx294_reports_the_incident_cclc_actually_acknowledged() -> None:
     ]
 
 
+# M6 (item 36): incident A (shown) was replaced by B before the press arrived.
+REPLACED = {**ESTOP, "incident_id": "incident.arm.2", "cause_class": "collision"}
+
+
+def test_item36_a_press_expecting_a_replaced_incident_is_refused_before_any_step() -> None:
+    world = World(
+        snapshots=[{"arm": snapshot("arm", REPLACED)}, {"arm": snapshot("arm", None)}],
+        offers=[offer("ready")],
+    )
+
+    result = run(world, expected_incident_ids=frozenset({"incident.arm.1"}))
+
+    assert reason_code(result) == "cclc_incident_changed"
+    assert result["reason"]["details"] == {
+        "controllable_component_id": "arm",
+        "incident_id": "incident.arm.2",
+        "cause_class": "collision",
+    }
+    # Nothing acknowledged, no latch touched: B stays open.
+    assert result["acknowledged_incidents"] == []
+    assert result["latch_cleared"] is False
+    assert world.lifecycle == []
+    assert world.recoveries == []
+
+
+def test_item36_a_press_expecting_the_current_incident_pins_its_acknowledgement() -> None:
+    world = World(
+        snapshots=[{"arm": snapshot("arm", REPLACED)}, {"arm": snapshot("arm", None)}],
+    )
+    world.acknowledged_incident_id = "incident.arm.2"
+
+    result = run(world, expected_incident_ids=frozenset({"incident.arm.1", "incident.arm.2"}))
+
+    assert result["outcome"] == "done"
+    assert [row["incident_id"] for row in result["acknowledged_incidents"]] == ["incident.arm.2"]
+    [request] = world.lifecycle
+    assert request.expected_incident_id == "incident.arm.2"
+
+
+def test_item36_without_expected_incidents_the_press_is_unchanged() -> None:
+    world = World(snapshots=[{"arm": snapshot("arm", REPLACED)}, {"arm": snapshot("arm", None)}])
+    world.acknowledged_incident_id = "incident.arm.2"
+
+    result = run(world)
+
+    assert result["outcome"] == "done"
+    assert [row["incident_id"] for row in result["acknowledged_incidents"]] == ["incident.arm.2"]
+    [request] = world.lifecycle
+    assert request.expected_incident_id is None
+
+
+def test_item36_cclc_refusing_a_replaced_incident_mid_press_is_typed_and_names_it() -> None:
+    # The snapshot still showed A; CCLC already had B at the submit.
+    world = World(snapshots=[{"arm": snapshot("arm", ESTOP)}], offers=[offer("ready")])
+
+    async def refuse(_payload: dict[str, Any]) -> dict[str, Any]:
+        raise CCLCOwnerRefusal(
+            "cclc_incident_changed",
+            "the component's open incident is not the one this Recover expects",
+            details={
+                "effect": "not_started",
+                "reason": "incident_changed",
+                "expected_incident_id": "incident.arm.1",
+                "incident_id": "incident.arm.2",
+            },
+        )
+
+    result = run(
+        world, expected_incident_ids=frozenset({"incident.arm.1"}), submit_lifecycle=refuse
+    )
+
+    assert reason_code(result) == "cclc_incident_changed"
+    assert result["reason"]["details"]["incident_id"] == "incident.arm.2"
+    assert result["reason"]["details"]["controllable_component_id"] == "arm"
+    assert result["acknowledged_incidents"] == []
+    assert world.recoveries == []
+
+
+def test_item26_a_press_expecting_an_incident_closed_meanwhile_is_an_ordinary_press() -> None:
+    # The incident shown was closed elsewhere; nothing else is open.
+    world = World(offers=[offer("ready")])
+
+    result = run(world, expected_incident_ids=frozenset({"incident.arm.1"}))
+
+    assert result["outcome"] == "done"
+    assert result["reason"] is None
+    assert result["acknowledged_incidents"] == []
+    assert result["latch_cleared"] is True
+    assert world.lifecycle == []
+    assert len(world.recoveries) == 1
+
+
+def test_item26_cclc_falling_through_mid_press_continues_the_press() -> None:
+    # The snapshot still showed A; CCLC found it closed and, nothing else
+    # being open, answered an ordinary Recover instead of refusing.
+    world = World(
+        snapshots=[{"arm": snapshot("arm", ESTOP)}, {"arm": snapshot("arm", None)}],
+        offers=[offer("ready")],
+        cclc_result={
+            "acceptance": {"lifecycle_transaction_id": "lifecycle.1"},
+            "status": None,
+            "replay_status": "accepted_new",
+        },
+    )
+
+    result = run(world, expected_incident_ids=frozenset({"incident.arm.1"}))
+
+    assert result["outcome"] == "done"
+    assert result["acknowledged_incidents"] == []
+    assert result["latch_cleared"] is True
+    [request] = world.lifecycle
+    assert request.expected_incident_id == "incident.arm.1"
+
+
 def test_sx294_ledger_replays_without_reading_state() -> None:
     ledger = CellRecoverLedger(maximum=2)
     assert ledger.begin("press.1") is None
@@ -567,6 +685,48 @@ def test_sx294_ledger_replays_without_reading_state() -> None:
     # Bounded: the oldest completed result is dropped.
     assert ledger.begin("press.1") is None
 
+
+
+def test_rectime_replay_only_never_starts_a_press_after_a_restart() -> None:
+    """RECTIME (SX-642/646): the GUI's automatic resend is replay-only. A
+    restarted Headless (an empty ledger) or an evicted result answers an
+    unknown outcome with `details.replay`, reads no owner and claims nothing,
+    even with a newer latch ready to recover."""
+
+    world = World(snapshots=[{"arm": snapshot("arm", ESTOP)}], offers=[offer("ready")])
+    restarted = CellRecoverLedger()
+    result, replayed = asyncio.run(
+        recover_cell_once(restarted, world.ports(), request_id="press.1",
+                          source_label="composer_ui", replay_only=True)
+    )
+    assert replayed is True
+    assert reason_code(result) == "cell_recover_outcome_unknown"
+    assert result["reason"]["details"] == {"replay": "request_id_unknown"}
+    assert result["request_id"] == "press.1"
+    assert world.lifecycle == [] and world.recoveries == []
+    assert world.snapshot_reads == 0
+    # Not claimed: the same ID stays unknown to the ledger.
+    assert reason_code(restarted.begin("press.1", replay_only=True)) == (
+        "cell_recover_outcome_unknown"
+    )
+
+    # Evicted: the oldest completed result is gone; a replay-only resend of it
+    # still starts nothing.
+    ledger = CellRecoverLedger(maximum=1)
+    for request_id in ("press.a", "press.b"):
+        ledger.begin(request_id)
+        ledger.finish(request_id, {"outcome": "done", "reason": None})
+    assert ledger.begin("press.a", replay_only=True)["reason"]["details"] == {
+        "replay": "request_id_unknown"
+    }
+
+
+def test_rectime_replay_only_returns_in_progress_and_the_stored_result() -> None:
+    ledger = CellRecoverLedger()
+    assert ledger.begin("press.1") is None
+    assert reason_code(ledger.begin("press.1", replay_only=True)) == "cell_recover_in_progress"
+    ledger.finish("press.1", {"outcome": "done", "reason": None})
+    assert ledger.begin("press.1", replay_only=True) == {"outcome": "done", "reason": None}
 
 class RecoverExecution(FakeExecution):
     def identity(self) -> dict[str, Any]:
@@ -599,7 +759,11 @@ class RecoverCCLC:
         return {"request_owner_epoch": "cclc-owner.3"}
 
     def component_snapshot(self, component_id: str) -> dict[str, Any]:
-        return snapshot(component_id, None if self.submitted else ESTOP)
+        # CCLC's mark: the incident retired the Active target (SX-668).
+        return {
+            **snapshot(component_id, None if self.submitted else ESTOP),
+            "active_target_retired_by_incident": True,
+        }
 
     def submit_lifecycle(self, intent: dict[str, Any]) -> dict[str, Any]:
         self.submitted.append(intent)
@@ -664,6 +828,37 @@ def test_route_takes_only_a_request_identity_and_reads_every_fence() -> None:
     [(kind, recovery)] = [row for row in execution.requests if row[0] == "recover_stop_fault"]
     assert recovery.request_context.request_owner_epoch == "kernel-owner.7"
     assert recovery.expected_latch_id == "stop-fault.1.1"
+
+
+def test_item36_route_passes_the_shown_incidents_and_refuses_an_unshown_one() -> None:
+    execution = RecoverExecution()
+    cclc = RecoverCCLC()
+    app = create_app(
+        service=_service(
+            FakeCore(),
+            FakeManager(),
+            execution,
+            program_runner=FakeProgramRunner(active=False),
+            cclc=cclc,
+        )
+    )
+    context = {"request_id": "press.1", "source_label": "composer_ui", "correlation_id": None}
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/api/execution/cell-recover",
+            json={"request_context": context, "expected_incident_ids": [""]},
+        )
+        refused = client.post(
+            "/api/execution/cell-recover",
+            json={"request_context": context, "expected_incident_ids": ["incident.arm.0"]},
+        )
+
+    assert invalid.status_code == 422
+    assert refused.status_code == 200
+    assert refused.json()["reason"]["code"] == "cclc_incident_changed"
+    assert refused.json()["reason"]["details"]["incident_id"] == "incident.arm.1"
+    assert cclc.submitted == []
+    assert [row for row in execution.requests if row[0] == "recover_stop_fault"] == []
 
 
 def test_sx294_replayed_noop_press_does_not_touch_a_newer_latch() -> None:
@@ -769,6 +964,46 @@ def test_sx296_two_press_estop_sequence_submits_the_component_recover_on_press_t
     assert len(world.lifecycle) == 2
 
 
+def test_item36_the_persisting_cause_recover_of_a_pinned_press_acknowledges_nothing() -> None:
+    """S3: with the operator's list, the press's later Recover never
+    acknowledges an incident; one opened meanwhile refuses it typed."""
+
+    world = World(snapshots=[{"arm": persisting("arm")}])
+    world.cclc_result = {
+        "acceptance": {"request_id": derived_request_id("press.1", "recover.arm")},
+        "status": None,
+        "replay_status": "accepted_new",
+    }
+
+    result = run(world, expected_incident_ids=frozenset())
+
+    assert result["outcome"] == "done"
+    assert result["recovered_components"] == ["arm"]
+    [recover] = world.lifecycle
+    assert recover.intent == "recover"
+    assert recover.acknowledge_incident is False
+    assert recover.expected_incident_id is None
+
+    # Without the list the same press is unchanged (today's Recover).
+    world.lifecycle.clear()
+    assert run(world)["recovered_components"] == ["arm"]
+    assert world.lifecycle[-1].acknowledge_incident is None
+
+    async def incident_opened(payload: dict[str, Any]) -> dict[str, Any]:
+        world.lifecycle.append(ComponentLifecycleRequest.model_validate(payload))
+        raise CCLCOwnerRefusal(
+            "cclc_incident_open",
+            "a component incident is open; the operator's Recover acknowledges it",
+            details={"effect": "not_started", "reason": "incident_open",
+                     "incident_id": "incident.arm.2"},
+        )
+
+    refused = run(world, expected_incident_ids=frozenset(), submit_lifecycle=incident_opened)
+    assert reason_code(refused) == "cclc_incident_open"
+    assert refused["reason"]["details"]["incident_id"] == "incident.arm.2"
+    assert refused["recovered_components"] == []
+
+
 def test_sx303_cancel_after_dispatch_then_replay_dispatches_nothing_new() -> None:
     world = World(snapshots=[{"arm": snapshot("arm", ESTOP)}], offers=[offer("ready")])
     ports = world.ports()
@@ -841,7 +1076,7 @@ def test_sx305_owner_accepts_then_the_reply_fails_is_unknown_not_refused() -> No
 
     async def accepted_then_invalid(payload: dict[str, Any]) -> dict[str, Any]:
         world.lifecycle.append(ComponentLifecycleRequest.model_validate(payload))
-        raise HeadlessApiError("cclc_open_response_identity_mismatch", "reply invalid")
+        raise HeadlessApiError("cclc_open_response_invalid", "reply invalid")
 
     result = run(world, submit_lifecycle=accepted_then_invalid)
 
@@ -849,7 +1084,7 @@ def test_sx305_owner_accepts_then_the_reply_fails_is_unknown_not_refused() -> No
     assert result["reason"]["details"] == {
         "step": "incident",
         "controllable_component_id": "arm",
-        "code": "cclc_open_response_identity_mismatch",
+        "code": "cclc_open_response_invalid",
     }
     assert result["acknowledged_incidents"] == []  # not confirmed, not proven undone
     assert len(world.lifecycle) == 1
@@ -981,6 +1216,9 @@ def _error_envelope(details: dict[str, str]):
     [
         # CCLC's known-unstarted refusal (effect=not_started): a confirmed refusal.
         (_error_envelope({"effect": "not_started"}), "stale_request_owner_epoch"),
+        # M6 (item 35): CCLC's stale-epoch refusal as it is sent (no `effect`):
+        # the press pinned the epoch and sent the step once, so it is confirmed.
+        (_error_envelope({"reason": "request_owner_epoch_stale"}), "stale_request_owner_epoch"),
         # A valid error envelope after a claim or journal step: no proof of no effect.
         (_error_envelope({}), "cell_recover_outcome_unknown"),
         # A reply that fails validation after the send.
@@ -1068,3 +1306,26 @@ def test_sx315_route_ingress_refusal_is_typed_and_never_reaches_the_kernel() -> 
 
     assert reason_code(result) == "command_not_allowed"
     assert [row for row in execution.requests if row[0] == "recover_stop_fault"] == []
+
+
+def test_abort_route_refuses_typed_when_no_press_runs() -> None:
+    """SX-679: the abort applies only while a Recover cell press runs."""
+
+    app = create_app(
+        service=_service(
+            FakeCore(),
+            FakeManager(),
+            RecoverExecution(),
+            program_runner=FakeProgramRunner(active=False),
+            cclc=RecoverCCLC(),
+        )
+    )
+    context = {"request_id": "abort.1", "source_label": "composer_ui", "correlation_id": None}
+    with TestClient(app) as client:
+        refused = client.post(
+            "/api/execution/cell-recover/abort", json={"request_context": context}
+        )
+        paths = client.get("/openapi.json").json()["paths"]
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "cell_recover_not_running"
+    assert "/api/execution/cell-recover/abort" in paths

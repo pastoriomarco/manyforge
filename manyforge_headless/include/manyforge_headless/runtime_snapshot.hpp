@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 namespace manyforge::headless {
@@ -41,6 +42,12 @@ struct HeadlessRuntimeSnapshot final {
 /// it neither builds a projection nor grants command/owner authority.
 [[nodiscard]] std::optional<std::pair<std::string, std::int64_t>> ReadControlSourceFileHint(
     const std::filesystem::path& path);
+
+/// Verified Scene source for the demand-scoped viewer reader.
+[[nodiscard]] std::optional<std::tuple<std::string, std::string, std::int64_t>>
+ReadViewerSceneSource(const std::filesystem::path &path, const std::string &cell_id);
+[[nodiscard]] std::optional<std::pair<std::string, std::string>>
+ReadViewerPoseSessions(const std::filesystem::path &path, const std::string &cell_id);
 
 /// Independently restartable, read-only projection over immutable Manager and
 /// logical-scene source publications. It measures freshness from the exact

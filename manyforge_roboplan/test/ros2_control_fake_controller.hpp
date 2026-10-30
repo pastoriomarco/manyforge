@@ -13,6 +13,8 @@
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <control_msgs/msg/speed_scaling_factor.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
+#include <controller_manager_msgs/srv/list_controllers.hpp>
+#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <controller_manager_msgs/srv/set_hardware_component_state.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
@@ -337,6 +339,7 @@ public:
       : PeerNode("manyforge_fake_controller_manager"),
         controller_(std::move(controller)), hardware_(std::move(hardware)),
         jtc_(jtc), reset_writer_(std::move(reset_writer)) {
+    manager_ = manager;
     activity_ = node()->create_publisher<controller_manager_msgs::msg::ControllerManagerActivity>(
         manager + "/activity", rclcpp::QoS(1).reliable().transient_local());
     switch_ = node()->create_service<controller_manager_msgs::srv::SwitchController>(
@@ -426,6 +429,7 @@ public:
           // Before the answer, like the vendor plugin's on_activate/write().
           if (response->ok && active && hook) hook();
         });
+    ServeListServices();
     if (!reset_writer_.empty()) {
       const auto manager_suffix = manager.rfind('/');
       reset_subscription_ =
@@ -444,6 +448,7 @@ public:
 
   ~FakeControllerManager() override {
     SetSwitchRepliesPaused(false);
+    SetListRepliesPaused(false);
     Stop();
   }
 
@@ -462,6 +467,8 @@ public:
     PeerNode::Stop();
     switch_.reset();
     hardware_state_.reset();
+    list_controllers_.reset();
+    list_hardware_.reset();
     activity_.reset();
   }
 
@@ -501,6 +508,66 @@ public:
   }
 
   void SetHardwareRefused(bool refused) { hardware_refused_ = refused; }
+
+  /// M6 XADAPT: the stock manager's state queries (served from the start).
+  void ServeListServices() {
+    // Their own group: a held switch reply does not hold the state queries.
+    if (!list_group_)
+      list_group_ = node()->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    list_controllers_ = node()->create_service<controller_manager_msgs::srv::ListControllers>(
+        manager_ + "/list_controllers",
+        [this](const std::shared_ptr<controller_manager_msgs::srv::ListControllers::Request>,
+               std::shared_ptr<controller_manager_msgs::srv::ListControllers::Response>
+                   response) {
+          ++list_requests_;
+          WaitWhileListRepliesPaused();
+          const auto row = [&](const std::string &name, const bool active) {
+            controller_manager_msgs::msg::ControllerState state;
+            state.name = name;
+            state.state = active ? "active" : "inactive";
+            response->controller.push_back(state);
+          };
+          row(controller_, active_);
+          if (broadcaster_listed_) row("joint_state_broadcaster", broadcaster_active_);
+          if (!reset_writer_.empty()) row(reset_writer_, writer_active_);
+        },
+        rclcpp::ServicesQoS(), list_group_);
+    list_hardware_ =
+        node()->create_service<controller_manager_msgs::srv::ListHardwareComponents>(
+            manager_ + "/list_hardware_components",
+            [this](const std::shared_ptr<
+                       controller_manager_msgs::srv::ListHardwareComponents::Request>,
+                   std::shared_ptr<
+                       controller_manager_msgs::srv::ListHardwareComponents::Response>
+                       response) {
+              WaitWhileListRepliesPaused();
+              controller_manager_msgs::msg::HardwareComponentState component;
+              component.name = hardware_;
+              component.state.id = hardware_active_
+                                       ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
+                                       : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+              response->component.push_back(component);
+            },
+            rclcpp::ServicesQoS(), list_group_);
+  }
+  /// M6 XADAPT: the state queries are gone (not discovered).
+  void DropListServices() {
+    list_controllers_.reset();
+    list_hardware_.reset();
+    // An idle executor keeps the services it waits on alive until it wakes;
+    // wake it so they are destroyed (and leave the graph) now.
+    node()->get_node_base_interface()->trigger_notify_guard_condition();
+  }
+  /// M6 XADAPT: a received state query is not answered until released (a
+  /// manager alive but unresponsive).
+  void SetListRepliesPaused(bool paused) {
+    {
+      std::lock_guard lock(reply_mutex_);
+      list_replies_paused_ = paused;
+    }
+    reply_changed_.notify_all();
+  }
+  [[nodiscard]] std::size_t list_requests() const { return list_requests_.load(); }
 
   /// Run on every successful hardware activation, before its answer (the
   /// vendor plugin's first write() cycles after `on_activate`).
@@ -595,6 +662,18 @@ private:
   rclcpp::Service<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_;
   rclcpp::Service<controller_manager_msgs::srv::SetHardwareComponentState>::SharedPtr
       hardware_state_;
+  rclcpp::Service<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_;
+  rclcpp::Service<controller_manager_msgs::srv::ListHardwareComponents>::SharedPtr
+      list_hardware_;
+  std::atomic<std::size_t> list_requests_{0U};
+  bool list_replies_paused_{false};
+  std::string manager_;
+  rclcpp::CallbackGroup::SharedPtr list_group_;
+
+  void WaitWhileListRepliesPaused() {
+    std::unique_lock lock(reply_mutex_);
+    reply_changed_.wait(lock, [&] { return !list_replies_paused_; });
+  }
 };
 
 template <typename Predicate>

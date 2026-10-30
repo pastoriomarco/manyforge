@@ -485,7 +485,7 @@ struct SealedInputs final {
   return payload;
 }
 
-TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
+TEST(PreparedOperationParticipantCodecTest, SealsAndEncodesBothPayloadTags) {
   const auto base = BasePlan();
   auto command_inputs = Inputs(base, true);
   auto command = MakePreparedOperationParticipant(
@@ -497,23 +497,13 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
       command.value(), command_inputs.binding, command_inputs.readiness, DefaultLimits(),
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(command_bytes.ok()) << command_bytes.error().message;
-  // Current candidates prove deterministic construction and round-trip
-  // integrity; the obsolete pre-typed-Stop aggregate hash is not a contract.
+  // Current candidates prove deterministic construction; the obsolete pre-typed-Stop aggregate hash is not a contract.
   const auto rebuilt = MakePreparedOperationParticipant(
       Candidate(command_inputs.binding, command_inputs.readiness, CommandPayload()),
       command_inputs.binding, command_inputs.readiness, DefaultLimits(),
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(rebuilt.ok());
   EXPECT_EQ(EncodePreparedOperationParticipant(rebuilt.value(), command_inputs.binding,
-                                               command_inputs.readiness, DefaultLimits(),
-                                               MotionInterruptNodeCategory::kGeneric)
-                .value(),
-            command_bytes.value());
-  const auto command_decoded = DecodePreparedOperationParticipant(
-      command_bytes.value(), command_inputs.binding, command_inputs.readiness,
-      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(command_decoded.ok()) << command_decoded.error().message;
-  EXPECT_EQ(EncodePreparedOperationParticipant(command_decoded.value(), command_inputs.binding,
                                                command_inputs.readiness, DefaultLimits(),
                                                MotionInterruptNodeCategory::kGeneric)
                 .value(),
@@ -531,24 +521,20 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
       motion.value(), motion_inputs.binding, motion_inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_bytes.ok()) << motion_bytes.error().message;
   EXPECT_EQ(motion_bytes.value().find("\"motion_endpoint\""), std::string::npos);
-  const auto motion_decoded = DecodePreparedOperationParticipant(
-      motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(motion_decoded.ok()) << motion_decoded.error().message;
-  const auto& decoded_payload =
-      std::get<PreparedMotionExecutionDTO>(motion_decoded.value().payload);
-  EXPECT_EQ(decoded_payload.move_id.value(), "move.1");
+  const auto& sealed_payload = std::get<PreparedMotionExecutionDTO>(motion.value().payload);
+  EXPECT_EQ(sealed_payload.move_id.value(), "move.1");
   ASSERT_TRUE(
-      decoded_payload.validation_evidence.noncollision_result.trajectory_metrics.has_value());
-  const auto& metrics = *decoded_payload.validation_evidence.noncollision_result.trajectory_metrics;
+      sealed_payload.validation_evidence.noncollision_result.trajectory_metrics.has_value());
+  const auto& metrics = *sealed_payload.validation_evidence.noncollision_result.trajectory_metrics;
   EXPECT_DOUBLE_EQ(metrics.trajectory_duration_s, 1.0);
   EXPECT_EQ(metrics.peak_abs_joint_velocity_rad_s, (std::vector<double>{0.5, 0.5}));
   EXPECT_EQ(metrics.peak_abs_joint_acceleration_rad_s2, (std::vector<double>{0.0, 0.0}));
   ASSERT_TRUE(metrics.peak_tcp_linear_speed_mps.has_value());
   EXPECT_DOUBLE_EQ(*metrics.peak_tcp_linear_speed_mps, 0.1);
-  ASSERT_TRUE(decoded_payload.requested_tcp_linear_speed_mps.has_value());
-  EXPECT_DOUBLE_EQ(*decoded_payload.requested_tcp_linear_speed_mps, 0.75);
-  EXPECT_DOUBLE_EQ(decoded_payload.deployment_maximum_tcp_linear_speed_mps, 0.5);
-  EXPECT_EQ(decoded_payload.plan_request.speed_profile.max_tcp_linear_speed_mps, 0.5);
+  ASSERT_TRUE(sealed_payload.requested_tcp_linear_speed_mps.has_value());
+  EXPECT_DOUBLE_EQ(*sealed_payload.requested_tcp_linear_speed_mps, 0.75);
+  EXPECT_DOUBLE_EQ(sealed_payload.deployment_maximum_tcp_linear_speed_mps, 0.5);
+  EXPECT_EQ(sealed_payload.plan_request.speed_profile.max_tcp_linear_speed_mps, 0.5);
 }
 
 TEST(PreparedOperationParticipantCodecTest, RejectsCartesianMilestonesForAnotherIntent) {
@@ -646,6 +632,20 @@ TEST(PreparedOperationParticipantCodecTest,
           made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution)
           .has_value());
 
+  // ur5_pick_and_place: a second role (the UR5 `flange`) on the compiled frame
+  // of an existing role (its `tcp`) still contains the Program participant.
+  auto shared_value = physical.value().value();
+  ASSERT_FALSE(shared_value.frame_bindings.empty());
+  auto shared_frame = shared_value.frame_bindings.back();
+  shared_frame.frame_role_id = FrameRoleId("shared_frame_role");
+  shared_value.frame_bindings.push_back(std::move(shared_frame));
+  auto shared = verify_runtime_participant_binding(std::move(shared_value));
+  ASSERT_TRUE(shared.ok()) << shared.error().message;
+  EXPECT_FALSE(
+      prepared_participant_backend_physical_binding_field_error(
+          made.value(), shared.value(), PreparedParticipantPayloadKindDTO::kMotionExecution)
+          .has_value());
+
   auto crossed = made.value();
   crossed.controller().control_route_id = ControlRouteId("route.other");
   EXPECT_EQ(prepared_participant_backend_physical_binding_field_error(
@@ -695,7 +695,7 @@ TEST(PreparedOperationParticipantCodecTest,
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     MotionScopeRoundTripJoinsExactPreparedStopAndRejectsCrossedOwners) {
+     MotionScopeJoinsExactPreparedStopAndRejectsCrossedOwners) {
   const auto inputs = Inputs(BasePlan(), false);
   auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
   MotionInterruptStopProfileDTO profile;
@@ -740,12 +740,8 @@ TEST(PreparedOperationParticipantCodecTest,
                                          DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(encoded.ok());
   EXPECT_EQ(encoded.value().find("result_binding_key"), std::string::npos);
-  const auto decoded =
-      DecodePreparedOperationParticipant(encoded.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   const auto& scope =
-      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+      std::get<PreparedMotionExecutionDTO>(made.value().payload).interrupt_scopes.front();
   EXPECT_EQ(scope.stop_plan, stop.value());
   EXPECT_EQ(scope.activation_mode, MotionInterruptActivationMode::kFreshEdgeAfterArm);
   auto crossed_context = context;
@@ -772,7 +768,7 @@ TEST(PreparedOperationParticipantCodecTest,
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     FaultScopeRoundTripUsesOrdinaryPlanWithoutDesiredProfileAndRejectsCrossedAction) {
+     FaultScopeUsesOrdinaryPlanWithoutDesiredProfileAndRejectsCrossedAction) {
   const auto inputs = Inputs(BasePlan(), false);
   auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
   auto prepared =
@@ -801,12 +797,8 @@ TEST(PreparedOperationParticipantCodecTest,
                                          DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(bytes.ok()) << bytes.error().message;
   EXPECT_NE(bytes.value().find("\"preemption_action\":\"preempt_trajectory\""), std::string::npos);
-  const auto decoded =
-      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   const auto& scope =
-      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+      std::get<PreparedMotionExecutionDTO>(candidate.payload).interrupt_scopes.front();
   EXPECT_FALSE(scope.stop_profile);
   EXPECT_EQ(scope.preemption_action, InterruptPreemptionAction::kPreemptTrajectory);
   EXPECT_EQ(scope.stop_plan, candidate.controller().ordinary_stop_plan);
@@ -838,11 +830,7 @@ TEST(PreparedOperationParticipantCodecTest, MovingPrefixKeepsItsCapAndExactPrepa
       EncodePreparedOperationParticipant(made.value(), inputs.binding, inputs.readiness,
                                          DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(bytes.ok()) << bytes.error().details.at("reason");
-  const auto decoded =
-      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().details.at("reason");
-  const auto& restored = std::get<PreparedMotionExecutionDTO>(decoded.value().payload);
+  const auto& restored = std::get<PreparedMotionExecutionDTO>(made.value().payload);
   ASSERT_TRUE(restored.plan_request.moving_replacement);
   ASSERT_TRUE(restored.validation_evidence.noncollision_result.moving_replacement);
   const auto* context = &*restored.plan_request.moving_replacement;
@@ -854,11 +842,6 @@ TEST(PreparedOperationParticipantCodecTest, MovingPrefixKeepsItsCapAndExactPrepa
                         ->peak_tcp_linear_speed_mps,
                    0.7);
   EXPECT_DOUBLE_EQ(*restored.plan_request.speed_profile.max_tcp_linear_speed_mps, 0.5);
-  EXPECT_EQ(
-      EncodePreparedOperationParticipant(decoded.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
-          .value(),
-      bytes.value());
 }
 
 TEST(PreparedOperationParticipantCodecTest,
@@ -921,7 +904,7 @@ TEST(PreparedOperationParticipantCodecTest,
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     RuleSelectedModeRoundTripSealsParametersFallbackAndOriginalStageChain) {
+     RuleSelectedModeSealsParametersFallbackAndOriginalStageChain) {
   auto base_candidate = BasePlan();
   base_candidate.escalation_stages.front()
       .command_qualification.controlled_substitution_contract->fallback_stop_modes.push_back(
@@ -1004,12 +987,8 @@ TEST(PreparedOperationParticipantCodecTest,
       EncodePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness,
                                          DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(bytes.ok()) << bytes.error().message;
-  const auto decoded =
-      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   const auto& scope =
-      std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+      std::get<PreparedMotionExecutionDTO>(candidate.payload).interrupt_scopes.front();
   ASSERT_TRUE(scope.stop_profile);
   EXPECT_EQ(scope.stop_profile->stop_mode, MotionInterruptStopMode::kSpringBackHold);
   EXPECT_EQ(scope.stop_profile->fallback_stop_modes,
@@ -1055,11 +1034,6 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
                                          DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(bytes.ok()) << bytes.error().message;
   EXPECT_NE(bytes.value().find("\"motion_endpoint\""), std::string::npos);
-  const auto decoded =
-      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
-                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value().motion_endpoint, value.motion_endpoint);
   auto crossed = prepared.value();
   crossed.motion_endpoint->target_role_id = TargetRoleId("other_tool");
   EXPECT_FALSE(VerifyPreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
@@ -1074,6 +1048,22 @@ TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrosse
                    Candidate(inputs.binding, inputs.readiness, wrong_frame), inputs.binding,
                    inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
                    .ok());
+  // B7: the TCP frame carries its owner, here a tool mounted on the motion
+  // component; the endpoint is compared by its frame key, never the stamp.
+  auto tool_owned = payload;
+  std::get<ResolvedComponentModelFrameDTO>(tool_owned.plan_request.tcp_frame)
+      .controllable_component_id = ControllableComponentId("gripper.component");
+  const auto owner_stamped = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, tool_owned), inputs.binding, inputs.readiness,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(owner_stamped.ok()) << owner_stamped.error().details.at("reason");
+  // Active TCP (M7): the lane's TCP step reads the entry from the stamp.
+  EXPECT_EQ(prepared_motion_tcp_entry(owner_stamped.value()),
+            std::optional(TcpEntryDTO{ControllableComponentId("gripper.component"),
+                                      CommandTargetId("gripper"), FrameRoleId("fingertip")}));
+  EXPECT_EQ(prepared_motion_tcp_entry(prepared.value()),
+            std::optional(TcpEntryDTO{value.controllable_component_id, CommandTargetId("gripper"),
+                                      FrameRoleId("fingertip")}));
 }
 
 }  // namespace manyforge::core

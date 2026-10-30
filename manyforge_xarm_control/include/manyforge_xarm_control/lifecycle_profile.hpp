@@ -15,6 +15,7 @@
 #pragma once
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <string_view>
 #include <vector>
 
@@ -22,31 +23,11 @@ namespace manyforge::xarm_control {
 
 /// The two vendor primitives of the real xArm catalog (R7 package 4): the
 /// unmodified driver's `clean_error` and `clean_warn` services. The rest of
-/// the vendor ready sequence runs inside the plugin's own activation.
-inline constexpr std::string_view kXArmClearErrorPrimitiveId =
-    "xarm.clear_error";
+/// the vendor ready sequence runs inside the plugin's own activation. V-B1:
+/// the error clear is the shared `core::kDeviceClearErrorPrimitiveId`
+/// (`device.clear_error`); the warning clear is xArm-only and keeps its name.
 inline constexpr std::string_view kXArmClearWarningPrimitiveId =
     "xarm.clear_warning";
-
-/// The maintained xArm-family lifecycle providers (R7 D12).
-inline constexpr std::string_view kXArmArmLifecycleProviderManifestId =
-    "xarm_arm_provider";
-inline constexpr std::string_view kXArmGripperLifecycleProviderManifestId =
-    "xarm_gripper_provider";
-
-/// The xArm arm plans of the maintained catalog (mirrors the deployment
-/// generator): the operator's Recover clears the vendor error, then the
-/// warning, on the `device.*` facts. The vendor plugin's activation runs the
-/// rest of the ready sequence, so no other vendor primitive exists.
-[[nodiscard]] std::vector<core::LifecycleIntentPlanDTO>
-make_xarm_arm_lifecycle_plans();
-
-[[nodiscard]] core::Result<core::ContentDigest>
-compute_xarm_arm_lifecycle_catalog_semantic_digest();
-
-[[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
-make_xarm_arm_lifecycle_catalog(
-    const core::ProviderManifestDTO &provider_manifest);
 
 /// R7 package 4: the ros2_control provider of a Real xArm-family arm. It
 /// offers what `manyforge.provider.ros2_control` offers; only its lifecycle
@@ -54,7 +35,14 @@ make_xarm_arm_lifecycle_catalog(
 inline constexpr std::string_view kXArmRos2ControlLifecycleProviderManifestId =
     "manyforge.provider.ros2_control.xarm";
 
-/// The Real xArm arm plans (mirrors the deployment generator), on stock
+/// The provider of a Real xArm-family component's gripper domain: the shared
+/// Real gripper plans (`manyforge_roboplan`), Recover targeting `disabled`
+/// like the arm.
+inline constexpr std::string_view kXArmRos2ControlGripperLifecycleProviderManifestId =
+    "manyforge.provider.ros2_control.xarm.gripper";
+
+/// The Real xArm arm plans (the deployment generator reads their copy in
+/// `resources/xarm_ros2_control_lifecycle_plans.json`), on stock
 /// ros2_control plus the two vendor services (R7 §3.1, D1, D4, D10):
 /// - Prepare first clears a vendor error left on the unarmed robot (m5.5:
 ///   C2 after an emergency stop; the adapter verifies the clear), then arms
@@ -81,18 +69,6 @@ compute_xarm_ros2_control_lifecycle_catalog_semantic_digest();
 
 [[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
 make_xarm_ros2_control_lifecycle_catalog(
-    const core::ProviderManifestDTO &provider_manifest);
-
-/// The maintained native Lite 6 gripper plans, provided by `xarm_gripper_provider`.
-
-[[nodiscard]] std::vector<core::LifecycleIntentPlanDTO>
-make_lite6_gripper_lifecycle_plans();
-
-[[nodiscard]] core::Result<core::ContentDigest>
-compute_lite6_gripper_lifecycle_catalog_semantic_digest();
-
-[[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
-make_lite6_gripper_lifecycle_catalog(
     const core::ProviderManifestDTO &provider_manifest);
 
 } // namespace manyforge::xarm_control

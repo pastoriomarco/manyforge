@@ -628,9 +628,15 @@ struct RouteTables final {
     }
   }
   // An absent optional row keeps the established physical-required path.
-  // Only an exact matched strict None row may remove those expectations.
+  // Only an exact matched strict None row, or a lane-free tool's pneumatic
+  // row (D4: no controller profile, its lane in the referenced I/O), may
+  // remove those expectations.
   if (target == nullptr) return false;
-  if (target->output_mode != core::GripperOutputMode::kNone) return false;
+  const bool lane_free =
+      target->pneumatic_io.has_value() &&
+      ros2_control_execution_runtime_contract::find_controller_profile(
+          config, command->controllable_component_id) == nullptr;
+  if (target->output_mode != core::GripperOutputMode::kNone && !lane_free) return false;
   if (target->actuation_kind != "pneumatic" ||
       command->provider_runtime_unit_id != source_runtime_unit_id) {
     fail("no-output domain does not select its strict pneumatic runtime owner");

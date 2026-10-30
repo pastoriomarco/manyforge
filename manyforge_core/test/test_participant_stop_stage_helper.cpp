@@ -309,9 +309,9 @@ class GoalReadObservingPort final : public IExecutionPort {
                                        const TrajectoryDTO& trajectory) override {
     return port_.Submit(key, trajectory);
   }
-  ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active,
-                                        const ExecutionGoalKey& next,
-                                        const TrajectoryDTO& trajectory) override {
+  ExecutionPortCommandResultDTO Replace(
+      const ExecutionGoalKey& active, const ExecutionGoalKey& next,
+      const TrajectoryDTO& trajectory) override {
     return port_.Replace(active, next, trajectory);
   }
   ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key) override {
@@ -894,9 +894,9 @@ class SendTimeRecordingPort final : public IExecutionPort {
                                        const TrajectoryDTO& trajectory) override {
     return port_.Submit(key, trajectory);
   }
-  ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active,
-                                        const ExecutionGoalKey& next,
-                                        const TrajectoryDTO& trajectory) override {
+  ExecutionPortCommandResultDTO Replace(
+      const ExecutionGoalKey& active, const ExecutionGoalKey& next,
+      const TrajectoryDTO& trajectory) override {
     replace_clock.push_back(clock_.now());
     return port_.Replace(active, next, trajectory);
   }
@@ -1253,20 +1253,61 @@ TEST(ParticipantStopStageHelperTest, RefusedOrRejectedReplacementFailsTheStage) 
   EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
 }
 
-TEST(ParticipantStopStageHelperTest, StopDeadlineIsTheProfilesAndIsNeverExtended) {
-  World world;
-  const auto stage = Stage(0U);
-  world.Dispatch(stage);
-  world.Sample(0.5, 0.5, 1.0);
-  const auto t0 = world.clock.now();
-  ScriptReplacement(world, kSecond, 1000U, std::nullopt);  // never finishes
-  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
-  EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
-  EXPECT_EQ(result.error->details.at("reason"), "backend_stop_not_confirmed");
-  // Q28/Q51: deceleration 1.0 s + 500 ms from the Stop request (the robot's
-  // own profile deadline; no shared cell budget).
-  EXPECT_LE(world.clock.now(), t0 + 1'500'000'000);
-  EXPECT_GE(world.clock.now(), t0 + 1'500'000'000 - kTick);
+// Maintainer M6: a sent Stop trajectory finishes like a normal motion, on the
+// controller's report, whenever it comes inside a normal motion's no-report
+// bound (here 10 s from the send: the trajectory lasts under 5.3 s), well past
+// the profile's 1.5 s deadline to start braking. Within the arrival tolerance
+// it succeeds; outside it takes the Q18 path; with no report it expires at the
+// normal-motion bound, never before.
+TEST(ParticipantStopStageHelperTest, SentStopTrajectoryFinishesLikeANormalMotion) {
+  for (const auto ended : {std::optional(ExecutionGoalResult::kSucceeded),
+                           std::optional(ExecutionGoalResult::kAbortedGoalTolerance),
+                           std::optional<ExecutionGoalResult>()}) {
+    SCOPED_TRACE(ended ? std::string(to_string(*ended)) : std::string("no report"));
+    World world;
+    world.Lane(ExecutionGoalTolerancePolicy::kKept);
+    const auto stage = Stage(0U);
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    const auto t0 = world.clock.now();
+    std::optional<TimePoint> sent_seen;
+    std::size_t count = 0U;
+    bool finished = false;
+    world.on_tick = [&] {
+      if (Replaces(world.port).empty() || finished) return;
+      if (++count == 1U) {
+        sent_seen = world.clock.now();
+        world.Executing(kSecond);
+        world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond,
+                              world.clock.now());
+      }
+      world.Sample(0.01 * static_cast<double>(count), 0.5, 0.0);
+      // The controller's verdict, late (its settle window), past 1.5 s.
+      if (ended && world.clock.now() >= t0 + 3'000'000'000) {
+        world.Finish(kSecond, *ended);
+        finished = true;
+      }
+    };
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
+    EXPECT_TRUE(Cancels(world.port).empty());
+    ASSERT_TRUE(sent_seen.has_value());
+    if (ended == ExecutionGoalResult::kSucceeded) {
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+          << result.error->details.at("reason");
+      continue;
+    }
+    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error.has_value());
+    if (ended) {
+      EXPECT_EQ(result.error->details.at("reason"), "stop_goal_tolerance_violated");
+      continue;
+    }
+    EXPECT_EQ(result.error->details.at("reason"), "backend_stop_not_confirmed");
+    // max(10 s, 1.5 x duration + 2 s) from the send (one tick before seen).
+    EXPECT_GE(world.clock.now(), *sent_seen - kTick + 10'000'000'000);
+    EXPECT_LE(world.clock.now(), *sent_seen + 10'000'000'000);
+  }
 }
 
 TEST(ParticipantStopStageHelperTest, AConsumedPlanningLeadCanSelectAnEnabledImmediateFastStop) {
@@ -1794,6 +1835,52 @@ TEST(ParticipantStopStageHelperTest, PlannerChosenHardStopIsTaggedForTheKernel) 
   EXPECT_EQ(result.error->details.at("stop_disposition"), "planner_selected_hard_stop");
 }
 
+// Maintainer 2026-10-29 (Real Lite 6): the measured position trails the
+// command, so a lead-in anchored at the measured position can end before the
+// replacement can start (the soft Stop is refused and falls back). The lane's
+// `lead_in_anchor` selects the anchor; kCommanded (the default) starts the
+// lead-in at the command cursor and the soft Stop is sent.
+TEST(ParticipantStopStageHelperTest, MeasuredLaneLeadInAnchorSelectsTheSeam) {
+  EXPECT_EQ(StopStageHelperConfig{}.lead_in_anchor, StopLeadInAnchor::kCommanded);
+  for (const auto anchor : {StopLeadInAnchor::kCommanded, StopLeadInAnchor::kMeasured}) {
+    const bool commanded = anchor == StopLeadInAnchor::kCommanded;
+    SCOPED_TRACE(commanded ? "commanded" : "measured");
+    World world(false);
+    world.config.trip_authority = StateAuthorityClass::kMeasured;
+    world.config.lead_in_anchor = anchor;
+    world.Build();
+    const auto stage = Stage(0U);
+    world.Dispatch(stage);
+    // Command cursor 0.5; the measured position trails it by 0.05 rad (q = t).
+    // At the frozen factor 0.5 the lead-in ends 0.025 s of path after its
+    // anchor, and the replacement starts >= 0.01 s of path after the cursor.
+    world.Sample(0.5, 0.5, 1.0, 0.5, 0.45);
+    if (commanded) ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    if (commanded) {
+      ASSERT_EQ(Replaces(world.port).size(), 1U);
+      EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
+      EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
+      // The joined replacement never steps back behind the command cursor.
+      // Keep the copy alive: C++20 range-for does not extend the temporary.
+      const auto replaces = Replaces(world.port);
+      for (const auto& point : replaces.front().trajectory.waypoints) {
+        if (point.time_from_start_s >= 0.0) {
+          EXPECT_GE(point.positions_rad.front(), 0.5 - 1e-9);
+        }
+      }
+    } else {
+      EXPECT_TRUE(Replaces(world.port).empty());
+      EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kNotDispatched);
+      ASSERT_TRUE(result.error);
+      const auto& details = result.error->details;
+      EXPECT_TRUE(std::any_of(details.begin(), details.end(), [](const auto& row) {
+        return row.second.find("stop_delta_budget_exceeded") != std::string::npos;
+      })) << result.error->message;
+    }
+  }
+}
+
 TEST(ParticipantStopStageHelperTest, RealLaneGoalToleranceViolationIsMainsUnsettledCase) {
   for (const auto tolerance :
        {ExecutionGoalTolerancePolicy::kKept, ExecutionGoalTolerancePolicy::kErased}) {
@@ -1808,12 +1895,46 @@ TEST(ParticipantStopStageHelperTest, RealLaneGoalToleranceViolationIsMainsUnsett
     EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
     EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
     // Q18: the Kernel maps this reason to InterventionRequired with no second
-    // Stop command; only a real lane (goal tolerances kept) reports it.
+    // Stop command; only a lane that keeps goal tolerances (every ros2_control
+    // lane, merge 6 arrival) reports it.
     EXPECT_EQ(result.error->details.at("reason"),
               tolerance == ExecutionGoalTolerancePolicy::kKept
                   ? "stop_goal_tolerance_violated"
                   : "controller_terminal_result_unsuccessful");
     EXPECT_TRUE(Cancels(world.port).empty());
+  }
+}
+
+// Maintainer M6: a Stop trajectory gets the lane's arrival check like a
+// motion. On a lane that keeps goal tolerances, a controlled Stop goal (soft
+// ramp, spring-back, fast spring-back) that JTC finishes within it succeeds;
+// one that JTC aborts on the goal tolerance takes the existing Q18 path
+// (`stop_goal_tolerance_violated`: the Kernel ends the participant
+// InterventionRequired with no second Stop command).
+TEST(ParticipantStopStageHelperTest, StopTrajectoriesTakeTheLaneArrivalCheckLikeMotions) {
+  for (const auto* mode : {"soft_on_path", "spring_back_hold", "spring_back_fast"}) {
+    for (const auto ended :
+         {ExecutionGoalResult::kSucceeded, ExecutionGoalResult::kAbortedGoalTolerance}) {
+      SCOPED_TRACE(std::string(mode) + " " + std::string(to_string(ended)));
+      World world;
+      world.Lane(ExecutionGoalTolerancePolicy::kKept);
+      const auto stage = Stage(0U, Nominal::kControlled, Parameters(mode, false));
+      world.Dispatch(stage);
+      world.Sample(0.5, 0.5, 1.0);
+      ScriptReplacement(world, kSecond, 5U, ended);
+      const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+      EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
+      ASSERT_EQ(Replaces(world.port).size(), 1U);
+      EXPECT_TRUE(Cancels(world.port).empty());
+      if (ended == ExecutionGoalResult::kSucceeded) {
+        ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+            << result.error->details.at("reason");
+        continue;
+      }
+      EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+      ASSERT_TRUE(result.error.has_value());
+      EXPECT_EQ(result.error->details.at("reason"), "stop_goal_tolerance_violated");
+    }
   }
 }
 
@@ -1995,8 +2116,10 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenT
             "controlled_hard_stop_succeeded_then_hold");
   EXPECT_TRUE(Cancels(world.port).empty());
 
-  // Without this replacement's success the hold never finishes it: the
-  // stage's hard-stop bound decides (Q28, the lane's stop completion timeout).
+  // Without this replacement's success the hold never finishes it: as a sent
+  // trajectory with the arrival check, the brake's no-report bound is a normal
+  // motion's (SX-609: max(10 s, 1.5 x duration + 2 s) from its send), not the
+  // lane's 1 s stop-completion timeout.
   World held;
   const auto again = Stage(1U);
   held.Dispatch(again);
@@ -2011,14 +2134,71 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenT
   const auto failed = held.helper->TranslateStopStage(again, Budget(again, 0), {});
   EXPECT_EQ(failed.outcome, ParticipantStopStageOutcomeDTO::kFailed);
   EXPECT_EQ(failed.error->details.at("reason"), "stop_evidence_phase_expired");
-  EXPECT_LE(held.clock.now() - started_at, held.config.hard_stop_completion_timeout_ns + kTick);
+  EXPECT_GE(held.clock.now() - started_at, 10'000'000'000);
+  EXPECT_LE(held.clock.now() - started_at, 10'000'000'000 + kTick);
+}
+
+// SX-609: the brake finishes on the controller's report even after the lane's
+// hard-stop timeout (here 1 s; e.g. Isaac UR10e's 0.5 s below its 1.0 s
+// goal_time). Within tolerance it succeeds; a goal-tolerance abort falls to
+// the floor, which then has the lane's hard-stop timeout of its own.
+TEST(ParticipantStopStageHelperTest, BrakeFinishesOnTheControllerReportPastTheHardStopTimeout) {
+  for (const auto ended :
+       {ExecutionGoalResult::kSucceeded, ExecutionGoalResult::kAbortedGoalTolerance}) {
+    SCOPED_TRACE(to_string(ended));
+    World world;
+    world.Lane(ExecutionGoalTolerancePolicy::kKept);
+    const auto stage = Stage(1U);
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    const auto t0 = world.clock.now();
+    bool installed = false;
+    std::optional<TimePoint> ended_at;
+    world.on_tick = [&] {
+      if (Replaces(world.port).empty()) return;
+      if (!installed) {
+        installed = true;
+        world.Executing(kSecond);
+        world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond,
+                              world.clock.now());
+        world.Sample(0.004, 0.55, 0.4);  // installed: the cursor restarted
+        return;
+      }
+      // The controller's verdict comes 1.5 s after the stage started.
+      if (!ended_at && world.clock.now() >= t0 + 1'500'000'000) {
+        world.Finish(kSecond, ended);
+        ended_at = world.clock.now();
+        return;
+      }
+      // The brake's reference rests at its end; after an abort JTC holds.
+      world.Sample(0.0, world.BrakeEnd(), 0.0);
+    };
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage, 1'800'000'000), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << result.error->details.at("reason");
+    ASSERT_TRUE(ended_at.has_value());
+    EXPECT_GT(world.clock.now() - t0, world.config.hard_stop_completion_timeout_ns);
+    EXPECT_TRUE(Cancels(world.port).empty());
+    const auto& evidence = EvidenceObject(result);
+    if (ended == ExecutionGoalResult::kSucceeded) {
+      EXPECT_EQ(Text(evidence, "hard_stop_level"), "controlled_hard_stop");
+    } else {
+      EXPECT_EQ(Text(evidence, "hard_stop_level"), "goal_already_terminal");
+      EXPECT_EQ(Text(evidence, "hard_stop_fallback_reason"),
+                "controlled_hard_stop_ended_aborted_goal_tolerance");
+      EXPECT_LE(world.clock.now() - *ended_at, world.config.hard_stop_completion_timeout_ns);
+    }
+  }
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeEndingOtherwiseThanSucceededFallsToTheFloorAtOnce) {
   // Q42: a level-3 brake that ends aborted, preempted or unknown is not
   // finished; level 4 follows at once (nothing is left to cancel, so the
   // floor observes the controller's hold) instead of waiting for the bound.
+  // M6: a brake outside the lane's arrival tolerance after `goal_time` is
+  // JTC's goal-tolerance abort and takes the same path.
   for (const auto ended : {ExecutionGoalResult::kAbortedPathTolerance,
+                           ExecutionGoalResult::kAbortedGoalTolerance,
                            ExecutionGoalResult::kEndedUnknown, ExecutionGoalResult::kPreemptedBy}) {
     SCOPED_TRACE(to_string(ended));
     World world;
@@ -2285,17 +2465,20 @@ TEST(ParticipantStopStageHelperTest, BrakeProofCountsOnlyInsideTheStageCappedRec
     ScriptLateWakeBrake(world, receipt_after, 80'000'000, false);
     const auto result =
         world.helper->TranslateStopStage(stage, Budget(stage, 1'800'000'000), {});
-    // The 50 ms bound has passed when the poll wakes at 80 ms, so the stage
-    // itself fails either way; what differs is whether level 3 was taken as
-    // installed.
-    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
-    ASSERT_TRUE(result.error.has_value());
+    // The 50 ms bound has passed when the poll wakes at 80 ms. Not eligible:
+    // level 4 follows within that passed bound and fails. Eligible: the brake
+    // took over and, as a sent trajectory, finishes on its own report under a
+    // normal motion's bound (SX-609), not the 50 ms.
     if (receipt_after > 50'000'000) {
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+      ASSERT_TRUE(result.error.has_value());
       EXPECT_FALSE(Cancels(world.port).empty());  // not eligible: level 4 follows
       EXPECT_EQ(result.error->details.at("hard_stop_level"), "jtc_cancel_decelerate_on_cancel");
     } else {
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+          << result.error->details.at("reason");
       EXPECT_TRUE(Cancels(world.port).empty());  // eligible: the brake took over
-      EXPECT_EQ(result.error->details.at("hard_stop_level"), "controlled_hard_stop");
+      EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_level"), "controlled_hard_stop");
     }
   }
 }

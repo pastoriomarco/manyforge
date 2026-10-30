@@ -291,9 +291,9 @@ def test_ur_template_retains_ur_rates_and_tolerances_without_isaac_activation_ov
         "goal_time": 0.0,
         "stopped_velocity_tolerance": 0.2,
         "decelerate_on_cancel": True,
+        # The goal is the profile row's arrival tolerance, written by the host.
         "__joint__": {
             "trajectory": 0.2,
-            "goal": 0.1,
             "max_deceleration_on_cancel": None,
         },
     }

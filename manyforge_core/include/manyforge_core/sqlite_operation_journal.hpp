@@ -135,6 +135,8 @@ class SqliteOperationJournal final : public IOperationJournal {
       const IoRuleStateChangeDTO& change) override;
   [[nodiscard]] Result<std::uint64_t> RecordGlobalIoRuleCleared(
       const IoGlobalRuleRecoveryRecordDTO& record) override;
+  [[nodiscard]] Result<std::uint64_t> RecordActiveTcpChanged(
+      const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) override;
 
   /// Read-only, replay-safe projection. Reading never acknowledges, deletes,
   /// or changes operation ownership.

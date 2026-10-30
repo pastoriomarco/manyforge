@@ -90,7 +90,9 @@ beforeEach(() => {
 });
 async function mount(closeScenario = vi.fn(async () => empty as ManagerActiveProjection | null),
   documentUnavailableReason: string | null = null, motionActive = false, documentPath = '/projects/current.scenario',
-  readOnly = false, hasChanges = true) {
+  readOnly = false, hasChanges = true,
+  forceCloseScenario?: (expected: ManagerActiveProjection, confirmed?: unknown, signal?: AbortSignal) => Promise<ManagerActiveProjection | null>,
+  closeUnavailableReason: string | null = null) {
   const dom = mountedHost();
   const controller = {
     documentUnavailableReason, state: { status: 'ready', pendingAction: null, workspace: {
@@ -100,7 +102,6 @@ async function mount(closeScenario = vi.fn(async () => empty as ManagerActivePro
     saveScenarioDocument: vi.fn(), exportScenarioDocument: vi.fn(),
     scenarioReplacementIdentity: { authoring: { workspaceEpoch: 'workspace', workspaceRevision: 1,
       programDraftId: 'draft', programDraftRevision: 1, deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
-      receiverEpoch: 'receiver', managerOwnerId: 'manager', managerOwnerEpoch: 'manager.1',
       managerActive: { canonical_empty: active.canonicalEmpty, retained_bundle_id: active.retainedBundleId,
         graph_revision: active.graphRevision, publication: active.publication } },
     reportCloseCancellation: vi.fn(),
@@ -109,7 +110,9 @@ async function mount(closeScenario = vi.fn(async () => empty as ManagerActivePro
   } as unknown as ProgramWorkspaceController;
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(dom.host as unknown as Element);
-  await act(() => root.render(<ScenarioDocumentCommands controller={controller} closeScenario={closeScenario} motionActive={motionActive} />));
+  await act(() => root.render(<ScenarioDocumentCommands controller={controller} closeScenario={closeScenario}
+    forceCloseScenario={forceCloseScenario} motionActive={motionActive}
+    closeUnavailableReason={closeUnavailableReason} />));
   unmount = async () => { await act(() => root.unmount()); };
   const click = async (props: Props) => { await act(async () => props.onClick?.({ currentTarget: { focus: () => undefined } })); };
   const open = async (label: string) => click(dom.find((p) => p['aria-label'] === label));
@@ -156,7 +159,7 @@ it('different Load requires one confirmation and waits for successful Close', as
   await test.click(test.find((p) => p.children === 'Cancel'));
   expect(test.find((p) => p.role === 'dialog')).toBeDefined();
   await act(() => close.resolve(empty));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring);
   expect(() => test.find((p) => p.role === 'dialog')).toThrow();
 });
 
@@ -184,7 +187,7 @@ it('Load of the applied Scenario requires the same confirmation and waits for Cl
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
   expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
   await act(() => close.resolve(empty));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/current', true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/current', true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it('New asks no name: it confirms, closes first and then opens the Untitled Scenario', async () => {
@@ -196,8 +199,17 @@ it('New asks no name: it confirms, closes first and then opens the Untitled Scen
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
   await act(() => close.resolve(empty));
-  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true);
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true, test.controller.scenarioReplacementIdentity!.authoring);
   expect(() => test.find((p) => p.role === 'dialog')).toThrow();
+});
+
+it('SX-679: while Recover cell runs, New shows the reason and sends no Close', async () => {
+  const reason = 'Recover cell is in progress; wait for it to finish or abort it.';
+  const test = await mount(undefined, null, false, undefined, false, true, undefined, reason);
+  await test.open('New');
+  expect(test.find((p) => p.role === 'status' && p.children === reason)).toBeTruthy();
+  expect(test.closeScenario).not.toHaveBeenCalled();
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
 });
 
 it('New on an empty cell without Draft changes closes at once, without a popup', async () => {
@@ -207,7 +219,7 @@ it('New on an empty cell without Draft changes closes at once, without a popup',
   await test.open('New');
   expect(() => test.find((p) => p.children === 'Close Scenario?')).toThrow();
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(empty, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true);
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it('keeps empty Load Close-first', async () => {
@@ -221,7 +233,7 @@ it('keeps empty Load Close-first', async () => {
   await test.open('Load Scenario'); await test.choose('other');
   await test.click(test.primary('Load Scenario'));
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(empty, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it.each(['current', 'other'])('Load of %s is admitted by the Close path, not by ordinary document admission', async (id) => {
@@ -230,7 +242,7 @@ it.each(['current', 'other'])('Load of %s is admitted by the Close path, not by 
   expect(test.primary('Load Scenario').disabled).toBe(false);
   await test.click(test.primary('Load Scenario')); await test.ack();
   expect(test.closeScenario).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`/projects/${id}`, true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`/projects/${id}`, true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it('keeps the dialog after an unresolved replacement without sending it again', async () => {
@@ -282,7 +294,19 @@ it('keeps the popup bound to its captured Load path despite an intervening selec
   await act(() => selection.onChange?.({ target: { value: 'saved:/projects/current' } }));
   await test.ack();
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring);
+});
+
+it('sends the authoring identity confirmed before Close to the Load request', async () => {
+  const close = deferred<ManagerActiveProjection | null>();
+  const test = await mount(vi.fn(() => close.promise));
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  const confirmed = structuredClone(test.controller.scenarioReplacementIdentity!.authoring);
+  test.controller.scenarioReplacementIdentity = { ...test.controller.scenarioReplacementIdentity!,
+    authoring: { ...confirmed, workspaceRevision: confirmed.workspaceRevision + 1 } };
+  await act(() => close.resolve(empty));
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, confirmed);
 });
 
 
@@ -393,7 +417,7 @@ it('Load Browse… selects a Scenario project and loads it through Close', async
   expect(test.find((p) => p.value === 'saved:/projects/cells/pick.scenario')).toBeDefined();
   await test.click(test.primary('Load Scenario')); await test.ack();
   expect(test.closeScenario).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it('Load Browse… selects a project from another allowed root', async () => {
@@ -410,7 +434,7 @@ it('Load Browse… selects a project from another allowed root', async () => {
   await test.click(test.find((p) => p.role === 'listitem' && label(p).startsWith('pick.scenario')));
   expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith(external);
   await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/pick.scenario`, true);
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/pick.scenario`, true, test.controller.scenarioReplacementIdentity!.authoring);
 });
 
 it('Export Browse… picks a parent folder and exports the project there under its name', async () => {
@@ -445,4 +469,38 @@ it('Export Browse… can write to another allowed root', async () => {
   await test.click(test.find((p) => p.children === 'Use this folder'));
   await test.click(test.primary('Export copy'));
   expect(test.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/Lab_Cell.scenario`);
+});
+
+// Item 37: a refused Close offers Force close; one confirmation states the
+// risks, then the same replacement continues after the forced Close.
+it('a refused Load Close offers Force close, which confirms the risks and then loads', async () => {
+  const refused = vi.fn(async () => { throw Object.assign(new Error('Close cannot infer rest from an uncertain terminal'),
+    { code: 'cell_close_containment_uncertain' }); });
+  const forced = vi.fn(async () => empty as ManagerActiveProjection | null);
+  const test = await mount(refused, null, false, '/projects/current.scenario', false, true, forced);
+  expect(() => test.find((p) => p.children === 'Force close…')).toThrow();
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(refused).toHaveBeenCalledOnce();
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await test.click(test.find((p) => p.children === 'Force close…'));
+  expect(test.find((p) => p.children === 'Force close Scenario?')).toBeDefined();
+  expect(forced).not.toHaveBeenCalled();
+  await test.click(test.primary('Force close and continue'));
+  expect(forced).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring);
+});
+
+it('Cancel on the Force close confirmation sends nothing', async () => {
+  const refused = vi.fn(async () => { throw new Error('Close refused'); });
+  const forced = vi.fn(async () => empty as ManagerActiveProjection | null);
+  const test = await mount(refused, null, false, '/projects/current.scenario', false, true, forced);
+  await test.open('New'); await test.ack();
+  await test.click(test.find((p) => p.children === 'Force close…'));
+  const dialogs = (test.find((p) => p.children === 'Force close Scenario?'));
+  expect(dialogs).toBeDefined();
+  const cancel = test.find((p) => p.children === 'Cancel' && p.className === undefined && p.onClick !== undefined);
+  await test.click(cancel);
+  expect(forced).not.toHaveBeenCalled();
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
 });

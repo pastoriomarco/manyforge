@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <set>
 #include <string>
@@ -94,7 +95,7 @@ namespace {
   if (motion.move_id.empty() || motion.base_frame_role_id.empty()) {
     return invalid("motion intent has an empty portable identity", "motion_identity_empty");
   }
-  if (motion.tcp_endpoint.target_role_id.empty() || motion.tcp_endpoint.frame_role_id.empty()) {
+  if (!valid_tcp_selector(motion.tcp_endpoint)) {
     return invalid("motion TCP endpoint is incomplete", "motion_tcp_endpoint_invalid");
   }
   if (!std::isfinite(motion.tolerances.joint_position_tol_rad) ||
@@ -114,6 +115,10 @@ namespace {
        (!std::isfinite(*motion.speed_profile.max_tcp_linear_speed_mps) ||
         *motion.speed_profile.max_tcp_linear_speed_mps <= 0.0))) {
     return invalid("motion speed profile is invalid", "motion_speed_profile_invalid");
+  }
+  if (motion.clearance_m.has_value() &&
+      !(*motion.clearance_m >= 0.0 && *motion.clearance_m <= kMaxCollisionClearanceM)) {
+    return invalid("motion clearance must be within [0, 0.05] m", "motion_clearance_invalid");
   }
   if (!std::isfinite(motion.timeouts.planning_timeout_s) ||
       motion.timeouts.planning_timeout_s <= 0.0 ||
@@ -271,6 +276,14 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
       return invalid("manual handover context is invalid", "manual_handover_context_invalid");
     }
   }
+  const bool set_tcp = std::any_of(
+      intent.participants.begin(), intent.participants.end(), [](const auto& participant) {
+        return std::holds_alternative<SetTcpParticipantIntentDTO>(participant.payload);
+      });
+  if (set_tcp && (intent.participants.size() != 1U ||
+                  intent.coordination_policy != OperationCoordinationPolicy::kIndependent)) {
+    return invalid("Set TCP names exactly one robot", "set_tcp_shape_invalid");
+  }
   for (const auto& participant : intent.participants) {
     if (participant.component_role_id.empty() || participant.target_role_id.empty() ||
         participant.required_capability_id.empty()) {
@@ -297,6 +310,14 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
           using Payload = std::decay_t<decltype(payload)>;
           if constexpr (std::is_same_v<Payload, MotionParticipantIntentDTO>) {
             return validate_motion_intent(payload);
+          } else if constexpr (std::is_same_v<Payload, SetTcpParticipantIntentDTO>) {
+            if (std::holds_alternative<CurrentTcpDTO>(payload.tcp)) {
+              return invalid("Set TCP needs a TCP, not Current", "set_tcp_current_invalid");
+            }
+            if (!valid_tcp_selector(payload.tcp)) {
+              return invalid("Set TCP selector is incomplete", "motion_tcp_endpoint_invalid");
+            }
+            return Result<void>::Ok();
           } else {
             return validate_command_intent(payload);
           }

@@ -109,6 +109,18 @@ struct IsaacControllerLane final {
   std::vector<double> initial_joint_positions_rad;
 };
 
+/// The GripperCommand bridge an Isaac tool (gripper-only) component runs in
+/// its own namespace when its profile's gripper transport is the action
+/// (`ros_gripper_command`). A direct-effort transport has none.
+struct IsaacGripperBridgeLane final {
+  /// Relative to the tool's runtime namespace.
+  std::string action_name;
+  std::string command_topic;
+  std::string state_topic;
+  /// The bridge parameters file in `manyforge_ros_bringup/config`.
+  std::string parameters_file;
+};
+
 struct ControllerRobotDescriptionRequest final {
   /// Exact ManyForge model URDF text from the resolved model bundle.
   std::string_view model_urdf;

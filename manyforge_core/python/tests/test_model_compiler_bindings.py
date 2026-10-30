@@ -10,10 +10,10 @@ import pytest
 core = pytest.importorskip("manyforge_core_py")
 
 MODEL_ASSET_SCHEMA_REVISION = (
-    "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
+    "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
 )
 COMPONENT_TYPE_SCHEMA_REVISION = (
-    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
+    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde"
 )
 ZERO_DIGEST = "sha256:" + ("0" * 64)
 

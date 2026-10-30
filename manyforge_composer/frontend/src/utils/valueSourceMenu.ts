@@ -30,6 +30,8 @@ export interface ValueSourceMenuModel {
   formulaType: ExpressionValueType | null;
   /** Why a source cannot be chosen yet, or null. */
   unavailable: string | null;
+  /** Only a whole blackboard key is allowed for this value. */
+  keyOnly?: boolean;
 }
 
 export interface ValueSourceMenuInput {
@@ -72,6 +74,16 @@ export function valueSourceMenuModel(input: ValueSourceMenuInput): ValueSourceMe
   const segments = parseValuePath(input.path);
   if (segments === null || !catalogParameterSourceable(input.entry, String(segments[0]))) return null;
   const nested = segments.length > 1;
+  if (input.entry.id === 'motion.set_tcp' && input.path === 'tcp') {
+    const keyChoices = input.keys.filter((key) => key.type === 'tcp_entry' && key.access !== 'write')
+      .map((key): ValueSourceChoice => ({
+        label: `key.${key.key}`, source: { kind: 'blackboard_key', reference: key.key },
+      }));
+    return {
+      path: input.path, current: input.sources?.[input.path], keyChoices,
+      parameterChoices: [], formulaType: null, unavailable: null, keyOnly: true,
+    };
+  }
   if (nested && !nestedValueSourceable(segments, input.schema)) return null;
   const accepts = (type: string) => schemaAcceptsProgramType(input.schema, type);
   const keyChoices: ValueSourceChoice[] = [];

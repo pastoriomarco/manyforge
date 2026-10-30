@@ -80,6 +80,10 @@ struct ResolvedExecutionBindingDTO final {
   TargetRoleId target_role_id;
   std::vector<ProgramFrameRoleBindingDTO> frame_role_bindings;
   std::vector<ProgramCollisionBodyRoleBindingDTO> collision_body_role_bindings;
+  /// Frames held under the admitted TCP linear-speed limit, computed once at
+  /// admission (`speed_check_frames`): `tcp_frame` first, then the robot
+  /// flange under `active_tcp_and_flange`. Empty checks `tcp_frame` alone.
+  std::vector<ResolvedFrameDTO> speed_check_frames{};
 
   friend bool operator==(const ResolvedExecutionBindingDTO&,
                          const ResolvedExecutionBindingDTO&) = default;
@@ -245,6 +249,9 @@ struct ExecuteRequestDTO {
   /// Effective concrete contact-policy binding for this move. Empty means
   /// free-space validation/execution.
   std::string contact_policy_id;
+  /// The motion's collision clearance (MotionParticipantIntentDTO); absent
+  /// means the kernel's `collision_clearance_m`.
+  std::optional<double> clearance_m;
   /// Owner-resolved scale captured atomically with execution admission. This
   /// prevents a prior operation's participant-local scale from leaking into a
   /// newly dispatched operation before the first focused-port update.

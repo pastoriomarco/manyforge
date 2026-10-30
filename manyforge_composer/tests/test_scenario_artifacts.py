@@ -941,7 +941,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
         assert prepared["prepared_activation"] == candidate
         return {"status": "applied", "apply_id": None}
 
-    monkeypatch.setattr(state, "_manager_current", lambda _status: (
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: (
         "current-bundle", "current-graph", "manager-epoch"
     ))
     monkeypatch.setattr(
@@ -966,6 +966,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             "message": "Activation preparation failed",
             "details": {"preparer_detail": "invalid candidate geometry"},
             "effect": "none",
+            "producer": "composer",
         }
         assert admission.events == []
         assert state.authoring_workspace.snapshot() == before
@@ -1092,7 +1093,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
     monkeypatch.setattr(
         state,
         "_manager_current",
-        lambda _status: ("current-bundle", "current-graph", "manager-epoch"),
+        lambda _status, **_kw: ("current-bundle", "current-graph", "manager-epoch"),
     )
     monkeypatch.setattr(
         state, "execute_authored_deployment_candidate", prepare_or_reject
@@ -1170,7 +1171,7 @@ def test_scenario_load_partial_contained_install_keeps_the_claim(
     def broken_install(*_args, **_kwargs):
         raise RuntimeError("Deployment install failed")
 
-    monkeypatch.setattr(state, "_manager_current", lambda _status: (
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: (
         "current-bundle", "current-graph", "manager-epoch"
     ))
     monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
@@ -1246,7 +1247,7 @@ def test_new_loads_the_read_only_untitled_scenario_and_save_as_places_it(
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     canonical_empty = failure != "not_closed"
     state.headless_client = type("Manager", (), {"manager_status": lambda _self: {"status": {"active": {"canonical_empty": canonical_empty}}}})()  # type: ignore[assignment]
-    monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "epoch"))
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph", "epoch"))
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
     intents: list[dict] = []
@@ -2299,7 +2300,7 @@ def test_scenario_member_save_reports_the_effect_it_recorded(
 def test_load_identity_uses_owner_canonical_empty_proof(monkeypatch: pytest.MonkeyPatch, canonical_empty) -> None:
     state = ComposerState()
     status = {"status": {"active": {"canonical_empty": canonical_empty}}}
-    monkeypatch.setattr(state, "_manager_current", lambda actual: (
+    monkeypatch.setattr(state, "_manager_current", lambda actual, **_kw: (
         "bundle", "graph", "owner") if actual is status else None)
     if canonical_empty is True:
         routes_scenario_documents._require_scenario_closed(state, status)
@@ -2310,12 +2311,78 @@ def test_load_identity_uses_owner_canonical_empty_proof(monkeypatch: pytest.Monk
                                     else "scenario_load_current_configuration_unavailable")
 
 
+def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Item 40: the 503 says which check failed, where, and how old the source was."""
+
+    from manyforge_composer.backend import state as state_module
+    from manyforge_composer.backend.authoring_admission import draft_session_http_exception
+    from manyforge_composer.backend.draft_session import DraftSessionError
+
+    current = {
+        "source": {
+            "available": True, "freshness": "fresh", "known_gaps": [],
+            "receiver_age_ns": 400_000_000, "source_generation": 41,
+            "source_owner_epoch": "manager.epoch.1", "source_owner_id": "manager",
+            "projection_generation": 90,
+        },
+        "status": {"manager_ready": True, "active": {
+            "retained_bundle_id": "bundle", "graph_revision": "graph", "canonical_empty": True}},
+    }
+    stale = deepcopy(current)
+    stale["source"].update({
+        "freshness": "stale", "known_gaps": ["manager_source_stale"],
+        "receiver_age_ns": 2_600_000_000, "source_generation": 42,
+    })
+    before = state_module._MANAGER_PROJECTION_GAPS["count"]
+    # Unchanged on success; it marks the last current projection.
+    assert ComposerState._manager_current(current) == ("bundle", "graph", "manager.epoch.1")
+    with caplog.at_level("WARNING", logger=state_module.__name__):
+        with pytest.raises(DraftSessionError) as error:
+            ComposerState._manager_current(stale, phase="scenario_load.claim")
+
+    assert error.value.code == "manager_projection_unavailable"
+    assert error.value.status_code == 503
+    detail = error.value.detail
+    assert detail["phase"] == "scenario_load.claim"
+    assert detail["failed_checks"] == ["source_fresh", "no_known_gaps"]
+    assert detail["freshness"] == "stale"
+    assert detail["known_gaps"] == ["manager_source_stale"]
+    assert detail["receiver_age_ms"] == 2_600
+    assert isinstance(detail["source_last_update_unix_ms"], int)
+    assert detail["source_owner_id"] == "manager"
+    assert detail["source_generation"] == 42
+    assert detail["projection_generation"] == 90
+    assert detail["manager_ready"] is True
+    assert detail["unavailable_count"] == before + 1
+    assert isinstance(detail["since_last_current_ms"], int)
+    # One bounded log line per occurrence.
+    lines = [record for record in caplog.records if "manager_projection_unavailable" in record.getMessage()]
+    assert len(lines) == 1
+    assert len(lines[0].getMessage()) <= len("manager_projection_unavailable ") + 1_024
+    # The HTTP refusal keeps `effect: none` and carries the diagnostics.
+    http = draft_session_http_exception(error.value)
+    assert http.status_code == 503
+    assert http.detail["effect"] == "none"
+    assert http.detail["context"] == detail
+
+    # No source at all: every check is named, nothing raises while reporting it.
+    with pytest.raises(DraftSessionError) as missing:
+        ComposerState._manager_current({}, phase="activation.after_preparation")
+    assert missing.value.detail["failed_checks"] == [
+        "source_available", "source_fresh", "no_known_gaps",
+        "source_owner_epoch", "manager_ready", "active_identity",
+    ]
+    assert missing.value.detail["receiver_age_ms"] is None
+
+
 def test_load_of_the_applied_scenario_requires_close_first(monkeypatch: pytest.MonkeyPatch) -> None:
     """No same-Scenario reload shortcut: Load of the applied Scenario's own
     project is refused before Close exactly like a different Scenario."""
     state = ComposerState()
     status = {"status": {"active": {"canonical_empty": False}}}
-    monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "owner"))
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph", "owner"))
     monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {"scenario_id": "cell"}})
     monkeypatch.setattr(state, "_manager_published_matches_scenario", lambda _status, _publication: True)
     with pytest.raises(ScenarioArtifactError) as error:
@@ -2525,3 +2592,79 @@ def test_every_repository_example_lists_and_loads_by_its_folder_name() -> None:
     names = [row["folder_name"] for row in entries]
     assert len(set(names)) == len(names)
     assert {"ur5_pick_and_place", "ur5_pick_and_place_minimal"} <= set(names)
+
+
+def _gripper_closes(nodes: list[dict]) -> list[dict]:
+    found = []
+    for node in nodes:
+        parameters = node.get("parameters", {})
+        if (
+            node.get("node_id") == "gripper.command_position"
+            and parameters.get("position", {}).get("name") == "closed"
+        ):
+            found.append(parameters)
+        found.extend(_gripper_closes(node.get("children", [])))
+    return found
+
+
+def test_grasp_confirmed_example_requires_confirmation_on_its_mounted_tool() -> None:
+    # The split-form grasp confirmation example is lite6_pneumatic_mock with
+    # the policy on the tool's gripper row and no Close required inputs.
+    root = Path(__file__).resolve().parents[2]
+    examples = root / "examples"
+    _directory, entries = discover_scenario_artifacts(
+        str(examples), allowed_roots=[str(root)], manyforge_version="development",
+    )
+    rows = {row["folder_name"]: row for row in entries}
+    row = rows["lite6_pneumatic_grasp_confirmed_mock"]
+    assert row["display_status"] != "unsupported", row
+    document, _ = load_scenario_artifact(row["path"], allowed_roots=[str(root)])
+    base, _ = load_scenario_artifact(
+        rows["lite6_pneumatic_mock"]["path"], allowed_roots=[str(root)]
+    )
+
+    deployment = document["deployment_draft"]
+    components = {item["component_id"]: item for item in deployment["components"]}
+    tool = components["lite_gripper"]
+    assert tool["component_profile_id"] == "lite_gripper_pneumatic_v0"
+    assert "root_pose_in_cell" not in tool
+    assert deployment["attachments"] == [
+        {
+            "child": {"component_id": "lite_gripper", "interface": "mount"},
+            "parent": {"component_id": "lite6_robot", "interface": "flange"},
+        }
+    ]
+    assert "gripper_target_configurations" not in (
+        components["lite6_robot"]["configuration"]["runtime_configuration"]
+    )
+    (gripper,) = tool["configuration"]["runtime_configuration"][
+        "gripper_target_configurations"
+    ]
+    assert gripper["controllable_component_id"] == "lite_gripper"
+    assert gripper["grasp_confirmation"] == {"policy": "required"}
+    assert gripper["pneumatic_io"]["inputs"]["workpiece_grasped"]["signal"] == {
+        "controllable_component_id": "gripper_io",
+        "signal_name": "workpiece_grasped",
+    }
+    assert {
+        "component_role_id": "tool",
+        "controllable_component_id": "lite_gripper",
+    } in document["program_role_assignment"]["component_roles"]
+
+    # Apart from the policy and its names, the cell is the plain Mock example.
+    expected = deepcopy(base["deployment_draft"])
+    expected_tool = next(
+        item for item in expected["components"] if item["component_id"] == "lite_gripper"
+    )
+    expected_tool["configuration"]["runtime_configuration"][
+        "gripper_target_configurations"
+    ][0]["grasp_confirmation"] = {"policy": "required"}
+    for field in ("deployment_artifact_id", "name", "description"):
+        expected[field] = deployment[field]
+    assert deployment == expected
+    assert document["program_role_assignment"] == base["program_role_assignment"]
+
+    (close,) = _gripper_closes(document["program_draft"]["forest"])
+    assert "required_inputs" not in close
+    (base_close,) = _gripper_closes(base["program_draft"]["forest"])
+    assert base_close["required_inputs"] == [{"input": "workpiece_grasped", "value": True}]

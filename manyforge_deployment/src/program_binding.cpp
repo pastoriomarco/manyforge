@@ -21,6 +21,7 @@
 #include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_core/types/collision_world_snapshot.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/cell_kinematic_index.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "program_binding_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
@@ -402,8 +403,18 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
                      "target_role_bindings.controllable_component_id");
     require_identity(target.command_target_id.value(),
                      "target_role_bindings.command_target_id");
+    if (target.default_tcp.has_value()) {
+      require_identity(target.default_tcp->component_id.value(),
+                       "target_role_bindings.default_tcp.component_id");
+      require_identity(target.default_tcp->target_id.value(),
+                       "target_role_bindings.default_tcp.target_id");
+      require_identity(target.default_tcp->frame_role_id.value(),
+                       "target_role_bindings.default_tcp.frame_role_id");
+    }
     if (target.frame_role_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
+        (target.robot_tcps &&
+         target.robot_tcps->size() > core::kMaxProgramNestedRoleBindings) ||
         target.resource_role_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
         target.signal_role_bindings.size() >
@@ -413,6 +424,41 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
         target.capability_bindings.size() >
             core::kMaxProgramCapabilityBindings) {
       fail("target nested binding table exceeds fixed bound");
+    }
+
+    if (target.robot_tcps) {
+      for (auto& tcp : *target.robot_tcps) {
+        require_identity(tcp.entry.component_id.value(),
+                         "robot_tcps.entry.component_id");
+        require_identity(tcp.entry.target_id.value(),
+                         "robot_tcps.entry.target_id");
+        require_identity(tcp.entry.frame_role_id.value(),
+                         "robot_tcps.entry.frame_role_id");
+        require_identity(tcp.frame.frame_role_id.value(),
+                         "robot_tcps.frame.frame_role_id");
+        require_identity(tcp.frame.model_instance_id.value(),
+                         "robot_tcps.frame.model_instance_id");
+        require_digest(tcp.frame.model_revision.value(),
+                       "robot_tcps.frame.model_revision");
+        require_text(tcp.frame.compiled_frame_name,
+                     "robot_tcps.frame.compiled_frame_name");
+        if (tcp.entry.frame_role_id != tcp.frame.frame_role_id ||
+            tcp.frame.contact_body_role_ids.size() >
+                core::kMaxProgramNestedRoleBindings) {
+          fail("robot TCP entry/frame correspondence is malformed");
+        }
+        for (const auto& role : tcp.frame.contact_body_role_ids)
+          require_identity(role.value(), "robot_tcps.frame.contact_body_role_ids");
+        sort_unique(tcp.frame.contact_body_role_ids,
+                    [](const auto& role) { return role; },
+                    "robot_tcps.frame.contact_body_role_ids");
+      }
+      sort_unique(*target.robot_tcps,
+                  [](const auto& row) {
+                    return std::tie(row.entry.component_id, row.entry.target_id,
+                                    row.entry.frame_role_id);
+                  },
+                  "robot_tcps");
     }
 
     if (target.pneumatic_io) {
@@ -1098,7 +1144,8 @@ template <typename StrongType>
                     "controllable_component_id", "command_target_id",
                     "frame_role_bindings", "resource_role_bindings",
                     "collision_body_role_bindings", "capability_bindings"},
-                   {"signal_role_bindings", "pneumatic_io"}, path);
+                   {"signal_role_bindings", "pneumatic_io", "robot_tcps",
+                    "default_tcp"}, path);
 
     std::vector<core::ProgramFrameRoleBindingDTO> frames;
     const std::string frames_path = child_path(path, "frame_role_bindings");
@@ -1379,6 +1426,95 @@ template <typename StrongType>
       }
       pneumatic_io = std::move(decoded);
     }
+
+    std::optional<std::vector<core::ProgramRobotTcpBindingDTO>> robot_tcps;
+    if (const auto *supplied = find_member(target, "robot_tcps")) {
+      robot_tcps.emplace();
+      const auto tcps_path = child_path(path, "robot_tcps");
+      const auto &values = require_array(*supplied, tcps_path);
+      if (values.size() > core::kMaxProgramNestedRoleBindings)
+        fail(tcps_path + ": exceeds fixed bound");
+      robot_tcps->reserve(values.size());
+      for (std::size_t tcp_index = 0U; tcp_index < values.size(); ++tcp_index) {
+        const auto tcp_path = index_path(tcps_path, tcp_index);
+        const auto &tcp = require_object(values[tcp_index], tcp_path);
+        require_exact_fields(tcp,
+                             {"entry", "frame", "end_effector",
+                              "component_default"},
+                             tcp_path);
+        const auto entry_path = child_path(tcp_path, "entry");
+        const auto &entry = require_object(
+            require_member(tcp, "entry", tcp_path), entry_path);
+        require_exact_fields(entry,
+                             {"component_id", "target_id", "frame_role_id"},
+                             entry_path);
+        const core::TcpEntryDTO decoded_entry{
+            parse_identity<core::ControllableComponentId>(
+                require_member(entry, "component_id", entry_path),
+                child_path(entry_path, "component_id")),
+            parse_identity<core::CommandTargetId>(
+                require_member(entry, "target_id", entry_path),
+                child_path(entry_path, "target_id")),
+            parse_identity<core::FrameRoleId>(
+                require_member(entry, "frame_role_id", entry_path),
+                child_path(entry_path, "frame_role_id"))};
+
+        const auto frame_path = child_path(tcp_path, "frame");
+        const auto &frame = require_object(
+            require_member(tcp, "frame", tcp_path), frame_path);
+        require_fields(frame,
+                       {"frame_role_id", "model_instance_id", "model_revision",
+                        "compiled_frame_name"},
+                       {"contact_body_role_ids"}, frame_path);
+        std::vector<core::CollisionBodyRoleId> contact_body_role_ids;
+        if (const auto *body_roles = find_member(frame, "contact_body_role_ids"))
+          contact_body_role_ids = parse_identity_array<core::CollisionBodyRoleId>(
+              *body_roles, child_path(frame_path, "contact_body_role_ids"),
+              false);
+        const core::ProgramFrameRoleBindingDTO decoded_frame{
+            parse_identity<core::FrameRoleId>(
+                require_member(frame, "frame_role_id", frame_path),
+                child_path(frame_path, "frame_role_id")),
+            parse_identity<core::ModelInstanceId>(
+                require_member(frame, "model_instance_id", frame_path),
+                child_path(frame_path, "model_instance_id")),
+            parse_digest<core::ModelRevision>(
+                require_member(frame, "model_revision", frame_path),
+                child_path(frame_path, "model_revision")),
+            require_string(
+                require_member(frame, "compiled_frame_name", frame_path),
+                child_path(frame_path, "compiled_frame_name")),
+            std::move(contact_body_role_ids)};
+        const auto &end_effector =
+            require_member(tcp, "end_effector", tcp_path);
+        const auto &component_default =
+            require_member(tcp, "component_default", tcp_path);
+        if (!end_effector.is_bool() || !component_default.is_bool())
+          fail(tcp_path + ": TCP marks must be boolean");
+        robot_tcps->push_back(core::ProgramRobotTcpBindingDTO{
+            decoded_entry, decoded_frame, end_effector.as_bool(),
+            component_default.as_bool()});
+      }
+    }
+
+    std::optional<core::TcpEntryDTO> default_tcp;
+    if (const auto *supplied = find_member(target, "default_tcp")) {
+      const auto entry_path = child_path(path, "default_tcp");
+      const auto &entry = require_object(*supplied, entry_path);
+      require_exact_fields(entry,
+                           {"component_id", "target_id", "frame_role_id"},
+                           entry_path);
+      default_tcp = core::TcpEntryDTO{
+          parse_identity<core::ControllableComponentId>(
+              require_member(entry, "component_id", entry_path),
+              child_path(entry_path, "component_id")),
+          parse_identity<core::CommandTargetId>(
+              require_member(entry, "target_id", entry_path),
+              child_path(entry_path, "target_id")),
+          parse_identity<core::FrameRoleId>(
+              require_member(entry, "frame_role_id", entry_path),
+              child_path(entry_path, "frame_role_id"))};
+    }
     targets.push_back(core::ProgramTargetRoleBindingDTO{
         parse_identity<core::TargetRoleId>(
             require_member(target, "target_role_id", path),
@@ -1398,6 +1534,8 @@ template <typename StrongType>
         std::move(capabilities),
         std::move(signals),
         std::move(pneumatic_io),
+        std::move(robot_tcps),
+        std::move(default_tcp),
     });
   }
 
@@ -1830,21 +1968,44 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
     }
 
     for (const auto& frame_binding : target_binding.frame_role_bindings) {
-      const auto* frame = find_exactly_one<CompositionTargetFrameResolution>(
-          target->frames, [&](const auto& candidate) {
-            return candidate.frame_role_id == frame_binding.frame_role_id;
-          });
+      const auto* frame = find_target_frame_role(*target, frame_binding.frame_role_id);
       const auto* resolved =
           frame == nullptr
               ? nullptr
               : std::get_if<CompositionComponentModelFrame>(&frame->frame);
       if (resolved == nullptr ||
-          resolved->controllable_component_id !=
-              target_binding.controllable_component_id ||
+          !retained_model_map.kinematic_index().carries(
+              target_binding.controllable_component_id,
+              resolved->controllable_component_id) ||
           resolved->model_instance_id != frame_binding.model_instance_id ||
           resolved->model_revision != frame_binding.model_revision ||
           resolved->compiled_frame_name != frame_binding.compiled_frame_name) {
         fail("frame-role binding differs from the retained model map");
+      }
+    }
+
+    if (target_binding.robot_tcps) {
+      for (const auto& tcp : *target_binding.robot_tcps) {
+        const auto* owner = find_component(graph, tcp.entry.component_id);
+        const auto* owner_target = retained_model_map.find_target(
+            tcp.entry.component_id, tcp.entry.target_id);
+        const auto* owner_frame =
+            owner_target == nullptr
+                ? nullptr
+                : find_target_frame_role(*owner_target,
+                                         tcp.entry.frame_role_id);
+        const auto* resolved =
+            owner_frame == nullptr
+                ? nullptr
+                : std::get_if<CompositionComponentModelFrame>(
+                      &owner_frame->frame);
+        if (owner == nullptr || resolved == nullptr ||
+            resolved->controllable_component_id != tcp.entry.component_id ||
+            resolved->model_instance_id != tcp.frame.model_instance_id ||
+            resolved->model_revision != tcp.frame.model_revision ||
+            resolved->compiled_frame_name != tcp.frame.compiled_frame_name) {
+          fail("robot TCP frame differs from its exact retained owner target");
+        }
       }
     }
 
@@ -2222,6 +2383,45 @@ CanonicalValue program_binding_projection(
           {"outputs", CanonicalValue(std::move(outputs))},
           {"inputs", CanonicalValue(std::move(inputs))}}));
     }
+    if (target.robot_tcps) {
+      CanonicalValue::Array tcps;
+      tcps.reserve(target.robot_tcps->size());
+      for (const auto& tcp : *target.robot_tcps) {
+        CanonicalValue::Object frame{
+            {"frame_role_id", CanonicalValue(tcp.frame.frame_role_id.value())},
+            {"model_instance_id",
+             CanonicalValue(tcp.frame.model_instance_id.value())},
+            {"model_revision", CanonicalValue(tcp.frame.model_revision.value())},
+            {"compiled_frame_name",
+             CanonicalValue(tcp.frame.compiled_frame_name)},
+        };
+        if (!tcp.frame.contact_body_role_ids.empty())
+          frame.emplace_back("contact_body_role_ids",
+                             strong_array<core::CollisionBodyRoleId>(
+                                 tcp.frame.contact_body_role_ids));
+        tcps.emplace_back(CanonicalValue::Object{
+            {"entry", CanonicalValue(CanonicalValue::Object{
+                          {"component_id",
+                           CanonicalValue(tcp.entry.component_id.value())},
+                          {"target_id", CanonicalValue(tcp.entry.target_id.value())},
+                          {"frame_role_id",
+                           CanonicalValue(tcp.entry.frame_role_id.value())}})},
+            {"frame", CanonicalValue(std::move(frame))},
+            {"end_effector", CanonicalValue(tcp.end_effector)},
+            {"component_default", CanonicalValue(tcp.component_default)},
+        });
+      }
+      target_projection.emplace_back("robot_tcps",
+                                     CanonicalValue(std::move(tcps)));
+    }
+    if (target.default_tcp.has_value())
+      target_projection.emplace_back(
+          "default_tcp", CanonicalValue(CanonicalValue::Object{
+              {"component_id",
+               CanonicalValue(target.default_tcp->component_id.value())},
+              {"target_id", CanonicalValue(target.default_tcp->target_id.value())},
+              {"frame_role_id",
+               CanonicalValue(target.default_tcp->frame_role_id.value())}}));
     targets.emplace_back(std::move(target_projection));
   }
 
@@ -2380,6 +2580,12 @@ std::shared_ptr<const ProgramBinding> reload_verified_program_binding(
   } catch (const std::exception& error) {
     fail(std::string("program binding verification failed: ") + error.what());
   }
+}
+
+const CompositionTargetFrameResolution* find_target_frame_role(
+    const CompositionTargetResolution& target, const core::FrameRoleId& role) {
+  return find_exactly_one<CompositionTargetFrameResolution>(
+      target.frames, [&](const auto& frame) { return frame.frame_role_id == role; });
 }
 
 bool verify_program_binding_identity(const ProgramBinding& binding) noexcept {

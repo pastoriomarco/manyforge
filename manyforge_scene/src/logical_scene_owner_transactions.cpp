@@ -587,6 +587,7 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                                                      normalized.pose_in_cell},
               std::nullopt,
               std::move(support_contacts),
+              operation.mass_kg,
           };
           const bool unchanged = exists && *found == object;
           if (exists) {
@@ -802,20 +803,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                 "carrier target resolved to another component",
                 {{"reason", "carrier_frame_resolution_foreign"}});
           }
-          auto expected_revisions =
-              operation.expected_component_attachment_revisions;
-          if (!std::is_sorted(expected_revisions.begin(),
-                              expected_revisions.end()) ||
-              std::adjacent_find(expected_revisions.begin(),
-                                 expected_revisions.end()) !=
-                  expected_revisions.end() ||
-              expected_revisions !=
-                  frame_resolution->component_attachment_revisions) {
-            throw SceneRequestRejectionError(
-                "stale_revision",
-                "carrier structural-attachment precondition failed",
-                {{"reason", "carrier_attachment_revision_mismatch"}});
-          }
+          // The carrier frame resolves against the current structural
+          // attachments; expected_component_attachment_revisions is ignored.
           auto touch_roles = operation.touch_body_roles;
           if (std::any_of(touch_roles.begin(), touch_roles.end(),
                           [](const auto &role) { return role.empty(); }) ||
@@ -1067,19 +1056,9 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
           policy_changed = true;
         } else {
           topology_changed = false;
+          // Last arrival wins: expected_configured_policy_revision is
+          // ignored and the edit replaces the current configured policy.
           const auto &current_policy = current.configured_collision_policy;
-          if (operation.expected_configured_policy_revision.revision_id !=
-                  current_policy.revision.revision_id ||
-              operation.expected_configured_policy_revision.content_hash !=
-                  current_policy.revision.content_hash) {
-            throw SceneRequestRejectionError(
-                "stale_revision",
-                "configured collision-policy precondition failed",
-                {{"expected_collision_policy_revision",
-                  operation.expected_configured_policy_revision.content_hash},
-                 {"current_collision_policy_revision",
-                  current_policy.revision.content_hash}});
-          }
           if (!operation.configured_policy.allowed_static_static_pairs
                    .empty() ||
               !operation.configured_policy.allowed_touch_link_pairs.empty() ||
@@ -2143,26 +2122,28 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
                     "Logical-scene bootstrap is not finalized",
                     {{"reason", "scene_candidate_snapshot_unavailable"}});
     }
-    if (request.request_context.request_owner_epoch !=
-        observed_transactions->request_owner_epoch) {
-      return reject("stale_request_owner_epoch",
-                    "Candidate scene request names a stale owner epoch",
-                    {{"expected_request_owner_epoch",
-                      observed_transactions->request_owner_epoch.value()}});
-    }
     const auto access = AccessStatus(observed_state);
     if (!access.scene_writes_open) {
       return reject("live_scene_snapshot_unavailable",
                     "Logical-scene projection is unavailable or changing",
                     {{"reason", "scene_candidate_writes_fenced"}});
     }
-    if (request.expected_projection_revision !=
-        *observed_state.active_projection) {
+    if (!ExpectedProjectionAdmitsActive(request,
+                                        *observed_state.active_projection)) {
       return reject("stale_revision",
-                    "Candidate scene request does not name the active "
-                    "projection",
+                    "Candidate scene request names another Deployment or "
+                    "Scene",
                     {{"reason", "scene_candidate_projection_stale"}});
     }
+  }
+  // A request may name any revision of this Scene; the candidate resolves
+  // against the active revision, like Commit.
+  auto active_preview = preview;
+  active_preview.request.expected_projection_revision =
+      *observed_state.active_projection;
+  if (active_preview.frame_resolution.has_value()) {
+    active_preview.frame_resolution->projection_binding.projection_revision =
+        *observed_state.active_projection;
   }
 
   std::vector<RequiredSceneProjection> projections;
@@ -2195,7 +2176,7 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
   }
 
   return BuildResolvedSceneCandidatePreview(
-      preview, *observed_state.active_projection,
+      active_preview, *observed_state.active_projection,
       std::make_shared<const LogicalSceneSnapshotDTO>(*observed_state.active_scene_snapshot),
       observed_transactions->next_transaction_sequence,
       [&](const LogicalSceneSnapshotDTO &candidate) {
@@ -2393,11 +2374,13 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
         }
       }
       Transaction compaction(database, "BEGIN IMMEDIATE");
+      // Commit is the only writer and holds the owner mutex, so another
+      // write here is a store integrity failure, not a stale request.
       if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
         impl_->InvalidateSceneCommitState();
-        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                      "stale_revision",
-                      "logical-scene state changed before history compaction");
+        throw LogicalSceneOwnerIntegrityError(
+            "logical-scene database changed outside its owner before history "
+            "compaction");
       }
       impl_->InvalidateSceneCommitState();
       CompactSceneTransactionHistory(database, observed_state,
@@ -2523,9 +2506,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
             request.request_context.request_id)
             .has_value()) {
       impl_->InvalidateSceneCommitState();
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "stale_revision",
-                    "logical-scene state changed before durable acceptance");
+      throw LogicalSceneOwnerIntegrityError(
+          "logical-scene database changed outside its owner before durable "
+          "acceptance");
     }
     impl_->InvalidateSceneCommitState();
     InsertSceneIntent(database, request, request_digest, request_json,
@@ -2692,8 +2675,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   observed_transactions->unresolved_transaction_sequence.reset();
   observed_transactions->latest_uncertain_transaction_sequence.reset();
   if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
-    throw LogicalSceneOwnerConflictError(
-        "logical-scene database changed while completing a scene commit");
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene database changed outside its owner while completing a "
+        "scene commit");
   }
   impl_->StoreSceneCommitState(observed_state, observed_transactions,
                                external_data_version);

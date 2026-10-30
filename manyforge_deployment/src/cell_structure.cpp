@@ -2,6 +2,8 @@
 
 #include "manyforge_deployment/cell_composition.hpp"
 
+#include <manyforge_core/types/typed_error.hpp>
+
 #include <algorithm>
 #include <cstdint>
 #include <map>
@@ -19,6 +21,9 @@ namespace {
 
 using AssetKey = std::pair<std::string, std::string>;
 using ComponentTypeKey = std::pair<std::string, std::string>;
+
+// The component-type tag of a tool (the flange interfaces accept it).
+constexpr std::string_view kToolTag = "tool";
 
 [[noreturn]] void fail(std::string message) {
   throw CellCompositionError(std::move(message));
@@ -177,7 +182,7 @@ struct RoleContext final {
       [](const core::ModelFrameRoleBindingDTO& value)
           -> const core::FrameRoleId& { return value.frame_role_id; },
       "frame role", asset);
-  return {role.occurrence, frame_role_id, binding.source_link_name};
+  return {role.occurrence, frame_role_id, core::frame_role_link_name(binding)};
 }
 
 void require_asset_root(
@@ -196,7 +201,8 @@ void require_asset_root(
     const core::ComponentTypeCommandTargetDTO& target,
     const std::map<std::string, RoleContext, std::less<>>& roles) {
   StructuralCommandTargetResolution result{
-      target.command_target_id, {}, {}, {}, {}};
+      target.command_target_id, {}, {}, {}, {},
+      target.default_tcp_frame_role_id};
 
   result.model_groups.reserve(target.model_group_roles.size());
   for (const auto& group : target.model_group_roles) {
@@ -521,6 +527,11 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
 
   using EndpointKey = std::pair<std::string, std::string>;
   std::map<EndpointKey, std::uint64_t> endpoint_use_count;
+  // B5 (C-P1): per parent interface, the tools (components tagged `tool`),
+  // all primary marks, and the primary marks on tools.
+  std::map<EndpointKey, std::uint64_t> tool_count;
+  std::map<EndpointKey, std::uint64_t> primary_count;
+  std::map<EndpointKey, std::uint64_t> tool_primary_count;
   std::vector<StructuralAttachmentResolution> attachments;
   attachments.reserve(graph.component_attachments.size());
   for (const auto& attachment : graph.component_attachments) {
@@ -575,6 +586,12 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
       fail("attachment child interface '" + child_key.second +
            "' exceeds its declared capacity");
     }
+    const auto& child_tags = child_component->second->component_tags;
+    const bool tool = std::find(child_tags.begin(), child_tags.end(),
+                                kToolTag) != child_tags.end();
+    if (tool) ++tool_count[parent_key];
+    if (attachment.primary) ++primary_count[parent_key];
+    if (tool && attachment.primary) ++tool_primary_count[parent_key];
 
     attachments.push_back(
         {attachment.component_attachment_id,
@@ -584,6 +601,23 @@ StructurallyQualifiedCellGraph qualify_cell_structure(
          {attachment.child.controllable_component_id,
           attachment.child.attachment_interface_id, child_interface.frame},
          attachment.child_interface_pose_in_parent_interface});
+  }
+  // B5 (C-P1): two or more tools on one parent interface need exactly one
+  // primary mark there, on one of the tools. Other components sharing the
+  // interface (a camera without the `tool` tag) need none.
+  for (const auto& [parent_key, tools] : tool_count) {
+    const auto primaries = primary_count[parent_key];
+    if (tools > 1U &&
+        (primaries != 1U || tool_primary_count[parent_key] != 1U)) {
+      // Typed: the GUI explains it by its catalog code; the text is unchanged.
+      throw core::TypedError(
+          "mount_primary_tool_required",
+          "mount_primary_tool_required: interface '" + parent_key.second +
+              "' of component '" + parent_key.first + "' carries " +
+              std::to_string(tools) + " tools and " +
+              std::to_string(primaries) +
+              " primary; mark exactly one tool as primary");
+    }
   }
 
   std::vector<const SourceVerifiedModelAsset*> ordered_assets;

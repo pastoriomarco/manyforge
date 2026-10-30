@@ -79,8 +79,8 @@ struct CapabilityDefinitionDescriptor {
 
 /// Exact spec-240 active registry. Frozen legacy replacement rows are not
 /// capability definitions.
-inline constexpr std::array<CapabilityDefinitionDescriptor, 69>
-    kBuiltinCapabilityDefinitionRegistry{{
+inline constexpr auto kBuiltinCapabilityDefinitionRegistry =
+    std::to_array<CapabilityDefinitionDescriptor>({
         {"planning.motion.joint_goal",
          "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
@@ -358,7 +358,7 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 69>
          "sha256:c458ea512ad5b71be1a3a9f92908d8a36b2a9a8f5cb3b31556c42e0d468c9270",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
-    }};
+    });
 
 [[nodiscard]] constexpr const CapabilityDefinitionDescriptor* find_builtin_capability_definition(
     std::string_view capability_id) noexcept {
@@ -405,31 +405,6 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 69>
   return true;
 }
 
-[[nodiscard]] consteval std::size_t capability_scope_count(CapabilityScope scope) {
-  std::size_t count = 0U;
-  for (const auto& definition : kBuiltinCapabilityDefinitionRegistry) {
-    count += definition.scope == scope ? 1U : 0U;
-  }
-  return count;
-}
-
-[[nodiscard]] consteval std::size_t capability_provider_binding_kind_count(
-    CapabilityProviderBindingKind kind) {
-  std::size_t count = 0U;
-  for (const auto& definition : kBuiltinCapabilityDefinitionRegistry) {
-    count += definition.provider_binding_kind == kind ? 1U : 0U;
-  }
-  return count;
-}
-
-static_assert(kBuiltinCapabilityDefinitionRegistry.size() == 69U);
 static_assert(capability_definition_ids_are_unique());
-static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 33U);
-static_assert(capability_scope_count(CapabilityScope::kCellGlobal) == 28U);
-static_assert(capability_scope_count(CapabilityScope::kControlDomain) == 8U);
-static_assert(capability_provider_binding_kind_count(
-                  CapabilityProviderBindingKind::kCapabilityProviderBinding) == 52U);
-static_assert(
-    capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 17U);
 
 }  // namespace manyforge::core

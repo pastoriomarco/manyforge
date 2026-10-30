@@ -829,6 +829,56 @@ class PersistentKeyRegister:
                 )
             return removed
 
+    def reset_to_initial(
+        self,
+        project_path: str,
+        declarations: Mapping[str, BlackboardKeyDeclaration],
+        *,
+        edit: PersistentKeyEdit,
+    ) -> dict[str, Any]:
+        """Forget every stored value of the Scenario's persistent keys.
+
+        The Program Reset that reloads the initial scene: each key, whatever
+        its access, starts again from `initial:` (or empty). One write, with
+        one `reset` audit per key naming the value it had; a refused write
+        changes nothing. Returns the forgotten values by key.
+        """
+
+        _require_project(project_path)
+        persistent = {
+            key
+            for key, declaration in declarations.items()
+            if declaration.persistence == "persistent"
+        }
+        with self._lock:
+            self._reconcile_disk()
+            forgotten = {
+                key: json.loads(_canonical(row["value"]))
+                for (row_project, key), row in sorted(self._rows.items())
+                if row_project == project_path and key in persistent
+            }
+            if forgotten:
+                rows = {
+                    identity: row
+                    for identity, row in self._rows.items()
+                    if identity[0] != project_path or identity[1] not in forgotten
+                }
+                self._write(
+                    rows,
+                    self._sequence + 1,
+                    [
+                        _audit(
+                            edit,
+                            "reset",
+                            project_path,
+                            key,
+                            detail=f"Reset reloaded the initial scene; was {_canonical(value)}",
+                        )
+                        for key, value in forgotten.items()
+                    ],
+                )
+            return forgotten
+
     @property
     def sequence(self) -> int:
         """Advances with every change of any Scenario; never repeats."""

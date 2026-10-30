@@ -12,6 +12,9 @@
  * (ROS topic, xArm pin, ...) when it declares that source for the signal.
  */
 
+import type { StructuredError } from '../types/api';
+import { operatorAlarmRefusalMessage } from './operatorAlarmRefusal';
+
 export const GLOBAL_INTERRUPT_SOURCE_NOT_READY = 'global_interrupt_source_not_ready';
 export const GLOBAL_INTERRUPT_GATED = 'global_interrupt_gated';
 
@@ -59,7 +62,9 @@ export function motionWaitRefusalMessage(
     : `${PREFIX}${rule} is waiting for ${signal}, which has no fresh reading yet. Try again once it reports.`;
 }
 
-/** A presented message that is this wait, not a failure. */
-export function isMotionWaitRefusal(message: string | null | undefined): boolean {
-  return typeof message === 'string' && message.startsWith(PREFIX);
+/** Classify the owner's typed reason, never the rendered message. */
+export function isMotionWaitRefusal(error: StructuredError | null | undefined): boolean {
+  return error != null
+    && operatorAlarmRefusalMessage(error.code, error.details) === null
+    && motionWaitRefusalMessage(error.code, error.details) !== null;
 }

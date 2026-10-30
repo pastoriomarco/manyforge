@@ -94,7 +94,6 @@ def test_query_model_names_a_resource_role_only_for_io_signal() -> None:
         {"value": _value(source_sequence="07")},
         {"value": _value(quality="unknown")},
         {"value": _value(value_type="int")},
-        {"target_role_id": "other"},
         {"evaluated_at_ns": None},
         {"evaluated_at_ns": "07"},
         {"evaluated_at_ns": -1},
@@ -164,27 +163,37 @@ def test_watch_commands_use_the_ordinary_socket_and_exact_token(monkeypatch, tmp
     assert all(command["attribution"]["transport"] == "internal" for command, _ in sent)
 
 
-@pytest.mark.parametrize("mismatch", ["attempt", "run", "result"])
-def test_registration_must_identify_its_node_attempt(monkeypatch, tmp_path, mismatch) -> None:
+def test_registration_reply_must_carry_a_valid_result(monkeypatch, tmp_path) -> None:
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    registration = _registration()
-    result = _result()
-    if mismatch == "attempt":
-        registration["scope"]["node"]["node_attempt_id"] = "attempt.2"
-    elif mismatch == "run":
-        registration["scope"]["program_run_id"] = "run.2"
-    else:
-        result = {"state": "matched", "observation": _value(), "matched_sample": None}
+    result = {"state": "matched", "observation": _value(), "matched_sample": None}
     monkeypatch.setattr(
         ExecutionCommandClient,
         "_exchange_on",
         lambda *_: {
             "ok": True, "command": "register_io_watch",
-            "registration": registration, "result": result,
+            "registration": _registration(), "result": result,
         },
     )
-    with pytest.raises(HeadlessApiError):
+    with pytest.raises(HeadlessApiError) as invalid:
         transport.register_io_watch(_request())
+    assert invalid.value.code == "execution_command_response_invalid"
+
+
+def test_registration_echo_is_not_compared(monkeypatch, tmp_path) -> None:
+    """Each exchange is its own connection: the echoed scope is not compared."""
+
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+    registration = _registration()
+    registration["scope"]["node"]["node_attempt_id"] = "attempt.2"
+    monkeypatch.setattr(
+        ExecutionCommandClient,
+        "_exchange_on",
+        lambda *_: {
+            "ok": True, "command": "register_io_watch",
+            "registration": registration, "result": _result(),
+        },
+    )
+    assert transport.register_io_watch(_request())["registration"] == registration
 
 
 def test_edge_conditions_never_reach_the_socket(monkeypatch, tmp_path) -> None:
@@ -343,7 +352,7 @@ def test_scope_release_reply_must_name_its_command(monkeypatch, tmp_path) -> Non
     )
     with pytest.raises(HeadlessApiError) as invalid:
         transport.release_io_watch_scope(_scope_request())
-    assert invalid.value.code == "execution_command_response_identity_mismatch"
+    assert invalid.value.code == "execution_command_response_invalid"
 
 
 def test_matched_sample_source_epoch_is_opaque_and_its_sequence_a_counter() -> None:

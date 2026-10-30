@@ -231,3 +231,79 @@ def test_stop_refusing_second_valve_starts_fresh_attempt_and_rewrites_first():
     assert output_attempts == [(0, "attempt.0"), (0, "attempt.1"), (1, "attempt.1")]
 
 
+
+
+_PART_CHECK = {"node_id": "io.check_input",
+               "parameters": {"target_role": "io", "resource_role": "part", "expected_value": True}}
+
+
+def _confirming(node, events, check):
+    """The owner names the grasp read on the Close's own task metadata."""
+    class Confirming(_Operations):
+        def start(self, node_id, identity, inputs):
+            self.events.append(("logical", dict(inputs.parameters)))
+            return OwnerTaskSnapshot("gripper", OwnerTaskState.SUCCEEDED, metadata=(
+                {} if check is None else {"grasp_confirmation_check": check}))
+    node._port = Confirming(node._port.route, events)
+    return node
+
+
+def test_without_required_policy_close_reads_no_grasp_evidence():
+    node, events, levels, _ = _node(required=())
+    node = _confirming(node, events, None)
+    levels["part"] = False
+    _tick_until(node, lambda: node.status is py_trees.common.Status.SUCCESS)
+    assert ("read", "part") not in events
+
+
+@pytest.mark.parametrize("grasped", [True, False])
+def test_required_pneumatic_close_reads_workpiece_input_at_completion(grasped):
+    node, events, levels, _ = _node(required=())
+    node = _confirming(node, events, _PART_CHECK)
+    levels["part"] = grasped
+    _tick_until(node, lambda: node.status is not py_trees.common.Status.RUNNING)
+    # Read once, after the logical command completed and was acknowledged.
+    assert events[-1] == ("read", "part") and ("ack", "gripper") in events
+    if grasped:
+        assert node.status is py_trees.common.Status.SUCCESS
+    else:
+        assert node.status is py_trees.common.Status.FAILURE
+        assert node.failure_reason_code == "grasp_not_confirmed"
+        assert "workpiece_grasped" in node.feedback_message
+
+
+class _StatusReads:
+    def __init__(self, confirmed, events):
+        self.confirmed = confirmed
+        self.events = events
+
+    def invoke(self, node_id, identity, inputs):
+        self.events.append(("status", node_id))
+        return OwnerInvocationResult(True, metadata={"grasp_confirmed": self.confirmed})
+
+
+@pytest.mark.parametrize("confirmed,status", [
+    (True, py_trees.common.Status.SUCCESS),
+    (False, py_trees.common.Status.FAILURE),
+    (None, py_trees.common.Status.FAILURE),
+])
+def test_required_position_close_needs_stall_window_evidence(confirmed, status):
+    node, events, _, _ = _node(required=())
+    check = {"node_id": "gripper.check_status",
+             "parameters": {"target_role": "gripper", "expected_state": "reached"}}
+
+    class Position(_Operations):
+        def pneumatic_plan(self, identity, inputs):
+            return None
+
+        def start(self, node_id, identity, inputs):
+            return OwnerTaskSnapshot("gripper", OwnerTaskState.SUCCEEDED,
+                                     metadata={"grasp_confirmation_check": check})
+
+    node._port = Position(None, events)
+    node._io_signals = _StatusReads(confirmed, events)
+    _tick_until(node, lambda: node.status is not py_trees.common.Status.RUNNING)
+    assert node.status is status
+    assert events[-1] == ("status", "gripper.check_status")
+    if status is py_trees.common.Status.FAILURE:
+        assert node.failure_reason_code == "grasp_not_confirmed"

@@ -502,7 +502,8 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
             received_monotonic_ns=1,
         ),
     )
-    if case in {"current", "recovery"}:
+    # Like Stop, a Reset resolves to the operation's current revision.
+    if case in {"current", "recovery", "old_revision"}:
         assert result.disposition == "received"
         assert calls == ["projection", "effect"]
     else:

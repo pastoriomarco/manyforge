@@ -129,6 +129,7 @@ struct Options final {
 
 struct Scenario final {
   std::string_view source;
+  /// The robot's model family (its model asset id).
   std::string_view family_id;
   bool assistant_enabled;
   bool ros2_control_execution;
@@ -136,35 +137,38 @@ struct Scenario final {
   /// Q63-Q66: the offline mock controller profile replacing the native
   /// simulated executor (empty for Isaac).
   std::string_view mock_profile;
+  /// Merge 6: the family of the tool mounted on the robot's `flange` (empty
+  /// without a tool). Its lane and rows come from its maintained profile.
+  std::string_view tool_family_id{};
 };
 
-constexpr std::array<Scenario, 12U> kScenarios{{
-    {"examples/assistant_modes_scene_authoring.deployment.yaml",
-     "ur10e_robotiq_2f_140", true, true, "", "ur10e_robotiq_2f_140"},
+constexpr auto kScenarios = std::to_array<Scenario>({
+    {"examples/assistant_modes_scene_authoring.deployment.yaml", "ur10e", true,
+     true, "", "ur10e", "robotiq_2f_140"},
     {"examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6_lite_gripper", false, true, "lite6", ""},
+     "lite6", false, true, "lite6", "", "lite_gripper"},
     {"examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
-     "ur10e_robotiq_2f_140", true, true, "ur10e", ""},
+     "ur10e", true, true, "ur10e", "", "robotiq_2f_140"},
     {"examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, true, "ur10e", ""},
+     "ur10e", false, true, "ur10e", "", "robotiq_2f_140"},
     {"examples/"
      "isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, true, "ur10e", ""},
-    {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6_lite_gripper", false, true, "", "lite6_lite_gripper"},
+     "ur10e", false, true, "ur10e", "", "robotiq_2f_140"},
+    {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml", "lite6",
+     false, true, "", "lite6", "lite_gripper"},
     {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false, true,
      "", "ur5_roboplan"},
-    {"examples/pick_and_place_ur10e_robotiq.deployment.yaml",
-     "ur10e_robotiq_2f_140", false, true, "", "ur10e_robotiq_2f_140"},
-    {"examples/semantic_shape_pick.deployment.yaml", "ur5e_robotiq_2f_85", true,
-     true, "", "ur5e_robotiq_2f_85"},
-    {"examples/trocar_lite6_foundationpose_pick.deployment.yaml",
-     "lite6_lite_gripper", false, true, "lite6", ""},
-    {"examples/vision_guided_bin_pick.deployment.yaml", "ur5e_robotiq_2f_85", true,
-     true, "", "ur5e_robotiq_2f_85"},
+    {"examples/pick_and_place_ur10e_robotiq.deployment.yaml", "ur10e", false,
+     true, "", "ur10e", "robotiq_2f_140"},
+    {"examples/semantic_shape_pick.deployment.yaml", "ur5e", true, true, "",
+     "ur5e", "robotiq_2f_85"},
+    {"examples/trocar_lite6_foundationpose_pick.deployment.yaml", "lite6",
+     false, true, "lite6", "", "lite_gripper"},
+    {"examples/vision_guided_bin_pick.deployment.yaml", "ur5e", true, true, "",
+     "ur5e", "robotiq_2f_85"},
     {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true,
      true, "", "ur5_roboplan"},
-}};
+});
 
 constexpr std::array<Scenario, 1U> kComposedScenarios{{
     {"examples/ur5e_lite6_wall.deployment.yaml", "", false, true, "",
@@ -640,8 +644,7 @@ require_string_member(const deployment::CanonicalValue &root,
 }
 
 [[nodiscard]] std::vector<std::filesystem::path>
-source_files(const std::filesystem::path &directory,
-             std::optional<std::size_t> expected_count) {
+source_files(const std::filesystem::path &directory) {
   if (std::filesystem::is_symlink(directory) ||
       !std::filesystem::is_directory(directory)) {
     throw std::invalid_argument(
@@ -654,11 +657,11 @@ source_files(const std::filesystem::path &directory,
     }
   }
   std::sort(result.begin(), result.end());
-  if (expected_count.has_value() ? result.size() != *expected_count
-                                  : result.empty()) {
+  // ADR-0026: extra records are harmless; each consumer below requires what
+  // it selects, so only an empty directory is refused here.
+  if (result.empty()) {
     throw std::invalid_argument(
-        "maintained catalog directory has the wrong exact source count: " +
-        directory.string());
+        "maintained catalog directory has no sources: " + directory.string());
   }
   return result;
 }
@@ -748,11 +751,16 @@ void verify_gripper_resource_semantics(
     }
     return;
   }
+  // Merge 6: a split robot has no gripper (its mounted tool owns it, or it
+  // has none). Every component that owns a gripper target proves its finger
+  // resource.
+  std::set<core::ControllableComponentId> gripper_components;
   std::set<core::ControllableComponentId> found_components;
   for (const auto &binding : model_map.control_bindings()) {
     if (binding.command_target_id.value() != "gripper") {
       continue;
     }
+    gripper_components.insert(binding.controllable_component_id);
     const auto component = std::find_if(
         graph.controllable_components.begin(),
         graph.controllable_components.end(), [&](const auto &candidate) {
@@ -778,10 +786,10 @@ void verify_gripper_resource_semantics(
       }
     }
   }
-  if (found_components.size() != physical_components) {
+  if (found_components != gripper_components) {
     throw std::logic_error(
         "maintained deployment lacks one retained gripper resource proof per "
-        "component");
+        "gripper component");
   }
 }
 
@@ -1180,8 +1188,10 @@ void verify_resolved_program_binding(
     }
   }
   for (const auto &target : binding.value().target_role_bindings) {
-    if (target.frame_role_bindings.empty() ||
-        target.resource_role_bindings.empty() ||
+    // A target role may require no frame role (for example a gripper role
+    // used only through gripper commands, after the TCP migration drops its
+    // unused `tcp` requirement); its frame family is then legitimately empty.
+    if (target.resource_role_bindings.empty() ||
         target.collision_body_role_bindings.empty() ||
         target.capability_bindings.empty()) {
       throw std::logic_error(
@@ -1311,11 +1321,11 @@ struct MaintainedScenarioInput final {
   return deployment::CanonicalValue(std::move(identified));
 }
 
-// The closed maintained Scenario set: the thirteen described Program/Scenario
-// assignments plus the two generated UI6-I dual-robot fixtures. Other folders
-// under examples/ (for example the editable workbench Scenario) are ordinary
-// user projects and are never maintained qualification inputs.
-constexpr std::array<std::string_view, 15U> kMaintainedScenarioIds{{
+// The maintained Scenario set: the described Program/Scenario assignments plus
+// the generated UI6-I dual-robot fixtures. Each listed project must be present;
+// other folders under examples/ (for example the editable workbench Scenario)
+// are ordinary user projects and are never maintained qualification inputs.
+constexpr auto kMaintainedScenarioIds = std::to_array<std::string_view>({
     "isaac-lite6-pick-place",
     "isaac-lite6-trocar-foundationpose",
     "isaac-ur10e-light-scene",
@@ -1331,7 +1341,7 @@ constexpr std::array<std::string_view, 15U> kMaintainedScenarioIds{{
     "ur5_vision_guided_pose_pick",
     "ur5e_lite6_wall_grouped",
     "ur5e_lite6_wall_isolation",
-}};
+});
 
 [[nodiscard]] std::vector<MaintainedScenarioInput>
 load_maintained_scenario_inputs(const std::filesystem::path &root) {
@@ -1419,10 +1429,6 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
     const std::map<std::string, ScenarioProduct, std::less<>> &products,
     const std::filesystem::path &package_root) {
   const auto rows = load_maintained_scenario_inputs(root);
-  if (rows.size() != 15U || products.size() != 13U) {
-    throw std::invalid_argument(
-        "maintained Program/deployment assignment set has the wrong size");
-  }
 
   deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
   std::vector<StoredProgramBinding> stored;
@@ -1475,7 +1481,7 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
           product->first, binding->program_binding_id(),
           binding->value().program_id, binding->value().program_revision});
     }
-    if (repository.size() != 15U) {
+    if (repository.size() != rows.size()) {
       throw std::logic_error(
           "durable maintained Program-Binding repository has the wrong size");
     }
@@ -1529,12 +1535,12 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
                ? 0U
                : program_bundles.at(record->program_revision.value()).size();
   };
-  if (binding_ids.size() != 15U || program_revisions.size() != 13U ||
-      reopened.size() != 15U || program_reopened.size() != 13U ||
+  if (binding_ids.size() != rows.size() || reopened.size() != rows.size() ||
+      program_reopened.size() != program_revisions.size() ||
       reused_bundle_count("pick_and_place_ur10e_robotiq_demo") != 2U ||
       reused_bundle_count("isaac_manipulator_scene_light") != 2U) {
     throw std::logic_error(
-        "maintained Program-Binding set loses its thirteen-to-fifteen closure");
+        "maintained Program-Binding set loses its Program reuse closure");
   }
   return stored;
 }
@@ -1604,7 +1610,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 47U)) {
+       source_files(catalog_root / "capability_definition")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1622,17 +1628,13 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 26U) {
-    throw std::logic_error(
-        "maintained component closure has the wrong target-capability count");
-  }
   // One native component type per model family plus the fixed-scale ROS type
   // of every family with an Isaac or offline mock controller profile
   // (Q63-Q68), and the arm-only fixed-scale type of every family with a Real
   // profile (CP8 step 1). E1: generated per family, so no fixed count; each
-  // file is still fully qualified and the compiler requires what it selects.
-  for (const auto &path :
-       source_files(catalog_root / "component_type", std::nullopt)) {
+  // file is still fully qualified and must find every target capability it
+  // selects (a missing one is refused by its qualification).
+  for (const auto &path : source_files(catalog_root / "component_type")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
@@ -1665,7 +1667,7 @@ qualify_catalog(const std::filesystem::path &root,
 
   std::vector<deployment::QualifiedControlInterfaceContract> contracts;
   for (const auto &path :
-       source_files(catalog_root / "control_interface_contract", 2U)) {
+       source_files(catalog_root / "control_interface_contract")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ControlInterfaceContractCatalogRecordRefDTO>(
@@ -1678,8 +1680,7 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  for (const auto &path :
-       source_files(catalog_root / "controller_topology", 3U)) {
+  for (const auto &path : source_files(catalog_root / "controller_topology")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ControllerTopologyCatalogRecordRefDTO>(bytes);
@@ -1718,8 +1719,11 @@ qualify_catalog(const std::filesystem::path &root,
   bool found_ros2_control_lifecycle_manifest = false;
   bool found_xarm_ros2_control_lifecycle_manifest = false;
   bool found_xarm_ros2_control_gripper_lifecycle_manifest = false;
-  for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 12U)) {
+  // The lifecycle providers below must each be present once with their Stop
+  // contract roles. Their offer lists are not counted: the compiler refuses a
+  // capability binding no selected provider offers, and extra offers are
+  // harmless (ADR-0026).
+  for (const auto &path : source_files(catalog_root / "provider_manifest")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1740,10 +1744,6 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          // R7 package 5: the xArm catalog has only the Recover plan, so the
-          // lifecycle offers are observe and recover (no prepare/enable/disable).
-          manifest.value().offered_capabilities.size() != 11U ||
-          manifest.value().provider_contracts.size() != 2U ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
         throw std::logic_error(
@@ -1757,8 +1757,6 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 7U ||
-          manifest.value().provider_contracts.size() != 1U ||
           !has_contract_role("software_hard_stop")) {
         throw std::logic_error("maintained xArm gripper lifecycle provider "
                                "manifest is not exact");
@@ -1773,8 +1771,6 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 25U ||
-          manifest.value().provider_contracts.size() != 3U ||
           !has_contract_role("gripper_logical_cancel") ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1791,8 +1787,6 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 25U ||
-          manifest.value().provider_contracts.size() != 3U ||
           !has_contract_role("gripper_logical_cancel") ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1807,8 +1801,6 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 25U ||
-          manifest.value().provider_contracts.size() != 3U ||
           !has_contract_role("gripper_logical_cancel") ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1831,7 +1823,7 @@ qualify_catalog(const std::filesystem::path &root,
         "maintained lifecycle provider manifest closure is missing");
   }
 
-  for (const auto &path : source_files(catalog_root / "runtime_profile", 2U)) {
+  for (const auto &path : source_files(catalog_root / "runtime_profile")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::RuntimeProfileCatalogRecordRefDTO>(bytes);
@@ -1844,7 +1836,7 @@ qualify_catalog(const std::filesystem::path &root,
   }
 
   for (const auto &path :
-       source_files(catalog_root / "stop_evidence_policy", 4U)) {
+       source_files(catalog_root / "stop_evidence_policy")) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::StopEvidencePolicyCatalogRecordRefDTO>(bytes);
@@ -1992,8 +1984,7 @@ qualify_catalog(const std::filesystem::path &root,
       result.runtime_profiles.size() +
       result.stop_policies.size() + result.model_assets.size();
   if (result.records.size() != expected_record_count ||
-      result.model_assets.size() != result.structural_preparations.size() ||
-      result.runtime_profiles.size() != 2U) {
+      result.model_assets.size() != result.structural_preparations.size()) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -2009,7 +2000,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "bdf402bfa2ab540d6c3c1f4187f2dc4350477e1a550bff3a9c948d9a3e9ebb1c") {
+      "fe7a9f9c4fd516442f6f55ad2bccd073b181042beacde67a44004ef8145a7f42") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -2093,8 +2084,11 @@ void verify_scenarios(const std::filesystem::path &root,
     // Expected membership comes from independent pinned source and qualified
     // catalog inputs, never from the generated Deployment under verification.
     const auto &graph = verified.graph().graph();
-    if (graph.controllable_components.size() != 1U ||
-        graph.model_instances.size() != 1U ||
+    const bool has_tool = !scenario.tool_family_id.empty();
+    const std::size_t physical_count = has_tool ? 2U : 1U;
+    if (graph.controllable_components.size() != physical_count ||
+        graph.model_instances.size() != physical_count ||
+        graph.component_attachments.size() != physical_count - 1U ||
         graph.runtime_units.size() != 1U) {
       throw std::invalid_argument("maintained scenario has an incomplete "
                                   "component/runtime/capability closure: " +
@@ -2127,37 +2121,86 @@ void verify_scenarios(const std::filesystem::path &root,
     const auto &source_profile_id = require_text(
         require_member(*source_deployment, "runtime_restoration_profile_id",
                        "source Deployment"), "source Deployment profile");
-    const auto &component_id = graph.controllable_components.front()
-                                   .controllable_component_id.value();
+    // Components are identified by the independent source occurrences, never
+    // by their order in the generated graph.
+    const auto &component_id = require_text(
+        require_member(*source_deployment, "component_occurrence_id",
+                       "source Deployment"), "source occurrence");
+    const auto *source_tool = source_deployment->find_object_member("tool");
     if (require_text(require_member(*source_deployment, "model_family_id",
                                    "source Deployment"), "source family") !=
             scenario.family_id ||
-        require_text(require_member(*source_deployment, "component_occurrence_id",
-                                   "source Deployment"), "source occurrence") !=
-            component_id) {
+        (source_tool != nullptr) != has_tool ||
+        (has_tool &&
+         require_text(require_member(*source_tool, "model_family_id", "source tool"),
+                      "source tool family") != scenario.tool_family_id)) {
       throw std::invalid_argument("maintained source has a foreign family or occurrence");
     }
-    const deployment::CanonicalValue *source_profile = nullptr;
-    for (const auto &row : require_array(
-             require_member(description.root(), "runtime_restoration_profiles",
-                            "maintained source"), "source runtime profiles")) {
-      if (require_text(require_member(row, "runtime_restoration_profile_id",
-                                     "source profile"), "source profile ID") ==
-          source_profile_id) {
-        if (source_profile != nullptr) {
-          throw std::invalid_argument("maintained source repeats a runtime profile");
-        }
-        source_profile = &row;
+    const std::string tool_id =
+        has_tool ? require_text(require_member(*source_tool, "component_occurrence_id",
+                                               "source tool"), "source tool occurrence")
+                 : std::string{};
+    const auto graph_component = [&](std::string_view id) -> const core::ControllableComponentDTO & {
+      const auto found = std::find_if(
+          graph.controllable_components.begin(), graph.controllable_components.end(),
+          [&](const auto &row) { return row.controllable_component_id.value() == id; });
+      if (found == graph.controllable_components.end()) {
+        throw std::invalid_argument("maintained source has a foreign family or occurrence");
+      }
+      return *found;
+    };
+    static_cast<void>(graph_component(component_id));
+    if (has_tool) {
+      static_cast<void>(graph_component(tool_id));
+      // One flange->mount edge, identified by the tool, at identity.
+      const auto &edge = graph.component_attachments.front();
+      if (edge.component_attachment_id.value() != tool_id ||
+          edge.parent.controllable_component_id.value() != component_id ||
+          edge.parent.attachment_interface_id.value() != "flange" ||
+          edge.child.controllable_component_id.value() != tool_id ||
+          edge.child.attachment_interface_id.value() != "mount" ||
+          edge.child_interface_pose_in_parent_interface != core::PlacementPoseDTO{}) {
+        throw std::invalid_argument("maintained tool is not mounted on its robot's flange: " +
+                                    std::string(scenario.source));
       }
     }
-    if (source_profile == nullptr ||
-        require_text(require_member(*source_profile, "model_family_id",
-                                   "source profile"), "source profile family") !=
-            scenario.family_id) {
-      throw std::invalid_argument("maintained source has no exact runtime profile");
-    }
+    const auto find_profile = [&](std::string_view profile_id,
+                                  std::string_view family_id) -> const deployment::CanonicalValue & {
+      const deployment::CanonicalValue *selected = nullptr;
+      for (const auto &row : require_array(
+               require_member(description.root(), "runtime_restoration_profiles",
+                              "maintained source"), "source runtime profiles")) {
+        if (require_text(require_member(row, "runtime_restoration_profile_id",
+                                       "source profile"), "source profile ID") ==
+            profile_id) {
+          if (selected != nullptr) {
+            throw std::invalid_argument("maintained source repeats a runtime profile");
+          }
+          selected = &row;
+        }
+      }
+      if (selected == nullptr ||
+          require_text(require_member(*selected, "model_family_id",
+                                     "source profile"), "source profile family") !=
+              family_id) {
+        throw std::invalid_argument("maintained source has no exact runtime profile");
+      }
+      return *selected;
+    };
+    const auto *source_profile = &find_profile(source_profile_id, scenario.family_id);
     const auto &source_runtime = require_member(
         *source_profile, "ros2_control_runtime", "source profile");
+    // The gripper rows and lane of the mounted tool come from its own profile.
+    const auto &gripper_runtime =
+        has_tool ? require_member(
+                       find_profile(require_text(require_member(*source_tool,
+                                                                "runtime_restoration_profile_id",
+                                                                "source tool"),
+                                                 "source tool profile"),
+                                    scenario.tool_family_id),
+                       "ros2_control_runtime", "source tool profile")
+                 : source_runtime;
+    const std::string &gripper_owner = has_tool ? tool_id : component_id;
     const auto &source_family = unique(
         require_array(require_member(description.root(), "model_families",
                                      "maintained source"), "source families"),
@@ -2177,10 +2220,16 @@ void verify_scenarios(const std::filesystem::path &root,
                                      "source finger joints").empty();
       }
     }
-    const auto &selected_component = unique(catalog.component_types, [&](const auto &row) {
-      return row.value().component_type_id.value() ==
-             std::string(scenario.family_id) + ".fixed_scale.component";
-    }).value();
+    if (has_gripper && has_tool) {
+      throw std::invalid_argument("maintained tool needs an arm-only robot: " +
+                                  std::string(scenario.source));
+    }
+    const auto component_type = [&](std::string_view family) -> const core::ComponentTypeDTO & {
+      return unique(catalog.component_types, [&](const auto &row) {
+        return row.value().component_type_id.value() ==
+               std::string(family) + ".fixed_scale.component";
+      }).value();
+    };
     const auto definition = [&](std::string_view id) -> const core::CapabilityDefinitionDTO & {
       return unique(catalog.capabilities, [&](const auto &row) {
         return row.value().capability_id.value() == id;
@@ -2201,37 +2250,48 @@ void verify_scenarios(const std::filesystem::path &root,
     };
     using BindingKey = std::tuple<std::string, std::string, std::string>;
     std::set<BindingKey> expected_control, expected_providers;
-    std::set<std::string> expected_facilities, expected_targets;
-    for (const auto &target : selected_component.command_targets) {
-      const auto &target_id = target.command_target_id.value();
-      expected_targets.insert(target_id);
-      for (const auto &capability : target.capabilities) {
-        const auto &id = capability.capability_id.value();
-        const auto &qualified = definition(id);
-        if (qualified.scope != core::CapabilityScope::kTargetBinding ||
-            qualified.capability_definition_revision != capability.capability_definition_revision) {
-          throw std::invalid_argument("maintained source has an inexact target capability");
+    std::set<std::string> expected_facilities;
+    // The robot's and the mounted tool's component types, each with the
+    // targets its source model resources imply.
+    const auto expect_component = [&](const std::string &owner, std::string_view family,
+                                      const std::set<std::string> &source_targets) {
+      const auto &selected_component = component_type(family);
+      std::set<std::string> expected_targets;
+      for (const auto &target : selected_component.command_targets) {
+        const auto &target_id = target.command_target_id.value();
+        expected_targets.insert(target_id);
+        for (const auto &capability : target.capabilities) {
+          const auto &id = capability.capability_id.value();
+          const auto &qualified = definition(id);
+          if (qualified.scope != core::CapabilityScope::kTargetBinding ||
+              qualified.capability_definition_revision != capability.capability_definition_revision) {
+            throw std::invalid_argument("maintained source has an inexact target capability");
+          }
+          select(core::CatalogRecordKind::kCapabilityDefinition, id);
+          expected_facilities.insert(id);
+          const BindingKey key{owner, target_id, id};
+          if (qualified.provider_binding_kind == core::CapabilityProviderBindingKind::kControlBinding) {
+            expected_control.insert(key);
+          } else {
+            expected_providers.insert(key);
+          }
         }
-        select(core::CatalogRecordKind::kCapabilityDefinition, id);
-        expected_facilities.insert(id);
-        const BindingKey key{component_id, target_id, id};
-        if (qualified.provider_binding_kind == core::CapabilityProviderBindingKind::kControlBinding) {
-          expected_control.insert(key);
-        } else {
-          expected_providers.insert(key);
-        }
+        select(core::CatalogRecordKind::kControlInterfaceContract,
+               "manyforge.ros2_control_" + target_id + "_position");
+        select(core::CatalogRecordKind::kControllerTopology,
+               "manyforge.ros2_control_" + target_id + "_direct");
       }
-      select(core::CatalogRecordKind::kControlInterfaceContract,
-             "manyforge.ros2_control_" + target_id + "_position");
-      select(core::CatalogRecordKind::kControllerTopology,
-             "manyforge.ros2_control_" + target_id + "_direct");
-    }
-    const std::set<std::string> source_targets =
-        has_gripper ? std::set<std::string>{"arm", "gripper"}
-                    : std::set<std::string>{"arm"};
-    if (expected_targets != source_targets) {
-      throw std::invalid_argument("maintained component targets differ from source resources");
-    }
+      if (expected_targets != source_targets) {
+        throw std::invalid_argument("maintained component targets differ from source resources");
+      }
+      select(core::CatalogRecordKind::kComponentType, selected_component.component_type_id.value());
+      select(core::CatalogRecordKind::kModelAsset, family);
+    };
+    expect_component(component_id, scenario.family_id,
+                     has_gripper ? std::set<std::string>{"arm", "gripper"}
+                                 : std::set<std::string>{"arm"});
+    if (has_tool)
+      expect_component(tool_id, scenario.tool_family_id, {"gripper"});
     for (const auto &offer : manifest("manyforge.provider.logical_scene").offered_capabilities) {
       const auto &id = offer.capability_id.value();
       const auto &qualified = definition(id);
@@ -2251,15 +2311,13 @@ void verify_scenarios(const std::filesystem::path &root,
         select(core::CatalogRecordKind::kCapabilityDefinition, offer.capability_id.value());
       }
     }
-    select(core::CatalogRecordKind::kComponentType, selected_component.component_type_id.value());
-    select(core::CatalogRecordKind::kModelAsset, scenario.family_id);
     select(core::CatalogRecordKind::kRuntimeProfile, expected_runtime_profile_id);
     select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.ros2_control");
     select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.logical_scene");
     select(core::CatalogRecordKind::kStopEvidencePolicy, "manyforge.arm_motion_controlled_stop");
-    if (has_gripper) {
+    if (has_gripper || has_tool) {
       select(core::CatalogRecordKind::kCommandSchema, "gripper.command_position");
-      const auto &grippers = require_array(require_member(source_runtime,
+      const auto &grippers = require_array(require_member(gripper_runtime,
           "gripper_target_configurations", "source runtime"), "source grippers");
       if (grippers.size() != 1U) {
         throw std::invalid_argument("maintained source must have one exact gripper row");
@@ -2376,7 +2434,7 @@ void verify_scenarios(const std::filesystem::path &root,
           core::JsonValueDTO{2.63422544},   core::JsonValueDTO{-0.875980752},
           core::JsonValueDTO{1.551074106},  core::JsonValueDTO{-2.29231544},
           core::JsonValueDTO{-1.560498884}, core::JsonValueDTO{-2.038544566}};
-    } else if (scenario.family_id == std::string_view("lite6_lite_gripper")) {
+    } else if (scenario.family_id == std::string_view("lite6")) {
       initial_positions = {core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0},
                            core::JsonValueDTO{1.57}, core::JsonValueDTO{0.0},
                            core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0}};
@@ -2436,11 +2494,12 @@ void verify_scenarios(const std::filesystem::path &root,
     }
     core::JsonObjectDTO expected_motion_target{
         {"command_target_id", core::JsonValueDTO{std::string("arm")}},
-        {"controllable_component_id",
-         core::JsonValueDTO{graph.controllable_components.front()
-                                .controllable_component_id.value()}},
+        {"controllable_component_id", core::JsonValueDTO{component_id}},
         {"maximum_tcp_linear_speed_mps",
-         core::JsonValueDTO{*expected_target_speed_limit}}};
+         core::JsonValueDTO{*expected_target_speed_limit}},
+        // Maintained Deployments keep the materialized default.
+        {"tcp_speed_check",
+         core::JsonValueDTO{std::string("active_tcp_and_flange")}}};
       expected_runtime_configuration.emplace(
           "motion_target_limits",
           core::JsonValueDTO{core::JsonValueDTO::Array{
@@ -2451,7 +2510,7 @@ void verify_scenarios(const std::filesystem::path &root,
     const auto &actual_configuration = require_member(
         actual_units.front(), "configuration", "verified runtime unit");
     const auto *source_grippers =
-        source_runtime.find_object_member("gripper_target_configurations");
+        gripper_runtime.find_object_member("gripper_target_configurations");
     const auto *actual_grippers =
         actual_configuration.find_object_member("gripper_target_configurations");
     const auto decoded_grippers =
@@ -2469,7 +2528,7 @@ void verify_scenarios(const std::filesystem::path &root,
                                          "source gripper row"));
         for (const auto &[name, value] : require_object(row, "source gripper row")) {
           rebound.emplace_back(name, name == "controllable_component_id"
-                                         ? deployment::CanonicalValue(component_id)
+                                         ? deployment::CanonicalValue(gripper_owner)
                                          : value);
         }
         expected_grippers.emplace_back(std::move(rebound));
@@ -2486,19 +2545,35 @@ void verify_scenarios(const std::filesystem::path &root,
           deployment::detail::decode_ros2_control_execution_gripper_target_configurations(
               *rows));
     }
-    // CP9: the stream defaults are rebound exactly as the gripper rows.
+    // CP9: the stream defaults are rebound exactly as the gripper rows, the
+    // robot's and the mounted tool's each to its own component.
     {
-      deployment::CanonicalValue::Array expected_streams;
-      for (const auto &row : require_array(
-               require_member(source_runtime, "component_streams", "source runtime"),
-               "source stream rows")) {
-        deployment::CanonicalValue::Object rebound;
-        for (const auto &[name, value] : require_object(row, "source stream row")) {
-          rebound.emplace_back(name, name == "controllable_component_id"
-                                         ? deployment::CanonicalValue(component_id)
-                                         : value);
+      std::vector<std::pair<std::string, deployment::CanonicalValue>> keyed_streams;
+      const auto rebind_streams = [&](const deployment::CanonicalValue &runtime,
+                                      const std::string &owner) {
+        for (const auto &row : require_array(
+                 require_member(runtime, "component_streams", "source runtime"),
+                 "source stream rows")) {
+          deployment::CanonicalValue::Object rebound;
+          for (const auto &[name, value] : require_object(row, "source stream row")) {
+            rebound.emplace_back(name, name == "controllable_component_id"
+                                           ? deployment::CanonicalValue(owner)
+                                           : value);
+          }
+          keyed_streams.emplace_back(
+              owner + '\0' + require_text(require_member(row, "stream_id", "source stream row"),
+                                          "source stream ID"),
+              deployment::CanonicalValue(std::move(rebound)));
         }
-        expected_streams.emplace_back(std::move(rebound));
+      };
+      rebind_streams(source_runtime, component_id);
+      if (has_tool) rebind_streams(gripper_runtime, tool_id);
+      std::sort(keyed_streams.begin(), keyed_streams.end(),
+                [](const auto &left, const auto &right) { return left.first < right.first; });
+      deployment::CanonicalValue::Array expected_streams;
+      for (auto &[unused, row] : keyed_streams) {
+        static_cast<void>(unused);
+        expected_streams.push_back(std::move(row));
       }
       if (require_member(actual_configuration, "component_streams",
                          "verified runtime configuration") !=
@@ -2507,29 +2582,42 @@ void verify_scenarios(const std::filesystem::path &root,
       }
     }
     if (scenario.ros2_control_execution) {
-      const auto &component_id = graph.controllable_components.front()
-                                     .controllable_component_id.value();
-      // Q68: the component's own controller profile row.
+      // Q68: each component's own controller profile row. A mounted tool's
+      // lane is its own profile's selector (none for a lane-free tool, D4).
+      std::map<std::string, core::JsonValueDTO, std::less<>> profile_rows;
+      profile_rows.emplace(
+          component_id,
+          core::JsonValueDTO{core::JsonObjectDTO{
+              {"controllable_component_id", core::JsonValueDTO{component_id}},
+              {"frame_prefix", core::JsonValueDTO{std::string{}}},
+              {scenario.mock_profile.empty() ? "isaac_profile" : "mock_profile",
+               core::JsonValueDTO{std::string(scenario.mock_profile.empty()
+                                                  ? scenario.isaac_profile
+                                                  : scenario.mock_profile)}}}});
+      for (const std::string_view selector : {std::string_view("isaac_profile"),
+                                              std::string_view("mock_profile")}) {
+        const auto *lane = has_tool ? gripper_runtime.find_object_member(selector) : nullptr;
+        if (lane == nullptr) continue;
+        profile_rows.emplace(
+            tool_id,
+            core::JsonValueDTO{core::JsonObjectDTO{
+                {"controllable_component_id", core::JsonValueDTO{tool_id}},
+                {"frame_prefix", core::JsonValueDTO{std::string{}}},
+                {std::string(selector),
+                 core::JsonValueDTO{require_text(*lane, "source tool lane")}}}});
+      }
+      core::JsonValueDTO::Array controller_profiles;
+      for (auto &[unused, row] : profile_rows) {
+        static_cast<void>(unused);
+        controller_profiles.push_back(std::move(row));
+      }
       expected_runtime_configuration.emplace(
-          "controller_profiles",
-          core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
-              core::JsonObjectDTO{
-                  {"controllable_component_id",
-                   core::JsonValueDTO{component_id}},
-                  {"frame_prefix", core::JsonValueDTO{std::string{}}},
-                  {scenario.mock_profile.empty() ? "isaac_profile"
-                                                 : "mock_profile",
-                   core::JsonValueDTO{std::string(
-                       scenario.mock_profile.empty()
-                           ? scenario.isaac_profile
-                           : scenario.mock_profile)}}}}}});
+          "controller_profiles", core::JsonValueDTO{std::move(controller_profiles)});
       // Q37: main's authored `default_fault_stop_profile`, read directly.
       // The offline mock profiles carry the native profiles' authored values
       // unchanged: the UR10e assistant and UR5 profiles name
-      // `default_fault_spring_back` without backend confirmation, and the
-      // UR10e Robotiq profile also lists its six gripper joints.
-      const bool lite6 =
-          scenario.family_id == std::string_view("lite6_lite_gripper");
+      // `default_fault_spring_back` without backend confirmation.
+      const bool lite6 = scenario.family_id == std::string_view("lite6");
       const bool legacy_default_fault =
           scenario.source == std::string_view("examples/assistant_modes_scene_"
                                               "authoring.deployment.yaml") ||
@@ -2552,9 +2640,7 @@ void verify_scenarios(const std::filesystem::path &root,
                        "source fault profile ID") != fault_profile_id) {
         throw std::invalid_argument("maintained fault Stop identity differs from its mode");
       }
-      const bool ur10e_mock_with_fingers =
-          scenario.source == std::string_view("examples/pick_and_place_ur10e_"
-                                              "robotiq.deployment.yaml");
+      // Merge 6: the split arm profiles list arm joints only.
       std::vector<std::string_view> fault_joints;
       if (lite6) {
         fault_joints = {"joint1", "joint2", "joint3",
@@ -2563,15 +2649,6 @@ void verify_scenarios(const std::filesystem::path &root,
         fault_joints = {"elbow_joint",   "shoulder_lift_joint",
                         "shoulder_pan_joint", "wrist_1_joint",
                         "wrist_2_joint", "wrist_3_joint"};
-        if (ur10e_mock_with_fingers) {
-          fault_joints.insert(fault_joints.end(),
-                              {"finger_joint", "left_inner_finger_joint",
-                               "left_inner_knuckle_joint",
-                               "right_inner_finger_joint",
-                               "right_inner_knuckle_joint",
-                               "right_outer_knuckle_joint"});
-          std::sort(fault_joints.begin(), fault_joints.end());
-        }
       }
       core::JsonValueDTO::Array limits;
       for (const std::string_view joint : fault_joints) {
@@ -2631,7 +2708,9 @@ void verify_scenarios(const std::filesystem::path &root,
     }
 
     std::set<std::string> historical_capabilities;
-    std::optional<core::ProviderInstanceId> ros2_control_provider_instance;
+    // One physical ROS provider occurrence per component (robot, tool).
+    std::map<core::ControllableComponentId, core::ProviderInstanceId>
+        ros2_control_provider_instances;
     for (const auto &binding : graph.control_bindings) {
       historical_capabilities.insert(binding.capability_id.value());
       if (scenario.ros2_control_execution) {
@@ -2644,10 +2723,9 @@ void verify_scenarios(const std::filesystem::path &root,
               "Isaac scenario loses its commanded ROS control binding: " +
               std::string(scenario.source));
         }
-        if (!ros2_control_provider_instance.has_value()) {
-          ros2_control_provider_instance = binding.provider_instance_id;
-        } else if (*ros2_control_provider_instance !=
-                   binding.provider_instance_id) {
+        const auto [instance, inserted] = ros2_control_provider_instances.emplace(
+            binding.controllable_component_id, binding.provider_instance_id);
+        if (!inserted && instance->second != binding.provider_instance_id) {
           throw std::invalid_argument(
               "Isaac scenario splits one physical ROS provider occurrence");
         }
@@ -2676,12 +2754,17 @@ void verify_scenarios(const std::filesystem::path &root,
                                       "the logical-scene boundary: " +
                                       binding.capability_id.value());
         }
-      } else if (scenario.ros2_control_execution &&
+      } else if (const auto *target = std::get_if<
+                     core::TargetBindingCapabilityProviderTargetDTO>(&binding.target);
+                 scenario.ros2_control_execution &&
                  binding.provider_manifest_id.value() ==
                      "manyforge.provider.ros2_control" &&
-                 (!ros2_control_provider_instance.has_value() ||
+                 (target == nullptr ||
+                  !ros2_control_provider_instances.contains(
+                      target->controllable_component_id) ||
                   binding.provider_instance_id !=
-                      *ros2_control_provider_instance)) {
+                      ros2_control_provider_instances.at(
+                          target->controllable_component_id))) {
         throw std::invalid_argument(
             "Isaac planning capability does not join its physical ROS "
             "provider occurrence");
@@ -2695,36 +2778,44 @@ void verify_scenarios(const std::filesystem::path &root,
           "maintained scenario does not retain its exact source facilities: " +
           std::string(scenario.source));
     }
-    const auto &component = graph.controllable_components.front();
-    const auto &model = graph.model_instances.front();
-    const std::string expected_component_id =
-        std::string(scenario.family_id) + ".fixed_scale.component";
-    if (component.component_type_id.value() != expected_component_id ||
-        model.model_asset_id.value() != scenario.family_id) {
-      throw std::invalid_argument(
-          "maintained scenario selects the wrong shared family closure: " +
-          std::string(scenario.source));
-    }
-    const auto identity = std::pair{component.component_type_revision.value(),
-                                    model.model_revision.value()};
-    const auto [position, inserted] =
-        family_identities.emplace(expected_component_id, identity);
-    if (!inserted && position->second != identity) {
-      throw std::invalid_argument(
-          "same-profile scenarios select different component/model revisions");
-    }
-    const auto [model_position, model_inserted] = family_models.emplace(
-        std::string(scenario.family_id), model.model_revision.value());
-    if (!model_inserted &&
-        model_position->second != model.model_revision.value()) {
-      throw std::invalid_argument(
-          "same-family profiles select different models");
-    }
-  }
-  // Current maintained scenarios select four fixed-scale ROS families,
-  // including the approved UR5e Robotiq retargets.
-  if (family_identities.size() != 4U || family_models.size() != 4U) {
-    throw std::logic_error("maintained scenarios do not cover four families");
+    // Each component (robot, mounted tool) selects its family's one shared
+    // component type and model.
+    const auto record_family = [&](const std::string &owner, std::string_view family) {
+      const auto &component = graph_component(owner);
+      const auto model = std::find_if(
+          graph.model_instances.begin(), graph.model_instances.end(),
+          [&](const auto &row) {
+            return component.model_role_bindings.size() == 1U &&
+                   row.model_instance_id ==
+                       component.model_role_bindings.front().model_instance_id;
+          });
+      const std::string expected_component_id =
+          std::string(family) + ".fixed_scale.component";
+      if (model == graph.model_instances.end() ||
+          component.component_type_id.value() != expected_component_id ||
+          model->model_asset_id.value() != family) {
+        throw std::invalid_argument(
+            "maintained scenario selects the wrong shared family closure: " +
+            std::string(scenario.source));
+      }
+      const auto identity = std::pair{component.component_type_revision.value(),
+                                      model->model_revision.value()};
+      const auto [position, inserted] =
+          family_identities.emplace(expected_component_id, identity);
+      if (!inserted && position->second != identity) {
+        throw std::invalid_argument(
+            "same-profile scenarios select different component/model revisions");
+      }
+      const auto [model_position, model_inserted] = family_models.emplace(
+          std::string(family), model->model_revision.value());
+      if (!model_inserted &&
+          model_position->second != model->model_revision.value()) {
+        throw std::invalid_argument(
+            "same-family profiles select different models");
+      }
+    };
+    record_family(component_id, scenario.family_id);
+    if (has_tool) record_family(tool_id, scenario.tool_family_id);
   }
 }
 
@@ -2777,7 +2868,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
     compiled = compile_activation_deployment(
         intent, runtime_cell_id, component_profiles, prepared_models,
         catalog_records, catalog.runtime_profiles, io_types,
-        catalog.provider_manifests, assistant_profile);
+        catalog.provider_manifests, assistant_profile, catalog.component_types);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");
@@ -2888,14 +2979,9 @@ int run_maintained_example_qualification(int argc, char **argv) {
     }
     const auto bindings =
         verify_program_bindings(root, products, package.path());
-    if (bindings.size() != 15U) {
-      throw std::logic_error(
-          "maintained scenario documents lost a Program Binding");
-    }
-    std::cout
-        << "13 deployments, 5 shared families, 34 historical facilities, "
-           "15 durable Program Bindings, and 15 self-contained scenario "
-           "documents validated\n";
+    std::cout << products.size() << " deployments and " << bindings.size()
+              << " durable Program Bindings in self-contained scenario "
+                 "documents validated\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what()

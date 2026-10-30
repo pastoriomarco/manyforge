@@ -71,28 +71,25 @@ not Load a Scenario, Apply or Run.
 
 The package is produced by the maintained materializer
 `manyforge_maintained_deployment_occurrences`, built with `manyforge_deployment`.
-It requires one prepared model root for each of the five maintained robot
-families. A `manyforge_deployment` build configured with `BUILD_TESTING`
-creates them under `generated/<family>_structural` in its build directory.
-
-| Family ID | Robot and gripper |
-|---|---|
-| `lite6_lite_gripper` | UFactory Lite 6, Lite gripper |
-| `uf850_xarm_gripper` | UFactory UF850, xArm gripper |
-| `ur10e_robotiq_2f_140` | UR10e, Robotiq 2F-140 |
-| `ur5_roboplan` | UR5 (RoboPlan example model) |
-| `ur5e_robotiq_2f_85` | UR5e, Robotiq 2F-85 |
+It requires one prepared model root for each model family listed in
+`manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json`
+(`model_families`). Robots and the grippers mounted on them are separate
+families: for example `lite6` with the tool `lite_gripper`, `ur10e` with
+`robotiq_2f_140`, `ur5e` with `robotiq_2f_85`. A `manyforge_deployment`
+build configured with `BUILD_TESTING` creates every root under
+`generated/<family>_structural` in its build directory.
 
 ```bash
 PACKAGE_ROOT=/absolute/path/to/new-empty-package-root
 mkdir "$PACKAGE_ROOT"
+PREPARED=()
+for family in $(python3 -c 'import json, sys; print(" ".join(row["model_family_id"] for row in json.load(open(sys.argv[1]))["model_families"]))' \
+    "$MANYFORGE_ROOT/manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"); do
+  PREPARED+=(--prepared "$family=$GENERATED/${family}_structural")
+done
 "$MATERIALIZER" --check \
   --workspace-root "$MANYFORGE_ROOT" --package-root "$PACKAGE_ROOT" \
-  --prepared "lite6_lite_gripper=$GENERATED/lite6_lite_gripper_structural" \
-  --prepared "uf850_xarm_gripper=$GENERATED/uf850_xarm_gripper_structural" \
-  --prepared "ur10e_robotiq_2f_140=$GENERATED/ur10e_robotiq_2f_140_structural" \
-  --prepared "ur5_roboplan=$GENERATED/ur5_roboplan_structural" \
-  --prepared "ur5e_robotiq_2f_85=$GENERATED/ur5e_robotiq_2f_85_structural"
+  "${PREPARED[@]}"
 PACKAGE_SHA256=$(python3 -m manyforge_operator.package_aggregate \
   --package-root "$PACKAGE_ROOT")
 ```
@@ -244,6 +241,13 @@ itself; paths cannot be overridden. Output goes to journald: read it with
 
 ## Using Composer
 
+In the live Scene, a carried-object card offers **Detach here** while the
+Program is idle or held. Confirm "Detach <part> from <gripper> at its current
+pose?" to detach it at that pose. The action is disabled while the Program is
+running and reports a typed Scene refusal if the detach cannot be completed.
+The availability check uses the current run status; another client can start a
+Run between that check and the Scene commit.
+
 Open `http://<advertised-host>:9000/` once `start` or `status` reports
 `ready`. The Composer flow is the same as with the workbench:
 
@@ -252,16 +256,80 @@ Open `http://<advertised-host>:9000/` once `start` or `status` reports
    as a Draft. Close can proceed with a latched Stop fault when the required
    effects and teardown are confirmed: it acknowledges open component
    incidents (recorded in History), disables eligible components without a
-   recovery and stops their processes; a faulted component, or one whose
-   Disable is confirmed to have no effect, is only process-stopped. An unknown
-   output or operation effect, or another unresolved condition, refuses Close.
-   Close keeps an open cell Stop fault; **Recover cell** cannot clear that latch
-   while Close is in progress (component acknowledgements in the same press may
-   still happen). After Close, load a Scenario with the robots the fault names,
+   recovery and stops their processes; a faulted component is only
+   process-stopped. If a Disable fails, Close reads the component's current
+   state: a component left declared, disabled or faulted is process-stopped
+   and Close continues, while one still prepared, active or degraded refuses
+   Close with the reason (Force close stays available). An unknown output or
+   operation effect, or another unresolved condition, refuses Close.
+   Composer's Close first detaches every carried part at its current pose. An
+   API client that closes a Scenario itself must do the same, in order: Reset,
+   detach, then Close. The server refuses Close with
+   `scenario_close_attachment_present` while a part is still attached (see
+   `POST /api/activation-preparations` in the REST reference). Close keeps an
+   open cell Stop fault; **Recover cell** cannot clear that latch while Close
+   is in progress (component acknowledgements in the same press may still
+   happen). After Close, load a Scenario with the robots the fault names,
    then press **Recover cell** when its reported conditions, including any
    required rest proof, are satisfied (right after Load it may report that
    the configuration is not installed yet; press again shortly). No robot
    moves until then.
+
+   **Close and Recover cell.** They never run together. While **Recover
+   cell** runs, Close (also the Close that New and Load start) is disabled
+   with the reason, and the server refuses Close with
+   `recover_cell_in_progress`; while Close runs, **Recover cell** is disabled.
+   A Recover cell that does not finish can be stopped with **Abort Recover
+   cell** in the Errors panel: no later step starts, the step in progress
+   finishes or fails within its own limit, and the result lists what was done
+   (incidents acknowledged, whether the cell latch was cleared, the re-enable
+   steps per robot) and which robots were not enabled again. Close is then
+   allowed again; press **Recover cell** again to finish the recovery.
+
+   **Force close.** When Close is refused because an outcome is uncertain
+   and nothing in the cell can resolve it (for example an output whose I/O
+   device cannot be disabled and enabled again), or because a component whose
+   Disable failed is still engaged, the New or Load dialog offers **Force
+   close…**. It asks for one confirmation that lists its
+   risks, then:
+   - sends a cell **Full Stop** and waits until the Kernel confirms it. If
+     the Full Stop is not confirmed, Force close stops there with
+     `scenario_force_close_stop_unconfirmed` (`details.reason`) and changes
+     nothing else; stopping a driver process does not stop motion;
+   - retires the lifecycle targets;
+   - moves every stuck or uncertain operation into history, marked
+     `cell_force_closed_by_operator` (state intervention required, kept in
+     the Kernel journal, so a restart finds them settled, not as orphan
+     resources), and writes one History row
+     (`scenario_force_closed`) naming each operation and each output left
+     in an unknown state. If an operation's closure had an unknown outcome,
+     the cell-wide motion block it left is cleared too (the row says
+     `motion_block_cleared`); robots still need the ordinary Prepare and
+     Enable. Resources an earlier restart left as orphans are freed too,
+     their operations are kept settled in the journal, and the motion block
+     they left ends. Force close arms only after a confirmed contained Full
+     Stop; a pending predecessor Stop must settle through that existing path;
+   - runs the ordinary Reset and detaches carried objects at their current
+     pose, while the robots' processes still run. Before each detach,
+     Composer uses the latest Scene owner identity it has observed; the Scene
+     checks that identity on every detach. If the Scene restarts during Force
+     close, the remaining parts are detached and Force close completes
+     without another press.
+     If a detach is refused (for example the robot's process is already
+     dead), the part stays attached in the Scene and Force close continues
+     without the "part still attached" check;
+   - retires every component: incidents acknowledged, Disable where
+     possible, then each process stopped. A process Stop whose outcome is
+     unknown stops Force close ("Restart the workbench");
+   - then runs the empty Apply and continues with the New or Load.
+
+   Force close never commands an output: an output, valve or gripper keeps
+   whatever physical state it has, and a write already queued in a remote
+   device may still act. Check them physically before the next Run. An open
+   cell Stop fault is kept, so no robot moves until **Recover cell**, as
+   after Close. API clients use `POST /api/execution/force-close` (steps `stop`,
+   then `close_operations`, in the order above, and `end` on every exit; see
+   the REST reference).
 2. Review the Draft. **Discard** drops unapplied changes; **Revert** returns
    to the saved files.
 3. **Apply** makes the Draft the running configuration.

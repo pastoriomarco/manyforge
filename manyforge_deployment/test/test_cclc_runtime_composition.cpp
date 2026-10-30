@@ -3,6 +3,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/component_lifecycle_admission.hpp>
+#include <manyforge_core/component_lifecycle_admission_query.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -1563,17 +1564,21 @@ TEST(CCLCRuntimeComposition,
 
 class UnobservedCandidateBrandPort final : public core::IBrandLifecyclePort {
 public:
+  explicit UnobservedCandidateBrandPort(core::BrandLifecyclePlanCatalogDTO catalog)
+      : admission(std::move(catalog)) {}
   core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &) override {
     ++observations;
     return core::Result<core::BrandLifecycleObservationDTO>::Err(unsupported());
   }
+  const core::ILifecycleAdmission &Admission() const override { return admission; }
   core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &,
-           std::stop_token) override {
+           const core::LifecycleSubstepFeedbackSink &, std::stop_token) override {
     ++dispatches;
     throw std::logic_error("candidate source must never dispatch");
   }
+  core::CatalogLifecycleAdmission admission;
   unsigned observations{};
   unsigned dispatches{};
 };
@@ -1613,7 +1618,7 @@ TEST(
   const core::ResolvedLifecycleControlDomainScopeDTO scope{
       domain.control_domain_id, domain.control_domain_revision,
       core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt, {}}};
-  auto port = std::make_shared<UnobservedCandidateBrandPort>();
+  auto port = std::make_shared<UnobservedCandidateBrandPort>(catalog.value());
   const std::vector<core::BrandLifecyclePortRegistrationDTO> ports{
       {occurrence, port}};
   UnusedKernelPorts kernel;

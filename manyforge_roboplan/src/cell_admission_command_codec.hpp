@@ -39,6 +39,7 @@ TryDecodeCellAdmissionCommand(std::string_view bytes);
 CellAdmissionResponseValue(
     std::string_view command,
     const manyforge::component_manager::detail::
-        KernelCellAdmissionRpcResponse &response);
+        KernelCellAdmissionRpcResponse &response,
+    std::string_view producer = "kernel");
 
 } // namespace manyforge::roboplan_backend::detail

@@ -10,6 +10,7 @@ optional HTTP clients that own no runtime truth.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import logging
 import hashlib
 from pathlib import Path
@@ -193,6 +194,58 @@ _DEPLOYMENT_GRAPH_COMPOSITION_RECORDS = (
     "model_instances",
 )
 _LOGGER = logging.getLogger(__name__)
+# F-6b (item 40): process-lifetime diagnostics of the rare
+# `manager_projection_unavailable` refusal; they decide nothing.
+_MANAGER_PROJECTION_GAPS: dict[str, Any] = {"count": 0, "last_current_monotonic": None}
+_MAX_DIAGNOSTIC_GAPS = 8
+_MAX_DIAGNOSTIC_TEXT = 128
+_MAX_DIAGNOSTIC_LOG_LINE = 1_024
+
+
+def _manager_projection_diagnostics(
+    phase: str,
+    failed: list[str],
+    source: dict[str, Any],
+    payload: Any,
+) -> dict[str, Any]:
+    """F-6b (item 40): what one `manager_projection_unavailable` saw, bounded."""
+
+    gaps = _MANAGER_PROJECTION_GAPS
+    gaps["count"] += 1
+    last_current = gaps["last_current_monotonic"]
+    age_ns = source.get("receiver_age_ns")
+    age_ns = age_ns if isinstance(age_ns, int) and not isinstance(age_ns, bool) else None
+    known_gaps = source.get("known_gaps")
+    owner = source.get("source_owner_id")
+    return {
+        "phase": phase,
+        "failed_checks": failed,
+        "available": source.get("available"),
+        "freshness": source.get("freshness"),
+        "known_gaps": (
+            [str(gap)[:_MAX_DIAGNOSTIC_TEXT] for gap in known_gaps[:_MAX_DIAGNOSTIC_GAPS]]
+            if isinstance(known_gaps, list)
+            else None
+        ),
+        # Age of the Manager publication when Headless read it, and the
+        # publication time it implies (this host's wall clock).
+        "receiver_age_ms": None if age_ns is None else age_ns // 1_000_000,
+        "source_last_update_unix_ms": (
+            None if age_ns is None else (time.time_ns() - age_ns) // 1_000_000
+        ),
+        "source_owner_id": (
+            owner[:_MAX_DIAGNOSTIC_TEXT] if isinstance(owner, str) else None
+        ),
+        "source_generation": source.get("source_generation"),
+        "projection_generation": source.get("projection_generation"),
+        "manager_ready": payload.get("manager_ready") if isinstance(payload, dict) else None,
+        # Refusals in this process, and time since a current projection was
+        # last seen here (the length of the gap so far).
+        "unavailable_count": gaps["count"],
+        "since_last_current_ms": (
+            None if last_current is None else int((time.monotonic() - last_current) * 1000)
+        ),
+    }
 
 
 def _runtime_composition_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
@@ -219,9 +272,9 @@ def _controllable_composition_change_kinds(
 
     This deliberately uses the Deployment and graph record names owned by the
     compiler. It does not infer robot identity from names or configuration
-    strings. Source-referenced intents expose only the fields that Composer can
-    classify locally; their profile-specific configuration remains opaque and
-    needs the prepared candidate/Manager preview before it can be classified.
+    strings. On a source-referenced intent, a component's `configuration` and
+    `target_settings` are ordinary parameters: they stay in the Draft until the
+    confirmed Apply, where the Manager replaces the edited component.
     """
 
     if not isinstance(after, dict):
@@ -316,19 +369,6 @@ def _controllable_composition_change_kinds(
                 changed.add("controllable_components")
             if old.get("model_source") != new.get("model_source"):
                 changed.add("model_instances")
-            # The authoring envelope leaves profile configuration and target
-            # extensions opaque. A generic Draft edit cannot prove that one of
-            # those values is only a motion parameter rather than a controller,
-            # route or endpoint change. The dedicated typed parameter routes
-            # remain available for the known draftable controls.
-            if old.get("configuration") != new.get("configuration"):
-                return None
-            old_targets = old.get("target_settings")
-            new_targets = new.get("target_settings")
-            if not isinstance(old_targets, dict) or not isinstance(new_targets, dict):
-                return None
-            if old_targets != new_targets:
-                return None
 
         if old_attachments != new_attachments:
             changed.add("component_attachments")
@@ -1030,28 +1070,51 @@ class ComposerState:
     @staticmethod
     def _manager_current(
         status: dict[str, Any],
+        *,
+        phase: str = "unspecified",
     ) -> tuple[str, str, str]:
         source = status.get("source")
         payload = status.get("status")
         active = payload.get("active") if isinstance(payload, dict) else None
-        if (
-            not isinstance(source, dict)
-            or source.get("available") is not True
-            or source.get("freshness") != "fresh"
-            or source.get("known_gaps") != []
-            or not isinstance(source.get("source_owner_epoch"), str)
-            or not source["source_owner_epoch"]
-            or not isinstance(payload, dict)
-            or payload.get("manager_ready") is not True
-            or not isinstance(active, dict)
-            or not isinstance(active.get("retained_bundle_id"), str)
-            or not isinstance(active.get("graph_revision"), str)
-        ):
+        row = source if isinstance(source, dict) else {}
+        # The same predicates as before, named so a refusal says which failed.
+        failed = [
+            check
+            for check, current in (
+                ("source_available", row.get("available") is True),
+                ("source_fresh", row.get("freshness") == "fresh"),
+                ("no_known_gaps", row.get("known_gaps") == []),
+                (
+                    "source_owner_epoch",
+                    isinstance(row.get("source_owner_epoch"), str)
+                    and bool(row["source_owner_epoch"]),
+                ),
+                (
+                    "manager_ready",
+                    isinstance(payload, dict) and payload.get("manager_ready") is True,
+                ),
+                (
+                    "active_identity",
+                    isinstance(active, dict)
+                    and isinstance(active.get("retained_bundle_id"), str)
+                    and isinstance(active.get("graph_revision"), str),
+                ),
+            )
+            if not current
+        ]
+        if failed:
+            diagnostics = _manager_projection_diagnostics(phase, failed, row, payload)
+            _LOGGER.warning(
+                "manager_projection_unavailable %s",
+                json.dumps(diagnostics, sort_keys=True, default=str)[:_MAX_DIAGNOSTIC_LOG_LINE],
+            )
             raise DraftSessionError(
                 "manager_projection_unavailable",
                 "activation requires one fresh Manager projection",
                 status_code=503,
+                detail=diagnostics,
             )
+        _MANAGER_PROJECTION_GAPS["last_current_monotonic"] = time.monotonic()
         return (
             active["retained_bundle_id"],
             active["graph_revision"],
@@ -1364,7 +1427,9 @@ class ComposerState:
         phases["preparation_ms"] = (time.monotonic() - started) * 1000.0
         started = time.monotonic()
         status = self.headless_client.manager_status()
-        current_bundle, current_graph, manager_epoch = self._manager_current(status)
+        current_bundle, current_graph, manager_epoch = self._manager_current(
+            status, phase="activation.after_preparation"
+        )
         if intent["expected_manager_current"] != {
             "retained_bundle_id": current_bundle,
             "graph_revision": current_graph,

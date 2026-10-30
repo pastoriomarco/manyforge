@@ -608,6 +608,17 @@ void append_collision_failure_diagnostics(std::map<std::string, std::string>& de
     details["collision_result_first_failure_pair"] = collision_pair_name(first_failure_pair->pair);
     details["collision_result_first_failure_classification"] =
         collision_pair_classification_name(first_failure_pair->classification);
+    // A pair that collides only through its clearance margin keeps the
+    // validation_collision code; the classification tells it apart.
+    const auto clearance = std::find_if(
+        result.clearance_violations.begin(), result.clearance_violations.end(),
+        [&](const CollisionPairClearance& violation) {
+          return violation.pair == first_failure_pair->pair;
+        });
+    if (clearance != result.clearance_violations.end()) {
+      details["classification"] = "clearance";
+      details["signed_clearance_m"] = format_double(clearance->signed_clearance_m);
+    }
   }
   if (const auto violation = result.raw_diagnostics.find("contact_release_violation");
       violation != result.raw_diagnostics.end()) {
@@ -900,6 +911,11 @@ std::string pre_dispatch_collision_validation_message(
   }
   if (contact_release_violation == "contact_process_policy_not_implemented") {
     return with_contact_pair("Contact-process collision policy is not implemented");
+  }
+
+  if (value("classification") == "clearance") {
+    return "Trajectory comes closer than the collision clearance: " +
+           std::string(value("collision_result_first_failure_pair"));
   }
 
   const auto status = value("collision_result_engine_status");

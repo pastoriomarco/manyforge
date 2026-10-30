@@ -128,10 +128,15 @@ public:
   std::atomic<bool> delay_next_cancel{false};
   std::atomic<bool> cancel_blocked{false};
   std::atomic<bool> accepted_callback_context_valid{false};
+  ExecutionGoalTolerancePolicy goal_tolerance_policy_{
+      ExecutionGoalTolerancePolicy::kErased};
 
-  explicit Rig(bool two_bindings = false, bool scheduled_replacement = false)
+  explicit Rig(bool two_bindings = false, bool scheduled_replacement = false,
+               ExecutionGoalTolerancePolicy goal_tolerance_policy =
+                   ExecutionGoalTolerancePolicy::kErased)
       : resources("jtc_adapter_test_" + std::to_string(++sequence_), "", 2,
                   sink, "arm", clock) {
+    goal_tolerance_policy_ = goal_tolerance_policy;
     route_ = "/adapter_test_" + std::to_string(sequence_.load());
     server_ = rclcpp_action::create_server<Action>(
         resources.node(), route_ + "/fjt",
@@ -214,6 +219,7 @@ public:
     config.lane_facts.supports_scheduled_replacement = scheduled_replacement;
     config.lane_facts.has_measured_velocity = true;
     config.lane_facts.controller_update_rate_hz = 100;
+    config.lane_facts.goal_tolerance_policy = goal_tolerance_policy_;
     return config;
   }
   ExecutionPortCommandResultDTO submit(const ExecutionGoalKey &goal_key) {
@@ -702,6 +708,72 @@ TEST(JtcExecutionPort, SubmitMapsFullPvaAndReportsLocalAcceptanceAndUuid) {
   EXPECT_EQ(actual->trajectory.points[0].accelerations.size(), 2U);
   ASSERT_EQ(actual->goal_tolerance.size(), 2U);
   EXPECT_EQ(actual->goal_tolerance[0].position, -1.0);
+}
+
+// Merge 6 arrival: a lane that keeps goal tolerances sends none, so stock JTC
+// applies its configured per-joint `goal` constraint (the lane's arrival
+// tolerance) and succeeds only when finished within it.
+TEST(JtcExecutionPort, KeptGoalTolerancesSendNoOverride) {
+  Rig rig(false, false, ExecutionGoalTolerancePolicy::kKept);
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  const auto actual = rig.handle()->get_goal();
+  EXPECT_TRUE(actual->goal_tolerance.empty());
+  EXPECT_TRUE(actual->path_tolerance.empty());
+}
+
+// Maintainer M6 (reverses ARRIVE-FIX1): on a lane that keeps goal tolerances,
+// a Stop goal (ramp, spring-back, brake), immediate or scheduled, carries no
+// per-goal override and no goal time, exactly like a motion goal: stock JTC
+// applies the lane's arrival tolerance and `goal_time`. A cancel-type Stop
+// sends no goal at all.
+TEST(JtcExecutionPort, StopGoalsKeepTheLaneArrivalCheckLikeMotionGoals) {
+  const auto lane_check = [](const control_msgs::action::FollowJointTrajectory::Goal &goal) {
+    return goal.goal_tolerance.empty() && goal.path_tolerance.empty() &&
+           goal.goal_time_tolerance.sec == 0 && goal.goal_time_tolerance.nanosec == 0U;
+  };
+  Rig rig(false, true, ExecutionGoalTolerancePolicy::kKept);
+  // The fake server never ends goals: preempt each predecessor like stock JTC,
+  // so at most two goal records stay unfinished.
+  const auto preempt = [&](std::size_t index, const ExecutionGoalKey &predecessor) {
+    auto result = std::make_shared<Action::Result>();
+    result->error_code = Action::Result::INVALID_GOAL;
+    rig.handle(index)->abort(result);
+    ASSERT_TRUE(wait_until([&] {
+      const auto goal = rig.adapter->ReadGoal(predecessor);
+      return !goal || goal->result;
+    }));
+  };
+  ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(1)));
+  EXPECT_TRUE(lane_check(*rig.handle(0)->get_goal()));
+  // An ordinary motion replacement (the default purpose).
+  ASSERT_EQ(rig.adapter->Replace(key(1), key(2), trajectory()).dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(2)));
+  EXPECT_TRUE(lane_check(*rig.handle(1)->get_goal()));
+  preempt(0, key(1));
+  // A Stop replacement.
+  ASSERT_EQ(rig.adapter
+                ->Replace(key(2), key(3), trajectory())
+                .dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(3)));
+  EXPECT_TRUE(lane_check(*rig.handle(2)->get_goal()));
+  preempt(1, key(2));
+  // A scheduled Stop replacement.
+  ExecutionReplacementStartDTO start{ExecutionBindingEpoch(1U), 1'234'567'890'123LL};
+  ASSERT_EQ(rig.adapter
+                ->ReplaceScheduled(key(3), key(4), trajectory(), start)
+                .dispatch,
+            ExecutionPortDispatch::kDispatched);
+  ASSERT_TRUE(rig.accepted(key(4)));
+  EXPECT_TRUE(lane_check(*rig.handle(3)->get_goal()));
+  // A cancel-type Stop: the cancel request only, no trajectory goal.
+  const auto cancels = rig.cancel_count.load();
+  ASSERT_NE(rig.adapter->Cancel(key(4)).dispatch, ExecutionPortDispatch::kNotDispatched);
+  EXPECT_TRUE(wait_until([&] { return rig.cancel_count.load() == cancels + 1U; }));
+  EXPECT_EQ(rig.goal_count(), 4U);
 }
 
 TEST(JtcExecutionPort, RefusesInvalidPvaAndReplayedKeyBeforeEffect) {

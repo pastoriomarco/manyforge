@@ -120,5 +120,29 @@ TEST(GlobalRuleRecoveryWireTest, ResultReusesExactRuleStateAndActualCausalEncodi
       Field(Field(value, "rule"), "triggering_acquisition").storage()));
 }
 
+// Item 37: the Force close command names its step; only `arm` carries the
+// operator's Full Stop generation. Any other shape is refused before the Kernel.
+TEST(ForceCloseWireTest, DecodesBothStepsAndRefusesOtherShapes) {
+  const auto command = [](Value::Object extra) {
+    Value::Object root{{"api_version", Value(std::string(kCommandApiVersion))},
+                       {"command", Value("force_close")}};
+    for (auto &row : extra) root.emplace_back(std::move(row));
+    return content_identity::canonical_json(Value(std::move(root)));
+  };
+  const auto arm = DecodeCommand(command({{"step", Value("arm")}, {"stop_generation", Value(5.0)}}));
+  EXPECT_EQ(arm.kind, CommandKind::kForceClose);
+  EXPECT_EQ(arm.force_close_step, std::optional<std::string>("arm"));
+  ASSERT_TRUE(arm.stop_generation.has_value());
+  EXPECT_EQ(arm.stop_generation->value(), 5U);
+  const auto close = DecodeCommand(command({{"step", Value("close_operations")}}));
+  EXPECT_EQ(close.force_close_step, std::optional<std::string>("close_operations"));
+  EXPECT_FALSE(close.stop_generation.has_value());
+  EXPECT_ANY_THROW(static_cast<void>(DecodeCommand(command({{"step", Value("arm")}}))));
+  EXPECT_ANY_THROW(static_cast<void>(DecodeCommand(command({{"step", Value("arm")}, {"stop_generation", Value(0.0)}}))));
+  EXPECT_ANY_THROW(static_cast<void>(DecodeCommand(
+      command({{"step", Value("close_operations")}, {"stop_generation", Value(5.0)}}))));
+  EXPECT_ANY_THROW(static_cast<void>(DecodeCommand(command({{"step", Value("recover")}}))));
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail

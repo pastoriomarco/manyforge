@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -51,12 +52,12 @@ enum class ArmTemplate { kUFactory, kUr, kUFactoryReal };
                                                : "UR mock arm";
 }
 
-/// Per-joint vendor trajectory/goal constraints copied exactly from the model
+/// Per-joint vendor trajectory constraint copied exactly from the model
 /// family's vendor controller file (UFactory template rule); absent for the
-/// UR template, which already carries its retained constraints.
+/// UR template, which already carries its retained constraint. The per-joint
+/// `goal` constraint is the row's arrival tolerance.
 struct VendorJointConstraints final {
   std::string_view trajectory;
-  std::string_view goal;
 };
 
 struct ControllerProfileRow final {
@@ -69,12 +70,17 @@ struct ControllerProfileRow final {
   bool gripper_required;
   double hard_stop_completion_timeout_s;
   double gripper_result_timeout_s;
+  /// Arrival (maintainer 2026-10-28): every arm joint's stock JTC `goal`
+  /// constraint, kept on every goal, so a successful result means the
+  /// trajectory finished with every joint within this tolerance. The Real
+  /// lane's measured terminal gate reads the same value.
+  double arrival_tolerance_rad;
 };
 
 // Q63-Q66/Q74 offline mock controller profiles, one per offline model family,
 // as data (E1): manyforge_ros_bringup/config/mock_controller_profiles.yaml,
 // validated and turned into these rows at configure time by
-// scripts/robots/mock_controller_profiles.py. Q79: hard-stop completion and
+// scripts/components/mock_controller_profiles.py. Q79: hard-stop completion and
 // gripper result timeouts are Isaac's values per model family.
 constexpr ControllerProfileRow kMockProfiles[] = {
 #include "mock_controller_profiles.inc"
@@ -102,7 +108,9 @@ constexpr double kLite6FamilyGripperResultTimeoutS = 5.0;
 // The measured-state gates are per robot data, to be checked live: the joint
 // freshness budget (R7 D3: 0.25 s) and `main`'s measured start/terminal state
 // checks (ros2_control_capability.hpp: start and final tolerance 0.02 rad,
-// `wait_for_state_timeout_s` 1.0 s). R7 package 4: the Enable gate's
+// `wait_for_state_timeout_s` 1.0 s); the final tolerance is the row's arrival
+// tolerance, 0.01 rad (maintainer 2026-10-28: ManyMove's vendor value), now
+// kept as the JTC `goal` of every joint. R7 package 4: the Enable gate's
 // measured-versus-reported joint tolerance (§3.6; 0.02 rad, the start
 // tolerance, to be checked live).
 struct RealProfileRow final {
@@ -111,30 +119,84 @@ struct RealProfileRow final {
   std::string_view dof;
   double joint_state_freshness_s;
   double start_tolerance_rad;
-  double final_tolerance_rad;
   double completion_state_timeout_s;
   double joint_agreement_tolerance_rad;
 };
 constexpr std::array<RealProfileRow, 1U> kRealProfiles{{
     {{"lite6_real", "RealLite6System", ArmTemplate::kUFactoryReal,
-      "lite6_traj_controller", VendorJointConstraints{"1.0", "0.01"}, "", false,
-      kLite6FamilyHardStopCompletionTimeoutS, kLite6FamilyGripperResultTimeoutS},
-     "lite", "6", 0.25, 0.02, 0.02, 1.0, 0.02},
+      "lite6_traj_controller", VendorJointConstraints{"1.0"}, "", false,
+      kLite6FamilyHardStopCompletionTimeoutS, kLite6FamilyGripperResultTimeoutS,
+      0.01},
+     "lite", "6", 0.25, 0.02, 1.0, 0.02},
 }};
 
+/// The Isaac rows' arrival tolerance (rad, every arm joint), written as the
+/// JTC `goal` constraint of the retained Isaac controller file at activation,
+/// and its settle window, written as JTC `goal_time` (stock JTC 6.10: 0 is no
+/// window, so a motion outside the tolerance on the first cycle after its end
+/// aborts; only a negative value waits indefinitely).
+/// PLACEHOLDERS: both to be set from the Isaac measurement (merge 6 ARRIVE
+/// report).
+constexpr double kIsaacArrivalToleranceRadPlaceholder = 0.05;
+constexpr double kIsaacGoalTimeSPlaceholder = 1.0;
+struct IsaacProfileRow final {
+  std::string_view profile_id;
+  double arrival_tolerance_rad;
+  double goal_time_s;
+};
+constexpr std::array<IsaacProfileRow, 2U> kIsaacProfiles{{
+    {"lite6", kIsaacArrivalToleranceRadPlaceholder, kIsaacGoalTimeSPlaceholder},
+    // Night change 5: the ur10e's retained (pre-merge-6) goal, 0.1 rad. 0.05 aborted
+    // pick_retreat with the cheese box carried (joint 4 at 0.0552 after 1 s).
+    {"ur10e", 0.1, kIsaacGoalTimeSPlaceholder},
+}};
+
+/// The arm controllers and arm launch of an Isaac robot row (merge 6). A
+/// tool row has none.
+[[nodiscard]] std::string_view
+isaac_arm_controller_profile(const std::string_view isaac_profile) {
+  if (isaac_profile == "lite6") {
+    return "lite6";
+  }
+  if (isaac_profile == "ur10e") {
+    return "ur10e";
+  }
+  fail("unsupported Isaac controller profile '" + std::string(isaac_profile) +
+       "'");
+}
+
+/// The arrival row of an Isaac robot row.
+[[nodiscard]] const IsaacProfileRow &isaac_row(const std::string_view id) {
+  const auto arm = isaac_arm_controller_profile(id);
+  const auto found =
+      std::find_if(kIsaacProfiles.begin(), kIsaacProfiles.end(),
+                   [&](const auto &row) { return row.profile_id == arm; });
+  if (found == kIsaacProfiles.end()) {
+    fail("unsupported Isaac controller profile '" + std::string(id) + "'");
+  }
+  return *found;
+}
+
 // The vendor driver's services this component serves. The driver serves only
-// services set true (`get_parameter_or(..., false)`), so every motion or
-// mode service the vendor file enables by default stays off: ManyForge is the
-// only motion authority and the plugin arms through the SDK (R7 D1). Served:
-// the error/warning clears (R7 recovery), one joint read, and ManyMove's I/O
-// services (plan R7, "xArm I/O") and the tool payload (D11, applied at
-// Enable). Every other value of the vendor
+// services set true (`get_parameter_or(..., false)`), so every motion service
+// the vendor file enables by default stays off: ManyForge is the only motion
+// authority and the plugin arms through the SDK (R7 D1). Served: the
+// error/warning clears (R7 recovery), one joint read, ManyMove's I/O services
+// (plan R7, "xArm I/O"), the tool context (TOOLCTX: TCP offset and payload,
+// applied at rest) and the mode and state (M6 ADAPTERM: the adapter
+// re-engages joint-servo mode at rest before an admitted motion after a move
+// from the robot's own interface). Every other value of the vendor
 // xarm_api/config/xarm_params.yaml equals the driver's own default, so no
 // vendor file or Python is read at runtime.
-constexpr std::array<std::string_view, 8U> kXArmDriverServices{
+// M6 XADAPT D11: `get_err_warn_code` (`xarm_msgs/srv/GetInt16List`, datas
+// [error, warning]) and `get_state` (`xarm_msgs/srv/GetInt16`) are the
+// on-demand reads before an own clear.
+constexpr std::array<std::string_view, 13U> kXArmDriverServices{
     "clean_error",       "clean_warn",        "get_servo_angle",
     "get_tgpio_digital", "get_cgpio_digital", "set_tgpio_digital",
-    "set_cgpio_digital", "set_tcp_load"};
+    "set_cgpio_digital", "set_tcp_load",      "set_tcp_offset",
+    "set_mode",          "set_state",         "get_err_warn_code",
+    "get_state"};
 
 // The vendor `hw_ns` of every xArm-family Real component: the driver's topics
 // and services sit below `<component namespace>/xarm`.
@@ -272,6 +334,21 @@ remapping_argument(const std::vector<std::pair<std::string, std::string>> &remap
   return text;
 }
 
+/// A positive tolerance in its shortest round-trip form (0.05, not
+/// 0.050000000000000003), always read as a double.
+[[nodiscard]] std::string yaml_tolerance(const double value,
+                                         const std::string_view what) {
+  if (!std::isfinite(value) || !(value > 0.0)) {
+    fail(std::string(what) + " must be a finite positive number");
+  }
+  char buffer[64];
+  const auto [end, error] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+  if (error != std::errc{}) fail("a numeric value could not be formatted");
+  std::string text(buffer, end);
+  if (text.find_first_of(".eE") == std::string::npos) text += ".0";
+  return text;
+}
+
 [[nodiscard]] std::vector<std::string> lines_of(const std::string_view text) {
   std::vector<std::string> lines;
   std::size_t cursor = 0U;
@@ -404,9 +481,16 @@ arm_yaml(const ControllerProfileRow &profile,
           }
           entries = "trajectory: " +
                     std::string(profile.vendor_joint_constraints->trajectory) +
-                    ", goal: " +
-                    std::string(profile.vendor_joint_constraints->goal) + ", ";
+                    ", ";
         }
+        if (entries.find("goal:") != std::string::npos) {
+          fail(std::string(name) + " template carries its own goal "
+               "constraint; the row's arrival tolerance is the goal");
+        }
+        entries += "goal: " +
+                   yaml_tolerance(profile.arrival_tolerance_rad,
+                                  "arrival_tolerance_rad") +
+                   ", ";
         expanded.push_back(indentation(line) + joint + ": {" + entries +
                            "max_deceleration_on_cancel: " +
                            yaml_double(found->second,
@@ -531,7 +615,17 @@ std::vector<std::string> mock_controller_profile_ids() {
 }
 
 std::vector<std::string> isaac_controller_profile_ids() {
-  return {"lite6", "ur10e"};
+  std::vector<std::string> result;
+  for (const auto &row : kIsaacProfiles) result.emplace_back(row.profile_id);
+  return result;
+}
+
+double isaac_controller_arrival_tolerance_rad(const std::string_view isaac_profile) {
+  return isaac_row(isaac_profile).arrival_tolerance_rad;
+}
+
+double isaac_controller_goal_time_s(const std::string_view isaac_profile) {
+  return isaac_row(isaac_profile).goal_time_s;
 }
 
 MockControllerProfileFacts
@@ -544,7 +638,7 @@ mock_controller_profile_facts(const std::string_view mock_profile) {
           ? std::nullopt
           : std::optional<std::string>(row.gripper_controller_name),
       row.gripper_required, row.hard_stop_completion_timeout_s,
-      row.gripper_result_timeout_s};
+      row.gripper_result_timeout_s, row.arrival_tolerance_rad};
 }
 
 MockControllerLaneRates
@@ -571,7 +665,7 @@ real_controller_profile_facts(const std::string_view real_profile) {
       row.controllers.hard_stop_completion_timeout_s,
       row.joint_state_freshness_s,
       row.start_tolerance_rad,
-      row.final_tolerance_rad,
+      row.controllers.arrival_tolerance_rad,
       row.completion_state_timeout_s};
 }
 
@@ -628,6 +722,10 @@ namespace {
     fail("the binding names an arm joint more than once");
   }
   for (const auto &joint : arm_joint_names) require_token(joint, "arm joint");
+  // Merge 6: a tool's gripper-only row has no arm controller.
+  if (!arm_joint_names.empty() && row.arm_controller_name.empty()) {
+    fail("mock profile '" + profile_id + "' has no arm controller");
+  }
   if (gripper_joint_name.has_value()) {
     if (physical_gripper && row.gripper_controller_name.empty()) {
       fail("mock profile '" + profile_id +
@@ -732,12 +830,55 @@ std::string generate_mock_controllers_yaml(
       max_deceleration_on_cancel_rad_s2, gripper_joint_name, gripper_output_mode);
 }
 
+std::string isaac_controllers_yaml(const std::string_view isaac_profile) {
+  // Every arm joint's `goal` constraint becomes the row's arrival tolerance
+  // and `goal_time` its settle window; the rest of the retained file is
+  // unchanged.
+  std::string out(retained_isaac_controllers_yaml(isaac_profile));
+  const auto &row = isaac_row(isaac_profile);
+  constexpr std::string_view kGoalTime = "goal_time: ";
+  const auto goal_time = out.find(kGoalTime);
+  if (goal_time == std::string::npos ||
+      out.find(kGoalTime, goal_time + kGoalTime.size()) != std::string::npos ||
+      out.find('\n', goal_time) == std::string::npos) {
+    fail("Isaac controller file does not carry one goal_time");
+  }
+  const auto time_begin = goal_time + kGoalTime.size();
+  out.replace(time_begin, out.find('\n', time_begin) - time_begin,
+              yaml_tolerance(row.goal_time_s, "Isaac goal_time_s"));
+  const auto goal = yaml_tolerance(row.arrival_tolerance_rad,
+                                   "Isaac arrival_tolerance_rad");
+  constexpr std::string_view kKey = ", goal: ";
+  std::size_t replaced = 0U;
+  for (auto at = out.find(kKey); at != std::string::npos;
+       at = out.find(kKey, at + kKey.size())) {
+    const auto begin = at + kKey.size();
+    const auto end = out.find(',', begin);
+    if (end == std::string::npos || out.find('\n', begin) < end) {
+      fail("Isaac controller file has an unterminated goal constraint");
+    }
+    out.replace(begin, end - begin, goal);
+    ++replaced;
+  }
+  std::size_t joints = 0U;
+  for (auto at = out.find("max_deceleration_on_cancel:"); at != std::string::npos;
+       at = out.find("max_deceleration_on_cancel:", at + 1U)) {
+    ++joints;
+  }
+  if (replaced == 0U || replaced != joints) {
+    fail("Isaac controller file does not carry one goal constraint per arm "
+         "joint");
+  }
+  return out;
+}
+
 std::string_view
 retained_isaac_controllers_yaml(const std::string_view isaac_profile) {
-  if (isaac_profile == "lite6") {
+  const auto arm = isaac_arm_controller_profile(isaac_profile);
+  if (arm == "lite6") {
     return detail::kEmbeddedIsaacLite6ControllersYaml;
   }
-  if (isaac_profile == "ur10e") {
+  if (arm == "ur10e") {
     return detail::kEmbeddedIsaacUr10eControllersYaml;
   }
   fail("unsupported Isaac controller profile '" + std::string(isaac_profile) +
@@ -870,8 +1011,10 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
             result.lane = ControllerLaunchLane::kMock;
             result.controller_profile = lane.real_profile;
             result.arm_controller_name = row.controllers.arm_controller_name;
+            // V-B4: the adapter family is the deployment's, never implied.
             result.vendor_adapter = VendorAdapterSelection{
-                "xarm", runtime_namespace + "/" + std::string(kXArmDriverNamespace),
+                lane.adapter_family,
+                runtime_namespace + "/" + std::string(kXArmDriverNamespace),
                 std::stoi(std::string(row.dof)),
                 row.joint_agreement_tolerance_rad};
           } else {
@@ -879,8 +1022,7 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
                 ControllerRobotDescriptionRequest{
                     request.model_urdf, request.arm_joint_names, lane.lane,
                     request.gripper_without_control_interfaces});
-            controllers = std::string(
-                retained_isaac_controllers_yaml(lane.isaac_profile));
+            controllers = isaac_controllers_yaml(lane.isaac_profile);
             result.lane = ControllerLaunchLane::kIsaac;
             result.controller_profile = lane.isaac_profile;
             result.arm_controller_name = "isaac_arm_controller";
@@ -961,7 +1103,8 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
         {"MANYFORGE_ROBOT_DESCRIPTION_FILE",
          result.robot_description_file.string()},
         {"MANYFORGE_CONTROLLERS_FILE", result.controllers_file.string()},
-        {"ISAAC_TOPIC_CONTROL_PROFILE", result.controller_profile},
+        {"ISAAC_TOPIC_CONTROL_PROFILE",
+         std::string(isaac_arm_controller_profile(result.controller_profile))},
         {"MANYFORGE_ISAAC_COMPONENT_ID", result.controllable_component_id},
     };
     if (!result.frame_prefix.empty()) {
@@ -1063,7 +1206,8 @@ ControllerLaunchArtifacts write_component_controller_launch_artifacts(
            "supplies no initial joint positions");
     }
     request.lane = RealControllerArtifactsInput{
-        *input.real_profile, input.robot_ip, std::move(cancel_limits)};
+        *input.real_profile, input.adapter_family, input.robot_ip,
+        std::move(cancel_limits), input.controller_tcp_offset_sync};
     return write_controller_launch_artifacts(request);
   }
   MockControllerArtifactsInput lane;
@@ -1128,6 +1272,32 @@ ControllerLaunchArtifacts write_component_controller_launch_artifacts(
       input.artifacts_root, component, input.model_urdf, {},
       MockControllerArtifactsInput{*input.mock_profile, {}, {}, binding},
       input.frame_prefix});
+}
+
+ControllerLaunchArtifacts write_isaac_gripper_launch_artifacts(
+    const std::filesystem::path &artifacts_root,
+    const std::string_view controllable_component_id,
+    const std::string_view isaac_profile, const std::string &model_urdf,
+    const std::string &frame_prefix) {
+  if (artifacts_root.empty() || !artifacts_root.is_absolute()) {
+    fail("the artifacts root must be an absolute host-owned directory");
+  }
+  ControllerLaunchArtifacts result;
+  result.lane = ControllerLaunchLane::kIsaac;
+  result.controllable_component_id = std::string(controllable_component_id);
+  result.controller_profile = std::string(isaac_profile);
+  result.runtime_namespace = controller_runtime_namespace(controllable_component_id);
+  result.frame_prefix = frame_prefix;
+  result.directory = artifacts_root / result.controllable_component_id;
+  std::error_code error;
+  std::filesystem::create_directories(result.directory, error);
+  if (error || !std::filesystem::is_directory(result.directory)) {
+    fail("cannot create " + result.directory.string());
+  }
+  result.robot_description_file = result.directory / "robot_description.urdf";
+  write_exact(result.robot_description_file, model_urdf);
+  result.robot_description_sha256 = content_identity::sha256_digest(model_urdf);
+  return result;
 }
 
 std::string

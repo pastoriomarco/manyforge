@@ -61,6 +61,10 @@ set(
 set(
   MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR
   "${_MANYFORGE_WORKSPACE_ROOT}/scripts/qualification/generate_ui6i_dual_robot_scenario.py")
+# V-A (A7): the xArm-owned Real arm plans the occurrence generator reads.
+set(
+  MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_xarm_control/resources/xarm_ros2_control_lifecycle_plans.json")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
    NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
@@ -72,7 +76,8 @@ if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}" OR
    NOT EXISTS "${MANYFORGE_NODE_CATALOG_SOURCE}" OR
    NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}" OR
-   NOT EXISTS "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}")
+   NOT EXISTS "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}" OR
+   NOT EXISTS "${MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS}")
   message(FATAL_ERROR
     "manyforge_deployment production retention requires the node-environment "
     "closure, structural-model preparation tool, and maintained N6 source "
@@ -123,7 +128,8 @@ set_property(
   "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}"
   "${MANYFORGE_NODE_CATALOG_SOURCE}"
   "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}"
-  "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}")
+  "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}"
+  "${MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS}")
 
 file(READ
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
@@ -678,6 +684,7 @@ add_library(manyforge_deployment_verification_core
   src/controller_topology_codec.cpp
   src/contact_policy_codec.cpp
   src/cell_graph_codec.cpp
+  src/cell_kinematic_index.cpp
   src/closed_schema.cpp
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
@@ -846,7 +853,6 @@ endif()
 # free of runtime journals and mutable repositories.
 set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT OFF)
 if(TARGET manyforge_core_sqlite_cclc_journal AND
-   TARGET manyforge_core_filesystem_resolved_stop_base_plan_repository AND
    TARGET manyforge_deployment_resolved_stop_base_plan_resolver AND
    TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
   set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT ON)
@@ -857,11 +863,10 @@ option(
   ${_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT})
 if(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
   if(NOT TARGET manyforge_core_sqlite_cclc_journal OR
-     NOT TARGET manyforge_core_filesystem_resolved_stop_base_plan_repository OR
      NOT TARGET manyforge_deployment_resolved_stop_base_plan_resolver OR
      NOT TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
     message(FATAL_ERROR
-      "CCLC runtime composition requires the Core journals/repository and "
+      "CCLC runtime composition requires the Core journal and "
       "Deployment current-source/Stop-plan targets")
   endif()
   add_library(manyforge_deployment_cclc_runtime_composition
@@ -877,8 +882,7 @@ if(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
     manyforge_deployment_cclc_runtime_composition PUBLIC
     manyforge_deployment_component_lifecycle_current_snapshot_source
     manyforge_deployment_resolved_stop_base_plan_resolver
-    manyforge_core_sqlite_cclc_journal
-    manyforge_core_filesystem_resolved_stop_base_plan_repository)
+    manyforge_core_sqlite_cclc_journal)
   set_target_properties(
     manyforge_deployment_cclc_runtime_composition
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -1293,6 +1297,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_activation_pose_source PRIVATE
     manyforge_preparation_support manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_activation_pose_source PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_activation_attachments test/test_activation_attachments.cpp)
+  target_include_directories(test_activation_attachments PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_attachments PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_attachments PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_activation_ai_model test/test_activation_ai_model.cpp)
   target_compile_definitions(test_activation_ai_model PRIVATE
@@ -1809,6 +1819,11 @@ if(BUILD_TESTING)
   manyforge_add_prepare_activation_test(
     PrepareActivationDualDocument
     "examples/ur5e_lite6_wall_grouped.scenario")
+  # Merge 6 (item 47): UF850 on Mock, with the xArm gripper mounted as its own
+  # tool component.
+  manyforge_add_prepare_activation_test(
+    PrepareActivationUf850MockSplit
+    "examples/uf850_xarm_gripper_mock.scenario")
   manyforge_add_prepare_activation_test(
     PrepareActivationAssignmentRejections
     "examples/ur5e_lite6_wall_grouped.scenario"
@@ -1833,6 +1848,12 @@ if(BUILD_TESTING)
     PrepareActivationRos2Control
     "examples/isaac-ur10e-light-scene.scenario"
     --ros2-control)
+  # Merge 6 slice B: the mounted lane-free pneumatic tool of the split
+  # Scenario (slices A and D).
+  manyforge_add_prepare_activation_test(
+    PrepareActivationToolSplit
+    "examples/lite6_pneumatic_mock.scenario"
+    --tool-split)
   manyforge_add_prepare_activation_test(
     PrepareActivationVisionBinPick
     "examples/ur5_vision_guided_bin_pick.scenario")
@@ -1942,6 +1963,17 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_scenario_activation_empty_map
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_activation_catalog_presence
+    test/test_activation_catalog_presence.cpp)
+  target_compile_definitions(test_activation_catalog_presence PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_catalog_presence PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_catalog_presence PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_catalog_presence
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_apply_affected_scope
     test/test_apply_affected_scope.cpp)
   target_include_directories(test_apply_affected_scope PRIVATE
@@ -1961,6 +1993,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_apply_component_delta PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_apply_component_delta
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # M7 U1/U2: the cell kinematic index and its equivalence oracle against
+  # verbatim copies of the merge-6b helpers it replaces.
+  add_executable(test_cell_kinematic_index
+    test/test_cell_kinematic_index.cpp)
+  target_link_libraries(test_cell_kinematic_index PRIVATE
+    manyforge_deployment_verification_core GTest::gtest_main)
+  gtest_discover_tests(test_cell_kinematic_index
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_bundle_store

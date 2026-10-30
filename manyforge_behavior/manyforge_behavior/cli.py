@@ -198,11 +198,19 @@ def _parser() -> argparse.ArgumentParser:
         "--output", required=True, help="new path; existing files are never overwritten"
     )
     migrate_groups.set_defaults(handler=_program_migrate_execution_groups)
+    migrate_pick_place_help = (
+        "replace catalog-2.2 composite Pick/Place nodes with visible ordinary "
+        "subtrees; a converted composite whose holder lacks a composed tcp is "
+        "refused at binding; open it in Composer and choose the attach frame"
+    )
     migrate_pick_place = program_commands.add_parser(
         "migrate-pick-place",
-        help=(
-            "replace catalog-2.2 composite Pick/Place nodes with visible ordinary "
-            "subtrees; never modifies the input or a Binding"
+        help=migrate_pick_place_help,
+        description=(
+            "Replace catalog-2.2 composite Pick/Place nodes with visible ordinary "
+            "subtrees. A converted composite whose holder lacks a composed tcp is "
+            "refused at binding. Open the migrated Program in Composer and choose "
+            "the attach frame. The command never modifies the input or a Binding."
         ),
     )
     migrate_pick_place.add_argument("--input", required=True)

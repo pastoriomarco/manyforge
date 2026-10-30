@@ -31,6 +31,7 @@ from .program_binding_projection import (
 )
 from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
+    ManagerApplyAcknowledgementContext,
     RuntimeScaleControlSelectorRequest,
 )
 
@@ -52,12 +53,15 @@ class HeadlessClientError(RuntimeError):
         *,
         details: Mapping[str, Any] | None = None,
         response: Mapping[str, Any] | None = None,
+        producer: str = "headless_api",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.details = deepcopy(dict(details or {}))
         self.response = dict(response) if response is not None else None
+        # The owner that produced the refusal, as the headless API reported it.
+        self.producer = producer
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +159,29 @@ class HeadlessExecutionObservationStream:
         )
 
 
+class HeadlessViewerPoseStream(HeadlessExecutionObservationStream):
+    """One credited viewer-only Manager projection stream."""
+
+    def __init__(self, base_url: str, timeout_seconds: float) -> None:
+        super().__init__(base_url, timeout_seconds)
+        self._url = self._url.removesuffix("/ws/execution/observations") + "/ws/scene/viewer-poses"
+
+    def next(self, cursor: int | None, cancelled: threading.Event) -> dict[str, Any]:
+        connection = self._connection
+        if connection is None:
+            raise HeadlessClientError("headless_viewer_pose_closed", "viewer pose stream is closed")
+        connection.send(json.dumps({"last_applied": cursor}, separators=(",", ":")))
+        while not cancelled.is_set():
+            try:
+                payload = connection.recv(timeout=0.25)
+            except TimeoutError:
+                continue
+            if not isinstance(payload, str):
+                raise HeadlessClientError("headless_viewer_pose_invalid", "viewer pose frame is not text")
+            return strict_json_object(payload, label="headless viewer pose frame", maximum_bytes=_MAXIMUM_OBSERVATION_FRAME_BYTES)
+        raise HeadlessClientError("headless_viewer_pose_cancelled", "viewer pose demand ended")
+
+
 class HeadlessHttpClient:
     """Transport only: never cache, reconcile, or infer owner state."""
 
@@ -198,21 +225,22 @@ class HeadlessHttpClient:
             self._timeout_seconds,
         )
 
+    def open_viewer_pose_stream(self) -> HeadlessViewerPoseStream:
+        return HeadlessViewerPoseStream(self._base_url, self._timeout_seconds)
+
     @staticmethod
     def _error_from_response(
         value: dict[str, Any],
         status_code: int,
     ) -> HeadlessClientError:
         detail = value.get("detail")
-        if isinstance(detail, dict):
-            code = detail.get("code")
-            message = detail.get("message")
-            details = detail.get("details")
-        else:
-            error = value.get("error")
-            code = error.get("code") if isinstance(error, dict) else None
-            message = error.get("message") if isinstance(error, dict) else None
-            details = error.get("details") if isinstance(error, dict) else None
+        carrier = detail if isinstance(detail, dict) else value.get("error")
+        if not isinstance(carrier, dict):
+            carrier = {}
+        code = carrier.get("code")
+        message = carrier.get("message")
+        details = carrier.get("details")
+        producer = carrier.get("producer")
         normalized_details = dict(details) if isinstance(details, dict) else {}
         return HeadlessClientError(
             code if isinstance(code, str) and code else "headless_http_error",
@@ -224,6 +252,7 @@ class HeadlessHttpClient:
             status_code,
             details=normalized_details,
             response=value,
+            producer=producer if isinstance(producer, str) and producer else "headless_api",
         )
 
     @staticmethod
@@ -985,6 +1014,38 @@ class HeadlessHttpClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def manager_apply_acknowledge(
+        self,
+        apply_id: str,
+        apply_generation: int,
+        request_context: ManagerApplyAcknowledgementContext | Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(apply_id, str)
+            or not apply_id
+            or len(apply_id.encode("utf-8")) > 256
+            or type(apply_generation) is not int
+            or not 1 <= apply_generation <= 9_007_199_254_740_991
+        ):
+            raise ValueError("Manager Apply identity is invalid")
+        context = (
+            request_context
+            if isinstance(request_context, ManagerApplyAcknowledgementContext)
+            else ManagerApplyAcknowledgementContext.model_validate(request_context)
+        )
+        return self.request(
+            "POST",
+            "/api/manager/apply/acknowledge",
+            params=(
+                ("apply_id", apply_id),
+                ("apply_generation", apply_generation),
+            ),
+            body={"request_context": context.model_dump(mode="json", exclude_none=True)},
+            timeout_seconds=timeout_seconds,
+        )
+
     def execution_diagnostics(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/diagnostics")
 
@@ -1092,6 +1153,12 @@ class HeadlessHttpClient:
 
     def cell_recover(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/cell-recover", body=body)
+
+    def cell_recover_abort(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/cell-recover/abort", body=body)
+
+    def force_close(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/force-close", body=body)
 
     def set_runtime_scale_control(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/runtime-scale-control", body=body)

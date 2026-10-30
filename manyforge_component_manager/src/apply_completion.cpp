@@ -12,10 +12,25 @@ bool ManagerApplyFenceReleasedDTO::valid() const noexcept {
 }
 
 bool ManagerApplyFailureEvidenceDTO::valid() const noexcept {
+  if (cause_details.size() > kMaximumManagerApplyFailureCauseDetails) {
+    return false;
+  }
+  for (const auto &[key, value] : cause_details) {
+    if (key.empty() || key.size() > kMaximumManagerApplyFailureCauseDetailKeyBytes ||
+        value.size() > kMaximumManagerApplyFailureCauseDetailValueBytes) {
+      return false;
+    }
+  }
   return !intent_digest.empty() && !failure_code.empty() &&
          failure_code.size() <= kMaximumManagerApplyFailureCodeBytes &&
          !failure_message.empty() &&
-         failure_message.size() <= kMaximumManagerApplyFailureMessageBytes;
+         failure_message.size() <= kMaximumManagerApplyFailureMessageBytes &&
+         !cause_code.empty() &&
+         cause_code.size() <= kMaximumManagerApplyFailureCodeBytes &&
+         !producer.empty() &&
+         producer.size() <= kMaximumManagerApplyFailureProducerBytes &&
+         (effect_boundary != ManagerApplyEffectBoundary::kBeforeEffect ||
+          effect_disposition == ManagerApplyEffectDisposition::kKnown);
 }
 
 bool ManagerApplyTerminalOutcomeDTO::valid() const noexcept {
@@ -63,6 +78,16 @@ const char* ToString(const ManagerApplyTerminalOutcomeState state) noexcept {
       return "failed";
     case ManagerApplyTerminalOutcomeState::kUnknownEffect:
       return "unknown_effect";
+  }
+  return "unknown";
+}
+
+const char *ToString(const ManagerApplyEffectBoundary boundary) noexcept {
+  switch (boundary) {
+    case ManagerApplyEffectBoundary::kBeforeEffect:
+      return "before_effect";
+    case ManagerApplyEffectBoundary::kUnknown:
+      return "unknown";
   }
   return "unknown";
 }

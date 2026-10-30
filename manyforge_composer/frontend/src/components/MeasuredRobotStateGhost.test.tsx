@@ -56,6 +56,7 @@ const manifest: SceneUrdfManifest = {
 
 const empty: RuntimeScenePresentation = {
   measuredRobot: null,
+  measuredRobotSources: [],
   measuredTcp: null,
   measuredObjects: [],
   attachedObjects: [],

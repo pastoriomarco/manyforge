@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include <manyforge_core/types/collision_world_snapshot.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/program_binding.hpp>
@@ -414,6 +416,62 @@ TEST(ProgramBindingTest, InitialSceneProjectionRejectsMissingComponentFrame) {
                ProgramBindingError);
 }
 
+TEST(ProgramBindingTest, InitialSceneProjectionParsesOptionalMetadataMass) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  const auto binding = make_binding_value(context);
+  const auto scene_with = [](std::optional<CanonicalValue> metadata) {
+    CanonicalValue::Object row{
+        {"scene_resource_id", CanonicalValue("object")},
+        {"shape", CanonicalValue(CanonicalValue::Object{
+                      {"type", CanonicalValue("sphere")},
+                      {"sphere_radius_m", CanonicalValue(0.1)}})},
+        {"pose", CanonicalValue(CanonicalValue::Object{
+                     {"frame_ref", CanonicalValue(CanonicalValue::Object{
+                                       {"kind", CanonicalValue("cell_frame")}})},
+                     {"position_m", CanonicalValue(CanonicalValue::Array{
+                                        CanonicalValue(0.0), CanonicalValue(0.0),
+                                        CanonicalValue(0.0)})},
+                     {"orientation", CanonicalValue(CanonicalValue::Object{
+                                         {"xyzw", CanonicalValue(CanonicalValue::Array{
+                                                      CanonicalValue(0.0), CanonicalValue(0.0),
+                                                      CanonicalValue(0.0), CanonicalValue(1.0)})}})}})},
+    };
+    if (metadata) {
+      row.emplace_back("metadata", std::move(*metadata));
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"scene", CanonicalValue(CanonicalValue::Array{
+                      CanonicalValue(std::move(row))})}});
+  };
+  const auto project = [&](const CanonicalValue &scene) {
+    return manyforge::deployment::detail::project_bound_initial_scene_value(
+        scene, binding, context.bundle->value().cell_graph.cell_id);
+  };
+  const auto mass = [](CanonicalValue value) {
+    return CanonicalValue(
+        CanonicalValue::Object{{"mass_kg", std::move(value)}});
+  };
+
+  // Absent metadata or an absent key is massless.
+  EXPECT_DOUBLE_EQ(project(scene_with(std::nullopt)).front().mass_kg, 0.0);
+  EXPECT_DOUBLE_EQ(
+      project(scene_with(CanonicalValue(CanonicalValue::Object{})))
+          .front()
+          .mass_kg,
+      0.0);
+  EXPECT_DOUBLE_EQ(project(scene_with(mass(CanonicalValue(2.5)))).front().mass_kg,
+                   2.5);
+  EXPECT_DOUBLE_EQ(project(scene_with(mass(CanonicalValue(0.0)))).front().mass_kg,
+                   0.0);
+
+  for (auto invalid : {CanonicalValue(-1.0), CanonicalValue(1000.5),
+                       CanonicalValue("2.5"), CanonicalValue(nullptr)}) {
+    EXPECT_THROW(static_cast<void>(project(scene_with(mass(std::move(invalid))))),
+                 ProgramBindingError);
+  }
+}
+
 TEST(ProgramBindingTest,
      SealedEnvelopeReloadsOnlyAgainstItsExactBundleAndModelMap) {
   ScopedTrustedRoot root;
@@ -431,6 +489,30 @@ TEST(ProgramBindingTest,
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->program_binding_id(), sealed->program_binding_id());
   EXPECT_EQ(reloaded->value(), sealed->value());
+}
+
+TEST(ProgramBindingTest, RobotTcpPresenceSurvivesCanonicalSealAndReload) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  auto &target = value.target_role_bindings.front();
+  target.robot_tcps.reset();
+  const auto absent = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(absent->canonical_bytes().find("\"robot_tcps\""), std::string::npos);
+  // Structural round-trip only: this fixture is an arm, not a non-robot.
+  const auto absent_reloaded =
+      ProgramBindingConstructionAuthority::reload_intrinsic(absent->canonical_bytes());
+  EXPECT_FALSE(absent_reloaded->value().target_role_bindings.front().robot_tcps);
+
+  target.robot_tcps.emplace();
+  const auto empty = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(empty->canonical_bytes().find("\"robot_tcps\":[]"), std::string::npos);
+  EXPECT_NE(empty->program_binding_id(), absent->program_binding_id());
+  const auto empty_reloaded = reload_verified_program_binding(
+      empty->canonical_bytes(), *context.bundle, context.model_map);
+  ASSERT_TRUE(empty_reloaded->value().target_role_bindings.front().robot_tcps);
+  EXPECT_TRUE(empty_reloaded->value().target_role_bindings.front().robot_tcps->empty());
+  EXPECT_EQ(empty_reloaded->value(), empty->value());
 }
 
 TEST(ProgramBindingTest, MotionEndpointReleaseBindingRoundTripsExactEnvelope) {
@@ -1127,5 +1209,101 @@ TEST(ProgramBindingTest,
                d::RuntimeProgramBindingResolutionError);
 }
 } // namespace output_runtime_tests
+
+
+// TCP-D: the owner guard (`CellKinematicIndex::carries`) accepts the component
+// itself and every component mounted on it, directly or through a tool chain;
+// nothing else.
+TEST(ProgramBindingMountedOwnerTest, SelfOrMountedDescendantFollowsAttachments) {
+  namespace core = manyforge::core;
+  const auto edge = [](std::string parent, std::string parent_interface,
+                       std::string child) {
+    return core::ComponentAttachmentEdgeDTO{
+        core::ComponentAttachmentId(child),
+        core::ComponentAttachmentRevision(
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+        {core::ControllableComponentId(parent),
+         core::AttachmentInterfaceId(parent_interface)},
+        {core::ControllableComponentId(child), core::AttachmentInterfaceId("mount")},
+        {}};
+  };
+  core::CellGraphDTO graph{
+      "manyforge.cell_graph.v1",
+      core::GraphRevision(
+          "sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+      core::CellId("tool-split-cell"),
+      {}, {}, {}, {}, {},
+      {edge("lite6_robot", "flange", "lite_gripper"),
+       edge("lite_gripper", "tool_flange", "sensor")},
+  };
+  const auto mounted = [&](std::string component, std::string owner) {
+    return manyforge::deployment::CellKinematicIndex(graph).carries(
+        core::ControllableComponentId(component),
+        core::ControllableComponentId(owner));
+  };
+  EXPECT_TRUE(mounted("lite6_robot", "lite6_robot"));
+  EXPECT_TRUE(mounted("lite6_robot", "lite_gripper"));
+  EXPECT_TRUE(mounted("lite6_robot", "sensor"));        // tool chain
+  EXPECT_TRUE(mounted("lite_gripper", "sensor"));
+  EXPECT_FALSE(mounted("lite_gripper", "lite6_robot"));  // never upwards
+  EXPECT_FALSE(mounted("lite6_robot", "station_io"));    // unmounted
+  graph.component_attachments.clear();
+  EXPECT_FALSE(mounted("lite6_robot", "lite_gripper"));
+}
+
+// B5/B1 with BFIX: on a shared flange without a primary mark, the tool is the
+// child carrying a TCP (a camera that is no tool needs no mark), and a robot
+// whose flange tool has no default TCP has no End-effector TCP (C-P2,
+// B-run-1).
+TEST(ProgramBindingMountedOwnerTest, FlangeToolAndMissingEndEffectorTcp) {
+  namespace core = manyforge::core;
+  const std::string zero =
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+  const auto component = [&](std::string id,
+                             std::optional<core::ComponentDefaultTcpDTO> tcp) {
+    return core::ControllableComponentDTO{
+        core::ControllableComponentId(id), core::ComponentTypeId(id + "_type"),
+        core::ComponentTypeRevision(zero), {}, {}, std::nullopt, std::move(tcp)};
+  };
+  const auto edge = [&](std::string parent, std::string child, bool primary) {
+    return core::ComponentAttachmentEdgeDTO{
+        core::ComponentAttachmentId(child), core::ComponentAttachmentRevision(zero),
+        {core::ControllableComponentId(parent), core::AttachmentInterfaceId("flange")},
+        {core::ControllableComponentId(child), core::AttachmentInterfaceId("mount")},
+        {}, primary};
+  };
+  const core::ComponentDefaultTcpDTO cup{core::CommandTargetId("gripper"),
+                                         core::FrameRoleId("cup_center")};
+  const auto graph = [&](std::vector<core::ControllableComponentDTO> components,
+                         std::vector<core::ComponentAttachmentEdgeDTO> edges) {
+    return core::CellGraphDTO{"manyforge.cell_graph.v1", core::GraphRevision(zero),
+                              core::CellId("flange-tool-cell"), {}, {},
+                              std::move(components), {}, {}, std::move(edges)};
+  };
+  using manyforge::deployment::CellKinematicIndex;
+  const core::ControllableComponentId robot("lite6_robot");
+  // A camera (no TCP) first on the flange, the gripper second: the gripper.
+  const CellKinematicIndex shared(graph(
+      {component("lite6_robot", std::nullopt), component("camera", std::nullopt),
+       component("lite_gripper", cup)},
+      {edge("lite6_robot", "camera", false), edge("lite6_robot", "lite_gripper", false)}));
+  ASSERT_NE(shared.tool_on(robot, "flange"), nullptr);
+  EXPECT_EQ(shared.tool_on(robot, "flange")->value(), "lite_gripper");
+  const core::CommandTargetId arm("arm");
+  ASSERT_TRUE(shared.end_effector_entry(robot, arm).has_value());
+  EXPECT_EQ(shared.end_effector_entry(robot, arm)->component_id.value(), "lite_gripper");
+  // A primary mark still wins.
+  const CellKinematicIndex marked(graph(
+      {component("lite6_robot", std::nullopt), component("camera", std::nullopt),
+       component("lite_gripper", cup)},
+      {edge("lite6_robot", "camera", true), edge("lite6_robot", "lite_gripper", false)}));
+  EXPECT_EQ(marked.tool_on(robot, "flange")->value(), "camera");
+  // C-P2: a bracket without a TCP leaves the robot without an End-effector TCP.
+  const CellKinematicIndex bracket(graph(
+      {component("lite6_robot", std::nullopt), component("lite_bracket", std::nullopt)},
+      {edge("lite6_robot", "lite_bracket", false)}));
+  EXPECT_EQ(bracket.tool_on(robot, "flange")->value(), "lite_bracket");
+  EXPECT_FALSE(bracket.end_effector_entry(robot, arm).has_value());
+}
 
 } // namespace

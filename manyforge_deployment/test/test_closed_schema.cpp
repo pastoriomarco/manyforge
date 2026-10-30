@@ -817,7 +817,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4");
+          "d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -868,7 +868,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c");
+          "397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -949,7 +949,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   EXPECT_NE(
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-          core::SchemaRevision("sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48")),
+          core::SchemaRevision("sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190")),
       nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
@@ -1014,7 +1014,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4"));
+          "253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7"));
   ASSERT_NE(schema, nullptr);
   const auto source = parse_strict_json_model_yaml(R"({
     "io_signals":[
@@ -1033,7 +1033,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
   const auto &root = normalized.normalized_value();
   ASSERT_EQ(root.find_object_member("io_signals")->as_array().size(), 2U);
   const auto &device = root.find_object_member("io_provider_devices")->as_array().front();
-  EXPECT_EQ(canonical_json(*device.find_object_member("lifecycle_command_timeout_s")), "30");
+  EXPECT_EQ(canonical_json(*device.find_object_member("lifecycle_command_timeout_s")), "10");
   const auto &output = root.find_object_member("io_signals")->as_array().front();
   EXPECT_EQ(output.find_object_member("resource_role_id")->as_string(), "lamp");
   EXPECT_EQ(output.find_object_member("freshness"), nullptr);
@@ -1069,7 +1069,7 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4"));
+          "253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7"));
   ASSERT_NE(schema, nullptr);
   const std::string signal = R"({"controllable_component_id":"device.io",
     "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
@@ -1148,7 +1148,7 @@ TEST(ClosedSchema,
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48"));
+          "19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({
@@ -1174,6 +1174,7 @@ TEST(ClosedSchema,
                    {"enabled", CanonicalValue(false)},
                    {"preset_reference_time_s", CanonicalValue(1.0)},
                    {"joint_limits", CanonicalValue(CanonicalValue::Array{})}})},
+               {"tcp_speed_check", CanonicalValue("active_tcp_and_flange")},
            })})},
       {"direct_control_joint_limits",
        CanonicalValue(
@@ -1225,6 +1226,33 @@ TEST(ClosedSchema,
           *schema, CanonicalValue(std::move(retired_operator_field))),
       ClosedSchemaError);
 
+  // tcp_speed_check: omission materializes `active_tcp_and_flange`; only the
+  // two modes are accepted.
+  const auto with_speed_check = [&](std::optional<CanonicalValue> mode) {
+    auto fields = valid.as_object();
+    for (auto &[name, value] : fields) {
+      if (name != "motion_target_limits") continue;
+      auto rows = value.as_array();
+      CanonicalValue::Object row;
+      for (const auto &[field, item] : rows.front().as_object())
+        if (field != "tcp_speed_check") row.emplace_back(field, item);
+      if (mode) row.emplace_back("tcp_speed_check", *mode);
+      rows.front() = CanonicalValue(std::move(row));
+      value = CanonicalValue(std::move(rows));
+    }
+    return CanonicalValue(std::move(fields));
+  };
+  EXPECT_EQ(validate_and_normalize_build_qualified_value(
+                *schema, with_speed_check(std::nullopt))
+                .normalized_value(),
+            valid);
+  EXPECT_NO_THROW(static_cast<void>(validate_and_normalize_build_qualified_value(
+      *schema, with_speed_check(CanonicalValue("active_tcp")))));
+  for (const auto &invalid : {CanonicalValue("flange"), CanonicalValue(1.0)})
+    EXPECT_THROW(static_cast<void>(validate_and_normalize_build_qualified_value(
+                     *schema, with_speed_check(invalid))),
+                 ClosedSchemaError);
+
   EXPECT_THROW(
       validate_and_normalize_build_qualified_value(
           *schema,
@@ -1251,7 +1279,7 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 69U);
+  ASSERT_FALSE(core::kBuiltinCapabilityDefinitionRegistry.empty());
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());
@@ -1627,7 +1655,7 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kComponentType) {
         expected_revision =
             "sha256:"
-            "2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
+            "d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
         expected_path = "catalog/manyforge.component_type.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kContactPolicy) {
@@ -1650,7 +1678,7 @@ TEST(ClosedSchema,
       } else if (built.record_kind() == core::CatalogRecordKind::kModelAsset) {
         expected_revision =
             "sha256:"
-            "0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c";
+            "397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
         expected_path = "catalog/manyforge.model_asset.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kProviderManifest) {
@@ -2150,8 +2178,11 @@ TEST(ClosedSchema, MaintainedPneumaticSourcesExplicitlyAuthorDeliveryTimeoutOnly
     if (runtime == nullptr) continue;
     const auto *rows = runtime->find_object_member("gripper_target_configurations");
     if (rows == nullptr) continue;
-    // Real carries a no-output (display-only) pneumatic gripper.
-    const bool real = runtime->find_object_member("real_profile") != nullptr;
+    // M6 tool split: grippers have their own profiles. A lane-simulated one
+    // (Mock or Isaac selector) commands its output; the lane-free pneumatic
+    // profile has no output (its valve and sensor are I/O components).
+    const bool simulated = runtime->find_object_member("mock_profile") != nullptr ||
+                           runtime->find_object_member("isaac_profile") != nullptr;
     for (const auto &row : rows->as_array()) {
       const auto *timeout = row.find_object_member("delivery_result_timeout_s");
       if (member(row, "actuation_kind").as_string() == "pneumatic") {
@@ -2164,17 +2195,18 @@ TEST(ClosedSchema, MaintainedPneumaticSourcesExplicitlyAuthorDeliveryTimeoutOnly
         EXPECT_EQ(timeout, nullptr);
         EXPECT_EQ(row.as_object().size(), 13U);
       }
-      EXPECT_EQ(member(row, "output_mode").as_string(), real ? "none" : "commanded");
+      EXPECT_EQ(member(row, "output_mode").as_string(), simulated ? "commanded" : "none");
     }
   }
   EXPECT_EQ(pneumatic, 3U);
-  EXPECT_EQ(position, 5U);
+  EXPECT_EQ(position, 3U);
 }
 
 // CP9: every maintained ROS profile declares its streams with their defaults:
 // Isaac arm measured joints and gripper feedback warning/auto, Mock arm and
-// gripper fault/ack, gripper feedback 1 s. A Real no-output pneumatic gripper
-// declares no gripper feedback. One data source; no code default.
+// gripper fault/ack, gripper feedback 1 s. M6 tool split: the Real arm profile
+// carries no gripper, and the lane-free no-output pneumatic gripper profile
+// declares no stream. One data source; no code default.
 TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
   const auto source = parse_strict_json_model_yaml(
       read_resource("../maintained/maintained_deployment_sources.v1.json"));
@@ -2190,13 +2222,24 @@ TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
     const bool real = runtime->find_object_member("real_profile") != nullptr;
     const bool gripper = runtime->find_object_member("gripper_target_configurations") != nullptr;
     if (real) {
+      EXPECT_FALSE(gripper);
+    }
+    bool no_output = false;
+    if (gripper) {
       const auto &grippers = member(*runtime, "gripper_target_configurations").as_array();
       ASSERT_EQ(grippers.size(), 1U);
-      EXPECT_EQ(member(grippers.front(), "actuation_kind").as_string(), "pneumatic");
-      EXPECT_EQ(member(grippers.front(), "output_mode").as_string(), "none");
+      no_output = member(grippers.front(), "output_mode").as_string() == "none";
+      if (no_output) {
+        EXPECT_EQ(member(grippers.front(), "actuation_kind").as_string(), "pneumatic");
+        EXPECT_FALSE(isaac || runtime->find_object_member("mock_profile") != nullptr);
+      }
     }
-    const bool feedback_stream = gripper && !real;
     const auto &rows = member(*runtime, "component_streams").as_array();
+    if (no_output) {
+      EXPECT_TRUE(rows.empty());
+      continue;
+    }
+    const bool feedback_stream = gripper;
     ASSERT_EQ(rows.size(), feedback_stream ? 2U : 1U);
     const auto &measured = rows.back();
     EXPECT_EQ(member(measured, "stream_id").as_string(), "measured_joints");
@@ -2210,7 +2253,7 @@ TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
     EXPECT_EQ(member(feedback, "severity").as_string(), isaac ? "warning" : "fault");
     EXPECT_EQ(member(feedback, "recovery").as_string(), isaac ? "auto" : "ack");
   }
-  EXPECT_EQ(profiles, 9U);
+  EXPECT_EQ(profiles, 15U);
 }
 
 } // namespace

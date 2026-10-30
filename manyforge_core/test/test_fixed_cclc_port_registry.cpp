@@ -16,7 +16,12 @@ class BrandPort final : public IBrandLifecyclePort {
     throw std::logic_error("unused brand observation");
   }
 
+  const ILifecycleAdmission& Admission() const override {
+    throw std::logic_error("unused brand admission");
+  }
+
   BrandLifecyclePrimitiveResultDTO Dispatch(const BrandLifecyclePrimitiveIntentDTO&,
+                                            const LifecycleSubstepFeedbackSink&,
                                             std::stop_token) override {
     throw std::logic_error("unused brand dispatch");
   }

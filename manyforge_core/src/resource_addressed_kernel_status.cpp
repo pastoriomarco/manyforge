@@ -486,6 +486,13 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     }
     assessment.retry_eligibility = operation_retry_eligibility_locked(*operation, assessments);
     assessment.eligible_close = operation_close_eligible_locked(*operation, assessments);
+    // The Stop's requester decides an ordinary Stop's class: only a Stop the
+    // Program's own configuration requested, settled at its first stage,
+    // is its ordinary failure; every other Stopped operation stays an
+    // operator hold (spec 260 §2.8.4).
+    if (assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
+        operation->ordinary_program_stop())
+      assessment.recovery_class = RecoveryClass::kOrdinaryProgramStop;
     if (std::any_of(operation->participants.begin(), operation->participants.end(),
                     [](const auto& row) { return row.runtime_collision_error.has_value(); }))
       assessment.recovery_class = RecoveryClass::kRuntimeCollision;
@@ -1143,6 +1150,166 @@ Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_op
     retain({operation_id, expected_operation_revision, request, result});
   }
   return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
+}
+
+Result<StopGeneration> ResourceAddressedExecutionKernel::arm_force_close(
+    const StopGeneration stop_generation) {
+  const auto unconfirmed = [&](const char* reason) {
+    return Result<StopGeneration>::Err(
+        ErrorDTO{"scenario_force_close_stop_unconfirmed",
+                 "Force close requires the operator's confirmed Full Stop",
+                 {{"reason", reason}, {"stop_generation", std::to_string(stop_generation.value())}}});
+  };
+  std::lock_guard state_lock(state_mutex_);
+  // A newer Stop supersedes the operator's Full Stop: its outcome decides.
+  if (stop_generation.value() == 0U || cell_stop_generation_ != stop_generation)
+    return unconfirmed("stop_superseded");
+  const auto* terminal_record =
+      stop_terminal_history_.empty() ? nullptr : stop_terminal_history_.back().get();
+  if (terminal_record == nullptr || terminal_record->certificate.stop_generation != stop_generation)
+    return unconfirmed("stop_pending");
+  const auto result = terminal_record->certificate.result;
+  if (result != StopCertificateResultDTO::kSucceededNominal &&
+      result != StopCertificateResultDTO::kSucceededEscalated)
+    return unconfirmed("stop_not_contained");
+  force_close_stop_generation_ = stop_generation;
+  return Result<StopGeneration>::Ok(stop_generation);
+}
+
+Result<ForceCloseResultDTO> ResourceAddressedExecutionKernel::force_close_operations() {
+  // The same lock order as close_operation: recovery, submission, state.
+  std::lock_guard recovery_lock(operation_recovery_mutex_);
+  std::lock_guard submission_lock(submission_mutex_);
+  ForceCloseResultDTO result;
+  // Journaled after the state lock is released (below).
+  std::vector<OperationStateDTO> settled;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    if (!force_close_stop_generation_.has_value())
+      return Result<ForceCloseResultDTO>::Err(
+          ErrorDTO{"scenario_force_close_stop_unconfirmed",
+                   "Force close requires the operator's confirmed Full Stop first",
+                   {{"reason", "not_armed"}}});
+    if (!close_retired_product_)
+      return Result<ForceCloseResultDTO>::Err(
+          ErrorDTO{"scenario_force_close_not_closing",
+                   "Force close moves operations only after Close retired the lifecycle targets",
+                   {}});
+    // Another thread is writing this operation right now; it re-finds the
+    // operation by id afterwards, so only this short window is refused.
+    // Item 39: a pending I/O-rule Stop response is not waited for; it may
+    // never arrive, and its late certificate skips an operation in history.
+    for (const auto& [id, operation] : active_operations_) {
+      if (operation->ordinary_commit_in_flight || operation->recovery_effect_in_flight ||
+          operation->coordinated_cancellation_in_flight || operation->takeover_advance_in_flight)
+        return Result<ForceCloseResultDTO>::Err(
+            ErrorDTO{"scenario_force_close_operation_busy",
+                     "An operation is being updated right now; retry Force close",
+                     {{"operation_id", id.value()}}});
+    }
+    result.stop_generation = *force_close_stop_generation_;
+    std::vector<OperationId> closed;
+    closed.reserve(active_operations_.size());
+    for (const auto& [id, operation] : active_operations_) {
+      closed.push_back(id);
+      ForceClosedOperationDTO row{id, operation->state.operation_revision, operation->state.state,
+                                  operation->containment_effect_uncertain(), {}};
+      for (const auto& participant : operation->state.participants)
+        row.targets.push_back({participant.controllable_component_id,
+                               participant.command_target_id,
+                               participant.output_evidence == IoOutputEvidence::kAcceptanceUnknown});
+      result.operations.push_back(std::move(row));
+    }
+    for (const auto& id : closed) {
+      // The history copy is this state: marked here, then the ordinary
+      // retirement (I/O rules, continuations, the Program node's slot).
+      auto* operation = find_active_operation_locked(id);
+      auto& state = operation->state;
+      // Item 25: settled as a replaced host settles it. Interrupted is not
+      // settled for the journal's clean owner close, so it is relabelled too.
+      if (!terminal(state.state) || state.state == OperationStateKind::kInterrupted)
+        state.state = OperationStateKind::kInterventionRequired;
+      for (auto& participant : state.participants) {
+        if (participant.terminal_error.has_value())
+          participant.terminal_error->details["force_closed"] = "cell_force_closed_by_operator";
+        else
+          participant.terminal_error = ErrorDTO{
+              "cell_force_closed_by_operator",
+              "Force close moved this operation into history; its effect is unknown", {}};
+      }
+      state.updated_at_ns = clock_.now();
+      stamp_operation_capture_locked(*operation, state);
+      settled.push_back(state);
+      static_cast<void>(retire_operation_ownership_locked(id, true, true, true));
+    }
+    // An unresolved closure (U6) belongs to an operation that no longer exists.
+    const auto is_closed = [&](const auto& row) {
+      return std::find(closed.begin(), closed.end(), row.operation_id) != closed.end();
+    };
+    const bool unresolved_closure =
+        std::any_of(operation_recovery_replay_ledger_.begin(), operation_recovery_replay_ledger_.end(),
+                    [&](const auto& row) { return row.outcome_unresolved && is_closed(row); });
+    std::erase_if(operation_recovery_replay_ledger_, is_closed);
+    result.released_orphan_resources = resource_slots_->force_release(closed);
+    // An operation an earlier restart left orphaned on a freed slot is settled
+    // too (journaled below), so a later start does not fence that slot again.
+    auto freed = result.released_orphan_resources;
+    std::sort(freed.begin(), freed.end());
+    for (auto& history : historical_operations_) {
+      const bool orphaned = std::any_of(
+          history.participants.begin(), history.participants.end(), [&](const auto& participant) {
+            return participant.terminal_error.has_value() &&
+                   participant.terminal_error->code == "execution_host_replaced" &&
+                   std::any_of(participant.resources.begin(), participant.resources.end(),
+                               [&](const auto& resource) {
+                                 return std::binary_search(freed.begin(), freed.end(), resource);
+                               });
+          });
+      if (!orphaned) continue;
+      for (auto& participant : history.participants)
+        if (participant.terminal_error.has_value())
+          participant.terminal_error->details["force_closed"] = "cell_force_closed_by_operator";
+      history.updated_at_ns = clock_.now();
+      if (history.journal_capture_order != 0U) ++history.journal_capture_order;
+      settled.push_back(history);
+    }
+    // Every orphan slot is free now: the reconcile_orphaned_resources rule.
+    if (motion_admission_unreconciled_) {
+      motion_admission_unreconciled_ = false;
+      result.motion_block_cleared = !motion_admission_closed_;
+    }
+    // FIX1 (maintainer): the cell-wide motion block that unresolved closure
+    // left ends with its operation, by the same rule as a Stop-fault clear.
+    if (unresolved_closure && motion_admission_closed_) {
+      motion_admission_closed_ =
+          restart_required_fault_locked() || manager_liveness_motion_inhibited_ ||
+          is_active_stop_fault_latch(active_stop_fault_latch_) ||
+          std::any_of(incident_containments_.begin(), incident_containments_.end(),
+                      [](const auto& row) { return !row.receipt.has_value(); });
+      result.motion_block_cleared = !motion_admission_closed_;
+    }
+  }
+  // Item 25: the settled states are journaled, so a restart finds these
+  // operations in history and fences none of their resources. A failed write
+  // is the ordinary journal write fault; the operations stay history here.
+  for (const auto& state : settled) {
+    const auto written = attempt_journal_write([&] {
+      return journal_.RecordOperationState(config_.request_owner_epoch, state, nullptr,
+                                           "cell_force_closed_by_operator");
+    });
+    if (!written.ok()) {
+      std::lock_guard state_lock(state_mutex_);
+      retain_operation_journal_write_fault_locked("cell_force_closed_by_operator",
+                                                  written.error(), &state, std::nullopt);
+      result.motion_block_cleared = false;
+    }
+  }
+  if (result.motion_block_cleared)
+    static_cast<void>(cell_admission_owner_->RefreshStopFaultAdmission());
+  // A manual claim whose operation is now history and whose slots are free
+  // settles through the existing exact path.
+  static_cast<void>(reconcile_manual_operation_admission_locked());
+  return Result<ForceCloseResultDTO>::Ok(std::move(result));
 }
 
 Result<KernelRecoveryActionResultDTO>

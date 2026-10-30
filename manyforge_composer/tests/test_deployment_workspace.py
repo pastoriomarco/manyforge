@@ -18,6 +18,7 @@ from manyforge_composer.backend.deployment_draft import (
     DeploymentDraftSession,
     _edit_controlled_stop_profile,
     compile_deployment_document,
+    validate_deployment_draft_document,
 )
 from manyforge_composer.backend.draft_session import ComposerDraftSession
 from manyforge_composer.backend.routes_deployment_draft import (
@@ -1485,7 +1486,11 @@ def test_draft_composition_classifier_fails_closed_on_mixed_or_unknown_schema() 
     assert _controllable_composition_change_kinds(compiled, intent) is None
 
 
-def test_opaque_runtime_or_controller_configuration_is_not_draft_classified() -> None:
+def test_scenario_component_settings_are_draft_parameters() -> None:
+    """Decision A: a Scenario component's configuration and target settings
+    are ordinary Draft parameters; the confirmed Apply replaces the component.
+    A compiled runtime unit's configuration stays unclassified."""
+
     intent = {
         "api_version": "manyforge.deployment_intent.v2",
         "components": [
@@ -1493,7 +1498,7 @@ def test_opaque_runtime_or_controller_configuration_is_not_draft_classified() ->
                 "component_id": "robot",
                 "component_profile_id": "robot_profile",
                 "model_source": {"urdf": "robot.urdf"},
-                "target_settings": {},
+                "target_settings": {"arm": {"maximum_tcp_linear_speed_mps": 0.1}},
                 "configuration": {"controller_endpoint": "controller-a"},
             }
         ],
@@ -1503,7 +1508,15 @@ def test_opaque_runtime_or_controller_configuration_is_not_draft_classified() ->
     changed_intent["components"][0]["configuration"]["controller_endpoint"] = (
         "controller-b"
     )
-    assert _controllable_composition_change_kinds(intent, changed_intent) is None
+    changed_intent["components"][0]["target_settings"]["arm"][
+        "maximum_tcp_linear_speed_mps"
+    ] = 0.2
+    assert _controllable_composition_change_kinds(intent, changed_intent) == ()
+    # A model change in the same edit is still composition.
+    changed_intent["components"][0]["model_source"] = {"urdf": "other.urdf"}
+    assert _controllable_composition_change_kinds(intent, changed_intent) == (
+        "model_instances",
+    )
 
     compiled = _focused_document()
     changed_compiled = deepcopy(compiled)
@@ -1839,6 +1852,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             "code": "activation_input_changed_after_confirmation",
             "message": "Draft changed after confirmation; review again",
             "effect": "none",
+            "producer": "composer",
         }
     assert len(effects) == effects_before_scope
     assert capture_calls == capture_calls_after_preparation
@@ -1908,6 +1922,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert rejected.json()["detail"] == {
         "code": "manager_apply_rejected",
         "message": f"Manager rejected the exact Deployment candidate: {manager_cause}",
+        "producer": "composer",
     }
 
     def preview_refused(*_args, **_kwargs):
@@ -1925,6 +1940,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert refused_preview.json()["detail"] == {
         "code": "deployment_candidate_rejected",
         "message": f"Manager rejected the prepared Deployment candidate: {manager_cause}",
+        "producer": "composer",
     }
     state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
 
@@ -2350,6 +2366,20 @@ def test_focused_motion_target_limit_updates_one_exact_target_atomically(
     assert rejected.json()["detail"]["code"] == (
         "deployment_motion_target_limit_scope_mismatch"
     )
+    assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
+
+    unknown_check = client.post(
+        "/api/deployment/draft/motion-target-limit",
+        json=_request(
+            current,
+            controllable_component_id="robot",
+            command_target_id="arm",
+            maximum_tcp_linear_speed_mps=0.1,
+            tcp_speed_check="flange_only",
+            kind="unknown-check",
+        ),
+    )
+    assert unknown_check.status_code == 422
     assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
 
 
@@ -2832,7 +2862,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
                               "payload": {
                                   "kind": "motion", "move_id": "manual-move",
                                   "base_frame_role_id": "base",
-                                  "tcp_endpoint": {"target_role_id": "arm", "frame_role_id": "tcp"},
+                                  "tcp_endpoint": {"kind": "current"},
                                   "tolerances": {"joint_position_tol_rad": 0.05, "translation_tol_m": 0.005,
                                                  "rotation_tol_rad": 0.05},
                                   "speed_profile": {"velocity_scale": 1.0, "acceleration_scale": 1.0,
@@ -3141,3 +3171,347 @@ def test_captured_scene_initialization_is_part_of_manager_request(tmp_path, purp
     # Changing the local intent after capture cannot alter its prepared request.
     intent["scene_initialization"] = "initialize" if purpose == "preserve" else "preserve"
     assert prepared["manager_apply"]["scene_initialization"] == purpose
+
+
+def _io_component(identity: str, timeout_s: int = 30) -> dict[str, Any]:
+    return {
+        "component_id": identity,
+        "component_profile_id": "io_device_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "io_provider",
+            "runtime_configuration": {
+                "io_provider_devices": [
+                    {
+                        "controllable_component_id": identity,
+                        "lifecycle_command_timeout_s": timeout_s,
+                    }
+                ],
+                "io_signals": [],
+            },
+        },
+    }
+
+
+def _io_intent(*components: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "api_version": "manyforge.deployment_intent.v2",
+        "deployment_artifact_id": "cell_a",
+        "name": "Cell A",
+        "components": list(components),
+        "attachments": [],
+        "policies": {},
+    }
+
+
+def test_add_component_is_a_draft_only_edit(tmp_path: Path) -> None:
+    """Add component composes into the Draft; Manager Applied is not touched."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_io_component("station_io")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    added = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            before,
+            path=["components"],
+            operation="append",
+            value=_io_component("plc_io"),
+            kind="add-component",
+        ),
+    )
+
+    assert added.status_code == 200, added.text
+    rows = added.json()["draft"]["document"]["components"]
+    assert [row["component_id"] for row in rows] == ["plc_io", "station_io"]
+    assert added.json()["draft"]["revision"] == before["draft"]["revision"] + 1
+    assert added.json()["managerApplied"] == before["managerApplied"]
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        # An addition that also changes an existing row is not a pure addition.
+        lambda: [_io_component("plc_io"), _io_component("station_io", 12)],
+        # Removing a component stays activation-only.
+        lambda: [],
+        # Replacing one component by another is not an addition.
+        lambda: [_io_component("plc_io")],
+    ],
+)
+def test_only_pure_component_additions_skip_the_activation_boundary(
+    tmp_path: Path, after
+) -> None:
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_io_component("station_io")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    rejected = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            before,
+            path=["components"],
+            operation="set",
+            value=after(),
+            kind="not-an-addition",
+        ),
+    )
+
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] in {
+        "deployment_activation_required",
+        "deployment_activation_classification_unavailable",
+    }
+    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+
+
+def _scenario_robot_and_tool() -> dict[str, Any]:
+    """A Scenario Draft: a Real robot and a gripper tool on its flange."""
+
+    arm = _model_component("arm")
+    arm["configuration"] = {
+        "runtime_kind": "ros2_control",
+        "runtime_configuration": {
+            "real_profile": "lite6_real",
+            "device_address_ref": "cell_robot",
+        },
+    }
+    hand = _model_component("hand", mounted=True)
+    hand["configuration"] = {
+        "runtime_kind": "ros2_control",
+        "runtime_configuration": {
+            "gripper_target_configurations": [
+                {
+                    "controllable_component_id": "hand",
+                    "command_target_id": "gripper",
+                    "actuation_kind": "position_commanded",
+                }
+            ],
+        },
+    }
+    intent = _io_intent(arm, hand)
+    intent["attachments"] = [_mount("arm", "hand")]
+    return intent
+
+
+def test_grasp_confirmation_edit_enters_a_scenario_draft(tmp_path: Path) -> None:
+    """B2: a Settings edit on a Scenario component is a Draft edit, not a refusal."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _scenario_robot_and_tool(), compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+    path = [
+        "components", 1, "configuration", "runtime_configuration",
+        "gripper_target_configurations", 0, "grasp_confirmation",
+    ]
+    value = {"policy": "required", "stall_window": {"min_position": 0.001, "max_position": 0.02}}
+
+    edited = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(before, path=path, operation="set", value=value, kind="grasp"),
+    )
+
+    assert edited.status_code == 200, edited.text
+    row = edited.json()["draft"]["document"]["components"][1]["configuration"][
+        "runtime_configuration"
+    ]["gripper_target_configurations"][0]
+    assert row["grasp_confirmation"] == value
+    assert edited.json()["draft"]["revision"] == before["draft"]["revision"] + 1
+    # Nothing takes effect before the confirmed Apply.
+    assert edited.json()["managerApplied"] == before["managerApplied"]
+
+
+def test_endpoint_edit_enters_the_draft_and_applies_as_a_confirmed_replace(
+    tmp_path: Path,
+) -> None:
+    """An endpoint field is a Draft parameter too; the Manager's Apply replaces
+    the component, and that destructive impact needs the confirmation."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _scenario_robot_and_tool(), compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    edited = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            before,
+            path=["components", 0, "configuration", "runtime_configuration",
+                  "device_address_ref"],
+            operation="set",
+            value="spare_robot",
+            kind="endpoint",
+        ),
+    )
+
+    assert edited.status_code == 200, edited.text
+    document = edited.json()["draft"]["document"]
+    assert document["components"][0]["configuration"]["runtime_configuration"][
+        "device_address_ref"
+    ] == "spare_robot"
+    assert edited.json()["managerApplied"] == before["managerApplied"]
+
+    # Apply carries the Draft; the Manager reports the changed controller
+    # profile row as a replace (apply_component_delta.cpp), which is
+    # destructive, so Composer asks for the confirmation first.
+    apply_state, intent, preview = _configuration_preparation(tmp_path)
+    intent["deployment"] = document
+    preview["impact"]["components"][0] = {
+        "controllable_component_id": "arm",
+        "disposition": "replace",
+        "replacement_reasons": ["runtime_units"],
+    }
+    preview["impact"]["destructive"] = True
+    preview["candidate_receipt"]["destructive_impact"] = True
+    prepared = apply_state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert prepared["confirmation_required"] is True
+    assert prepared["manager_apply"] is None
+    intent["confirmation_token"] = prepared["confirmation_token"]
+    confirmed = apply_state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert confirmed["manager_apply"]["accepted_impact_digest"] == (
+        preview["candidate_receipt"]["impact_digest"]
+    )
+
+
+def _mount(robot: str, tool: str) -> dict[str, Any]:
+    return {
+        "parent": {"component_id": robot, "interface": "flange"},
+        "child": {"component_id": tool, "interface": "mount"},
+    }
+
+
+def _model_component(identity: str, *, mounted: bool = False) -> dict[str, Any]:
+    """A model row; a mounted tool carries no root pose (its mount places it)."""
+
+    row: dict[str, Any] = {
+        "component_id": identity,
+        "component_profile_id": f"{identity}_v0",
+        "model_source": {"urdf": {"project_path": f"{identity}.urdf"}, "package_roots": {}},
+        "target_settings": {},
+        "configuration": {"runtime_kind": "ros2_control"},
+    }
+    if not mounted:
+        row["root_pose_in_cell"] = {
+            "position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+    return row
+
+
+def test_add_tool_with_its_mount_is_a_draft_only_edit(tmp_path: Path) -> None:
+    """A new tool (no root pose) and its new attachment row are one pure addition."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_model_component("arm")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    added = client.post(
+        "/api/deployment/draft/components",
+        json=_request(
+            before,
+            components=[_model_component("hand", mounted=True)],
+            attachments=[_mount("arm", "hand")],
+            kind="add-tool",
+        ),
+    )
+
+    assert added.status_code == 200, added.text
+    document = added.json()["draft"]["document"]
+    rows = {row["component_id"]: row for row in document["components"]}
+    assert list(rows) == ["arm", "hand"]
+    assert "root_pose_in_cell" not in rows["hand"]
+    assert document["attachments"] == [_mount("arm", "hand")]
+    assert added.json()["draft"]["revision"] == before["draft"]["revision"] + 1
+    assert added.json()["managerApplied"] == before["managerApplied"]
+
+
+def test_add_tool_refuses_a_root_pose_on_the_mounted_tool(tmp_path: Path) -> None:
+    """Slice B's intent validator: a mounted child takes no root pose."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_model_component("arm")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    refused = client.post(
+        "/api/deployment/draft/components",
+        json=_request(
+            before,
+            components=[_model_component("hand")],
+            attachments=[_mount("arm", "hand")],
+            kind="posed-tool",
+        ),
+    )
+
+    assert refused.status_code == 400, refused.text
+    assert "root_pose_in_cell" in refused.text
+    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+
+
+@pytest.mark.parametrize(
+    ("components", "attachments"),
+    [
+        # An attachment whose child already exists changes the composition.
+        (lambda: [_io_component("hand")], lambda: [_mount("hand", "arm")]),
+        # A new attachment between existing components only.
+        (lambda: [_io_component("hand")], lambda: [_mount("arm", "station")]),
+    ],
+)
+def test_add_components_refuses_attachments_of_existing_components(
+    tmp_path: Path, components, attachments
+) -> None:
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_io_component("arm"), _io_component("station")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    rejected = client.post(
+        "/api/deployment/draft/components",
+        json=_request(
+            before, components=components(), attachments=attachments(), kind="not-pure",
+        ),
+    )
+
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] in {
+        "deployment_activation_required",
+        "deployment_activation_classification_unavailable",
+    }
+    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+
+
+@pytest.mark.parametrize("after", [lambda: [], lambda: [_mount("arm", "station")]])
+def test_changing_or_removing_an_attachment_stays_activation_only(
+    tmp_path: Path, after
+) -> None:
+    client, state = _client(tmp_path)
+    intent = _io_intent(_io_component("arm"), _io_component("hand"), _io_component("station"))
+    intent["attachments"] = [_mount("arm", "hand")]
+    _seed_existing_deployment(state, intent, compiler=validate_deployment_draft_document)
+    before = client.get("/api/deployment/workspace").json()
+
+    rejected = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            before, path=["attachments"], operation="set", value=after(), kind="re-mount",
+        ),
+    )
+
+    assert rejected.status_code == 409, rejected.text
+    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]

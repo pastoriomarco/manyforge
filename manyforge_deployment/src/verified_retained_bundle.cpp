@@ -464,10 +464,11 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
         "retained cell_graph differs from its exact verified projection");
   }
   const auto &graph = verified.graph();
-  if (!graph.component_attachments.empty()) {
-    detail::fail_retained_bundle(
-        "retained cell_graph is outside the structural no-attachment subset");
-  }
+  // A mounted child takes its placement from its one attachment edge; the
+  // intrinsic graph validation already proves it omits a root pose.
+  std::set<core::ControllableComponentId> mounted;
+  for (const auto &attachment : graph.component_attachments)
+    mounted.insert(attachment.child.controllable_component_id);
   const bool passive = graph.controllable_components.empty() &&
                        graph.control_domains.empty() &&
                        graph.control_bindings.empty();
@@ -521,8 +522,10 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
                              domain.provider()->controllable_component_id ==
                                  component.controllable_component_id;
                     });
-    if ((!model_free_provider && (!component.root_pose_in_cell.has_value() ||
-                                  component.model_role_bindings.empty())) ||
+    if ((!model_free_provider &&
+         ((!component.root_pose_in_cell.has_value() &&
+           !mounted.contains(component.controllable_component_id)) ||
+          component.model_role_bindings.empty())) ||
         !has_execution_runtime || component.runtime_unit_ids.empty() ||
         !std::all_of(component.runtime_unit_ids.begin(),
                      component.runtime_unit_ids.end(),

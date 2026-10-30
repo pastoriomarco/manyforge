@@ -587,6 +587,103 @@ TEST(CellGraphCodec, TwoSameTypeInstancesAreDistinctAndIntrinsicallyValid) {
             "articulated_arm");
 }
 
+// TCP-A: an owned occurrence carries its Deployment custom TCPs (sorted,
+// emitted only when present).
+TEST(CellGraphCodec, OwnedOccurrenceCarriesSortedCustomTcps) {
+  const std::string custom =
+      "    custom_tcps:\n"
+      "      - frame_role_id: pen\n"
+      "        parent_link_name: link_eef\n"
+      "        pose_in_parent_link:\n"
+      "          position_m: [0.0, 0.0, 0.12]\n"
+      "          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n"
+      "      - frame_role_id: probe\n"
+      "        parent_link_name: pen\n"
+      "        pose_in_parent_link:\n"
+      "          position_m: [0.01, 0.0, 0.0]\n"
+      "          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n";
+  const std::string anchor = "  - model_instance_id: robot_1_model\n";
+  const auto graph = replace_once(two_instance_graph(false), anchor, anchor + custom);
+  const auto validated = validate(graph);
+  const auto& rows = validated.graph().model_instances[0].custom_tcps;
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(rows[0].frame_role_id.value(), "pen");
+  EXPECT_EQ(rows[0].parent_link_name, "link_eef");
+  EXPECT_EQ(rows[0].pose_in_parent_link.position_m[2], 0.12);
+  EXPECT_EQ(rows[1].parent_link_name, "pen");
+  EXPECT_TRUE(validated.graph().model_instances[1].custom_tcps.empty());
+  EXPECT_NE(canonical_json(decode(graph).structurally_normalized_root()),
+            canonical_json(decode(two_instance_graph(false)).structurally_normalized_root()));
+  EXPECT_NE(canonical_json(decode(graph).structurally_normalized_root()).find("\"custom_tcps\""),
+            std::string::npos);
+  EXPECT_EQ(canonical_json(decode(two_instance_graph(false)).structurally_normalized_root())
+                .find("custom_tcps"),
+            std::string::npos);
+
+  // Unsorted, empty or malformed rows are refused.
+  const std::string unsorted =
+      "    custom_tcps:\n"
+      "      - {frame_role_id: probe, parent_link_name: pen, pose_in_parent_link: "
+      "{position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1]}}\n"
+      "      - {frame_role_id: pen, parent_link_name: link_eef, pose_in_parent_link: "
+      "{position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1]}}\n";
+  EXPECT_THROW((void)decode(replace_once(two_instance_graph(false), anchor, anchor + unsorted)),
+               CellGraphCodecError);
+  EXPECT_THROW((void)decode(replace_once(two_instance_graph(false), anchor,
+                                         anchor + "    custom_tcps: []\n")),
+               CellGraphCodecError);
+  const std::string not_unit =
+      "    custom_tcps:\n"
+      "      - {frame_role_id: pen, parent_link_name: link_eef, pose_in_parent_link: "
+      "{position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 2]}}\n";
+  EXPECT_THROW((void)decode(replace_once(two_instance_graph(false), anchor, anchor + not_unit)),
+               CellGraphCodecError);
+}
+
+// B5: a component's compiled `default_tcp` pair and a mount's authored
+// `primary` round-trip; each is emitted only when present (true).
+TEST(CellGraphCodec, CarriesDefaultTcpAndPrimaryOnlyWhenPresent) {
+  const std::string tcp_anchor = "  - controllable_component_id: robot_1\n";
+  const std::string with_tcp = replace_once(
+      two_instance_graph(false), tcp_anchor,
+      tcp_anchor + "    default_tcp: {command_target_id: gripper, frame_role_id: tcp}\n");
+  const auto validated = validate(with_tcp);
+  const auto& tcp = validated.graph().controllable_components[0].default_tcp;
+  ASSERT_TRUE(tcp.has_value());
+  EXPECT_EQ(tcp->command_target_id.value(), "gripper");
+  EXPECT_EQ(tcp->frame_role_id.value(), "tcp");
+  EXPECT_FALSE(validated.graph().controllable_components[1].default_tcp.has_value());
+  EXPECT_NE(canonical_json(decode(with_tcp).structurally_normalized_root())
+                .find("\"default_tcp\":{\"command_target_id\":\"gripper\",\"frame_role_id\":\"tcp\"}"),
+            std::string::npos);
+  EXPECT_EQ(canonical_json(decode(two_instance_graph(false)).structurally_normalized_root())
+                .find("default_tcp"),
+            std::string::npos);
+  for (const char* bad : {"    default_tcp: {command_target_id: gripper}\n",
+                          "    default_tcp: {command_target_id: gripper, frame_role_id: tcp, "
+                          "extra: 1}\n",
+                          "    default_tcp: null\n"}) {
+    EXPECT_THROW((void)decode(replace_once(two_instance_graph(false), tcp_anchor,
+                                           tcp_anchor + bad)),
+                 CellGraphCodecError)
+        << bad;
+  }
+
+  const std::string edge_anchor = "      attachment_interface_id: mount\n";
+  const std::string primary =
+      replace_once(full_graph(), edge_anchor, edge_anchor + "    primary: true\n");
+  EXPECT_TRUE(validate(primary).graph().component_attachments.front().primary);
+  EXPECT_FALSE(validate(full_graph()).graph().component_attachments.front().primary);
+  EXPECT_NE(canonical_json(decode(primary).structurally_normalized_root()).find("\"primary\":true"),
+            std::string::npos);
+  EXPECT_EQ(canonical_json(decode(full_graph()).structurally_normalized_root()).find("primary"),
+            std::string::npos);
+  // `false` is omitted, never written.
+  EXPECT_THROW((void)decode(replace_once(full_graph(), edge_anchor,
+                                         edge_anchor + "    primary: false\n")),
+               CellGraphCodecError);
+}
+
 TEST(CellGraphCodec, RejectsOneModelBoundToMultipleRolesInOneComponent) {
   std::string graph = two_instance_graph(false);
   graph = replace_once(std::move(graph),

@@ -283,10 +283,12 @@ struct ResolvedPickOffsetBases final {
     const ReferenceTargetDTO reference_owner = selected->target.value_or(
         ReferenceTargetDTO{arm_binding.target_role_id, arm_binding.controllable_component_id,
                            arm_binding.command_target_id});
+    // C-P7 (G7): the candidate TCP's orientation is kept when the reference is
+    // the move's TCP entry (its target role names the entry's owner), whether
+    // that entry is the arm's own or a mounted tool's.
     const bool candidate_tcp =
         selected->type == ReferenceDTO::Type::kFrameRole && arm_binding.motion_endpoint &&
         reference_owner.target_role_id == arm_binding.motion_endpoint->target_role_id &&
-        reference_owner.controllable_component_id == arm_binding.controllable_component_id &&
         reference_owner.command_target_id == arm_binding.motion_endpoint->command_target_id &&
         std::get<FrameRoleId>(selected->id) == arm_binding.motion_endpoint->frame.frame_role_id;
     if (candidate_tcp) {

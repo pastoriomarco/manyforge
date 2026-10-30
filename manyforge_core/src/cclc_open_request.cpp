@@ -352,7 +352,8 @@ template <typename StrongCounter>
                {"request_context", "controllable_component_id", "intent", "expected_graph_revision",
                 "expected_component_lifecycle_generation", "expected_control_domains",
                 "expected_admission_generation"},
-               {"reason", "program_node_evidence", "close_incident_recovery"}, "component lifecycle intent");
+               {"reason", "program_node_evidence", "close_incident_recovery",
+                "acknowledge_incident", "expected_incident_id"}, "component lifecycle intent");
   std::vector<ExpectedControlDomainRevisionDTO> domains;
   const auto& encoded =
       bounded_array(member(value, "expected_control_domains", "component lifecycle intent"),
@@ -598,8 +599,6 @@ template <typename StrongCounter>
       return "verifying";
     case ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown:
       return "outcome_unknown";
-    case ComponentLifecycleTransactionPhaseDTO::kReconciling:
-      return "reconciling";
     case ComponentLifecycleTransactionPhaseDTO::kSucceeded:
       return "succeeded";
     case ComponentLifecycleTransactionPhaseDTO::kFailed:
@@ -619,31 +618,10 @@ template <typename StrongCounter>
       return "executing";
     case ComponentLifecycleDomainActionStateDTO::kVerifying:
       return "verifying";
-    case ComponentLifecycleDomainActionStateDTO::kReconciling:
-      return "reconciling";
     case ComponentLifecycleDomainActionStateDTO::kSucceeded:
       return "succeeded";
     case ComponentLifecycleDomainActionStateDTO::kFailed:
       return "failed";
-    case ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown:
-      return "outcome_unknown";
-  }
-  return {};
-}
-
-[[nodiscard]] std::string_view lifecycle_effect(
-    const ComponentLifecycleDomainEffectDTO value) noexcept {
-  switch (value) {
-    case ComponentLifecycleDomainEffectDTO::kNone:
-      return "none";
-    case ComponentLifecycleDomainEffectDTO::kKnownNoEffect:
-      return "known_no_effect";
-    case ComponentLifecycleDomainEffectDTO::kEffectObserved:
-      return "effect_observed";
-    case ComponentLifecycleDomainEffectDTO::kPartialEffectObserved:
-      return "partial_effect_observed";
-    case ComponentLifecycleDomainEffectDTO::kEffectUncertain:
-      return "effect_uncertain";
   }
   return {};
 }
@@ -653,10 +631,10 @@ template <typename StrongCounter>
   switch (value) {
     case ComponentLifecycleTerminalResultDTO::kSucceeded:
       return "succeeded";
-    case ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect:
-      return "failed_known_no_effect";
-    case ComponentLifecycleTerminalResultDTO::kFailedPartialEffect:
-      return "failed_partial_effect";
+    case ComponentLifecycleTerminalResultDTO::kFailed:
+      return "failed";
+    case ComponentLifecycleTerminalResultDTO::kConnectionLost:
+      return "connection_lost";
   }
   return {};
 }
@@ -781,7 +759,6 @@ template <typename StrongCounter>
         {"current_state", domain.current_state.has_value()
                               ? CanonicalValue(std::string(to_string(*domain.current_state)))
                               : CanonicalValue(nullptr)},
-        {"effect", CanonicalValue(std::string(lifecycle_effect(domain.effect)))},
         {"error",
          domain.error.has_value() ? error_value(*domain.error) : CanonicalValue(nullptr)}});
   }
@@ -1227,6 +1204,9 @@ template <typename StrongCounter>
   }
   if (!target_view.stream_health.empty())
     fields.emplace_back("stream_health", stream_health_value(target_view.stream_health));
+  // M6: present only when true (Recover cell enables such a component again).
+  if (target_view.active_target_retired_by_incident)
+    fields.emplace_back("active_target_retired_by_incident", CanonicalValue(true));
   return CanonicalValue(std::move(fields));
 }
 
@@ -1389,6 +1369,53 @@ Result<CCLCLifecycleRequestResultDTO> ComponentLifecycleCoordinatorOpenRequestPo
     target_driver_->Wake();
   }
   return result;
+}
+
+// M6 (`acknowledge_incident: false`): never the authorization-only incident
+// Recover. An incident is recorded only after its containment latched the
+// cell Stop fault (CCLCLifecycleTargetDriver::ContainAndRecordIncident), and a
+// latched cell refuses the lifecycle claim of ordinary admission; so an
+// incident detected after this check is refused there too, and an ordinary
+// Recover never acknowledges an incident record or a stream latch.
+Result<CCLCLifecycleRequestResultDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::SubmitLifecycleWithoutIncidentAcknowledgement(
+    const ComponentLifecycleIntentDTO& intent) {
+  // Exact replay first (a retry of an accepted request replays it), then the
+  // incident/stream check inside admission, immediately before the durable
+  // Kernel claim; a refusal is retained as this request's no-effect result.
+  auto result =
+      target_driver_ == nullptr
+          ? coordinator_.SubmitLifecycle(intent)
+          : coordinator_.SubmitLifecycle(intent, [this, &intent] {
+              return target_driver_->RefuseWhileAcknowledgementPending(
+                  intent.controllable_component_id);
+            });
+  if (target_driver_ != nullptr && result.ok() &&
+      result.value().replay_status == RequestReplayStatusDTO::kAcceptedNew &&
+      result.value().acceptance.has_value()) {
+    target_driver_->Wake();
+  }
+  return result;
+}
+
+// M6 (item 36): a Recover press acknowledges only the incident it displayed.
+// The check reads before the stream acknowledgement and the journal write of
+// `SubmitLifecycle`; an incident replaced inside that short same-call window
+// is acknowledged and named in the result, as every Recover was before.
+Result<CCLCLifecycleRequestResultDTO>
+ComponentLifecycleCoordinatorOpenRequestPort::SubmitLifecycleExpectingIncident(
+    const ComponentLifecycleIntentDTO& intent, const std::string& expected_incident_id) {
+  // An exact retransmission of an earlier press is answered from its retained
+  // result by ordinary admission, never re-checked against a later incident.
+  const auto retained = coordinator_.ReadLifecycleRequestResult(intent);
+  if (retained.ok() && retained.value()) return SubmitLifecycle(intent);
+  // No lifecycle driver, no incidents: an ordinary Recover (item 26).
+  if (target_driver_ != nullptr) {
+    const auto expected = target_driver_->RefuseIfAnotherIncidentOpen(
+        intent.controllable_component_id, expected_incident_id);
+    if (!expected.ok()) return Result<CCLCLifecycleRequestResultDTO>::Err(expected.error());
+  }
+  return SubmitLifecycle(intent);
 }
 
 Result<std::optional<CCLCLifecycleRequestResultDTO>>
@@ -1617,7 +1644,33 @@ Result<std::string> ExecuteCanonicalCCLCOpenRequest(const std::string_view canon
       return encode_response(response_value(command, route_template_set_value(result.value())));
     }
     if (command == "lifecycle_submit") {
-      auto result = port.SubmitLifecycle(lifecycle_intent(payload, transport_attribution));
+      // M6: `acknowledge_incident` (optional, default true: today's Recover).
+      bool acknowledge_incident = true;
+      if (const auto* acknowledge = payload.find_object_member("acknowledge_incident")) {
+        if (!acknowledge->is_bool()) fail("acknowledge_incident is not a boolean");
+        acknowledge_incident = acknowledge->as_bool();
+      }
+      // M6 (item 36): `expected_incident_id` (optional): the operator's
+      // Recover acknowledges only that open incident.
+      std::optional<std::string> expected_incident_id;
+      if (const auto* expected = payload.find_object_member("expected_incident_id")) {
+        expected_incident_id = text(*expected, "expected incident id");
+        if (expected_incident_id->empty()) fail("expected incident id is empty");
+      }
+      auto intent = lifecycle_intent(payload, transport_attribution);
+      if (!acknowledge_incident && intent.close_incident_recovery) {
+        fail("Close incident recovery always acknowledges its incident");
+      }
+      if (expected_incident_id &&
+          (intent.intent != ComponentLifecycleIntentKindDTO::kRecover || !acknowledge_incident ||
+           intent.close_incident_recovery)) {
+        fail("expected_incident_id belongs to an ordinary Recover that acknowledges an incident");
+      }
+      auto result = expected_incident_id
+                        ? port.SubmitLifecycleExpectingIncident(intent, *expected_incident_id)
+                    : acknowledge_incident
+                        ? port.SubmitLifecycle(intent)
+                        : port.SubmitLifecycleWithoutIncidentAcknowledgement(intent);
       if (!result.ok()) {
         return encode_response(error_response_value(command, result.error()));
       }

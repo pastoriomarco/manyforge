@@ -6,6 +6,10 @@ import type {
 } from '../types/api';
 import { reactPropsHost } from '../test/reactPropsHost';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
+import {
+  createdReferenceValue,
+  type ProgramReferenceSource,
+} from './property/ProgramSchemaValueEditor';
 
 const DEFAULT_POLICY = { raise_alarm: true, stop_motion: true, set_key: null, detach: true };
 const onGraspLost: CatalogParameter = {
@@ -96,6 +100,7 @@ beforeEach(() => {
 
 async function mount(node: ProgramTreeNode = attachNode) {
   const onMutate = vi.fn().mockResolvedValue(null);
+  const onCreateReference = vi.fn();
   const { host, find, all } = reactPropsHost();
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
@@ -107,10 +112,11 @@ async function mount(node: ProgramTreeNode = attachNode) {
     busy={false}
     onMutate={onMutate}
     onUpdateNodePolicies={vi.fn()}
-    onCreateReference={vi.fn()}
+    onCreateReference={onCreateReference}
   />));
   return {
     onMutate,
+    onCreateReference,
     all,
     control: (label: string) => find((props) => props['aria-label'] === label),
     unmount: () => act(() => root.unmount()),
@@ -228,5 +234,39 @@ describe('Composer attach-node grasp-lost policy', () => {
     } finally {
       await mounted.unmount();
     }
+  });
+
+  it('writes a key created from the picker into set_key only, keeping the other settings', async () => {
+    const node: ProgramTreeNode = {
+      ...attachNode,
+      parameters: { on_grasp_lost: { ...DEFAULT_POLICY, detach: false } },
+    };
+    const mounted = await mount(node);
+    try {
+      await act(() => mounted.control('Set key on grasp loss').onChange?.({ target: { checked: true } }));
+      await act(() => mounted.control('Choose blackboard key for on grasp lost.set key')
+        .onChange?.({ target: { value: '__create__' } }));
+      expect(mounted.onMutate).not.toHaveBeenCalled();
+      expect(mounted.onCreateReference).toHaveBeenCalledTimes(1);
+      const [target, , , source] = mounted.onCreateReference.mock.calls[0] as
+        [string, unknown, unknown, ProgramReferenceSource];
+      expect(target).toBe('blackboard_key');
+      expect(source).toMatchObject({ nodeId: 'attach_part', parameterId: 'on_grasp_lost' });
+      // Regression: the created key used to replace the whole on_grasp_lost value.
+      expect(createdReferenceValue(source, node.parameters.on_grasp_lost, 'part_dropped')).toEqual({
+        raise_alarm: true, stop_motion: true, set_key: 'part_dropped', detach: false,
+      });
+      expect(createdReferenceValue(source, undefined, 'part_dropped')).toEqual({
+        ...DEFAULT_POLICY, set_key: 'part_dropped',
+      });
+    } finally {
+      await mounted.unmount();
+    }
+  });
+
+  it('keeps a whole-parameter picker writing the created id itself', () => {
+    expect(createdReferenceValue(
+      { nodeId: 'n', parameterId: 'key', semanticType: 'blackboard_key' }, 'old_key', 'new_key',
+    )).toBe('new_key');
   });
 });

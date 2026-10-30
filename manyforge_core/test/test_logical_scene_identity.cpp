@@ -361,6 +361,37 @@ TEST(LogicalSceneIdentity, RejectsStalePolicyAndAttachmentInconsistency) {
                LogicalSceneIdentityError);
 }
 
+TEST(LogicalSceneIdentity, ObjectMassIsAbsentAtZeroAndCoveredWhenPositive) {
+  const auto baseline = RichSnapshot();
+  const auto digest = ComputeLogicalSceneContentHash(baseline);
+  const auto collision =
+      ComputeSceneObjectCollisionIdentity(baseline.objects[1], baseline.cell_id);
+
+  // A zero mass is absent from identity: existing digests keep their value.
+  auto massless = baseline;
+  massless.objects[1].mass_kg = 0.0;
+  EXPECT_EQ(ComputeLogicalSceneContentHash(massless), digest);
+
+  auto heavy = baseline;
+  heavy.objects[1].mass_kg = 1.5;
+  EXPECT_TRUE(heavy.objects[1].locally_valid());
+  EXPECT_NE(ComputeLogicalSceneContentHash(heavy), digest);
+  // Mass is payload, not collision geometry.
+  EXPECT_EQ(
+      ComputeSceneObjectCollisionIdentity(heavy.objects[1], heavy.cell_id),
+      collision);
+
+  for (const double invalid :
+       {-1.0, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::infinity()}) {
+    auto refused = baseline;
+    refused.objects[1].mass_kg = invalid;
+    EXPECT_FALSE(refused.objects[1].locally_valid());
+    EXPECT_THROW(ComputeLogicalSceneContentHash(refused),
+                 LogicalSceneIdentityError);
+  }
+}
+
 TEST(LogicalSceneIdentity, RejectsNegativeZero) {
   auto snapshot = RichSnapshot();
   std::get<CellFixedSceneObjectPlacementDTO>(snapshot.objects[0].placement)

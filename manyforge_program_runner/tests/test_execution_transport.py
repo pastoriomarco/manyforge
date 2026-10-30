@@ -55,7 +55,7 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
     port = fixture.NativeKernelProgramPort(fixture.KernelClient(recorder))
     port.bind(fixture._context())
     parameters = dict(fixture._motion_inputs().parameters)
-    parameters["tcp_endpoint"] = {"target_role": endpoint_owner, "frame_role": "tcp"}
+    parameters["tcp_endpoint"] = {"kind": "default_of_role", "role": endpoint_owner}
     port.operations.start(
         "motion.move_to_pose",
         fixture._identity("runner-endpoint"),
@@ -72,20 +72,25 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
             "accepted": {
                 "request_id": command["operation"]["request_context"]["request_id"]
             },
+            "active_tcp": [{"component_id": "robot.1", "entry": None,
+                            "owner_epoch": "owner.1", "registration_generation": 1,
+                            "sequence": 0}],
         }
 
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
-    assert transport.submit(operation)["ok"] is True
+    result = transport.submit(operation)
+    assert result["ok"] is True
+    assert result["active_tcp"][0]["component_id"] == "robot.1"
     sent = commands[0]["operation"]["participants"][0]
     assert sent["payload"]["tcp_endpoint"] == {
-        "target_role_id": endpoint_owner, "frame_role_id": "tcp",
+        "kind": "default_of_role", "role": endpoint_owner,
     }
     assert "tcp_frame_role_id" not in sent["payload"]
     assert sent["execution_scope"] == operation["participants"][0]["execution_scope"]
     legacy = deepcopy(operation)
     payload = legacy["participants"][0]["payload"]
-    payload["tcp_frame_role_id"] = payload.pop("tcp_endpoint")["frame_role_id"]
+    payload["tcp_endpoint"] = {"target_role_id": endpoint_owner, "frame_role_id": "tcp"}
     with pytest.raises(HeadlessApiError) as refused:
         transport.submit(legacy)
     assert refused.value.code == "execution_command_invalid"
@@ -94,9 +99,9 @@ def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
 
 @pytest.mark.parametrize(
     "failure",
-    ["command", "group", "missing_groups", "empty_groups", "release_revision"],
+    ["command", "missing_groups", "empty_groups", "release_command"],
 )
-def test_selection_results_must_identify_the_requested_transition(
+def test_selection_results_must_have_their_kind_and_shape(
     monkeypatch, tmp_path, failure
 ):
     from manyforge_behavior.kernel_client import KernelClient, KernelClientResponseError
@@ -117,8 +122,6 @@ def test_selection_results_must_identify_the_requested_transition(
     assert kernel.stop_program_selection(request)["group_ids"] == ["arm", "grippers"]
     if failure == "command":
         response["command"] = "unrelated_command"
-    elif failure == "group":
-        response["accepted"]["group_ids"] = ["grippers"]
     elif failure == "missing_groups":
         del request["group_ids"]
         del response["accepted"]["group_ids"]
@@ -132,9 +135,9 @@ def test_selection_results_must_identify_the_requested_transition(
             "scope": {"selection_revision": 3},
         }
         assert kernel.release_program_selection(request, 2)["selection_revision"] == 3
-        response["scope"]["selection_revision"] = 2
+        response["command"] = "unrelated_command"
     with pytest.raises(KernelClientResponseError):
-        if failure == "release_revision":
+        if failure == "release_command":
             kernel.release_program_selection(request, 2)
         else:
             kernel.stop_program_selection(request)
@@ -337,9 +340,12 @@ def test_capture_registration_sends_identities_and_checks_the_returned_claim(
             "capture": capture,
         }
     ]
-    response["claim_generation"] = 5
-    with pytest.raises(HeadlessApiError, match="registered claim"):
+    response["claim_generation"] = 5  # The echo is not compared.
+    assert transport.register_program_run_capture(capture) == response
+    response["command"] = "register_io_watch"
+    with pytest.raises(HeadlessApiError) as invalid:
         transport.register_program_run_capture(capture)
+    assert invalid.value.code == "execution_command_response_invalid"
 
 
 def test_control_origin_is_forwarded_privately_and_forbidden_publicly(
@@ -500,3 +506,58 @@ def test_position_effect_rejects_arbitrary_targets_and_mismatched_success(monkey
     with pytest.raises(HeadlessApiError):
         transport.reset_robot_position(request)
     assert len(packets) == (1 if mutation in {"joints", "extra_authority", "claim_union"} else 2)
+
+
+@pytest.mark.parametrize("command", ["read_active_tcp", "reset_active_tcp"])
+def test_active_tcp_commands_keep_rows_and_internal_reset_attribution(monkeypatch, tmp_path, command):
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
+    commands = []
+    rows = [{"component_id": "robot", "entry": {"component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"},
+             "owner_epoch": "owner.1", "registration_generation": 2, "sequence": 3}]
+    response = {"api_version": "manyforge.execution_command_response.v1", "command": command,
+                "ok": True, "robots": rows}
+    def exchange(_client, request, _socket_path):
+        commands.append(request)
+        return response
+    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
+    assert getattr(transport, command)()["robots"] == rows
+    assert commands[0]["command"] == command
+    if command == "reset_active_tcp":
+        assert commands[0]["attribution"] == {"transport": "internal", "assurance": "unverified", "principal_id": None}
+    else:
+        assert "attribution" not in commands[0]
+    response["robots"][0]["registration_generation"] = True
+    with pytest.raises(HeadlessApiError, match="Active TCP response is invalid"):
+        getattr(transport, command)()
+
+
+def test_runner_set_tcp_participant_strictly_round_trips():
+    from manyforge_program_runner.execution_transport import _ProgramParticipant
+    body = {"component_role_id": "robot", "target_role_id": "arm",
+            "required_capability_id": "execution.trajectory.execute", "action_span": None,
+            "execution_scope": {"node_instance_id": "set", "node_attempt_id": "attempt.1"},
+            "payload": {"kind": "set_tcp", "tcp": {"kind": "default_of_role", "role": "tool"}}}
+    assert _ProgramParticipant.model_validate(body).model_dump(mode="json") == body
+    body["payload"]["tcp"] = {"target_role_id": "tool", "frame_role_id": "tcp"}
+    with pytest.raises(ValidationError):
+        _ProgramParticipant.model_validate(body)
+
+
+def test_admitted_immediate_failure_preserves_confirmed_active_tcp(monkeypatch, tmp_path):
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
+    rows = [{"component_id": "robot", "entry": None, "owner_epoch": "owner.1",
+             "registration_generation": 1, "sequence": 2}]
+    response = {"ok": False, "error": {"code": "tcp_offset_not_applied", "message": "failed",
+        "producer": "kernel", "details": {"immediate_step": "admitted", "request_id": "request.1", "operation_id": "operation.1"}},
+        "active_tcp": rows}
+    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", lambda *_: response)
+    with pytest.raises(HeadlessApiError) as caught:
+        transport._exchange({"command": "submit"})
+    assert caught.value.code == "tcp_offset_not_applied"
+    assert caught.value.producer == "kernel"
+    assert caught.value.details["request_id"] == "request.1"
+    assert caught.value.active_tcp == rows
+    del response["active_tcp"]
+    with pytest.raises(HeadlessApiError) as invalid:
+        transport._exchange({"command": "submit"})
+    assert invalid.value.code == "execution_command_response_invalid"

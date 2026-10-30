@@ -23,7 +23,7 @@ namespace {
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
+    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -50,6 +50,10 @@ struct TargetSpec final {
       {"planning.motion.pose_goal", std::nullopt},
       {"state.observed.current", std::nullopt},
   };
+  // TCP-A: frame roles tagged `tcp` (`flange` adds a flange row) and the
+  // target's default TCP.
+  std::vector<std::string> tcp_frames{};
+  std::optional<std::string> default_tcp{};
 };
 
 struct TypeSpec final {
@@ -151,17 +155,32 @@ struct TypeSpec final {
   CanonicalValue::Array groups;
   CanonicalValue::Array frames;
   CanonicalValue::Array bodies;
+  const auto tagged = [&spec](std::string_view role) {
+    return std::find(spec.tcp_frames.begin(), spec.tcp_frames.end(), role) !=
+           spec.tcp_frames.end();
+  };
   if (spec.include_model_aliases) {
     groups.emplace_back(CanonicalValue::Object{
         {"model_group_role_id", CanonicalValue("arm_group")},
         {"model_role_id", CanonicalValue(spec.source_model_role)},
         {"asset_model_group_role_id", CanonicalValue("arm")},
     });
+    if (tagged("flange")) {
+      frames.emplace_back(CanonicalValue::Object{
+          {"frame_role_id", CanonicalValue("flange")},
+          {"model_role_id", CanonicalValue(spec.source_model_role)},
+          {"asset_frame_role_id", CanonicalValue("flange")},
+          {"tcp", CanonicalValue(true)},
+      });
+    }
     CanonicalValue::Object frame{
         {"frame_role_id", CanonicalValue("tcp")},
         {"model_role_id", CanonicalValue(spec.source_model_role)},
         {"asset_frame_role_id", CanonicalValue("tcp")},
     };
+    if (tagged("tcp")) {
+      frame.emplace_back("tcp", CanonicalValue(true));
+    }
     if (!spec.contact_body_role_ids.empty()) {
       frame.emplace_back("contact_body_role_ids",
                          string_array(spec.contact_body_role_ids));
@@ -226,14 +245,19 @@ struct TypeSpec final {
     });
   }
 
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object target{
       {"command_target_id", CanonicalValue(spec.target_id)},
       {"model_group_roles", CanonicalValue(std::move(groups))},
       {"resource_roles", CanonicalValue(std::move(resources))},
       {"frame_roles", CanonicalValue(std::move(frames))},
       {"collision_body_roles", CanonicalValue(std::move(bodies))},
       {"capabilities", capability_rows(spec.capabilities)},
-  });
+  };
+  if (spec.default_tcp.has_value()) {
+    target.emplace_back("default_tcp_frame_role_id",
+                        CanonicalValue(*spec.default_tcp));
+  }
+  return CanonicalValue(std::move(target));
 }
 
 [[nodiscard]] CanonicalValue component_identity_value(
@@ -539,6 +563,58 @@ TEST(ComponentTypeCodecTest,
   duplicate_body.targets.front().contact_body_role_ids = {
       "arm_collision", "arm_collision"};
   EXPECT_ANY_THROW(qualify(duplicate_body, rich_dependencies()));
+}
+
+// TCP-A: TCP tags and the default TCP; a motion target tags its flange.
+TEST(ComponentTypeCodecTest, TcpTagsNeedOneTaggedDefaultAndAMotionFlange) {
+  TypeSpec spec;
+  spec.targets.front().tcp_frames = {"tcp"};
+  spec.targets.front().default_tcp = "tcp";
+  const auto qualified = qualify(spec, rich_dependencies());
+  const auto& target = qualified.value().command_targets.front();
+  ASSERT_EQ(target.frame_roles.size(), 1U);
+  EXPECT_TRUE(target.frame_roles.front().tcp);
+  EXPECT_EQ(target.default_tcp_frame_role_id,
+            std::optional<core::FrameRoleId>(core::FrameRoleId("tcp")));
+
+  TypeSpec untagged;  // no TCP: no default, and nothing changes
+  const auto plain = qualify(untagged, rich_dependencies());
+  EXPECT_FALSE(plain.value().command_targets.front().frame_roles.front().tcp);
+  EXPECT_FALSE(plain.value().command_targets.front()
+                   .default_tcp_frame_role_id.has_value());
+
+  auto missing_default = spec;
+  missing_default.targets.front().default_tcp.reset();
+  expect_rejection(missing_default, rich_dependencies(), "default_tcp_unknown");
+  auto untagged_default = untagged;
+  untagged_default.targets.front().default_tcp = "tcp";
+  expect_rejection(untagged_default, rich_dependencies(), "default_tcp_unknown");
+
+  auto motion = spec;
+  // Capabilities are a keyed set: keep them sorted so the revision matches.
+  motion.targets.front().capabilities.insert(
+      motion.targets.front().capabilities.begin(),
+      {"execution.trajectory.execute", std::nullopt});
+  auto motion_dependencies = rich_dependencies();
+  motion_dependencies.push_back(
+      qualify_capability("execution.trajectory.execute"));
+  expect_rejection(motion, motion_dependencies, "robot_flange_tcp_missing");
+  motion.targets.front().tcp_frames = {"flange", "tcp"};
+  const auto robot = qualify(motion, motion_dependencies);
+  EXPECT_EQ(robot.value().command_targets.front().frame_roles.size(), 2U);
+}
+
+// O5: a passive tool's frame-only target selects no capability.
+TEST(ComponentTypeCodecTest, TargetWithoutCapabilitiesExposesOnlyFrames) {
+  TypeSpec spec;
+  spec.targets.front().capabilities.clear();
+  spec.targets.front().include_model_resource = false;
+  spec.targets.front().include_local_resource = false;
+  spec.targets.front().tcp_frames = {"tcp"};
+  spec.targets.front().default_tcp = "tcp";
+  auto with_group = spec;  // a model group needs a capability
+  const std::vector<QualifiedCapabilityDefinition> none;
+  expect_rejection(with_group, none, "may expose only frame");
 }
 
 TEST(ComponentTypeCodecTest, QualifiesZeroModelIoOnlyType) {

@@ -63,8 +63,7 @@
         }
       ],
       "required_frame_roles": [
-        "base",
-        "tcp"
+        "base"
       ],
       "required_model_roles": [
         "arm_model"
@@ -78,9 +77,6 @@
           "parameters": {},
           "disposition": "required"
         }
-      ],
-      "required_frame_roles": [
-        "tcp"
       ],
       "required_collision_body_roles": [
         "gripper_collision"
@@ -198,7 +194,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
+          "tcp_endpoint": {"kind": "current"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
@@ -230,7 +226,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
+          "tcp_endpoint": {"kind": "current"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
@@ -280,7 +276,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
+          "tcp_endpoint": {"kind": "current"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",

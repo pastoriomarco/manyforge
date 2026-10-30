@@ -67,6 +67,7 @@ import {
   scenarioActionRoute,
   type ScenarioAction,
 } from '../state/documentStates';
+import { CommandRefusalError } from '../state/commandRefusal';
 import { managerApplySettlementKey } from '../state/managerApply';
 import { resetApplyPhaseText } from '../state/resetApply';
 import { programActionUnavailableReason } from '../state/authoringWorkspace';
@@ -516,8 +517,38 @@ describe('A refused Deployment Apply preparation', () => {
     expect(hooks!.deployment.error).toBe(
       `Not applied: the candidate could not be prepared (${cause}). Correct it and try again.`,
     );
+    expect(hooks!.deployment.errorCauseCode).toBeNull();
     act(() => hooks!.deployment.dismissError());
     expect(hooks!.deployment.error).toBeNull();
+  });
+
+  it('keeps the typed cause the preparer named until the error is dismissed', async () => {
+    await mount({
+      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2,
+      deploymentContent: digest('e'),
+    });
+    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(new ApiError(
+      'candidate could not be prepared',
+      409,
+      { detail: {
+        code: 'activation_preparation_failed',
+        message: 'candidate could not be prepared',
+        effect: 'none',
+        details: {
+          preparer_detail: 'manyforge_prepare_activation: Activation Deployment compiler: '
+            + 'pneumatic_io_presets_coincident: robot Open and Close resolve to the same gripper coordinate',
+          cause_code: 'pneumatic_io_presets_coincident',
+        },
+      } },
+    ));
+
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+
+    expect(hooks!.deployment.error).toContain('Not applied: the candidate could not be prepared');
+    expect(hooks!.deployment.errorCauseCode).toBe('pneumatic_io_presets_coincident');
+    act(() => hooks!.deployment.dismissError());
+    expect(hooks!.deployment.error).toBeNull();
+    expect(hooks!.deployment.errorCauseCode).toBeNull();
   });
 });
 
@@ -665,6 +696,45 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     );
     expect(hooks!.runtime.state.controlPending)
       .toBe(`recovery:${stop.offerId}:retry_motion_from_current_state`);
+  });
+
+  it('keeps a held operator Stop offer actionable and shows a stale press refusal with its typed reason', async () => {
+    // Offers carry no expiry: freshness is checked when the action is pressed.
+    const base = heldCycle('failure_pause', {});
+    const stop = heldOffer({
+      offerId: digest('6'),
+      offerRevision: 2,
+      recoveryClass: 'ordinary_operator_stop',
+      actions: [{
+        actionId: 'replan_from_stopped_state',
+        requiresConfirmation: false, performsBackendReset: false,
+        enabled: true, disabledReasonCode: null,
+      }],
+    });
+    await mount({
+      ...HELD,
+      draftRevision: 4,
+      programRevision: digest('a'),
+      cycle: { runtimeControls: { ...base.runtimeControls!, recoveryOffer: stop, recoveryHolds: [] } },
+    });
+    const refusal = {
+      code: 'recovery_action_rejected',
+      message: 'Recovery action rejected',
+      details: { reason: 'observed_state_stale' },
+      origin: null,
+    };
+    transport.sendExecutionCommand.mockRejectedValueOnce(new CommandRefusalError(refusal));
+    await act(async () => { hooks!.runtime.applyRecoveryAction(stop, 'replan_from_stopped_state'); });
+    await flush();
+    expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
+      'execution_recovery',
+      expect.objectContaining({ offer_id: stop.offerId, action_id: 'replan_from_stopped_state' }),
+      expect.any(String),
+    );
+    expect(hooks!.runtime.state.controlPending).toBeNull();
+    expect(hooks!.runtime.state.errorRefusal).toEqual(refusal);
+    expect(hooks!.runtime.state.error).toContain('Recovery refused');
+    expect(hooks!.runtime.state.error).toContain('observed_state_stale');
   });
 
   it('refuse Run of a run Executed but never Run until the Draft is Applied', async () => {
@@ -1018,7 +1088,7 @@ describe('Apply while a run exists', () => {
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
   });
 
-  it('rechecks the runner owner before Apply: a restarted runner refuses it', async () => {
+  it('continues Reset-Apply when the runner owner changes but the confirmed cycle is unchanged', async () => {
     const render = await mount(HELD);
     expect(await confirm('program')).toBeNull();
     const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
@@ -1030,10 +1100,11 @@ describe('Apply while a run exists', () => {
       cycle: { ...idleCycle(correlationId), programRunnerOwnerEpoch: 'runner.epoch.2' },
     });
     await flush();
-    expect(hooks!.resetApply.sequence?.phase).toMatchObject({
-      kind: 'failed', stage: 'apply', message: expect.stringContaining('runner restarted after Reset settled'),
-    });
-    expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
+    expect(apiMock.programWorkspace.apply).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 3, expectedAdmissionGeneration: 12 }),
+      undefined,
+      correlationId,
+    );
   });
 
   it('reconciles a lost Reset reply from observation: unknown, no Apply, no resend', async () => {

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  componentHealthBadge,
   componentLifecyclePresentation,
   componentLifecycleToneClass,
   componentReadinessOccurrencePresentation,
   readinessBlockerPresentation,
+  vendorStatusFacts,
 } from './componentLifecyclePresentation';
 import type {
   CCLCComponentSnapshot,
@@ -347,4 +349,50 @@ it('does not invent elapsed time for missing, future or satisfied owner waiting 
   }
   current.readiness.ready = true;
   expect(componentLifecyclePresentation(current).readiness).not.toContain('Target wait');
+});
+
+describe('Components page status', () => {
+  it('lists the vendor facts a driver reports, in a fixed order, then the blocking reason', () => {
+    const current = snapshot('active', { requestedState: 'active' }, {
+      phase: 'satisfied', blockingCauseClass: 'none',
+      blockingReason: 'moved_externally:rearm_at_next_motion',
+    });
+    const domain = readinessDomain();
+    domain.health!.facts = [
+      ...domain.health!.facts,
+      { lifecycleFactId: 'manyforge.vendor_code.state', value: { kind: 'integer', integerValue: 4 } },
+      { lifecycleFactId: 'manyforge.vendor_code.error', value: { kind: 'token', tokenValue: 'C2' } },
+      { lifecycleFactId: 'manyforge.vendor_code.condition', value: { kind: 'token', tokenValue: 'xarm_manual_mode' } },
+      { lifecycleFactId: 'device.moved_externally', value: { kind: 'boolean', booleanValue: true } },
+      { lifecycleFactId: 'device.warning_present', value: { kind: 'unknown' } },
+    ];
+    current.readiness.providerOccurrences = [domain];
+    expect(vendorStatusFacts(current)).toEqual([
+      { label: 'Error code', value: 'C2' },
+      { label: 'State', value: '4' },
+      { label: 'Condition', value: 'xarm manual mode' },
+      { label: 'Warning present', value: 'unknown' },
+      { label: 'Moved externally', value: 'yes' },
+      { label: 'Blocking reason', value: 'moved externally · rearm at next motion' },
+    ]);
+  });
+
+  it('reports no vendor status when the driver reports none', () => {
+    const current = snapshot('active', { requestedState: 'active' }, { phase: 'satisfied', blockingCauseClass: 'none' });
+    current.readiness.providerOccurrences = [readinessDomain()];
+    expect(vendorStatusFacts(current)).toEqual([]);
+  });
+
+  it('gives each listed component a health badge, also before its first read', () => {
+    expect(componentHealthBadge(snapshot('active', { requestedState: 'active' }, null), null))
+      .toEqual({ dotClass: 'status-ready', state: 'active', message: 'Ready' });
+    expect(componentHealthBadge(null, null)).toEqual({
+      dotClass: 'status-offline', state: 'unknown', message: 'Current component health has not been read.',
+    });
+    expect(componentHealthBadge(null, 'owner unavailable').message).toBe('owner unavailable');
+    const fault = componentHealthBadge(snapshot('active', { requestedState: 'active' }, {
+      phase: 'satisfied', blockingCauseClass: 'emergency_stop',
+    }), null);
+    expect(fault).toEqual({ dotClass: 'status-fault', state: 'active', message: 'Emergency stop engaged' });
+  });
 });

@@ -55,7 +55,7 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v2",
-    "content_version": "2.8.0"
+    "content_version": "2.9.0"
   },
   "compatibility": {
     "assistant": "forbidden",
@@ -120,7 +120,7 @@
       ]
     }
   ],
-  "description": "Retained Isaac-compatible Lite6 trocar pick Program. The Manager latches the FoundationPose observation for graspable immediately before planning; this Program then synthesizes and executes the original top-down pick and place sequence using the physical lite-gripper and typed simulator lifecycle.",
+  "description": "Retained Isaac-compatible Lite6 trocar pick Program. The Manager latches the FoundationPose observation for graspable immediately before planning; this Program then synthesizes and executes the original top-down pick and place sequence using the physical lite-gripper and typed simulator lifecycle. When another Active TCP is selected, pick offsets stay relative to the gripper TCP.",
   "forest": [
     {
       "children": [
@@ -193,8 +193,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -247,6 +246,7 @@
               },
               "approach_offset_reference": {
                 "frame_role_id": "tcp",
+                "target_role": "gripper",
                 "type": "frame_role"
               },
               "force_vertical_pick": true,
@@ -275,6 +275,7 @@
               },
               "pick_offset_reference": {
                 "frame_role_id": "tcp",
+                "target_role": "gripper",
                 "type": "frame_role"
               },
               "rotation_step_deg": 15.0,
@@ -283,8 +284,7 @@
             },
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             },
             "tool_command_duration_s": 0.8,
             "tool_max_effort": {
@@ -308,8 +308,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -334,8 +333,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             },
             "velocity_scale": 0.2
           },
@@ -416,8 +414,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -461,8 +458,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -501,8 +497,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             },
             "velocity_scale": 0.2
           }
@@ -568,8 +563,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -615,8 +609,7 @@
             "planning_timeout_s": 10.0,
             "target_role": "arm",
             "tcp_endpoint": {
-              "frame_role": "tcp",
-              "target_role": "arm"
+              "kind": "current"
             }
           },
           "value_sources": {
@@ -836,8 +829,7 @@
         "arm_collision"
       ],
       "required_frame_roles": [
-        "base",
-        "tcp"
+        "base"
       ],
       "required_model_roles": [
         "arm_model"

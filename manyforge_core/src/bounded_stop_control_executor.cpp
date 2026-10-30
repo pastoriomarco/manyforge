@@ -60,6 +60,8 @@ class BoundedStopControlExecutor::Impl final {
            worker_running_.load(std::memory_order_acquire);
   }
 
+  void WakeForClockAdvanceTest() noexcept { WakeWorker(); }
+
   void Publish(const StopControlWorkToken token) noexcept {
     EnterApi();
     bool published = false;
@@ -352,6 +354,10 @@ std::size_t BoundedStopControlExecutor::capacity() const noexcept {
 
 bool BoundedStopControlExecutor::prequalified_ready() const noexcept {
   return impl_->prequalified_ready();
+}
+
+void BoundedStopControlExecutor::WakeForClockAdvanceTest() noexcept {
+  impl_->WakeForClockAdvanceTest();
 }
 
 void BoundedStopControlExecutor::Publish(const StopControlWorkToken token) noexcept {

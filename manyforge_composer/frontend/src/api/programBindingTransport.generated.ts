@@ -16,8 +16,10 @@ const FIELDS = {
   node_environment: ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
   component: ['component_role_id', 'controllable_component_id', 'component_type_id', 'component_type_revision', 'model_role_bindings'],
   model: ['model_role_id', 'model_instance_id', 'model_revision'],
-  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings', 'signal_role_bindings', 'pneumatic_io'],
+  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings', 'signal_role_bindings', 'pneumatic_io', 'robot_tcps', 'default_tcp'],
   frame: ['frame_role_id', 'model_instance_id', 'model_revision', 'compiled_frame_name', 'contact_body_role_ids'],
+  tcp_entry: ['component_id', 'target_id', 'frame_role_id'],
+  robot_tcp: ['entry', 'frame', 'end_effector', 'component_default'],
   resource: ['resource_role_id', 'resource_ids', 'compiled_resource_names'],
   collision: ['collision_body_role_id', 'model_instance_id', 'model_revision', 'compiled_collision_body_names'],
   capability: ['capability_id', 'capability_definition_revision', 'control_binding', 'capability_provider_binding', 'command_schema'],
@@ -36,7 +38,7 @@ const FIELDS = {
   pneumatic_input: ['input', 'target_role_id', 'resource_role_id'],
   contact_release: ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'mode', 'release_evidence_mode', 'enforce_max_start_penetration', 'max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact', 'bodies_from_motion_endpoint'],
 } as const;
-const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['signal_role_bindings', 'pneumatic_io'], 'frame': ['contact_body_role_ids'], 'contact': ['bodies_from_motion_endpoint'], 'contact_release': ['bodies_from_motion_endpoint']} as const;
+const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['signal_role_bindings', 'pneumatic_io', 'robot_tcps', 'default_tcp'], 'frame': ['contact_body_role_ids'], 'contact': ['bodies_from_motion_endpoint'], 'contact_release': ['bodies_from_motion_endpoint']} as const;
 const STOP_POLICIES = new Set(['inherit', 'hold', 'continue']);
 const INTERVENTION_STOP_SCOPES = new Set(['all', 'own_groups']);
 const COLLISION_BODY_ID = 'component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}';
@@ -198,6 +200,40 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
       );
       const component = componentByRole.get(target.component_role_id);
       if (!component || component.controllable_component_id !== target.controllable_component_id) bad(tp, 'target/component correspondence');
+      if ('default_tcp' in target) {
+        const dp = `${tp}.default_tcp`;
+        const entry = record(target.default_tcp, FIELDS.tcp_entry, dp);
+        ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${dp}.${field}`));
+      }
+      if ('robot_tcps' in target) {
+        const tcpPath = `${tp}.robot_tcps`;
+        const robotTcps = array(target.robot_tcps, tcpPath).map((item2, j) => {
+          const rp = `${tcpPath}[${j}]`;
+          const tcp = record(item2, FIELDS.robot_tcp, rp);
+          const entryPath = `${rp}.entry`;
+          const entry = record(tcp.entry, FIELDS.tcp_entry, entryPath);
+          ['component_id', 'target_id', 'frame_role_id'].forEach((field) => identity(entry[field], `${entryPath}.${field}`));
+          const framePath = `${rp}.frame`;
+          const frame = record(tcp.frame, FIELDS.frame, framePath, OPTIONAL_FIELDS.frame);
+          identity(frame.frame_role_id, `${framePath}.frame_role_id`);
+          identity(frame.model_instance_id, `${framePath}.model_instance_id`);
+          digest(frame.model_revision, `${framePath}.model_revision`);
+          text(frame.compiled_frame_name, `${framePath}.compiled_frame_name`);
+          if (frame.frame_role_id !== entry.frame_role_id) bad(rp, 'TCP entry/frame role correspondence');
+          if ('contact_body_role_ids' in frame) {
+            const bodyRoles = array(frame.contact_body_role_ids, `${framePath}.contact_body_role_ids`)
+              .map((role) => identity(role, `${framePath}.contact_body_role_ids`));
+            sorted(bodyRoles, (role) => role, `${framePath}.contact_body_role_ids`);
+          }
+          if (typeof tcp.end_effector !== 'boolean' || typeof tcp.component_default !== 'boolean') {
+            bad(rp, 'TCP marks must be boolean');
+          }
+          return tcp;
+        });
+        sorted(robotTcps,
+          (row) => `${(row.entry as Row).component_id}\u0000${(row.entry as Row).target_id}\u0000${(row.entry as Row).frame_role_id}`,
+          tcpPath);
+      }
       const frames = array(target.frame_role_bindings, `${tp}.frame_role_bindings`).map((item2, j) => {
         const fp = `${tp}.frame_role_bindings[${j}]`;
         const frame = record(item2, FIELDS.frame, fp, OPTIONAL_FIELDS.frame);

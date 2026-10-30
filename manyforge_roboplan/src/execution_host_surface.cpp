@@ -8,6 +8,7 @@
 #include "sealed_program_execution_capture.hpp"
 #include "host_io_signal_runtime.hpp"
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_core/tcp_selector_codec.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
@@ -206,6 +207,19 @@ CanonicalValue CarriedObjectLostSignalsValue() {
              loss.command_target_id.value()))},
     });
   return CanonicalValue(std::move(rows));
+}
+
+/// B1: the descriptor row of the robot's End-effector TCP (its `default`);
+/// null when the robot has none (C-P2, B-run-1). Joint moves need no TCP.
+const CanonicalValue *DefaultTcpRow(const CanonicalValue &descriptor) {
+  const auto *tcps = descriptor.find_object_member("tcps");
+  Require(tcps != nullptr && tcps->is_array(),
+          "direct-control descriptor has no TCP list");
+  for (const auto &tcp : tcps->as_array()) {
+    if (tcp.find_object_member("default")->as_bool())
+      return &tcp;
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -532,15 +546,20 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
                        return frame.frame_role_id.value() ==
                               deployment::kDirectControlBaseFrameRoleId;
                      });
-    const auto tcp_frame =
-        std::find_if(binding.frame_bindings.begin(),
-                     binding.frame_bindings.end(), [](const auto &frame) {
-                       return frame.frame_role_id.value() ==
-                              deployment::kDirectControlTcpFrameRoleId;
-                     });
-    Require(base_frame != binding.frame_bindings.end() &&
-                tcp_frame != binding.frame_bindings.end(),
-            "direct-control status has no exact base/TCP frame binding");
+    Require(base_frame != binding.frame_bindings.end(),
+            "direct-control status has no exact base frame binding");
+    // B1: the starting TCP is the End-effector TCP, null without one.
+    const auto *default_tcp =
+        DefaultTcpRow(composition.direct_control_motion_descriptor);
+    CanonicalValue default_tcp_frame_role_id(nullptr);
+    if (default_tcp != nullptr) {
+      const auto *entry = default_tcp->find_object_member("entry");
+      Require(entry != nullptr && entry->is_object() &&
+                  entry->find_object_member("frame_role_id") != nullptr,
+              "direct-control default TCP has no exact entry");
+      default_tcp_frame_role_id =
+          *entry->find_object_member("frame_role_id");
+    }
     return CanonicalValue(CanonicalValue::Object{
         {"command_target_id",
          CanonicalValue(binding.command_target_id.value())},
@@ -565,7 +584,7 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
         {"target_descriptor", composition.direct_control_motion_descriptor},
         {"tcp_frame_role_id",
-         CanonicalValue(std::string(deployment::kDirectControlTcpFrameRoleId))},
+         std::move(default_tcp_frame_role_id)},
     });
   }
 
@@ -1347,8 +1366,12 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
            CanonicalValue(static_cast<double>(status.command_id))},
           {"generation",
            CanonicalValue(static_cast<double>(status.generation))},
-          // No command echo or unqualified evidence label proves a grasp.
-          {"grasp_confirmed", CanonicalValue(nullptr)},
+          // No command echo or unqualified evidence label proves a grasp;
+          // only the opt-in stall-window evidence of this command does.
+          {"grasp_confirmed",
+           status.grasp_evidence
+               ? CanonicalValue(status.grasp_evidence->observation.confirmed)
+               : CanonicalValue(nullptr)},
           {"observed_position",
            CoordinatePositionValue(state.positions.front())},
           {"revision", CanonicalValue(static_cast<double>(status.revision))},
@@ -1489,33 +1512,53 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                        return frame.frame_role_id.value() ==
                               deployment::kDirectControlBaseFrameRoleId;
                      });
-    const auto tcp_frame =
-        std::find_if(binding.frame_bindings.begin(),
-                     binding.frame_bindings.end(), [](const auto &frame) {
-                       return frame.frame_role_id.value() ==
-                              deployment::kDirectControlTcpFrameRoleId;
-                     });
-    Require(base_frame != binding.frame_bindings.end() &&
-                tcp_frame != binding.frame_bindings.end(),
-            "direct-control observation has no exact base/TCP frame binding");
-    const auto current_tcp =
-        composition.runtime->kinematic_model->forward_kinematics(core::FkRequestDTO{
-            core::RobotStateDTO{observed_state.joint_names,
-                                std::move(observed_positions_rad),
-                                {}},
-            tcp_frame->compiled_frame_name, base_frame->compiled_frame_name});
-    if (!current_tcp.ok()) {
-      Fail("direct-control current TCP pose is unavailable: " +
-           current_tcp.error().message);
+    Require(base_frame != binding.frame_bindings.end(),
+            "direct-control observation has no exact base frame binding");
+    // TCP-C: FK in `base` only for TCPs this robot carries. The full list also
+    // contains unmounted tools, whose pose is not available in this robot's
+    // retained kinematic model. `current_tcp_pose` is the End-effector TCP's
+    // pose, null when the robot has none (B1, C-P2).
+    const core::RobotStateDTO robot_state{observed_state.joint_names,
+                                          std::move(observed_positions_rad), {}};
+    const auto *tcps =
+        composition.direct_control_motion_descriptor.find_object_member("tcps");
+    Require(tcps != nullptr && tcps->is_array(),
+            "direct-control descriptor has no TCP list");
+    CanonicalValue::Array tcp_poses;
+    CanonicalValue current_tcp_pose(nullptr);
+    for (const auto &tcp : tcps->as_array()) {
+      const auto *entry = tcp.find_object_member("entry");
+      const auto *frame = tcp.find_object_member("frame");
+      const auto *display = tcp.find_object_member("display");
+      const auto *mounted_here = tcp.find_object_member("mounted_here");
+      Require(entry != nullptr && frame != nullptr && display != nullptr &&
+                  mounted_here != nullptr && mounted_here->is_bool(),
+              "direct-control TCP row has no exact entry/frame/display");
+      if (!mounted_here->as_bool()) continue;
+      const auto pose = composition.runtime->kinematic_model->forward_kinematics(
+          core::FkRequestDTO{
+              robot_state,
+              frame->find_object_member("compiled_frame_name")->as_string(),
+              base_frame->compiled_frame_name});
+      if (!pose.ok()) {
+        Fail("direct-control TCP pose of " + display->as_string() +
+             " is unavailable: " +
+             pose.error().message);
+      }
+      if (tcp.find_object_member("default")->as_bool())
+        current_tcp_pose = PoseValue(pose.value());
+      tcp_poses.emplace_back(CanonicalValue::Object{
+          {"entry", *entry}, {"pose", PoseValue(pose.value())}});
     }
     return CanonicalValue(CanonicalValue::Object{
         {"complete", CanonicalValue(true)},
-        {"current_tcp_pose", PoseValue(current_tcp.value())},
+        {"current_tcp_pose", std::move(current_tcp_pose)},
         {"positions_rad", CanonicalValue(std::move(observed_positions))},
         {"sequence",
          CanonicalValue(static_cast<double>(observed_state.sequence))},
         {"source_epoch", CanonicalValue(observed_state.source_epoch.value())},
         {"source_joint_names", CanonicalValue(std::move(source_joint_names))},
+        {"tcp_poses", CanonicalValue(std::move(tcp_poses))},
     });
   }
 
@@ -1523,6 +1566,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
       Composition &composition,
       const core::ObservedStateSnapshotDTO &observed_state) const {
     auto fields = DirectControlTargetValue(composition).as_object();
+    fields.emplace_back("active_tcp", ActiveTcpStatusValue(composition));
     fields.emplace_back("observed_state", DirectControlObservedValue(
                                               composition, observed_state));
     return CanonicalValue(std::move(fields));
@@ -1687,12 +1731,15 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                          : composition.cell_runtime->clock()->now();
     std::optional<core::ObservedStateSnapshotDTO> motion_state;
     if (composition.runtime != nullptr) {
+      // M6 (items 23/34): a Real arm's pose follows the live controller
+      // stream while it counts as moved or re-arming, or its broadcaster is
+      // stale (Robot Control's jog base pose). Otherwise the addressed state.
       const auto motion =
-          composition.runtime->motion_state_channel->current_state(now);
+          composition.runtime->motion_state_channel->current_live_bound_state(now);
       if (!motion.ok())
         Fail("selected motion observed state is unavailable: " +
              motion.error().message);
-      motion_state = motion.value();
+      motion_state = motion.value().state;
     }
     const auto gripper_channel = composition.runtime != nullptr
                                      ? composition.runtime->gripper_state_channel
@@ -2274,6 +2321,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                CanonicalValue(motion.command_target_id.value())},
               {"operation_capability_id",
                CanonicalValue(motion.capability_id.value())},
+              {"active_tcp", ActiveTcpStatusValue(candidate)},
               {"observed", std::move(motion_observed)},
           })});
     }
@@ -2489,7 +2537,9 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                                  composition.runtime->clock != nullptr
                            ? composition.runtime->clock->now()
                            : WallClock{}.now();
-      const auto observed = source.channel->current_bound_state(now);
+      // M6 (items 23/34): the same live rule, so a stale broadcaster does not
+      // hide a Real arm whose display follows its vendor joint topic.
+      const auto observed = source.channel->current_live_bound_state(now);
       if (!observed.ok())
         Fail("selected observation is unavailable: " +
              observed.error().message);
@@ -2612,6 +2662,28 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         kinds.emplace_back(angular ? "angular" : "linear");
         positions.emplace_back(value);
       }
+      // M6: a measured Real arm with a vendor joint topic shows its vendor
+      // display coordinates (once one valid sample arrived). Presentation
+      // only; the addressed state is unchanged.
+      std::string row_epoch = state.source_epoch.value();
+      double row_sequence = static_cast<double>(state.sequence);
+      if (const auto render = source.channel->current_bound_render_state();
+          render.ok() && render.value().display_only &&
+          render.value().binding.value() == binding &&
+          render.value().positions_si.size() == binding.resources.size() &&
+          render.value().compiled_joint_names.size() == binding.resources.size()) {
+        bool aligned = true;
+        for (std::size_t index = 0U; aligned && index < binding.resources.size(); ++index)
+          aligned = render.value().compiled_joint_names[index] ==
+                        binding.resources[index].compiled_resource_name &&
+                    std::isfinite(render.value().positions_si[index]);
+        if (aligned) {
+          positions.clear();
+          for (const double value : render.value().positions_si) positions.emplace_back(value);
+          row_epoch = "render." + std::to_string(render.value().render_incarnation);
+          row_sequence = static_cast<double>(render.value().render_generation);
+        }
+      }
       rows.push_back(ObservationRow{
           {binding.controllable_component_id.value(),
            binding.command_target_id.value(), binding.capability_id.value()},
@@ -2626,10 +2698,9 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                CanonicalValue(binding.capability_id.value())},
               {"coordinate_kinds", CanonicalValue(std::move(kinds))},
               {"positions_si", CanonicalValue(std::move(positions))},
-              {"source_epoch", CanonicalValue(state.source_epoch.value())},
+              {"source_epoch", CanonicalValue(std::move(row_epoch))},
               {"source_joint_names", CanonicalValue(std::move(source_names))},
-              {"source_sequence",
-               CanonicalValue(static_cast<double>(state.sequence))},
+              {"source_sequence", CanonicalValue(row_sequence)},
           })});
       if (source.measured.has_value())
         project_measured(*source.measured, observed.value().binding, now);
@@ -3033,6 +3104,8 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
     auto global_fields = InterruptRuleEventMetadataFields(
         owner.ReadInterruptRuleStateBaseline(), actual_owner_epoch);
     for (auto &field : global_fields) metadata.push_back(std::move(field));
+    // Active TCP (M7): read before the page, so no row of it is newer.
+    metadata.emplace_back("active_tcp_baseline", ActiveTcpBaselineValue());
     auto *const journal = composition_access_.operation_journal.load();
     Require(journal != nullptr,
             "operational events have no stable cell journal owner");
@@ -3057,6 +3130,91 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
   }
 }
 
+CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue(
+    Composition &composition, const core::RequestOwnerEpoch &owner_epoch) {
+  CanonicalValue::Array robots;
+  const auto add = [&](const Composition &view) {
+    if (!view.ros2_control_runtime_handle) return;
+    const auto reading = view.ros2_control_runtime_handle->ReadActiveTcp();
+    if (!reading.robot) return;
+    robots.emplace_back(CanonicalValue::Object{
+        {"component_id", CanonicalValue(reading.robot->value())},
+        {"entry", reading.value ? core::EncodeTcpEntry(reading.value->entry)
+                                : CanonicalValue(nullptr)},
+        {"owner_epoch", CanonicalValue(owner_epoch.value())},
+        {"registration_generation",
+         CanonicalValue(static_cast<double>(reading.registration_generation))},
+        {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
+  };
+  add(composition);
+  for (const auto &participant : composition.participant_compositions)
+    add(*participant);
+  return CanonicalValue(std::move(robots));
+}
+
+CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue() const {
+  std::shared_lock composition_lock(composition_access_.mutex);
+  if (composition_access_.current == nullptr)
+    return CanonicalValue(CanonicalValue::Array{});
+  return ActiveTcpBaselineValue(*composition_access_.current,
+                                StableKernel().request_owner_epoch());
+}
+
+CanonicalValue ExecutionCommandSurface::ActiveTcpResponse(Composition *composition,
+                                                          const bool reset) {
+  if (composition != nullptr && reset) {
+    const auto reset_one = [](const Composition &view) {
+      // T-MQ9b: a reset always completes (the controller re-syncs at Enable).
+      if (view.ros2_control_runtime_handle)
+        static_cast<void>(view.ros2_control_runtime_handle->ResetActiveTcp());
+    };
+    reset_one(*composition);
+    for (const auto &participant : composition->participant_compositions)
+      reset_one(*participant);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue(reset ? "reset_active_tcp" : "read_active_tcp")},
+      {"ok", CanonicalValue(true)},
+      {"robots", composition == nullptr
+                     ? CanonicalValue(CanonicalValue::Array{})
+                     : ActiveTcpBaselineValue(
+                           *composition,
+                           composition->active_addressed_kernel()->request_owner_epoch())}});
+}
+
+CanonicalValue ExecutionCommandSurface::ActiveTcpStatusValue(Composition &composition) const {
+  if (!composition.ros2_control_runtime_handle) return CanonicalValue(nullptr);
+  const auto &owner_epoch = StableKernel().request_owner_epoch();
+  const auto reading = composition.ros2_control_runtime_handle->ReadActiveTcp();
+  if (!reading.value) return CanonicalValue(CanonicalValue::Object{
+      {"display", CanonicalValue(nullptr)}, {"entry", CanonicalValue(nullptr)},
+      {"owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"registration_generation", CanonicalValue(static_cast<double>(reading.registration_generation))},
+      {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
+  auto entry = core::EncodeTcpEntry(reading.value->entry);
+  // TCP-A1 rebase point: the descriptor row's display name for this entry.
+  const auto &tcp = reading.value->entry;
+  std::string display = tcp.component_id.value() + " \xc2\xb7 " + tcp.target_id.value() +
+                        " \xc2\xb7 " + tcp.frame_role_id.value();
+  if (const auto *rows =
+          composition.direct_control_motion_descriptor.find_object_member("tcps");
+      rows != nullptr && rows->is_array()) {
+    for (const auto &row : rows->as_array()) {
+      const auto *row_entry = row.find_object_member("entry");
+      const auto *row_display = row.find_object_member("display");
+      if (row_entry != nullptr && *row_entry == entry && row_display != nullptr &&
+          row_display->is_string())
+        display = row_display->as_string();
+    }
+  }
+  return CanonicalValue(CanonicalValue::Object{{"display", CanonicalValue(std::move(display))},
+                                               {"entry", std::move(entry)},
+                                               {"owner_epoch", CanonicalValue(owner_epoch.value())},
+                                               {"registration_generation", CanonicalValue(static_cast<double>(reading.registration_generation))},
+                                               {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
+}
+
 std::pair<std::string, CanonicalValue>
 ExecutionCommandSurface::EventStreamState() const {
   bool execution_owner_ready;
@@ -3069,6 +3227,7 @@ ExecutionCommandSurface::EventStreamState() const {
   // The same owner facts as the `events` reply, read the same way.
   auto state = InterruptRuleEventMetadataFields(
       owner.ReadInterruptRuleStateBaseline(), owner_epoch);
+  state.emplace_back("active_tcp_baseline", ActiveTcpBaselineValue());
   state.emplace_back("admission_generation",
                      CanonicalValue(static_cast<double>(
                          owner.GetAuthoringAdmission()
@@ -3245,6 +3404,10 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
   if (auto result = ExecuteProgramCommand(command, product, &StableKernel()))
     return std::move(*result);
   const auto &projection = product.projection_revision;
+  if (command.kind == CommandKind::kReadActiveTcp ||
+      command.kind == CommandKind::kReadActiveTcpOrdered ||
+      command.kind == CommandKind::kResetActiveTcp)
+    return ActiveTcpResponse(nullptr, command.kind == CommandKind::kResetActiveTcp);
   if (command.kind == CommandKind::kIdentity)
     return IdentityResponse(product, projection);
   const auto identity = IdentityValue(product, projection);
@@ -3313,6 +3476,29 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
     if (command.kind == CommandKind::kObservation) {
       return ObservationResponse(composition);
     }
+    if (command.kind == CommandKind::kResolveAttachActiveTcp) {
+      if (!composition.target_resolver)
+        return ErrorResponse("attach_holder_unavailable", "Applied holder resolver is unavailable");
+      const auto read = [&](const core::ControllableComponentId &robot) -> std::optional<RobotTcp> {
+        if (composition.controllable_component_id == robot && composition.ros2_control_runtime_handle)
+          return composition.ros2_control_runtime_handle->ReadActiveTcp().value;
+        for (const auto &part : composition.participant_compositions)
+          if (part && part->controllable_component_id == robot && part->ros2_control_runtime_handle)
+            return part->ros2_control_runtime_handle->ReadActiveTcp().value;
+        return std::nullopt;
+      };
+      const auto frame = composition.target_resolver->ResolveAttachActiveTcp(
+          *command.attach_binding_id, *command.attach_holder_role, read);
+      if (!frame.ok())
+        return ErrorResponse(frame.error().code, frame.error().message, frame.error().details);
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("resolve_attach_active_tcp")},
+          {"ok", CanonicalValue(true)}, {"frame_role_id", CanonicalValue(frame.value().value())}});
+    }
+    if (command.kind == CommandKind::kReadActiveTcp ||
+        command.kind == CommandKind::kReadActiveTcpOrdered)
+      return ActiveTcpResponse(&composition, false);
     if (command.kind == CommandKind::kStop ||
         command.kind == CommandKind::kStopProgramRun ||
         command.kind == CommandKind::kStopProgramSelection ||
@@ -3342,11 +3528,77 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           "ordinary execution command requires an exact current unfenced "
           "Manager lease");
     }
+    if (command.kind == CommandKind::kResetActiveTcp)
+      return ActiveTcpResponse(&composition, true);
     if (command.kind == CommandKind::kQueryTarget) {
       return QueryTargetResponse(*command.target_query, composition);
     }
     if (command.kind == CommandKind::kQueryOperation) {
       return QueryOperationResponse(*command.operation_query, composition);
+    }
+    if (command.kind == CommandKind::kForceClose) {
+      // Item 37: the two Kernel steps of an operator Force close.
+      auto &kernel = *composition.active_addressed_kernel();
+      const bool arm = *command.force_close_step == "arm";
+      core::ForceCloseResultDTO closed;
+      if (arm) {
+        const auto armed = kernel.arm_force_close(*command.stop_generation);
+        if (!armed.ok()) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+              {"error", ErrorValue(armed.error())},
+              {"ok", CanonicalValue(false)},
+          });
+        }
+        closed.stop_generation = armed.value();
+      } else {
+        auto result = kernel.force_close_operations();
+        if (!result.ok()) {
+          return CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+              {"error", ErrorValue(result.error())},
+              {"ok", CanonicalValue(false)},
+          });
+        }
+        closed = std::move(result.value());
+      }
+      CanonicalValue::Array operations;
+      for (const auto &operation : closed.operations) {
+        CanonicalValue::Array targets;
+        for (const auto &target : operation.targets) {
+          targets.emplace_back(CanonicalValue::Object{
+              {"command_target_id", CanonicalValue(target.command_target_id.value())},
+              {"controllable_component_id",
+               CanonicalValue(target.controllable_component_id.value())},
+              {"output_unknown", CanonicalValue(target.output_unknown)},
+          });
+        }
+        operations.emplace_back(CanonicalValue::Object{
+            {"containment_uncertain", CanonicalValue(operation.containment_uncertain)},
+            {"operation_id", CanonicalValue(operation.operation_id.value())},
+            {"operation_revision", CanonicalValue(static_cast<double>(
+                                       operation.operation_revision.value()))},
+            {"state", CanonicalValue(std::string(StateName(operation.state)))},
+            {"targets", CanonicalValue(std::move(targets))},
+        });
+      }
+      CanonicalValue::Array orphans;
+      for (const auto &resource : closed.released_orphan_resources)
+        orphans.emplace_back(CanonicalValue(resource.value()));
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("force_close")},
+          {"ok", CanonicalValue(true)},
+          {"result",
+           CanonicalValue(CanonicalValue::Object{
+               {"motion_block_cleared", CanonicalValue(closed.motion_block_cleared)},
+               {"operations", CanonicalValue(std::move(operations))},
+               {"released_orphan_resources", CanonicalValue(std::move(orphans))},
+               {"step", CanonicalValue(*command.force_close_step)},
+               {"stop_generation", CanonicalValue(static_cast<double>(
+                                       closed.stop_generation.value()))},
+           })},
+      });
     }
     if (command.kind == CommandKind::kRecoverStopFault) {
       if (command.global_io_rule_recovery)
@@ -3383,7 +3635,12 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
             {"ok", CanonicalValue(false)},
         });
       }
+      // Active TCP (M7): a move commits its TCP change before its goal is
+      // sent, so once it runs or ends this carries it (T-C2f included).
       return CanonicalValue(CanonicalValue::Object{
+          {"active_tcp",
+           ActiveTcpBaselineValue(
+               composition, composition.active_addressed_kernel()->request_owner_epoch())},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("read")},
           {"ok", CanonicalValue(true)},
@@ -3585,6 +3842,16 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
         });
       }
       auto start_state = session.value()->current_state();
+      // M6 (approval list 2, item 34): poses follow the live controller
+      // stream. While a Real arm counts as moved or re-arming, or its
+      // broadcaster is stale, the preview starts from its latest valid vendor
+      // joint sample (as the display). Execute re-arms and checks its start
+      // against the fresh measured state, unchanged.
+      if (const auto live =
+              composition.runtime->motion_state_channel->live_preview_start(
+                  composition.runtime->clock->now()))
+        start_state = core::Result<core::RobotStateDTO>::Ok(
+            core::RobotStateDTO{live->compiled_joint_names, live->positions_si, {}});
       if (!start_state.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3677,14 +3944,28 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           composition.active_addressed_kernel()->execute(
               *command.operation);
       if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
+        CanonicalValue::Object failed{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(result.error())},
             {"ok", CanonicalValue(false)},
-        });
+        };
+        // Active TCP (M7): an immediate step that failed after admission
+        // (`immediate_step: admitted`) carries the confirmed values too.
+        if (const auto step = result.error().details.find("immediate_step");
+            step != result.error().details.end() && step->second == "admitted")
+          failed.emplace_back(
+              "active_tcp",
+              ActiveTcpBaselineValue(
+                  composition, composition.active_addressed_kernel()->request_owner_epoch()));
+        return CanonicalValue(std::move(failed));
       }
+      // Active TCP (M7): the result carries every robot's confirmed Active
+      // TCP and its sequence (a Set TCP's is committed when this returns).
       return CanonicalValue(CanonicalValue::Object{
           {"accepted", AcceptedValue(result.value())},
+          {"active_tcp",
+           ActiveTcpBaselineValue(
+               composition, composition.active_addressed_kernel()->request_owner_epoch())},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("submit")},
           {"ok", CanonicalValue(true)},
@@ -3829,6 +4110,11 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:
+      case CommandKind::kForceClose:
+      case CommandKind::kResolveAttachActiveTcp:
+      case CommandKind::kReadActiveTcp:
+      case CommandKind::kReadActiveTcpOrdered:
+      case CommandKind::kResetActiveTcp:
         Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");
@@ -4272,13 +4558,12 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
               }
             }
           } catch (const std::exception &error) {
-            response =
-                cell_admission_command.has_value()
-                    ? detail::CellAdmissionResponseValue(
-                          *cell_admission_command,
-                          core::ErrorDTO{
-                              "execution_command_invalid", error.what(), {}})
-                    : ErrorResponse("execution_command_invalid", error.what());
+            const auto failure = ExecutionCommandExceptionError(error);
+            response = cell_admission_command.has_value()
+                           ? detail::CellAdmissionResponseValue(
+                                 *cell_admission_command, failure, "kernel")
+                           : ErrorResponse(failure.code, failure.message,
+                                           failure.details);
           }
         }
         // Core and composition scopes have unwound. Only a real source
@@ -4356,8 +4641,8 @@ void ExecutionCommandSurface::SendResponse(
   ///   admission and recovery. It never waits for planning, submission
   ///   ordering or a Manager round trip; those go to deferred lanes.
   /// - Submission-ordered lane: requests whose Kernel entry takes submission
-  ///   ordering (IsSubmissionOrdered). One worker, FIFO in accept order, one
-  ///   in flight, as the single ordinary lane executed them before.
+  ///   ordering (IsSubmissionOrdered). One worker, FIFO in host enqueue
+  ///   order, one in flight. A completed client send is not an enqueue receipt.
   /// - Scene-read lane: projections that first read the live Scene revision
   ///   from Manager (ReadsManagerScene). One worker, FIFO.
   ///
@@ -4516,7 +4801,9 @@ void ExecutionCommandSurface::RunDeferredLane(DeferredLane &lane,
                                       pending->cancellation.get_token(),
                                       stop_token);
         } catch (const std::exception &error) {
-          response = ErrorResponse("execution_command_invalid", error.what());
+          const auto failure = ExecutionCommandExceptionError(error);
+          response = ErrorResponse(failure.code, failure.message,
+                                   failure.details);
         }
         {
           std::lock_guard lock(lane.mutex);

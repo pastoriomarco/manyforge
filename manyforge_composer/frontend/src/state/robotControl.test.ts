@@ -12,6 +12,7 @@ import {
   robotControlPreviewApprovable,
   robotControlReducer,
   selectedStatusForState,
+  visibleRobotControlTcps,
   type ManualMotionSettings,
   type RobotControlState,
   appliedCartesianDefaults,
@@ -20,8 +21,23 @@ import {
 import { statusFixture, receiptFixture, readyState, executingState, gripperReceiptFixture } from '../testFixtures/robotControl';
 import { poseTupleFromValue, samePose } from '../utils/poseTransforms';
 import { computeCartesianMoveDraft } from '../utils/moveTo';
+import { tcpEntryIdentityKey } from '../types/robotControl';
 
 describe('addressed Robot Control state', () => {
+  it('keeps an owner refusal with its message and clears both together', () => {
+    const approving = robotControlReducer(readyState(), { type: 'approve_started' });
+    expect(approving.phase).toBe('approving');
+    const cause = { code: 'global_interrupt_gated', message: 'gate', details: {}, origin: null };
+    const refused = robotControlReducer(approving, {
+      type: 'approve_rejected', generation: approving.generation,
+      error: 'Motion waits: the gate is active.', errorRefusal: cause,
+    });
+    expect(refused.errorRefusal).toEqual(cause);
+    const dismissed = robotControlReducer(refused, { type: 'dismiss_error' });
+    expect(dismissed.error).toBeNull();
+    expect(dismissed.errorRefusal).toBeNull();
+  });
+
   it('keeps one stable addressed selection and fences the previous robot draft', () => {
     const status = statusFixture();
     const primaryMotion = status.directControl;
@@ -308,6 +324,23 @@ describe('addressed Robot Control state', () => {
     expect(sceneChanged.generation).toBe(blocked.generation);
   });
 
+  it('marks its own target validation as local by type, and an owner error as not local', () => {
+    const ready = readyState();
+    expect(ready.errorLocal).toBe(false);
+    const outside = robotControlReducer(ready, { type: 'edit_joint', jointIndex: 0, positionRad: 1_000 });
+    expect(outside).toMatchObject({ phase: 'blocked', errorLocal: true, errorRefusal: null });
+    expect(outside.error).not.toBeNull();
+    const pose = robotControlReducer(ready, { type: 'edit_pose', pose: {
+      ...ready.draftPose, position_m: { ...ready.draftPose.position_m, x_m: Number.NaN },
+    } });
+    expect(pose.errorLocal).toBe(true);
+    // A valid edit clears it; an owner refusal is never local, whatever its text.
+    expect(robotControlReducer(outside, { type: 'edit_joint', jointIndex: 0, positionRad: 0.1 }).errorLocal).toBe(false);
+    const owner = robotControlReducer(ready, { type: 'preview_rejected', generation: ready.generation,
+      error: 'The authored joint target is outside its retained limits.' });
+    expect(owner).toMatchObject({ errorLocal: false, error: 'The authored joint target is outside its retained limits.' });
+  });
+
   it('keeps a target rejection in the panel until the next edit, without an operational error', () => {
     const ready = readyState();
     const rejected = robotControlReducer(ready, { type: 'preview_rejected', generation: ready.generation,
@@ -337,10 +370,7 @@ describe('addressed Robot Control state', () => {
     expect(participant.component_role_id).toBe('controlled_component');
     expect(participant.target_role_id).toBe('command_target');
     expect(participant.payload.base_frame_role_id).toBe('base');
-    expect(participant.payload.tcp_endpoint).toEqual({
-      target_role_id: status.directControl!.targetRoleId,
-      frame_role_id: status.directControl!.tcpFrameRoleId,
-    });
+    expect(participant.payload.tcp_endpoint).toEqual({ kind: 'current' });
     expect(participant.payload).not.toHaveProperty('tcp_frame_role_id');
     expect(participant.payload.motion).toEqual({
       kind: 'joint_goal',
@@ -376,10 +406,7 @@ describe('addressed Robot Control state', () => {
       });
       if (payload.kind !== 'motion') throw new Error('expected motion payload');
       motionKinds.push(payload.motion.kind);
-      expect(payload.tcp_endpoint).toEqual({
-        target_role_id: state.status!.directControl!.targetRoleId,
-        frame_role_id: state.status!.directControl!.tcpFrameRoleId,
-      });
+      expect(payload.tcp_endpoint).toEqual({ kind: 'current' });
       expect(payload).not.toHaveProperty('tcp_frame_role_id');
       if (mode === 'cartesian_path') expect(payload).toMatchObject({ motion: {
         max_angular_speed_rad_s: 0.2,
@@ -399,6 +426,26 @@ describe('addressed Robot Control state', () => {
     expect(robotControlReducer(active, { type: 'edit_motion_settings', update: { velocityScale: 0.2 } })).toBe(active);
     for (const value of [0, -1, NaN, Infinity, 1.01]) {
       expect(robotControlReducer(state, { type: 'edit_motion_settings', update: { velocityScale: value } })).toBe(state);
+    }
+  });
+
+  it('sends the manual collision clearance only when the operator sets one', () => {
+    const ready = readyState();
+    const plain = buildPreviewIntent({ ...ready, mode: 'joint' }, 'clearance-default').participants[0].payload;
+    expect(plain).not.toHaveProperty('clearance_m');
+    const close = robotControlReducer(ready, { type: 'edit_motion_settings', update: { clearanceM: 0.0005 } });
+    for (const mode of ['joint', 'pose_goal', 'move_to', 'cartesian_path'] as const) {
+      expect(buildPreviewIntent({ ...close, mode }, `clearance-${mode}`).participants[0].payload)
+        .toMatchObject({ kind: 'motion', clearance_m: 0.0005 });
+    }
+    const off = robotControlReducer(close, { type: 'edit_motion_settings', update: { clearanceM: 0 } });
+    expect(buildPreviewIntent({ ...off, mode: 'joint' }, 'clearance-off').participants[0].payload)
+      .toMatchObject({ clearance_m: 0 });
+    const reset = robotControlReducer(off, { type: 'edit_motion_settings', update: { clearanceM: null } });
+    expect(buildPreviewIntent({ ...reset, mode: 'joint' }, 'clearance-reset').participants[0].payload)
+      .not.toHaveProperty('clearance_m');
+    for (const value of [-0.001, 0.0501, NaN]) {
+      expect(robotControlReducer(close, { type: 'edit_motion_settings', update: { clearanceM: value } })).toBe(close);
     }
   });
 
@@ -1243,5 +1290,72 @@ describe('addressed Robot Control state', () => {
     expect(payload.kind).toBe('capability_command');
     if (payload.kind !== 'capability_command') return;
     expect(payload.caller_options[0].value_s).toBe(0.5);
+  });
+});
+
+describe('Robot Control Active TCP', () => {
+  it('hides other robots’ tools by default and shows them on request', () => {
+    const motion = statusFixture().directControl!;
+    const row = motion.targetDescriptor.tcps[0];
+    const other = { ...row, entry: { componentId: 'other-tool', targetId: 'tool', frameRoleId: 'tcp' },
+      mountedHere: false, mountedElsewhere: true };
+    const unmounted = { ...row, entry: { componentId: 'bench-tool', targetId: 'tool', frameRoleId: 'tcp' },
+      mountedHere: false, mountedElsewhere: false };
+    motion.targetDescriptor.tcps.push(other, unmounted);
+    expect(visibleRobotControlTcps(motion, false)).toEqual([row, unmounted]);
+    expect(visibleRobotControlTcps(motion, true)).toEqual([row, other, unmounted]);
+  });
+  it('pairs a robot with the Applied flange tool rather than an unrelated gripper', () => {
+    const status = statusFixture();
+    const mounted = structuredClone(status.directControlGripper!);
+    mounted.controllableComponentId = 'tool-on-flange';
+    mounted.commandTargetId = 'gripper';
+    status.directControlGripperTargets.push(mounted);
+    const observed = structuredClone(status.observedGripper!);
+    observed.controllableComponentId = mounted.controllableComponentId;
+    status.observedGrippers.push(observed);
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    state = robotControlReducer(state, { type: 'mounted_tools_changed', mounts: { 'robot-a': 'tool-on-flange' } });
+    expect(selectedStatusForState(state)!.directControlGripper!.controllableComponentId).toBe('tool-on-flange');
+    expect(selectedStatusForState(state)!.observedGripper!.controllableComponentId).toBe('tool-on-flange');
+  });
+  it('uses the owner entry and its pose, rebasing an old draft when it changes', () => {
+    const status = statusFixture();
+    const motion = status.directControl!;
+    const flange = { componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange' };
+    const pose = { position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.37 },
+      orientation: { x: 0, y: 0, z: 0, w: 1 } };
+    motion.targetDescriptor.tcps.push({ ...motion.targetDescriptor.tcps[0], entry: flange,
+      frameRoleId: 'flange', qualifiedName: 'robot-a.flange', isDefault: false });
+    status.observedMotion!.tcpPoses[tcpEntryIdentityKey(flange)] = pose;
+    let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    state = robotControlReducer(state, { type: 'edit', positionsRad: [0.2, 0.1] });
+    const changed = structuredClone(status);
+    changed.directControl!.activeTcp = { entry: flange, display: 'robot-a.flange',
+      ownerEpoch: status.ownerEpoch, registrationGeneration: 1, sequence: 1 };
+    state = robotControlReducer(state, { type: 'status_refreshed', status: changed });
+    const selected = selectedStatusForState(state)!;
+    expect(selected.directControl!.tcpFrameRoleId).toBe('flange');
+    expect(selected.observedMotion!.currentTcpPose).toEqual(pose);
+    expect(state.draftPose).toEqual(pose);
+    expect(state.preview).toBeNull();
+    const payload = buildPoseMotionIntent(selected, pose, 'current').participants[0].payload;
+    if (payload.kind !== 'motion') throw new Error('expected motion');
+    expect(payload.tcp_endpoint).toEqual({ kind: 'current' });
+  });
+
+  it('sends Current for a joint jog with no active TCP and blocks Cartesian modes', () => {
+    const status = statusFixture();
+    status.directControl!.activeTcp = { entry: null, display: null, ownerEpoch: status.ownerEpoch,
+      registrationGeneration: 1, sequence: 0 };
+    const state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
+    const selected = selectedStatusForState(state)!;
+    expect(selected.directControl!.tcpFrameRoleId).toBeNull();
+    expect(selected.observedMotion!.currentTcpPose).toBeNull();
+    expect(robotControlReducer(state, { type: 'select_mode', mode: 'pose_goal' })).toBe(state);
+    const payload = buildJointMotionIntent(selected, [0.2, 0.1], 'joint').participants[0].payload;
+    if (payload.kind !== 'motion') throw new Error('expected motion');
+    expect(payload.tcp_endpoint).toEqual({ kind: 'current' });
+    expect(() => buildPoseMotionIntent(selected, state.draftPose, 'pose')).toThrow(/TCP frame contract/);
   });
 });

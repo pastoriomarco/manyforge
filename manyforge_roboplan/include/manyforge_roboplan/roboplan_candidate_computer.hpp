@@ -12,6 +12,7 @@
 #include <roboplan/core/scene.hpp>
 
 #include <manyforge_core/types/action_span.hpp>
+#include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/coordinate_state.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
@@ -47,6 +48,17 @@ struct RoboPlanCandidateBindingDTO final {
 /// public wire DTO and carries no caller-selected robot/group identity. The
 /// final IPlannerBackend wrapper constructs it only from a Kernel-produced
 /// addressed PlanRequestDTO.
+/// Collision clearance of one native worker-scene pair. The names are a
+/// compiled frame or a projected geometry name, `first < second`.
+struct RoboPlanPairMarginDTO final {
+  std::string first;
+  std::string second;
+  double margin_m{};
+
+  friend bool operator==(const RoboPlanPairMarginDTO&,
+                         const RoboPlanPairMarginDTO&) = default;
+};
+
 struct RoboPlanCandidateRequestDTO final {
   core::ControllableComponentId controllable_component_id;
   core::CommandTargetId command_target_id;
@@ -66,6 +78,13 @@ struct RoboPlanCandidateRequestDTO final {
   std::uint32_t planning_attempt_index{};
   std::optional<core::ActionSpanDTO> action_span;
   std::optional<core::MovingReplacementInputDTO> moving_replacement{};
+  /// Points held under `speed_profile.max_tcp_linear_speed_mps` by the
+  /// retime, `tcp_frame` first; empty retimes `tcp_frame` alone.
+  std::vector<core::ResolvedFrameDTO> speed_check_frames{};
+  /// Per-pair clearance margins the worker sets on its scene for this plan;
+  /// pairs not listed keep margin 0. Filled by the process client from the
+  /// selected retained projection.
+  std::vector<RoboPlanPairMarginDTO> collision_pair_margins{};
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these
@@ -84,6 +103,10 @@ struct RoboPlanCandidateComputerConfig final {
   std::optional<std::uint32_t> rng_seed;
   std::size_t maximum_trajectory_samples{65'536U};
   double trajectory_sample_period_s{0.01};
+  /// RRT and shortcut `collision_check_step_size` of the first attempt
+  /// (Deployment `collision_check_step_rad`); retries use min(step, 0.01).
+  /// Validation of each attempt's trajectory uses that attempt's step.
+  double collision_check_step_rad{core::kDefaultCollisionCheckStepRad};
 };
 
 /// Serialized native candidate computation over one exact worker-owned

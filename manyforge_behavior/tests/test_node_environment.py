@@ -33,7 +33,7 @@ def test_retained_environment_manifest_is_fresh_and_build_owned() -> None:
     assert retained.environment_digest.startswith("sha256:")
     assert retained.catalog_digest == environment.catalog.catalog_digest
     assert retained.executable_registry == environment.registry.rows
-    assert len(retained.executable_registry) == 49
+    assert len(retained.executable_registry) == 50  # TCP migration: motion.set_tcp row added
     assert len(retained.executable_packages) == 2
     assert retained.source_coverage
     assert any(

@@ -101,11 +101,23 @@ limits, and recovery decisions; the shared library interprets none of them.
 
 The bootstrap journal validates its exact schema, immutable rows, typed
 identities, canonical binding order, and semantic digests on every reopen. The
-Apply journal validates immutable public-request/Apply identity, contiguous
-per-Apply generations, exact predecessor projection, and candidate retained
-identity. The publication store separately validates generation continuity,
-each receipt digest, and the singleton head. Database files are opened without
-following a final-path symlink; SQLite 3.37 or newer and
+Apply journal performs full integrity verification when constructed/opened and
+when `VerifyIntegrity()` is explicitly called; startup after a crash uses the
+same construction/open path. Ordinary Apply-journal reads and writes validate
+the records they request or touch, plus the identity, generation, and
+provenance chain needed for that operation. Full-history decoding occurs at
+construction/open or through explicit `VerifyIntegrity()`; numeric SQL `COUNT`
+ceiling checks may still count historical rows during an ordinary operation.
+For generation continuity, a write checks the touched generation and its
+immediate predecessor; older generations are checked by full verification.
+Corruption outside the records and provenance checked by an operation may be
+detected only at the next open or explicit full verification. Existing
+record-count and database page-image limits remain in force. The journal
+validates immutable public-request/Apply identity,
+contiguous per-Apply generations, exact predecessor projection, and candidate
+retained identity. The publication store separately validates generation
+continuity, each receipt digest, and the singleton head. Database files are
+opened without following a final-path symlink; SQLite 3.37 or newer and
 `SQLITE_OPEN_NOFOLLOW` are mandatory.
 
 `ExternallyProvisionedManagerStores` is the composition-root startup helper.

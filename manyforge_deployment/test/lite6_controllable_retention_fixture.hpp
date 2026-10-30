@@ -158,6 +158,17 @@ provider_contract_role_id(const CanonicalValue &declaration) {
   });
 }
 
+/// The Lite6 arm target's `flange` frame role, a TCP as on the maintained
+/// Lite6 types (C-P3).
+[[nodiscard]] inline CanonicalValue lite6_arm_flange_frame() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"frame_role_id", CanonicalValue("flange")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("flange")},
+      {"tcp", CanonicalValue(true)},
+  });
+}
+
 [[nodiscard]] inline CanonicalValue gripper_target_configuration(
     std::string_view controllable_component_id, bool ros2_control_execution = false) {
   CanonicalValue::Object gripper_configuration{
@@ -250,6 +261,8 @@ native_execution_configuration(std::string_view controllable_component_id,
                {"command_target_id",
                 CanonicalValue(std::string(kLite6ArmTargetId))},
                {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+               // The fixture checks the active TCP only.
+               {"tcp_speed_check", CanonicalValue("active_tcp")},
            })})},
   };
   if (!motion) {
@@ -296,6 +309,8 @@ native_execution_configuration(std::string_view controllable_component_id,
                {"command_target_id",
                 CanonicalValue(std::string(motion_limit_target_id))},
                {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
+               // The fixture checks the active TCP only.
+               {"tcp_speed_check", CanonicalValue("active_tcp")},
            })})},
       {"planner_rng_seed", CanonicalValue(12345.0)},
       {"initial_joint_positions_rad",
@@ -843,10 +858,13 @@ assistant_source(const bool composer_draft_enabled = false) {
     });
   }
 
+  // C-P3: TCPs are tagged, as on the maintained Lite6 arm target
+  // (`lite6_lite_gripper`): `flange` and `tcp`, with `tcp` the default.
   CanonicalValue::Object arm_tcp_frame{
       {"frame_role_id", CanonicalValue("tcp")},
       {"model_role_id", CanonicalValue("arm_model")},
       {"asset_frame_role_id", CanonicalValue("tcp")},
+      {"tcp", CanonicalValue(true)},
   };
   if (associate_arm_tcp_contact_bodies) {
     arm_tcp_frame.emplace_back(
@@ -859,6 +877,7 @@ assistant_source(const bool composer_draft_enabled = false) {
           {"model_role_id", CanonicalValue("arm_model")},
           {"asset_frame_role_id", CanonicalValue("base")},
       }),
+      lite6_arm_flange_frame(),
       CanonicalValue(std::move(arm_tcp_frame)),
   };
 
@@ -921,6 +940,7 @@ assistant_source(const bool composer_draft_enabled = false) {
                         })})},
                    {"capabilities",
                     CanonicalValue(std::move(target_capabilities))},
+                   {"default_tcp_frame_role_id", CanonicalValue("tcp")},
                })})},
           {"attachment_interfaces", CanonicalValue(CanonicalValue::Array{})},
       }),
@@ -1687,10 +1707,13 @@ assistant_source(const bool composer_draft_enabled = false) {
         {"capability_definition_revision", CanonicalValue(catalog.observed_state_capability->value().capability_definition_revision.value())},
     });
   }
+  // C-P3: the arm target tags its TCPs as above; the gripper target's `tcp`
+  // stays an ordinary frame, so the component has one declared default.
   CanonicalValue::Object aggregate_arm_tcp_frame{
       {"frame_role_id", CanonicalValue("tcp")},
       {"model_role_id", CanonicalValue("arm_model")},
       {"asset_frame_role_id", CanonicalValue("tcp")},
+      {"tcp", CanonicalValue(true)},
   };
   CanonicalValue::Object aggregate_gripper_tcp_frame{
       {"frame_role_id", CanonicalValue("tcp")},
@@ -1712,6 +1735,7 @@ assistant_source(const bool composer_draft_enabled = false) {
           {"model_role_id", CanonicalValue("arm_model")},
           {"asset_frame_role_id", CanonicalValue("base")},
       }),
+      lite6_arm_flange_frame(),
       CanonicalValue(std::move(aggregate_arm_tcp_frame)),
   };
   if (shared_arm_endpoint_bodies) {
@@ -1776,6 +1800,7 @@ assistant_source(const bool composer_draft_enabled = false) {
                         })})},
                    {"capabilities",
                     CanonicalValue(std::move(arm_capabilities))},
+                   {"default_tcp_frame_role_id", CanonicalValue("tcp")},
                }),
                CanonicalValue(CanonicalValue::Object{
                    {"command_target_id",
@@ -2300,7 +2325,7 @@ assistant_source(const bool composer_draft_enabled = false) {
                    component_id, aggregate, !scalar_only,
                    initial_joint1_position_rad)},
     });
-    components.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object component_row{
         {"controllable_component_id", CanonicalValue(component_id)},
         {"component_type_id",
          CanonicalValue(
@@ -2317,7 +2342,23 @@ assistant_source(const bool composer_draft_enabled = false) {
         {"runtime_unit_ids", text_array({runtime_unit_id})},
         {"root_pose_in_cell",
          translated_pose(static_cast<double>(instance) * 2.0)},
-    });
+    };
+    // B5: the compiled default TCP, as the activation compiler writes it for
+    // a type whose one target declares a default.
+    std::vector<CanonicalValue> declared_defaults;
+    for (const auto &target : component_type.value().command_targets) {
+      if (target.default_tcp_frame_role_id.has_value())
+        declared_defaults.emplace_back(CanonicalValue::Object{
+            {"command_target_id",
+             CanonicalValue(target.command_target_id.value())},
+            {"frame_role_id",
+             CanonicalValue(target.default_tcp_frame_role_id->value())},
+        });
+    }
+    if (declared_defaults.size() == 1U)
+      component_row.emplace_back("default_tcp",
+                                 std::move(declared_defaults.front()));
+    components.emplace_back(std::move(component_row));
     // A gripper-only cell installs the same component type with its arm
     // target unbound: no arm domain, binding, route or planner.
     if (!scalar_only) domains.emplace_back(CanonicalValue::Object{

@@ -54,7 +54,7 @@ blackboard:
 | Persistence | Lifetime | Starting value at Run |
 | --- | --- | --- |
 | `run` | One Program run | `initial:`, otherwise empty |
-| `persistent` | Survives runs, Reset and restarts | The stored value, otherwise `initial:`, otherwise empty |
+| `persistent` | Survives runs, Reset (unless Reset reloads the initial scene) and restarts | The stored value, otherwise `initial:`, otherwise empty |
 
 A key with no value yet can still be written; a node that **reads** it
 before any value exists fails, naming the key. Starting values are loaded by
@@ -81,6 +81,15 @@ the Program runner itself, so a key declared `read` still receives its
   run starts, and the run still starts from `initial:`.
 - If the runner missed an Apply, the values are kept and the page shows an
   "Apply not observed" fault so the cause can be found and fixed.
+- A Reset with **Reload initial scene** also resets every persistent key,
+  whatever its access, to `initial:` (or empty). Its confirmation lists the
+  stored values it resets (current value → new value), and each reset is
+  recorded in the stored-value edits with that Reset. If they cannot be
+  reset, the Reset fails by name before the Scene is reloaded and the stored
+  values stay; Reset again to retry. The keys are reset before the Scene
+  reloads: if the Scene reload then fails, Reset again to finish it (if you
+  Close instead, the keys stay reset although the Scene was not reloaded). A Reset
+  without that option keeps them.
 - A persistent key cannot be a computed key.
 
 ## 5. Computed keys
@@ -120,8 +129,11 @@ Check pose bounds (Geometry) test poses.
 **Poses and frames:** a pose carries its frame: the cell, a frame of one of
 the robots (shown as robot · frame), or a Scene object. A pose key may limit
 the frames its values may use with `allowed_frames`; writes in any other
-frame are refused. The robot a node moves, and that robot's base and TCP
-frames, are fixed settings of the node and never come from keys. When a move
+frame are refused. The motion node's target robot and base frame, and its TCP
+selector, are node settings. **Current** resolves from the robot's Active TCP.
+Set TCP's entry selector may take a `tcp_entry` value directly from a key
+([TCPs](TCPS.md#tcps-in-programs)); that structured value is not read through
+an expression. When a move
 uses a frame of something that moves (another robot, a carried object), that
 frame is read once when the motion starts, and the target stays fixed from
 then on.
@@ -139,13 +151,23 @@ then on.
 
 ## 7. System keys
 
-The system writes two families of read-only keys: `node_outcome.<node>`
-(each motion node's last outcome, `none` until it ends in this Run) and
-`interrupt_state.<rule_id>` (each Deployment global rule's current state).
-Read them like any key; you never declare or write them, and no key,
-namespace or Program parameter may use the names `node_outcome` or
-`interrupt_state`. Their values are listed in
-[Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).
+The system writes three families of read-only keys: `node_outcome.<node>`
+(each motion node's last outcome, `none` until it ends in this Run),
+`interrupt_state.<rule_id>` (each Deployment global rule's current state) and
+`active_tcp.<target_role>` (the [Active TCP](TCPS.md#the-active-tcp) of the
+robot bound to that role, as a `tcp_entry`). You never declare or write
+these keys, and no key, namespace or Program parameter may use the names
+`node_outcome`, `interrupt_state` or `active_tcp`. The first two values are
+listed in [Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).
+
+`active_tcp` is a structured key. The runtime uses it for a move's **Current**
+selector, and the run view displays it. Robot Control reads the robot's status.
+Set TCP can also use
+a `tcp_entry` key as its entry selector. An Active TCP value cannot be used in
+an expression, computed key, Check/Wait condition, interrupt condition or
+`bbkey` publication; those consumers remain scalar-only. If the robot has no
+Active TCP, the key has no value and a node that needs it fails, naming the
+key.
 
 ## 8. Editing in Composer
 

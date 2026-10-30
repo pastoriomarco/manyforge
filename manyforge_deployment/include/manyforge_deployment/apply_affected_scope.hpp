@@ -2,6 +2,8 @@
 
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -11,6 +13,12 @@ namespace manyforge::deployment {
 class ApplyAffectedScopeError final : public std::invalid_argument {
 public:
   using std::invalid_argument::invalid_argument;
+  ApplyAffectedScopeError(std::string code, const std::string &message)
+      : std::invalid_argument(message), code_(std::move(code)) {}
+  [[nodiscard]] const std::string &code() const noexcept { return code_; }
+
+private:
+  std::string code_;
 };
 
 /// Purely derives the one atomic Kernel-admission scope for a named Apply.

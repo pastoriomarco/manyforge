@@ -70,6 +70,11 @@ retained_isaac_controller_lane(
     std::string_view isaac_profile,
     std::span<const double> initial_joint_positions_rad);
 
+/// The gripper bridge of one closed retained Isaac profile, if its gripper
+/// transport is the GripperCommand action; a tool component's launch runs it.
+[[nodiscard]] std::optional<IsaacGripperBridgeLane>
+retained_isaac_gripper_bridge(std::string_view isaac_profile);
+
 /// Expand one closed retained Isaac profile into the exact ROS execution
 /// configuration used by the installed execution host.
 ///
@@ -78,7 +83,8 @@ retained_isaac_controller_lane(
 /// identity, the lane's controller facts, the Core participant's lane inputs,
 /// the guard topics and the gripper transport are build-owned profile facts.
 /// Runtime participant bindings supply the compiled/source coordinate map and
-/// are checked exactly here.
+/// are checked exactly here. The gripper is optional: a robot whose tool is
+/// its own component carries none.
 ///
 /// The participant's in-motion staleness check
 /// (`participant.stop.controller_state_max_age_ns`) is the component's
@@ -115,6 +121,17 @@ void configure_retained_mock_gripper_action(
     const MockControllerProfileFacts& profile,
     std::string_view runtime_namespace,
     const std::string& controller_manager);
+
+/// Populate the Isaac gripper transport of `isaac_profile` in
+/// `runtime_namespace`. The arm builder (a robot that carries its gripper) and
+/// the no-motion tool owner share these unchanged lane values. The tool's
+/// joints stay in the robot's Isaac articulation: its state is on the shared
+/// joint-states topic and only its own joints are declared.
+void configure_retained_isaac_gripper_action(
+    RetainedRos2ControlBackendConfig& config,
+    const core::RuntimeParticipantBinding& gripper,
+    std::string_view isaac_profile,
+    std::string_view runtime_namespace);
 
 /// Expand one closed offline mock profile (catalog `mock_profile`) into the
 /// ROS execution configuration of its component, structured as the Isaac

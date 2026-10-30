@@ -68,6 +68,26 @@ describe('pneumatic gripper authoring', () => {
     } }] } })[0].path).toEqual(['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0, 'pneumatic_io']);
   });
 
+  it('finds the gripper target on a tool component mounted on the robot flange', () => {
+    const split = document(io);
+    const components = split.components as Array<Record<string, JsonValue>>;
+    // The robot keeps no gripper; the tool component owns its gripper row.
+    const tool = JSON.parse(JSON.stringify(components[0]).replaceAll('"robot"', '"lite_gripper"'));
+    split.components = [
+      { component_id: 'robot', target_settings: {}, configuration: { runtime_kind: 'ros2_control', runtime_configuration: {} } },
+      tool, components[1], components[2],
+    ];
+    split.attachments = [{
+      parent: { component_id: 'robot', interface: 'flange' },
+      child: { component_id: 'lite_gripper', interface: 'mount' },
+    }];
+    const rows = pneumaticGripperDrafts(split);
+    expect(rows.map((row) => [row.componentId, row.targetId])).toEqual([['lite_gripper', 'gripper']]);
+    expect(rows[0].path[1]).toBe(1);
+    expect(declaredPneumaticInputs(split, 'lite_gripper', 'gripper')).toEqual(['workpiece_grasped']);
+    expect(declaredPneumaticInputs(split, 'robot', 'gripper')).toEqual([]);
+  });
+
   it('authors signals from different I/O components in a Draft without any Applied descriptors', async () => {
     const controller = {
       workspace: { draft: { document: document() } }, mutationAvailable: true, busy: false,

@@ -240,9 +240,12 @@ TEST(ControllerLaunchArtifacts, UrMockControllersKeepTheirRetainedConstraints) {
                 "    joints: [shoulder_pan_joint, shoulder_lift_joint, "
                 "elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]\n"),
             std::string::npos);
-  EXPECT_NE(with_gripper.find("      wrist_3_joint: {trajectory: 0.2, goal: 0.1, "
+  // The retained trajectory constraint; the goal is the row's arrival
+  // tolerance (merge 6: Mock 0.01 rad), kept on every goal.
+  EXPECT_NE(with_gripper.find("      wrist_3_joint: {trajectory: 0.2, goal: 0.01, "
                               "max_deceleration_on_cancel: 10.0}\n"),
             std::string::npos);
+  EXPECT_EQ(count(with_gripper, "goal: 0.01, "), 6U);
   EXPECT_NE(with_gripper.find("    allow_partial_joints_goal: false\n"),
             std::string::npos);
   EXPECT_NE(with_gripper.find("    interpolate_from_desired_state: true\n"),
@@ -300,7 +303,8 @@ TEST(ControllerLaunchArtifacts, ControllersFileFailsClosed) {
                    cancel_limits(kUFactoryArm, 10.0),
                    std::string("right_finger_joint"))),
                ControllerLaunchArtifactError);
-  EXPECT_THROW(static_cast<void>(mock_controller_profile_facts("uf850")),
+  // `uf850` has its own Mock row since merge 6; an unknown id still throws.
+  EXPECT_THROW(static_cast<void>(mock_controller_profile_facts("not_a_mock_profile")),
                ControllerLaunchArtifactError);
   EXPECT_THROW(static_cast<void>(retained_isaac_controllers_yaml("ur5e")),
                ControllerLaunchArtifactError);
@@ -453,14 +457,26 @@ TEST(ControllerLaunchArtifacts, BothIsaacProfilesUseTheGeneratedDescriptionAndRe
     EXPECT_EQ(count(description, "<param name=\"initial_value\">"), 6U);
     EXPECT_EQ(description.find("version=\"1.2\"") != std::string::npos,
               item.profile == "lite6");
-    // The controllers file is the profile's retained Isaac file, unchanged.
-    EXPECT_EQ(read_file(written.controllers_file),
-              read_repository_file(item.retained_controllers));
-    EXPECT_EQ(written.controllers_yaml,
-              read_repository_file(item.retained_controllers));
+    // The controllers file is the profile's retained Isaac file with every
+    // arm joint's goal set to the Isaac row's arrival tolerance and goal_time
+    // to its settle window (merge 6). M6b night change 5 (slice 80-ISAACTOL):
+    // the ur10e row's goal is its retained 0.1 rad again; Lite 6 stays 0.05.
+    const std::string goal = item.profile == "ur10e" ? ", goal: 0.1," : ", goal: 0.05,";
+    auto expected = read_repository_file(item.retained_controllers);
+    ASSERT_EQ(count(expected, "      goal_time: 0.0\n"), 1U);
+    expected.replace(expected.find("      goal_time: 0.0\n"), 21U,
+                     "      goal_time: 1.0\n");
+    for (const auto *retained : {", goal: 0.05,", ", goal: 0.1,"}) {
+      for (auto at = expected.find(retained); at != std::string::npos;
+           at = expected.find(retained, at + 1U)) {
+        expected.replace(at, std::string_view(retained).size(), goal);
+      }
+    }
+    EXPECT_EQ(count(expected, goal), 6U);
+    EXPECT_EQ(read_file(written.controllers_file), expected);
+    EXPECT_EQ(written.controllers_yaml, expected);
     EXPECT_EQ(written.controllers_sha256,
-              manyforge::content_identity::sha256_digest(
-                  read_repository_file(item.retained_controllers)));
+              manyforge::content_identity::sha256_digest(expected));
     // Track 2's Isaac shell contract (DX-168).
     EXPECT_EQ(written.launch_environment,
               (std::vector<std::pair<std::string, std::string>>{
@@ -733,9 +749,16 @@ TEST(ControllerLaunchArtifactsHost, ActivationWritesBothFilesAndPassesTheLaunchC
                  isaac_written.controllers_file.string()},
                 {"ISAAC_TOPIC_CONTROL_PROFILE", "ur10e"},
                 {"MANYFORGE_ISAAC_COMPONENT_ID", "isaac_ur10e_light_robot"}}));
-  EXPECT_EQ(read_file(isaac_written.controllers_file),
-            read_repository_file("manyforge_ros_bringup/config/"
-                                 "isaac_ur10e_topic_based_controllers.yaml"));
+  // The retained file with goal_time set to the Isaac row's settle window
+  // (merge 6 slice 08-ARRIVE, FIX2: 1.0 s, never stock JTC's zero window);
+  // the ur10e goal is the retained 0.1 rad (M6b slice 80-ISAACTOL).
+  auto isaac_expected = read_repository_file(
+      "manyforge_ros_bringup/config/isaac_ur10e_topic_based_controllers.yaml");
+  ASSERT_EQ(count(isaac_expected, "      goal_time: 0.0\n"), 1U);
+  isaac_expected.replace(isaac_expected.find("      goal_time: 0.0\n"), 21U,
+                         "      goal_time: 1.0\n");
+  EXPECT_EQ(count(isaac_expected, ", goal: 0.1,"), 6U);
+  EXPECT_EQ(read_file(isaac_written.controllers_file), isaac_expected);
   EXPECT_NE(read_file(isaac_written.robot_description_file)
                 .find("<param name=\"initial_value\">2.634225"),
             std::string::npos);
@@ -1263,6 +1286,9 @@ TEST(ControllerLaunchArtifactsCharacterization, EveryMockProfileKeepsItsExactArt
     result.push_back("frame_prefix:=pre/");
     return result;
   };
+  // Merge 6 slice 08-ARRIVE: the UR template's own `goal: 0.1` became the
+  // row's 0.01 arrival tolerance, so the three UR controller files were
+  // repinned (each old pin is the new file with that goal at 0.1).
   const std::map<std::string, PinnedMockArtifacts> pinned{
       {"lite6_lite_gripper",
        {"sha256:17d491767b4e0a0f2c7465f76f038061133d1efa31683a69783b4bd99eb512a3",
@@ -1272,19 +1298,19 @@ TEST(ControllerLaunchArtifactsCharacterization, EveryMockProfileKeepsItsExactArt
                   "lite_gripper_controller")}},
       {"ur10e_robotiq_2f_140",
        {"sha256:b574bbf2058c22408642d92e86d002a51f6249fc96cdba9186838cb10fa14426",
-        "sha256:b2d27a9c1da41e0fce8dab51e2d27ea4f40dc7f588d3036d27547a323ce83137",
+        "sha256:16778a7b44b8a306fcb2a87ae561a0bb1eb86d52643613a7d701087cdae59a87",
         arguments("robot_ur10e_robotiq_2f_140", "joint_trajectory_controller",
                   "3c8b89392e8ce79e0364007a3f01ec4ccf3c582654ec488059c6649ffc5be030",
                   "robotiq_gripper_controller")}},
       {"ur5_roboplan",
        {"sha256:887213f8e460c80a0cd0744423985825cb2df1794ceb9c27e1666b5e351a29d1",
-        "sha256:cba2dbcf49adc1121d8499b01aef5244059004159fc2adab5f043b854f02627f",
+        "sha256:c7c7a854106c0f2e1a5af3e69963831c7a9490154745ed15d29b08b9682a2902",
         arguments("robot_ur5_roboplan", "joint_trajectory_controller",
                   "3218aa237a5e27a61133127b1090c6e1f7a5003275fde0cae4dec6b43e9ea474",
                   std::nullopt)}},
       {"ur5e_robotiq_2f_85",
        {"sha256:19588f4906aa9ed01ed94da212430b7af19a6739ead4b00da52b851e7fd1fbb1",
-        "sha256:bec492d593dd3463b7f643baee3cda30065398857cd8531086e306b503dcc1ff",
+        "sha256:35ef2d2b2564db42eb7f901078929bd7291c72f8bf45f5d07aebb31bf5fa0208",
         arguments("robot_ur5e_robotiq_2f_85", "joint_trajectory_controller",
                   "98b85126a58332dff2634af54e03c423daf17f57fcc521f7c769b010ed89c7a4",
                   "robotiq_gripper_controller")}},
@@ -1348,6 +1374,7 @@ namespace {
   ComponentControllerLaunchInput input;
   input.artifacts_root = root;
   input.real_profile = "lite6_real";
+  input.adapter_family = "xarm";
   input.robot_ip = robot_ip;
   input.model_urdf = read_repository_file(offline_profiles().front().model_path);
   input.controlled_stop_max_deceleration_rad_s2 = resource_limits(motion, 9.5);
@@ -1363,17 +1390,19 @@ TEST(ControllerLaunchArtifactsReal, ProfileFactsCarryTheMeasuredFreshnessBudgetA
   EXPECT_DOUBLE_EQ(facts.hard_stop_completion_timeout_s, 1.5);
   // R7 D3: joints 0.25 s, per robot.
   EXPECT_DOUBLE_EQ(facts.joint_state_freshness_s, 0.25);
-  // `main`'s measured start/terminal state checks.
+  // `main`'s measured start/terminal state checks; the terminal one is the
+  // Real row's arrival tolerance (also the JTC goal constraint).
   EXPECT_DOUBLE_EQ(facts.start_tolerance_rad, 0.02);
-  EXPECT_DOUBLE_EQ(facts.final_tolerance_rad, 0.02);
+  EXPECT_DOUBLE_EQ(facts.arrival_tolerance_rad, 0.01);
   EXPECT_DOUBLE_EQ(facts.completion_state_timeout_s, 1.0);
   // D7: ManyMove's vendor cadence (the vendor lite6_controllers.yaml): the
-  // same manager and state rates as Mock, the vendor 10 Hz action monitor.
+  // same manager and state rates as Mock; the action monitor at 20 Hz, as
+  // Mock (maintainer, M6b JTC20; the vendor yaml has 10 Hz).
   const auto real = real_controller_lane_rates("lite6_real");
   const auto mock = mock_controller_lane_rates("lite6_lite_gripper");
   EXPECT_DOUBLE_EQ(real.controller_update_rate_hz, mock.controller_update_rate_hz);
   EXPECT_DOUBLE_EQ(real.state_publish_rate_hz, mock.state_publish_rate_hz);
-  EXPECT_DOUBLE_EQ(real.action_monitor_rate_hz, 10.0);
+  EXPECT_DOUBLE_EQ(real.action_monitor_rate_hz, 20.0);
   EXPECT_THROW(static_cast<void>(real_controller_profile_facts("lite6_lite_gripper")),
                ControllerLaunchArtifactError);
   EXPECT_THROW(static_cast<void>(real_controller_lane_rates("lite6")),
@@ -1387,10 +1416,20 @@ TEST(ControllerLaunchArtifactsReal, DescriptionCarriesTheVendorPluginWithExactPa
   EXPECT_EQ(written.lane, ControllerLaunchLane::kMock);
   EXPECT_EQ(written.controller_profile, "lite6_real");
   // R7 package 3: the xArm adapter observes this component's own driver;
-  // package 4: with the Enable gate's per-robot joint agreement tolerance.
+  // package 4: with the Enable gate's per-robot joint agreement tolerance;
   EXPECT_EQ(written.vendor_adapter,
             (VendorAdapterSelection{"xarm", "/manyforge/real_lite6/xarm", 6,
                                     0.02}));
+  // V-B4: the adapter family is the deployment's, never implied by the
+  // profile (the registry refuses a family it does not have).
+  {
+    const TemporaryRoot other_root;
+    auto host = real_component(other_root.path(), "real_lite6", "192.168.1.31");
+    host.input.adapter_family = "other_family";
+    const auto other = write_host(host);
+    ASSERT_TRUE(other.vendor_adapter.has_value());
+    EXPECT_EQ(other.vendor_adapter->vendor, "other_family");
+  }
   const auto description = read_file(written.robot_description_file);
   EXPECT_EQ(written.robot_description_sha256,
             manyforge::content_identity::sha256_digest(description));
@@ -1436,7 +1475,7 @@ TEST(ControllerLaunchArtifactsReal, ControllersStartTheHardwareInactiveWithManyM
   EXPECT_EQ(written.controllers_sha256,
             manyforge::content_identity::sha256_digest(controllers));
   // Mock Lite 6's arm-only controllers with D7's ManyMove (vendor) values:
-  // position+velocity command interfaces and the 10 Hz action monitor; the
+  // position+velocity command interfaces and the 20 Hz action monitor; the
   // same cancel bounds plus the initial-inactive hardware entry; no
   // reset-position writer and no gripper controller.
   auto expected = generate_mock_controllers_yaml(
@@ -1451,7 +1490,9 @@ TEST(ControllerLaunchArtifactsReal, ControllersStartTheHardwareInactiveWithManyM
                "# Track 2's UFactory real arm template.\n");
   replace_once("    command_interfaces: [position]\n",
                "    command_interfaces: [position, velocity]\n");
-  replace_once("    action_monitor_rate: 20.0\n", "    action_monitor_rate: 10.0\n");
+  // Merge 6: the Real row's arrival tolerance (0.01 rad, ManyMove's value,
+  // equal to Mock's) is every joint's goal.
+  ASSERT_EQ(count(expected, "goal: 0.01, "), 6U);
   const std::string block = "    hardware_components_initial_state:\n";
   ASSERT_EQ(count(expected, block), 1U);
   expected.insert(expected.find(block) + block.size(),
@@ -1487,17 +1528,21 @@ TEST(ControllerLaunchArtifactsReal, DriverParametersEnableTheIoServicesUnderTheC
             std::string::npos);
   for (const auto *service :
        {"clean_error", "clean_warn", "get_tgpio_digital", "get_cgpio_digital",
-        "set_tgpio_digital", "set_cgpio_digital", "set_tcp_load"}) {
+        "set_tgpio_digital", "set_cgpio_digital", "set_tcp_load",
+        "set_tcp_offset", "set_mode", "set_state", "get_err_warn_code",
+        "get_state"}) {
     EXPECT_NE(driver.find("\n      " + std::string(service) + ": true\n"),
               std::string::npos)
         << service;
   }
-  EXPECT_EQ(count(driver, ": true\n"), 8U);
+  // M6 XADAPT D11/DX-2984: on-demand error and state reads for clear.
+  EXPECT_EQ(count(driver, ": true\n"), 13U);
   EXPECT_EQ(driver.find(": false"), std::string::npos);
-  // ManyForge is the only motion authority: the vendor's default-on motion and
-  // mode services stay off (the driver serves only services set true).
+  // ManyForge is the only motion authority: the vendor's default-on motion
+  // services stay off (the driver serves only services set true). The mode
+  // and state serve the adapter's re-engage at rest (M6 ADAPTERM).
   for (const auto *service :
-       {"set_mode", "set_state", "motion_enable", "set_position", "set_servo_angle",
+       {"motion_enable", "set_position", "set_servo_angle",
         "set_servo_angle_j", "move_gohome", "vc_set_joint_velocity",
         "vc_set_cartesian_velocity"}) {
     EXPECT_EQ(driver.find(std::string(service) + ":"), std::string::npos) << service;
@@ -1602,4 +1647,117 @@ TEST(ControllerLaunchArtifactsReal, RealInputsFailClosed) {
                ControllerLaunchArtifactError);
 }
 
+TEST(ControllerLaunchArtifacts, SplitArmAndToolRowsComeFromTheDataFile) {
+  // Merge 6: an arm row has no gripper controller, a tool row no arm
+  // controller; both keep their family's template rates.
+  for (const auto *arm : {"lite6", "uf850", "ur10e", "ur5e"}) {
+    SCOPED_TRACE(arm);
+    const auto facts = mock_controller_profile_facts(arm);
+    EXPECT_FALSE(facts.arm_controller_name.empty());
+    EXPECT_FALSE(facts.gripper_controller_name.has_value());
+    EXPECT_FALSE(facts.gripper_required);
+  }
+  for (const auto *tool :
+       {"lite_gripper", "xarm_gripper", "robotiq_2f_140", "robotiq_2f_85"}) {
+    SCOPED_TRACE(tool);
+    const auto facts = mock_controller_profile_facts(tool);
+    EXPECT_TRUE(facts.arm_controller_name.empty());
+    EXPECT_TRUE(facts.gripper_controller_name.has_value());
+    EXPECT_TRUE(facts.gripper_required);
+  }
+  EXPECT_DOUBLE_EQ(mock_controller_lane_rates("lite_gripper").controller_update_rate_hz,
+                   mock_controller_lane_rates("lite6").controller_update_rate_hz);
+
+  const auto lite6 = generate_mock_controllers_yaml(
+      mock_controller_profile_facts("lite6"), "lite6_robot", kUFactoryArm,
+      cancel_limits(kUFactoryArm, 10.0), std::nullopt);
+  EXPECT_NE(lite6.find("lite6_traj_controller:"), std::string::npos);
+  EXPECT_EQ(lite6.find("gripper"), std::string::npos);
+
+  const auto tool = generate_mock_controllers_yaml(
+      mock_controller_profile_facts("lite_gripper"), "lite_gripper", {}, {},
+      std::string("right_finger_joint"));
+  EXPECT_NE(tool.find("lite_gripper_controller:"), std::string::npos);
+  EXPECT_EQ(tool.find("traj_controller"), std::string::npos);
+
+  // Isaac: only a robot row has arm controllers. A tool row has none, and
+  // the combined ids are no Isaac row (Mock test fixtures only, D2).
+  for (const auto *tool : {"lite_gripper", "robotiq_2f_140", "lite6_lite_gripper",
+                           "ur10e_robotiq_2f_140"}) {
+    EXPECT_THROW(static_cast<void>(retained_isaac_controllers_yaml(tool)),
+                 ControllerLaunchArtifactError);
+  }
+
+  // A tool row cannot drive arm joints, and an arm row has no gripper.
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   mock_controller_profile_facts("lite_gripper"), "lite_gripper",
+                   kUFactoryArm, cancel_limits(kUFactoryArm, 10.0),
+                   std::string("right_finger_joint"))),
+               ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(generate_mock_controllers_yaml(
+                   mock_controller_profile_facts("lite6"), "lite6_robot",
+                   kUFactoryArm, cancel_limits(kUFactoryArm, 10.0),
+                   std::string("right_finger_joint"))),
+               ControllerLaunchArtifactError);
+}
+
 } // namespace
+
+// Merge 6 arrival: every lane's controller profile row carries its own
+// per-joint arrival tolerance, written as the stock JTC `goal` constraint of
+// every arm joint (Mock 0.01, Isaac the measurement placeholder, Real 0.01).
+TEST(ControllerLaunchArtifacts, EveryLaneRowCarriesItsArrivalToleranceAsTheJtcGoal) {
+  for (const auto &id : mock_controller_profile_ids()) {
+    SCOPED_TRACE(id);
+    const auto facts = mock_controller_profile_facts(id);
+    // Merge 6 tool split (slice 04-TOOLSPLIT): a tool's gripper-only row has
+    // no arm controller and no arrival tolerance (mock_controller_profiles.yaml);
+    // that it cannot drive arm joints is checked above.
+    if (facts.arm_controller_name.empty()) {
+      EXPECT_DOUBLE_EQ(facts.arrival_tolerance_rad, 0.0);
+      continue;
+    }
+    EXPECT_DOUBLE_EQ(facts.arrival_tolerance_rad, 0.01);
+    const bool ur = id.starts_with("ur");
+    const auto &arm = ur ? kUrArm : kUFactoryArm;
+    std::optional<std::string> gripper;
+    if (facts.gripper_required) {
+      gripper = ur ? "robotiq_85_left_knuckle_joint" : "right_finger_joint";
+    }
+    const auto yaml = generate_mock_controllers_yaml(
+        facts, "robot", arm, cancel_limits(arm, 10.0), gripper);
+    // One goal per arm joint, the row's value, no other goal constraint.
+    EXPECT_EQ(count(yaml, "goal: 0.01, max_deceleration_on_cancel: 10.0}"),
+              arm.size());
+    EXPECT_EQ(count(yaml, ", goal: "), arm.size());
+  }
+  EXPECT_EQ(isaac_controller_profile_ids(),
+            (std::vector<std::string>{"lite6", "ur10e"}));
+  for (const auto &id : isaac_controller_profile_ids()) {
+    SCOPED_TRACE(id);
+    // Placeholders, to be set from the Isaac measurement.
+    const double goal = id == "ur10e" ? 0.1 : 0.05;
+    EXPECT_DOUBLE_EQ(isaac_controller_arrival_tolerance_rad(id), goal);
+    EXPECT_DOUBLE_EQ(isaac_controller_goal_time_s(id), 1.0);
+    const auto yaml = isaac_controllers_yaml(id);
+    // A settle window, never stock JTC 6.10's zero window.
+    EXPECT_EQ(count(yaml, "      goal_time: 1.0\n"), 1U);
+    EXPECT_EQ(count(yaml, "goal_time: "), 1U);
+    EXPECT_EQ(count(yaml, id == "ur10e" ? ", goal: 0.1," : ", goal: 0.05,"), 6U);
+    EXPECT_EQ(count(yaml, ", goal: "), 6U);
+    EXPECT_EQ(isaac_controller_lane_rates(id).action_monitor_rate_hz, 20.0);
+  }
+  EXPECT_THROW(static_cast<void>(isaac_controller_arrival_tolerance_rad("ur5e")),
+               ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(isaac_controller_goal_time_s("ur5e")),
+               ControllerLaunchArtifactError);
+  // Mock and Real keep their templates' goal_time (UFactory and Real 0.5 s).
+  EXPECT_EQ(count(generate_mock_controllers_yaml(
+                      mock_controller_profile_facts("lite6_lite_gripper"), "robot",
+                      kUFactoryArm, cancel_limits(kUFactoryArm, 10.0),
+                      std::string("right_finger_joint")),
+                  "      goal_time: 0.5\n"),
+            1U);
+  EXPECT_DOUBLE_EQ(real_controller_profile_facts("lite6_real").arrival_tolerance_rad,
+                   0.01);
+}

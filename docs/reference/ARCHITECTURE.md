@@ -251,18 +251,31 @@ particular robot transport.
 
 Collision protection is dual-layered and configurable:
 
-- **Plan-time validation** checks the trajectory before it is dispatched; a
-  trajectory that fails is never sent to the robot. It checks the stored
-  waypoints and samples of the curve the controller executes between them
-  (linear, cubic or quintic from the waypoints' positions, velocities and
-  accelerations), so that no joint moves more than 0.0005 rad between two
-  checked configurations. A contact thinner than that step can still be
-  missed. A trajectory that would need more than 200,000 checked
-  configurations is refused (`collision_validation_sample_budget_exceeded`).
+- **Plan-time validation** checks the trajectory per waypoint before it is
+  dispatched; a trajectory that fails is never sent to the robot.
 - **Runtime monitoring** re-checks the lane-selected authoritative execution
-  state periodically during execution and faults on a policy violation. The
-  runtime lookahead is a quick check and does not sample every point; for
-  expanded collision models it uses the chord between waypoints.
+  state periodically during execution and faults on a policy violation.
+
+Plan-time validation and the planner can keep a **collision clearance**
+(Deployment `collision_clearance_m`, 0 to 0.05 m; 0, the default, turns it off
+and only contact is checked). A motion's own `clearance_m` (Program motion
+nodes, Robot Control's Advanced settings) replaces it for that move. Robot and carried bodies must stay at
+least that far from every environment body, except where the collision policy
+allows contact: static, touch-link and support-contact pairs and the active
+contact-grasp pairs keep clearance 0, and their contact tolerances apply as
+before. The move's target object gets the clearance unless such a policy
+allows the contact. A move that starts inside the clearance may move away but
+not closer. Runtime monitoring and lookahead use clearance 0: they stop only on
+contact.
+
+Validation checks the stored waypoints and samples of the curve the
+controller executes between them, at the collision-check step the trajectory
+was planned with: the Deployment `collision_check_step_rad` (0.05 rad of
+joint-space distance by default) on the planner's first attempt, and the finer
+of it and 0.01 rad on a replan after a refusal. A contact thinner
+than one step can be missed between two samples; the clearance makes this less
+likely. A trajectory that would need more than 200,000 checked configurations
+is refused (`collision_validation_sample_budget_exceeded`).
 
 Both layers use the same authority — the motion planner does not get to certify
 its own trajectories. Each state query first determines the colliding body-pair
@@ -298,11 +311,61 @@ Other contact policies include:
   bounded-penetration modes above.
 
 Every allowed and rejected contact is reported explicitly in diagnostics, so a
-tolerated contact is auditable rather than silent. There is no implicit
-minimum-clearance policy: when physical clearance is required, model it in the
-collision geometry (for example by conservative mesh inflation) or use an
-explicit future policy. A degraded collision-geometry proxy must be identified
+tolerated contact is auditable rather than silent. Beyond the collision
+clearance above, when more physical clearance is required for one body, model
+it in the collision geometry (for example by conservative mesh inflation). A degraded collision-geometry proxy must be identified
 in diagnostics rather than used silently.
+
+______________________________________________________________________
+
+## Cell kinematic index and TCP terms
+
+The cell kinematic index is a read-only view over facts the deployment layer
+already holds. It is built from the cell graph (what is mounted on what, and
+which component owns each model) and from the kinematic frame paths of a
+verified model map. Code that needs a mount, owner, child or frame-path answer
+asks the index instead of walking the graph by hand. The index is
+`deployment::CellKinematicIndex`, in `manyforge_deployment`.
+
+The index owns nothing. Each fact keeps the owner it already has:
+
+| Fact | Owner |
+| --- | --- |
+| What is mounted on what, who owns each model, the default TCP | The deployment recipe, compiled into the cell graph of the retained bundle |
+| Which scenario is live | The Component Manager's applied publication |
+| Each component's live status | CCLC |
+| Frames, targets, compiled links and frame paths | The compiled model map, verified at load |
+
+The index holds no state, authority, lifecycle, id or digest. It is derived
+again whenever a verified model map is built, and during Apply once for each
+side (the current graph and the candidate graph). It pins nothing: each
+consumer keeps its own identity checks and its own typed error codes. Queries
+return null or an empty list; they do not raise errors.
+
+The queries are:
+
+- the owner of a model instance (null for a passive model);
+- the component a given component is mounted on;
+- whether one component carries another, directly or through a chain of mounts;
+- a component and everything mounted on it, through the whole chain;
+- the direct children of a component, in graph order;
+- the tool on a robot interface (the first matching edge in graph order);
+- the kinematic frame paths, and the path of one frame (null when there is none
+  or more than one).
+
+Two frame role bindings are compared with `same_program_frame`, which checks
+role, model, revision and compiled name. The frame-subset checks use this
+helper.
+
+### TCP terms
+
+- **Flange**: a robot's mount point, the interface a tool attaches to. A
+  robot's flange takes at most one tool. The flange is also a frame role on
+  the robot.
+- **TCP**: a tool center point, a named frame of a robot or tool that a Program
+  or the GUI can target. A component lists its TCPs under `tcps`.
+- **Default TCP**: the first `tcps` entry of a robot or tool. While a tool is
+  mounted, its default TCP takes precedence over the robot's.
 
 ______________________________________________________________________
 
@@ -572,6 +635,47 @@ Exposed through:
   source reconciliation, and bounded lifecycle history; acknowledgement routes
   are revision/activation fenced.
 - MCP `manyforge_execution_status` — the same, for assistant/debug tooling.
+
+### Typed errors and the error catalog
+
+A refusal carries one carrier everywhere: `{code, message, details}` plus the
+`producer` that produced it (`component_manager`, `kernel`, `headless_api`,
+`composer`). The code is stable; the message is the producer's own text.
+
+- **C++ boundaries** throw `manyforge::core::TypedError` (code, message,
+  details, optional producer). A boundary catch keeps the code with
+  `core::CauseOf`; an exception without a code becomes the boundary's own code.
+- **Manager RPC**: every refusal's `error` carries `producer`. A command that
+  does not decode is `invalid_request` with `details` mapping the refused field
+  path to its field code.
+- **HTTP** (headless API and Composer): refusals are
+  `{"detail": {code, message, details, producer, request_id}}`. A request
+  that fails validation is `invalid_request` (HTTP 422) with `details` mapping
+  each refused field path (for example `body.request_id`) to its field code;
+  an uncaught headless failure is `headless_api_internal_failure` (HTTP 500).
+- **Apply**: a failed Apply's terminal record keeps the failed step as `code`,
+  the inner cause's own `cause_code` and `cause_details`, its `producer`, and
+  `effect_boundary`. `before_effect` means the Apply made no configuration,
+  runtime, component or Scene change; an admission claim, a Kernel fence and
+  fail-closed readiness may still exist, and whoever releases them checks those
+  facts directly. The operator can acknowledge a proven-before-effect failure
+  regardless of the requested component, Scene or attachment changes; planned
+  bring-up claims remain excluded until their exact settlement is supported.
+  `GET /api/manager/apply/status` reports the acknowledgement state. When the
+  native runtime finds a data or setup inconsistency while composing the
+  candidate, it refuses only that Apply (`scenario_composition_refused`, with
+  `details.cause`): the Apply ends `failed` with known effects, nothing is
+  published, and the runtime keeps running. The refused Apply keeps authoring
+  closed, so restart the workbench before the next Load.
+
+The error catalog `manyforge_core/resources/error_catalog.tsv` has one line per
+code: `code`, compact text, full text. The area is the code prefix. The
+generator `manyforge_core/tools/generate_error_catalog.py` renders C++, Python
+and TypeScript constants (nothing reads the file at runtime), and
+`scripts/ci/check-error-catalog.py` refuses a code used at an error-construction
+site that has no row. Codes built at runtime are not seen by that check. The GUI
+shows a refusal's compact text, with the full text and the producer's message as
+detail; a code without a row shows the producer's message.
 
 ______________________________________________________________________
 

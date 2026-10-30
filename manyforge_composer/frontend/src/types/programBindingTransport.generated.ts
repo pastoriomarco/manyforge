@@ -46,6 +46,8 @@ export interface ProgramTargetRoleBinding {
   capability_bindings: ProgramCapabilityBinding[];
   signal_role_bindings?: ProgramSignalRoleBinding[];
   pneumatic_io?: ProgramPneumaticIoBinding;
+  robot_tcps?: ProgramRobotTcpBinding[];
+  default_tcp?: ProgramTcpEntry;
 }
 export interface ProgramFrameRoleBinding {
   frame_role_id: string;
@@ -53,6 +55,17 @@ export interface ProgramFrameRoleBinding {
   model_revision: string;
   compiled_frame_name: string;
   contact_body_role_ids?: string[];
+}
+export interface ProgramTcpEntry {
+  component_id: string;
+  target_id: string;
+  frame_role_id: string;
+}
+export interface ProgramRobotTcpBinding {
+  entry: ProgramTcpEntry;
+  frame: ProgramFrameRoleBinding;
+  end_effector: boolean;
+  component_default: boolean;
 }
 export interface ProgramResourceRoleBinding {
   resource_role_id: string;

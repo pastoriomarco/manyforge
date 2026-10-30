@@ -422,6 +422,44 @@ std::optional<std::pair<std::string, std::int64_t>> ReadControlSourceFileHint(
   }
 }
 
+std::optional<std::tuple<std::string, std::string, std::int64_t>>
+ReadViewerSceneSource(const std::filesystem::path &path, const std::string &cell_id) {
+  try {
+    const auto observed = AtomicSourceSnapshotChannel(
+        path.parent_path(), path.filename().string()).ReadObserved();
+    if (!observed || observed->snapshot.source_owner_kind != "scene_runtime" ||
+        observed->snapshot.source_owner_id != "scene-runtime." + cell_id)
+      return std::nullopt;
+    ValidateSceneRuntimePayload(observed->snapshot.payload, cell_id);
+    return std::tuple{content_identity::canonical_json(observed->snapshot.payload),
+                      observed->snapshot.source_owner_epoch,
+                      observed->file_modified_at_unix_ns};
+  } catch (const SourceSnapshotError &) {
+    return std::nullopt;
+  } catch (const RuntimeSnapshotError &) {
+    return std::nullopt;
+  } catch (const std::invalid_argument &) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::pair<std::string, std::string>>
+ReadViewerPoseSessions(const std::filesystem::path &path, const std::string &cell_id) {
+  try {
+    const auto observed = AtomicSourceSnapshotChannel(
+        path.parent_path(), path.filename().string()).ReadObserved();
+    if (!observed || observed->snapshot.source_owner_kind != "scene_runtime" ||
+        observed->snapshot.source_owner_id != "scene-runtime." + cell_id)
+      return std::nullopt;
+    return std::pair{content_identity::canonical_json(observed->snapshot.payload),
+                     observed->snapshot.source_owner_epoch};
+  } catch (const SourceSnapshotError &) {
+    return std::nullopt;
+  } catch (const std::invalid_argument &) {
+    return std::nullopt;
+  }
+}
+
 RuntimeSnapshotAggregator::RuntimeSnapshotAggregator(
     std::filesystem::path publication_root, std::string cell_id,
     std::string projection_owner_id, std::string projection_owner_epoch,

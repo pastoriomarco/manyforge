@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
-from manyforge_composer.backend.app import _structured_error_details
+from fastapi.testclient import TestClient
+
+from manyforge_composer.backend.app import _structured_error_details, create_app
+from manyforge_composer.backend.state import ComposerState
 
 
 def _body(details: object) -> bytes:
@@ -36,3 +39,24 @@ def test_free_text_nested_or_oversized_details_are_never_logged() -> None:
     assert _structured_error_details(b"not json") is None
     many = {f"key_{index}": "v" for index in range(20)}
     assert len(_structured_error_details(_body(many)) or {}) == 8
+
+
+def test_unhandled_exception_keeps_a_typed_500_without_exposing_exception() -> None:
+    app = create_app(ComposerState())
+
+    def failing_route() -> None:
+        raise RuntimeError("private internal details")
+
+    app.add_api_route("/test-unhandled", failing_route, methods=["GET"])
+    app.router.routes.insert(0, app.router.routes.pop())
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/test-unhandled", headers={"X-Request-ID": "request-500"})
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "composer_internal_failure",
+        "message": "Internal Server Error",
+        "details": {},
+        "producer": "composer",
+        "request_id": "request-500",
+    }
+    assert "private internal details" not in response.text

@@ -3,12 +3,11 @@ project(manyforge_ua7wl_deployment_qualification LANGUAGES CXX)
 
 include(CTest)
 
-# Core supplies production journals and Stop-plan storage. Its independent
+# Core supplies production journals. Its independent
 # tests run in the Core lane; this tree qualifies Deployment's composition
 # tests against those real targets.
 set(BUILD_TESTING OFF)
 set(MANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL ON)
-set(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY ON)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../manyforge_core"
                  "${CMAKE_CURRENT_BINARY_DIR}/manyforge_core" EXCLUDE_FROM_ALL)
 

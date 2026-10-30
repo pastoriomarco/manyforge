@@ -237,7 +237,7 @@ protected:
         runtime_epoch,
         catalog.value().catalog_digest};
     auto made =
-        IoProviderDriverRecord::Create(scope, actual, manifest, clock, 1000);
+        IoProviderDriverRecord::Create(scope, actual, manifest, clock, 1000, 1'000'000);
     if (!made.ok())
       throw std::runtime_error(made.error().message);
     return std::move(made.value());
@@ -262,9 +262,10 @@ protected:
         core::LifecyclePrimitiveId(std::string("io.provider.") + action),
         core::LifecyclePrimitiveAttemptId(std::string("attempt.") + action),
         snapshot.value().source_generation,
-        1'000'000};
+        1'000'000,
+        core::ComponentLifecycleStateDTO::kUndeclared};
     const auto outcome = driver->Dispatch(intent, {});
-    if (outcome.known != core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+    if (outcome.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
       throw std::runtime_error(outcome.error ? outcome.error->message
                                              : "fixture lifecycle failed");
   }

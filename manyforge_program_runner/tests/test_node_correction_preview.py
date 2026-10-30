@@ -288,6 +288,10 @@ def _held_run():
                     "component_role_id": "robot",
                     "controllable_component_id": "ur5.1",
                     "command_target_id": "arm.command",
+                    "robot_tcps": [{"entry": {"component_id": "ur5.1",
+                                              "target_id": "arm.command",
+                                              "frame_role_id": "tcp"},
+                                    "end_effector": True}],
                     "capability_bindings": [
                         {"capability_id": "execution.trajectory.execute"},
                     ],
@@ -311,6 +315,10 @@ def _held_run():
         run_id_factory=lambda: "program-run-1",
     )
     run_id = owner.start(admission).capture.program_run_id
+    # Mirror the ordered Active TCP baseline that the Runner registers at start.
+    owner.value_store(run_id).write_active_tcp(
+        "arm", {"component_id": "ur5.1", "target_id": "arm.command", "frame_role_id": "tcp"}
+    )
     paused = owner.advance_once(run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     held = interventions.read(run_id)

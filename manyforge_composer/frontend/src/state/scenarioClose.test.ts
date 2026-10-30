@@ -5,12 +5,13 @@ import type { ComposerHeadlessState } from '../types/headless';
 
 const apiMock = vi.hoisted(() => ({ manager: { status: vi.fn(), canonicalEmptySelection: vi.fn(),
   prepareCanonicalEmpty: vi.fn(), previewCandidate: vi.fn(), applyCandidate: vi.fn(), applyStatus: vi.fn() },
-  execution: { identity: vi.fn() }, cclc: { targetRetirementOffer: vi.fn(), retireTargets: vi.fn(),
+  execution: { identity: vi.fn(), forceClose: vi.fn() }, cclc: { targetRetirementOffer: vi.fn(), retireTargets: vi.fn(),
     ownerSettlement: vi.fn(), owner: vi.fn(), component: vi.fn(), submitLifecycle: vi.fn(), lifecycleStatus: vi.fn(),
     componentProcessStopOffer: vi.fn(), stopComponentProcess: vi.fn(), componentProcessStopResult: vi.fn() },
   scene: { commit: vi.fn() } }));
 vi.mock('../api/client', () => ({ api: apiMock }));
-import { closeScenario, prepareSceneForClose, resetCloseSnapshot, sceneAtOrAfter, type ClosePreparationInputs } from './scenarioClose';
+import { closeErrorCode, closeScenario, forceCloseScenario, prepareSceneForClose, resetCloseSnapshot, sceneAtOrAfter,
+  type ClosePreparationInputs } from './scenarioClose';
 import { parseComponentProcessStopOffer } from '../api/processStopParsers';
 import { errorMessage } from './structuralResource';
 
@@ -42,7 +43,7 @@ const prepared = { schema_version: 'manyforge.prepared_activation.v6', prepared_
   retained_bundle_id: empty.retainedBundleId, graph_revision: empty.graphRevision };
 const receipt = { prepared_activation_id: prepared.prepared_activation_id, impact_digest: 'actual-impact' };
 const inputs = () => ({ expected: active, signal: new AbortController().signal, admissionGeneration: () => 8,
-  waitForObservation: vi.fn(async () => {}), trackApply: vi.fn(), progress: vi.fn() });
+  waitForObservation: vi.fn(async (_signal?: AbortSignal) => {}), trackApply: vi.fn(), progress: vi.fn() });
 beforeEach(() => {
   vi.resetAllMocks();
   apiMock.manager.status.mockResolvedValueOnce({ source, status: { managerReady: true, active } })
@@ -51,7 +52,8 @@ beforeEach(() => {
   apiMock.cclc.retireTargets.mockResolvedValue({ replay_status: 'accepted_new', scope, retired_targets: [] });
   apiMock.cclc.ownerSettlement.mockResolvedValue({ scope, settled: true });
   apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: cclcOwnerEpoch });
-  apiMock.execution.identity.mockResolvedValue({ retainedBundleId: active.retainedBundleId, graphRevision: active.graphRevision, activePublicationGeneration: 2 });
+  apiMock.execution.identity.mockResolvedValue({ retainedBundleId: active.retainedBundleId, graphRevision: active.graphRevision,
+    activePublicationGeneration: 2, ownerEpoch: 'kernel.epoch' });
   apiMock.cclc.component.mockResolvedValue(component);
   apiMock.cclc.submitLifecycle.mockResolvedValue({ transactionId: 'disable.1', status: { terminalResult: 'succeeded', reconciliationRequired: false } });
   apiMock.cclc.componentProcessStopOffer.mockResolvedValue({ controllable_component_id: 'arm', process_inventories: [{ request: processScope,
@@ -273,9 +275,6 @@ it('compares the exact predecessor publication independently of object key order
 it.each([
   ['stale predecessor', projection(active, { ...source, freshness: 'stale' })],
   ['unavailable predecessor', projection(active, { ...source, available: false, freshness: 'unavailable' })],
-  ['foreign predecessor owner', projection(active, { ...source, sourceOwnerEpoch: 'other.owner' })],
-  ['foreign candidate owner', projection(empty, { ...source, sourceOwnerEpoch: 'other.owner' })],
-  ['foreign source identity', projection(active, { ...source, sourceOwnerId: 'other.manager' })],
   ['changed predecessor pointer', projection({ ...active, publication: { ...active.publication, durable_public_pointer_content_digest: 'other.pointer' } })],
   ['changed predecessor scene', projection({ ...active, publication: { ...active.publication, projection_revision: {
     retained_bundle_id: active.retainedBundleId, graph_revision: active.graphRevision, scene_revision: { ...scene, revision_id: 2 } } } })],
@@ -293,6 +292,13 @@ it.each([
   expect(request.waitForObservation).toHaveBeenCalledTimes(2);
   expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
   expect(request.progress).not.toHaveBeenCalledWith('Scenario closed.');
+});
+
+it('accepts the exact empty Apply publication after a Manager owner change', async () => {
+  const changedSource = { ...source, sourceOwnerId: 'other.manager', sourceOwnerEpoch: 'other.owner' };
+  apiMock.manager.status.mockReset().mockResolvedValueOnce(projection(active))
+    .mockResolvedValue(projection(empty, changedSource));
+  expect(await closeScenario(inputs())).toEqual(empty);
 });
 
 it('propagates cancellation during final predecessor observation without another effect or read', async () => {
@@ -443,9 +449,9 @@ function standaloneFixture(state: ProgramCycleStatus['state'] = 'idle_after_rese
       payload: { active: { canonical_empty: active.canonicalEmpty, retained_bundle_id: active.retainedBundleId,
         graph_revision: active.graphRevision, publication: active.publication } } } } } } as unknown as ComposerHeadlessState;
   const reset = vi.fn<ClosePreparationInputs['reset']>(async (options) => ({ status: 'sent', reset: {
-    requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } }));
+    requestId: 'reset.1', correlationId: options.correlationId,
+    programRunnerOwnerEpoch: current.programCycle.programRunnerOwnerEpoch, ...options.expected } }));
   const preparation: ClosePreparationInputs = { confirmed: { authoring: workspace,
-    receiverEpoch: current.receiverEpoch, managerOwnerId: source.sourceOwnerId, managerOwnerEpoch: source.sourceOwnerEpoch,
     managerActive: current.runtime.sections.manager.payload!.active, closeCycle: initialCycle, closeScene: section },
     readSnapshot: () => current, reset };
   const abort = new AbortController();
@@ -481,7 +487,7 @@ it('standalone terminal Close sends one ordinary Reset and waits for its correla
   });
   expect(await closeScenario(test.request)).toEqual(empty);
   expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
-    programRunId: 'run.1', programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 7 } });
+    programRunId: 'run.1', cycleGeneration: 7 } });
   // Count only Reset settlement observations: the ordinary Close can also
   // observe later process-drain/Apply completion through this shared callback.
   const retirement = apiMock.cclc.retireTargets.mock.invocationCallOrder[0];
@@ -520,32 +526,72 @@ it('standalone Close joins distinct Manager and CCLC namespaces through the capt
   expect(apiMock.manager.applyCandidate.mock.calls[0][0].request_owner_epoch).toBe(managerOwnerEpoch);
 });
 
-it.each(['owner', 'publication', 'pointer'])(
+it.each(['publication', 'pointer'])(
   'standalone Close refuses a changed retirement %s before sending an effect', async (field) => {
     const test = standaloneFixture();
     apiMock.cclc.targetRetirementOffer.mockResolvedValue({ scope: { ...scope,
-      ...(field === 'owner' ? { request_owner_epoch: `sha256:${'9'.repeat(64)}` } : {}),
       ...(field === 'publication' ? { publication_generation: scope.publication_generation + 1 } : {}),
       ...(field === 'pointer' ? { active_public_pointer_digest: `sha256:${'a'.repeat(64)}` } : {}),
     }, targets: [] });
-    await expect(closeScenario(test.request)).rejects.toThrow('The lifecycle retirement owner or publication changed.');
+    await expect(closeScenario(test.request)).rejects.toThrow('The lifecycle retirement publication changed.');
     expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
     expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
   },
 );
 
-it('standalone Close refuses a coherent replacement CCLC owner after retirement without resending', async () => {
+it('standalone Close uses the current CCLC owner after retirement', async () => {
   const test = standaloneFixture();
   const changed = `sha256:${'9'.repeat(64)}`;
-  apiMock.cclc.owner.mockResolvedValueOnce({ requestOwnerEpoch: cclcOwnerEpoch })
-    .mockResolvedValue({ requestOwnerEpoch: changed });
+  apiMock.cclc.owner.mockResolvedValue({ requestOwnerEpoch: changed });
   apiMock.cclc.component.mockResolvedValue({ ...component, readiness: { requestOwnerEpoch: changed } });
-  await expect(closeScenario(test.request)).rejects.toThrow('The lifecycle owner changed during Close.');
+  expect(await closeScenario(test.request)).toEqual(empty);
   expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
-  expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
-  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  expect(apiMock.cclc.submitLifecycle.mock.calls[0][0].request_context.request_owner_epoch).toBe(changed);
+  expect(apiMock.manager.prepareCanonicalEmpty).toHaveBeenCalledTimes(1);
 });
+
+it('continues Close across owner and transport-freshness changes when the confirmed content and cycle match', async () => {
+  const test = standaloneFixture();
+  test.change({ ...test.current, receiverEpoch: 'receiver.2',
+    programCycle: { ...test.current.programCycle, programRunnerOwnerEpoch: 'runner.2', cycleClaimGeneration: 8 },
+    runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+      manager: { ...test.current.runtime.sections.manager, available: false, freshness: 'stale',
+        knownGaps: ['reconnecting'], sourceOwnerId: 'manager.2', sourceOwnerEpoch: 'manager.2' },
+      logicalScene: { ...test.current.runtime.sections.logicalScene,
+        sourceOwnerId: 'scene.2', sourceOwnerEpoch: 'scene.2' },
+    } } } as ComposerHeadlessState);
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
+});
+
+it.each(['unavailable', 'stale', 'gap'] as const)(
+  'refuses the detach phase when the Scene observation is %s', async (reason) => {
+    const test = standaloneFixture('idle_after_reset', ['held.1']);
+    const section = test.current.runtime.sections.logicalScene;
+    test.change({ ...test.current, runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+      logicalScene: { ...section, ...(reason === 'unavailable' ? { available: false } : {}),
+        ...(reason === 'stale' ? { freshness: 'stale' } : {}),
+        ...(reason === 'gap' ? { knownGaps: ['reconnecting'] } : {}) },
+    } } } as ComposerHeadlessState);
+    await expect(closeScenario(test.request)).rejects.toThrow('The current logical Scene owner is unavailable.');
+    expect(apiMock.scene.commit).not.toHaveBeenCalled();
+    expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  },
+);
+
+it.each(['run', 'generation', 'settlement'] as const)(
+  'refuses Close when the confirmed cycle %s changes', async (field) => {
+    const test = standaloneFixture('terminal_awaiting_reset');
+    test.cycle(field === 'run' ? { programRunId: 'run.2' }
+      : field === 'generation' ? { cycleGeneration: 8 }
+        : { terminalOrSettlementReference: 'terminal.2' });
+    await expect(closeScenario(test.request)).rejects.toThrow('The confirmed Program cycle or logical Scene changed.');
+    expect(test.reset).not.toHaveBeenCalled();
+    expect(apiMock.scene.commit).not.toHaveBeenCalled();
+    expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  },
+);
 
 it('idle manual detaches are sequential exact Scene successors without an authored admission bump or invented pose', async () => {
   const test = standaloneFixture('idle_after_reset', ['held.1', 'held.2']);
@@ -575,6 +621,20 @@ it('idle manual detaches are sequential exact Scene successors without an author
     expect(transaction.operation).not.toHaveProperty('pose_in_cell');
   }
   expect(apiMock.scene.commit.mock.invocationCallOrder[1]).toBeLessThan(apiMock.cclc.retireTargets.mock.invocationCallOrder[0]);
+});
+
+it('uses the current Scene owner for each detach after a rejoin', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1', 'held.2']);
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    test.publishScene(2, ['held.2']);
+    test.change({ ...test.current, runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+      logicalScene: { ...test.current.runtime.sections.logicalScene, sourceOwnerId: 'scene.owner.2',
+        sourceOwnerEpoch: 'scene.epoch.2' },
+    } } } as ComposerHeadlessState);
+  }).mockImplementationOnce(async () => test.publishScene(3, []));
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(apiMock.scene.commit.mock.calls.map(([transaction]) => transaction.request_context.request_owner_epoch))
+    .toEqual(['scene.epoch', 'scene.epoch.2']);
 });
 
 const staleRevision = () => Object.assign(new Error('expected composite projection revision is no longer active'),
@@ -641,7 +701,8 @@ it.each(['refused', 'unconfirmed'] as const)('Reset %s stops without any Close c
   const test = standaloneFixture('terminal_awaiting_reset');
   test.reset.mockImplementationOnce(async (options) => status === 'refused'
     ? { status, message: 'Reset refused by current owner' }
-    : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } });
+    : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId,
+      programRunnerOwnerEpoch: test.current.programCycle.programRunnerOwnerEpoch, ...options.expected } });
   await expect(closeScenario(test.request)).rejects.toThrow(status === 'refused' ? 'Reset refused' : 'Reset delivery unknown');
   expect(test.reset).toHaveBeenCalledTimes(1);
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
@@ -759,6 +820,42 @@ it('D6: an unavailable control projection stops Close before any Reset or detach
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
 });
 
+it('Load from a canonical-empty cell sends no Close, also without cell control state', async () => {
+  const test = standaloneFixture();
+  test.change({ ...test.current, executionControlStatus: null } as unknown as ComposerHeadlessState);
+  apiMock.manager.status.mockReset().mockResolvedValue(projection(empty));
+  expect(await closeScenario({ ...test.request, expected: empty })).toEqual(empty);
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.manager.canonicalEmptySelection).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+it('a non-empty cell without cell control state still refuses Close as cell_state_unavailable', async () => {
+  const test = standaloneFixture();
+  test.change({ ...test.current, executionControlStatus: null } as unknown as ComposerHeadlessState);
+  const refused = closeScenario(test.request);
+  await expect(refused.catch((error: unknown) => closeErrorCode(error))).resolves.toBe('cell_state_unavailable');
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+it('SX-679: Close and Force close start nothing while Recover cell runs', async () => {
+  const test = standaloneFixture();
+  for (const run of [closeScenario, forceCloseScenario]) {
+    const refused = run({ ...test.request, cellRecoverRunning: () => true });
+    await expect(refused.catch((error: unknown) => closeErrorCode(error)))
+      .resolves.toBe('recover_cell_in_progress');
+  }
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.execution.forceClose).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
 it('D6: a latch appearing after the read keeps it: Close sends its Reset with keepStopFault', async () => {
   const test = standaloneFixture('terminal_awaiting_reset');
   test.request.waitForObservation.mockImplementationOnce(async () => {
@@ -800,38 +897,75 @@ it('D6: an unconfirmed early retirement is reported as unconfirmed, a refused of
   await expect(closeScenario(latchedFixture().request)).rejects.toThrow('offer refused Close not completed.');
 });
 
-it('D6 (D-M4-4): after a provider loss the no-effect Disable is shut down by its drained process and retired again', async () => {
-  const test = latchedFixture();
-  apiMock.cclc.component.mockResolvedValue({ ...component,
-    lifecycleProgress: { incident: { incidentId: 'incident.provider_lost' } } });
-  apiMock.cclc.submitLifecycle.mockImplementation(async (request) => request.intent === 'recover'
-    ? { incidentRecovery: { closureReason: 'cell_closed_by_operator' } }
-    : { transactionId: 'disable.no_effect', status: { terminalResult: 'failed_known_no_effect',
-      reconciliationRequired: false, error: { code: 'component_lifecycle_transition_missing',
-        message: 'no transition satisfied' } } });
-  apiMock.cclc.componentProcessStopOffer.mockResolvedValue({ controllable_component_id: 'arm', process_inventories: [{
-    request: processScope, process_occurrences: [{ controllable_component_id: 'arm', launch_identity: 'actual-launch',
-      leader_pid: 42, process_presence: 'absent', cleanup_state: 'drained', receipt: null,
-      installed_runtime_identity: null }], error: null }] });
-  expect(await closeScenario(test.request)).toEqual(empty);
-  expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['recover', 'disable']);
-  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
-  // The waiting Disable target Close's own request left is retired before Apply.
-  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(2);
-  expect(apiMock.cclc.retireTargets.mock.invocationCallOrder[1])
-    .toBeLessThan(apiMock.manager.prepareCanonicalEmpty.mock.invocationCallOrder[0]);
-  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
-});
+it.each([
+  ['failed', 'faulted'],
+  ['connection_lost', 'declared'],
+  ['connection_lost', 'disabled'],
+  ['connection_lost', 'faulted'],
+] as const)(
+  'O3: %s Disable with current state %s continues after process Stop', async (terminalResult, currentState) => {
+    const test = latchedFixture();
+    let componentReads = 0;
+    apiMock.cclc.component.mockImplementation(async () => {
+      componentReads += 1;
+      return { ...component,
+        lifecycleState: componentReads < 3 ? 'active' : currentState,
+        lifecycleProgress: componentReads === 1
+          ? { incident: { incidentId: 'incident.provider_lost' } } : null };
+    });
+    apiMock.cclc.submitLifecycle.mockImplementation(async (request) => request.intent === 'recover'
+      ? { incidentRecovery: { closureReason: 'cell_closed_by_operator' } }
+      : { transactionId: 'disable.outcome', status: { terminalResult,
+        reconciliationRequired: false, error: { code: 'component_lifecycle_transition_missing',
+          message: 'no transition satisfied' } } });
+    expect(await closeScenario(test.request)).toEqual(empty);
+    expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['recover', 'disable']);
+    expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+    // The waiting Disable target Close's own request left is retired before Apply.
+    expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(2);
+    expect(apiMock.cclc.retireTargets.mock.invocationCallOrder[1])
+      .toBeLessThan(apiMock.manager.prepareCanonicalEmpty.mock.invocationCallOrder[0]);
+    expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+  },
+);
 
-it('D6: a Disable that fails with a partial effect still stops Close', async () => {
+it('O3: connection_lost Disable with current Prepared state refuses normal Close with the typed reason', async () => {
   const test = latchedFixture('idle_after_reset');
   test.request.waitForObservation.mockReset().mockResolvedValue(undefined);
-  apiMock.cclc.submitLifecycle.mockResolvedValue({ transactionId: 'disable.partial', status: {
-    terminalResult: 'failed_partial_effect', reconciliationRequired: false,
-    error: { code: 'controller_deactivate_failed', message: 'deactivate failed' } } });
-  await expect(closeScenario(test.request)).rejects.toThrow('deactivate failed');
+  let componentReads = 0;
+  apiMock.cclc.component.mockImplementation(async () => {
+    componentReads += 1;
+    return { ...component, lifecycleState: componentReads < 3 ? 'active' : 'prepared' };
+  });
+  apiMock.cclc.submitLifecycle.mockResolvedValue({ transactionId: 'disable.connection_lost', status: {
+    terminalResult: 'connection_lost', reconciliationRequired: false,
+    error: { code: 'controller_connection_lost', message: 'controller connection lost' } } });
+  const error = await closeScenario(test.request).then(() => new Error('Close completed'), (caught: unknown) => caught as Error);
+  expect(closeErrorCode(error)).toBe('controller_connection_lost');
+  expect(error.message).toContain('controller connection lost');
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
   expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
 });
+
+it.each(['prepared', 'active', 'degraded'] as const)(
+  'O3: failed Disable with current %s state refuses normal Close with the typed reason', async (currentState) => {
+    const test = latchedFixture('idle_after_reset');
+    test.request.waitForObservation.mockReset().mockResolvedValue(undefined);
+    let componentReads = 0;
+    apiMock.cclc.component.mockImplementation(async () => {
+      componentReads += 1;
+      return { ...component, lifecycleState: componentReads < 3 ? 'active' : currentState };
+    });
+    apiMock.cclc.submitLifecycle.mockResolvedValue({ transactionId: 'disable.partial', status: {
+      terminalResult: 'failed', reconciliationRequired: false,
+      error: { code: 'controller_deactivate_failed', message: 'deactivate failed' } } });
+    const error = await closeScenario(test.request).then(() => new Error('Close completed'), (caught: unknown) => caught as Error);
+    expect(closeErrorCode(error)).toBe('controller_deactivate_failed');
+    expect(error.message).toContain('deactivate failed');
+    expect(apiMock.cclc.component).toHaveBeenCalledTimes(3);
+    expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+  },
+);
 
 it('D6: a faulted component is shut down by its process Stop without a Disable or a recovery', async () => {
   const test = latchedFixture('idle_after_reset');
@@ -974,7 +1108,7 @@ it('confirmed replacement Resets a terminal Program once and observes its own id
   });
   expect(await closeScenario(test.request)).toEqual(empty);
   expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
-    programRunId: 'run.1', programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 7 } });
+    programRunId: 'run.1', cycleGeneration: 7 } });
   const retire = apiMock.cclc.retireTargets.mock.invocationCallOrder[0];
   expect(test.request.waitForObservation.mock.invocationCallOrder.filter((call) => call < retire)).toHaveLength(2);
   expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
@@ -1036,7 +1170,8 @@ it.each(['refused', 'unconfirmed'] as const)('confirmed replacement stops after 
   const test = standaloneFixture('terminal_awaiting_reset');
   test.reset.mockImplementationOnce(async (options) => status === 'refused'
     ? { status, message: 'Reset refused by current owner' }
-    : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } });
+    : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId,
+      programRunnerOwnerEpoch: test.current.programCycle.programRunnerOwnerEpoch, ...options.expected } });
   await expect(closeScenario(test.request)).rejects.toThrow(status === 'refused' ? 'Reset refused' : 'Reset delivery unknown');
   expect(test.reset).toHaveBeenCalledTimes(1);
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
@@ -1066,7 +1201,7 @@ it.each(['workspace', 'foreign_idle'])(
 
 
 it('empty-start Close without a captured replacement preparation skips Reset and completes the ordinary empty handoff', async () => {
-  const predecessor: ManagerActiveProjection = { ...empty,
+  const predecessor: ManagerActiveProjection = { ...empty, canonicalEmpty: false,
     cellGraph: { controllable_components: [] }, publication: { ...empty.publication,
       publication_generation: 2, durable_public_pointer_content_digest: scope.active_public_pointer_digest } };
   const request = { ...inputs(), expected: predecessor, preparation: undefined };
@@ -1127,7 +1262,7 @@ it('shared Close Resets one identity-matched held run, using the owner fact desp
   });
   expect(await closeScenario(test.request)).toEqual(empty);
   expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
-    programRunId: 'run.1', programRunnerOwnerEpoch: 'program-runner-9f8ad954ed9a49c1918d451f3c602f66', cycleGeneration: 7 } });
+    programRunId: 'run.1', cycleGeneration: 7 } });
   expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
 });
@@ -1162,7 +1297,8 @@ it.each(['refused', 'unconfirmed'] as const)('held-run Reset %s stops without Cl
   const test = heldCloseFixture();
   test.reset.mockImplementationOnce(async (options) => status === 'refused'
     ? { status, message: 'Held Reset refused' }
-    : { status, message: 'Held Reset unconfirmed', reset: { requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } });
+    : { status, message: 'Held Reset unconfirmed', reset: { requestId: 'reset.1', correlationId: options.correlationId,
+      programRunnerOwnerEpoch: test.current.programCycle.programRunnerOwnerEpoch, ...options.expected } });
   await expect(closeScenario(test.request)).rejects.toThrow(status === 'refused' ? 'Held Reset refused' : 'Held Reset unconfirmed');
   expect(test.reset).toHaveBeenCalledTimes(1);
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
@@ -1174,19 +1310,20 @@ function pendingResetObservationFixture() {
   let shell: Parameters<typeof resetCloseSnapshot>[0] = {
     snapshot: test.current, transportStatus: 'connected', semanticStatus: 'current',
   };
-  let strictReadsDuringSynchronization = 0;
+  let strictReadsDuringNonCurrentObservation = 0;
   const strictRead = vi.fn(() => {
-    if (shell.semanticStatus === 'synchronizing') strictReadsDuringSynchronization += 1;
+    if (shell.semanticStatus !== 'current') strictReadsDuringNonCurrentObservation += 1;
     if (shell.snapshot === null || shell.transportStatus !== 'connected' || shell.semanticStatus !== 'current')
       throw new Error('Control source is unavailable; Close is unresolved.');
     return shell.snapshot;
   });
-  const pendingRead = vi.fn(() => resetCloseSnapshot(shell));
+  const pendingRead = vi.fn(() => shell);
   test.request.preparation.readSnapshot = strictRead;
   test.request.preparation.readResetSnapshot = pendingRead;
   test.reset.mockImplementation(async (options) => {
     shell = { snapshot: test.current, transportStatus: 'connected', semanticStatus: 'synchronizing' };
-    return { status: 'sent', reset: { requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } };
+    return { status: 'sent', reset: { requestId: 'reset.1', correlationId: options.correlationId,
+      programRunnerOwnerEpoch: test.current.programCycle.programRunnerOwnerEpoch, ...options.expected } };
   });
   const idle = () => test.cycle({ state: 'idle_after_reset', programRunId: null, cycleGeneration: 8,
     cycleClaimGeneration: null, causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
@@ -1194,7 +1331,7 @@ function pendingResetObservationFixture() {
     observe: (patch: Partial<Parameters<typeof resetCloseSnapshot>[0]> = {}) => {
       shell = { snapshot: test.current, transportStatus: 'connected', semanticStatus: 'current', ...patch };
     },
-    get strictReadsDuringSynchronization() { return strictReadsDuringSynchronization; },
+    get strictReadsDuringNonCurrentObservation() { return strictReadsDuringNonCurrentObservation; },
   };
 }
 
@@ -1205,22 +1342,24 @@ it('Reset snapshot classification withholds synchronization and keeps unavailabl
   for (const source of [
     { snapshot: null, transportStatus: 'connected', semanticStatus: 'synchronizing' },
     { snapshot, transportStatus: 'connected', semanticStatus: 'unavailable' },
+    { snapshot: null, transportStatus: 'connected', semanticStatus: 'unavailable' },
     { snapshot, transportStatus: 'disconnected', semanticStatus: 'synchronizing' },
     { snapshot, transportStatus: 'stale', semanticStatus: 'synchronizing' },
   ] as const) expect(() => resetCloseSnapshot(source)).toThrow('Control source is unavailable');
 });
 
-it('accepted Reset waits through two synchronization gaps before exact correlated idle and one replacement Close', async () => {
+it('accepted Reset waits through synchronization and temporary unavailable gaps before one replacement Close', async () => {
     const test = pendingResetObservationFixture();
     test.request.waitForObservation.mockImplementationOnce(async () => {
       expect(test.reset).toHaveBeenCalledTimes(1);
       expect(test.pendingRead).toHaveBeenCalledTimes(1);
       expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
       test.idle();
-      // Even the correct idle body cannot grant freshness during synchronization.
-      test.observe({ semanticStatus: 'synchronizing' });
+      // Even the correct idle body cannot grant freshness while unavailable.
+      test.observe({ semanticStatus: 'unavailable' });
     }).mockImplementationOnce(async () => {
       expect(test.pendingRead).toHaveBeenCalledTimes(2);
+      expect(test.pendingRead.mock.results[1]?.value.semanticStatus).toBe('unavailable');
       expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
       expect(apiMock.scene.commit).not.toHaveBeenCalled();
       expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
@@ -1229,10 +1368,70 @@ it('accepted Reset waits through two synchronization gaps before exact correlate
     expect(await closeScenario(test.request)).toEqual(empty);
     expect(test.reset).toHaveBeenCalledTimes(1);
     expect(test.pendingRead).toHaveBeenCalledTimes(3);
-    expect(test.strictReadsDuringSynchronization).toBe(0);
+    expect(test.strictReadsDuringNonCurrentObservation).toBe(0);
     expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
     expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
     expect(apiMock.scene.commit).not.toHaveBeenCalled();
+});
+
+it('permanent unavailable refuses at 2 s even when the observation wait hangs', async () => {
+  vi.useFakeTimers();
+  try {
+    const test = pendingResetObservationFixture();
+    let enterUnavailableWait!: () => void;
+    const unavailableWaitEntered = new Promise<void>((resolve) => { enterUnavailableWait = resolve; });
+    let unavailableWaitSignal = null as AbortSignal | null;
+    test.request.waitForObservation.mockImplementationOnce(async () => {
+      test.observe({ semanticStatus: 'unavailable' });
+    }).mockImplementationOnce((signal) => {
+      unavailableWaitSignal = signal ?? null;
+      enterUnavailableWait();
+      return new Promise<void>(() => {});
+    });
+    const close = closeScenario(test.request);
+    const outcome = close.then(() => null, (error: unknown) => error as Error);
+    await unavailableWaitEntered;
+    await vi.advanceTimersByTimeAsync(2_000);
+    const failure = await outcome;
+    expect(failure?.message).toContain('Control source is unavailable; Close is unresolved.');
+    expect(failure?.message).toContain('Nothing was retried.');
+    expect(unavailableWaitSignal?.aborted).toBe(true);
+    expect(test.abort.signal.aborted).toBe(false);
+    expect(test.reset).toHaveBeenCalledTimes(1);
+    expect(test.pendingRead).toHaveBeenCalledTimes(2);
+    expect(test.request.waitForObservation).toHaveBeenCalledTimes(2);
+    expect(test.strictReadsDuringNonCurrentObservation).toBe(0);
+    expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+    expect(apiMock.scene.commit).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('caller AbortSignal ends a hanging unavailable observation wait immediately', async () => {
+  const test = pendingResetObservationFixture();
+  let enterUnavailableWait!: () => void;
+  const unavailableWaitEntered = new Promise<void>((resolve) => { enterUnavailableWait = resolve; });
+  let unavailableWaitSignal = null as AbortSignal | null;
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    test.observe({ semanticStatus: 'unavailable' });
+  }).mockImplementationOnce((signal) => {
+    unavailableWaitSignal = signal ?? null;
+    enterUnavailableWait();
+    return new Promise<void>(() => {});
+  });
+  const close = closeScenario(test.request);
+  await unavailableWaitEntered;
+  test.abort.abort(new Error('Close caller unmounted'));
+  await expect(close).rejects.toThrow('Close caller unmounted');
+  expect(unavailableWaitSignal?.aborted).toBe(true);
+  expect(test.reset).toHaveBeenCalledTimes(1);
+  expect(test.pendingRead).toHaveBeenCalledTimes(2);
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
 });
 
 it('workspace change after accepted Reset synchronization refuses before retirement without repeating Reset', async () => {
@@ -1246,16 +1445,16 @@ it('workspace change after accepted Reset synchronization refuses before retirem
   await expect(closeScenario(test.request)).rejects.toThrow('Reset done; Close not completed');
   expect(test.reset).toHaveBeenCalledTimes(1);
   expect(test.pendingRead).toHaveBeenCalledTimes(2);
-  expect(test.strictReadsDuringSynchronization).toBe(0);
+  expect(test.strictReadsDuringNonCurrentObservation).toBe(0);
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
 });
 
-it.each(['unavailable', 'disconnected'] as const)(
-  'accepted Reset synchronization followed by %s control is fatal without a retry or Close', async (condition) => {
+it.each(['missing_snapshot', 'disconnected'] as const)(
+  'accepted Reset wait followed by %s control is fatal without a retry or Close', async (condition) => {
     const test = pendingResetObservationFixture();
     test.request.waitForObservation.mockImplementationOnce(async () => {
-      test.observe(condition === 'unavailable' ? { semanticStatus: 'unavailable' } : { transportStatus: 'disconnected' });
+      test.observe(condition === 'missing_snapshot' ? { snapshot: null } : { transportStatus: 'disconnected' });
     });
     await expect(closeScenario(test.request)).rejects.toThrow('Control source is unavailable');
     expect(test.reset).toHaveBeenCalledTimes(1);
@@ -1272,7 +1471,7 @@ it('caller abort during an accepted-Reset synchronization gap prevents every nex
   await expect(closeScenario(test.request)).rejects.toThrow('Close caller unmounted');
   expect(test.reset).toHaveBeenCalledTimes(1);
   expect(test.pendingRead).toHaveBeenCalledTimes(1);
-  expect(test.strictReadsDuringSynchronization).toBe(0);
+  expect(test.strictReadsDuringNonCurrentObservation).toBe(0);
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
 });
@@ -1282,7 +1481,8 @@ it.each(['refused', 'unconfirmed'] as const)(
     const test = pendingResetObservationFixture();
     test.reset.mockImplementationOnce(async (options) => status === 'refused'
       ? { status, message: 'Reset refused' }
-      : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId, ...options.expected } });
+      : { status, message: 'Reset delivery unknown', reset: { requestId: 'reset.1', correlationId: options.correlationId,
+        programRunnerOwnerEpoch: test.current.programCycle.programRunnerOwnerEpoch, ...options.expected } });
     await expect(closeScenario(test.request)).rejects.toThrow(status === 'refused' ? 'Reset refused' : 'Reset delivery unknown');
     expect(test.reset).toHaveBeenCalledTimes(1);
     expect(test.pendingRead).not.toHaveBeenCalled();
@@ -1310,4 +1510,216 @@ it('a refused lifecycle step keeps what the refusal waits for in the Close messa
     + '(waiting for: resources_not_free; resources: resource.arm)',
   );
   expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+// Item 37: the Close refusals the GUI raises itself carry typed codes, and
+// Force close ends each stuck Close case after a confirmed Full Stop.
+const uncertainOutput = [{ operationId: 'op.io', operationRevision: 2, resident: true,
+  outputEvidence: 'acceptance_unknown', controllableComponentId: 'io', commandTargetId: 'valve' }];
+function stuckFixture(manualOperations: unknown[] = [], carried: string[] = []) {
+  const test = standaloneFixture('idle_after_reset', carried);
+  test.change({ ...test.current, executionControlStatus: { manualOperations,
+    cellStopAction: { fault: null, expectedStopGeneration: 4 } } } as unknown as ComposerHeadlessState);
+  apiMock.execution.forceClose.mockImplementation(async (request: { step: string }) => (
+    { step: request.step, stopGeneration: 5, motionBlockCleared: request.step !== 'stop', operations: request.step === 'stop' ? [] : [{ operationId: 'op.io',
+      operationRevision: 2, state: 'failed', containmentUncertain: false,
+      targets: [{ controllableComponentId: 'io', commandTargetId: 'valve', outputUnknown: true }] }] }));
+  return test;
+}
+const refusal = (code: string, message: string) => Object.assign(new Error(message),
+  { structuredError: { code, message, details: null, origin: null } });
+
+it('U1: an uncertain output refuses Close with the typed code before any effect', async () => {
+  const test = stuckFixture(uncertainOutput);
+  const caught = await closeScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(closeErrorCode(caught)).toBe('scenario_close_output_uncertain');
+  expect(errorMessage(caught, '')).toContain('use Force close');
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(test.reset).not.toHaveBeenCalled();
+});
+
+it('U1 on a latched cell keeps the typed code', async () => {
+  const test = latchedFixture();
+  test.change({ ...test.current, executionControlStatus: { ...test.current.executionControlStatus!,
+    manualOperations: uncertainOutput } } as unknown as ComposerHeadlessState);
+  const caught = await closeScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(closeErrorCode(caught)).toBe('scenario_close_output_uncertain');
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+});
+
+it('U4: a Program that cannot be Reset refuses Close with the typed code', async () => {
+  const test = standaloneFixture('recovery_required');
+  const caught = await closeScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(closeErrorCode(caught)).toBe('scenario_close_program_not_reset');
+  expect(errorMessage(caught, '')).toContain('Stop motion before closing the Scenario');
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['U1 uncertain output', 'scenario_close_output_uncertain'],
+  ['U2 uncertain containment', 'cell_close_containment_uncertain'],
+  ['U5/U6 resident operation refusing Disable', 'execution_rejected'],
+] as const)('%s: Close is refused with a typed code, then Force close completes', async (_case, code) => {
+  const test = stuckFixture(code === 'scenario_close_output_uncertain' ? uncertainOutput : []);
+  if (code === 'cell_close_containment_uncertain') {
+    apiMock.cclc.retireTargets.mockRejectedValueOnce(refusal(code, 'Close cannot infer rest from an uncertain terminal'));
+  }
+  if (code === 'execution_rejected') {
+    apiMock.cclc.submitLifecycle.mockRejectedValue(refusal(code, 'lifecycle mutation requires settled physical and Program work'));
+  }
+  const caught = await closeScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(closeErrorCode(caught)).toBe(code);
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+  expect(apiMock.execution.forceClose).not.toHaveBeenCalled();
+
+  vi.mocked(apiMock.cclc.retireTargets).mockClear();
+  vi.mocked(apiMock.cclc.stopComponentProcess).mockClear();
+  apiMock.manager.status.mockResolvedValueOnce({ source, status: { managerReady: true, active } });
+  expect(await forceCloseScenario(test.request)).toEqual(empty);
+  const steps = apiMock.execution.forceClose.mock.calls.map(([request]) => request);
+  expect(steps.map((request) => request.step)).toEqual(['stop', 'close_operations', 'end']);
+  expect(steps[0]).toMatchObject({ expected_stop_generation: 4,
+    request_context: { request_owner_epoch: 'kernel.epoch', source_label: 'composer_ui' } });
+  // Full Stop, retirement, Kernel step, process Stop, then the empty Apply.
+  const order = [apiMock.execution.forceClose.mock.invocationCallOrder[0], apiMock.cclc.retireTargets.mock.invocationCallOrder[0],
+    apiMock.execution.forceClose.mock.invocationCallOrder[1], apiMock.cclc.stopComponentProcess.mock.invocationCallOrder[0],
+    apiMock.manager.prepareCanonicalEmpty.mock.invocationCallOrder[0]];
+  expect(order).toEqual([...order].sort((a, b) => a - b));
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+  expect(test.request.progress).toHaveBeenCalledWith(expect.stringContaining('Motion block cleared'));
+  // A refused Disable leaves its target to a second retirement before Apply.
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(code === 'execution_rejected' ? 2 : 1);
+});
+
+it('Force close refuses with a typed reason when the Full Stop is not confirmed, before any retirement', async () => {
+  const test = stuckFixture(uncertainOutput);
+  apiMock.execution.forceClose.mockRejectedValue(Object.assign(new Error('Force close requires the operator\'s confirmed Full Stop'),
+    { structuredError: { code: 'scenario_force_close_stop_unconfirmed', message: 'unconfirmed',
+      details: { reason: 'stop_not_contained' }, origin: null } }));
+  const caught = await forceCloseScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(closeErrorCode(caught)).toBe('scenario_force_close_stop_unconfirmed');
+  expect(errorMessage(caught, '')).toContain('Force close stopped before any retirement');
+  expect(apiMock.execution.forceClose).toHaveBeenCalledTimes(1);
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+it('Force close stops at an unknown process Stop, after its Kernel step and before the empty Apply', async () => {
+  const test = stuckFixture(uncertainOutput);
+  apiMock.cclc.stopComponentProcess.mockResolvedValue({ state: 'unknown', error: { message: 'Old host drain unknown' }, receipt: null });
+  const caught = await forceCloseScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(errorMessage(caught, '')).toContain('Old host drain unknown');
+  expect(errorMessage(caught, '')).toContain('Lifecycle targets retired; finish with New or Load.');
+  expect(apiMock.execution.forceClose.mock.calls.map(([request]) => request.step)).toEqual(['stop', 'close_operations', 'end']);
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+it('B1: Force close detaches a carried part at its current pose before any process Stop', async () => {
+  const test = stuckFixture(uncertainOutput, ['held.1']);
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    // The detach is confirmed while every component process still runs.
+    expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
+    expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+    test.publishScene(2, []);
+  });
+  expect(await forceCloseScenario(test.request)).toEqual(empty);
+  expect(apiMock.execution.forceClose.mock.calls.map(([request]) => request.step)).toEqual(['stop', 'close_operations', 'end']);
+  expect(apiMock.scene.commit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    expected_authoring_workspace: test.workspace,
+    operation: expect.objectContaining({ kind: 'detach_carried_object_at_current_pose',
+      carried_object_attachment_id: 'attachment.held.1', expected_scene_resource_id: 'held.1' }),
+  }), test.request.signal);
+  // Full Stop, retirement, Kernel step, detach, process Stop, then the empty Apply.
+  const order = [apiMock.execution.forceClose.mock.invocationCallOrder[0], apiMock.cclc.retireTargets.mock.invocationCallOrder[0],
+    apiMock.execution.forceClose.mock.invocationCallOrder[1], apiMock.scene.commit.mock.invocationCallOrder[0],
+    apiMock.cclc.submitLifecycle.mock.invocationCallOrder[0], apiMock.cclc.stopComponentProcess.mock.invocationCallOrder[0],
+    apiMock.manager.prepareCanonicalEmpty.mock.invocationCallOrder[0]];
+  expect(order).toEqual([...order].sort((a, b) => a - b));
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('F1-FC: Force close uses the current Scene owner after a restart between detaches', async () => {
+  const test = stuckFixture(uncertainOutput, ['held.1', 'held.2']);
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
+    test.publishScene(2, ['held.2']);
+    test.change({ ...test.current, runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+      logicalScene: { ...test.current.runtime.sections.logicalScene, sourceOwnerId: 'scene.owner.2',
+        sourceOwnerEpoch: 'scene.epoch.2' },
+    } } } as ComposerHeadlessState);
+  }).mockImplementationOnce(async () => test.publishScene(3, []));
+  expect(await forceCloseScenario(test.request)).toEqual(empty);
+  expect(apiMock.scene.commit.mock.calls.map(([transaction]) => transaction.request_context.request_owner_epoch))
+    .toEqual(['scene.epoch', 'scene.epoch.2']);
+  expect(apiMock.scene.commit.mock.calls.map(([transaction]) => transaction.operation))
+    .toEqual([
+      expect.objectContaining({ kind: 'detach_carried_object_at_current_pose', expected_scene_resource_id: 'held.1' }),
+      expect.objectContaining({ kind: 'detach_carried_object_at_current_pose', expected_scene_resource_id: 'held.2' }),
+    ]);
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+// Item 38 (b): the robot's process is already dead, so the Scene owner refuses
+// the detach (no live carrier pose). Force close keeps the part attached and
+// the server's empty preparation (not a client flag) skips the attachment
+// check; ordinary Close does not.
+const carrierGone = () => Object.assign(new Error('current carried-object pose has no exact carrier-frame resolution'), {
+  payload: { ok: false, error: { code: 'missing_reference', details: { reason: 'kinematic_state_source_unavailable' } } },
+  structuredError: { code: 'missing_reference', message: 'no carrier frame',
+    details: { reason: 'kinematic_state_source_unavailable' }, origin: null } });
+
+it('item 38: with the robot process dead and a part attached, Force close completes with the part kept', async () => {
+  const test = stuckFixture(uncertainOutput, ['held.1']);
+  apiMock.scene.commit.mockRejectedValue(carrierGone());
+  expect(await forceCloseScenario(test.request)).toEqual(empty);
+  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
+  expect(test.request.progress).toHaveBeenCalledWith(expect.stringContaining('held.1 stays attached'));
+  expect(apiMock.manager.prepareCanonicalEmpty).toHaveBeenCalledTimes(1);
+  expect(apiMock.manager.prepareCanonicalEmpty.mock.calls[0][0]).not.toHaveProperty('force_close');
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalled();
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('item 38: ordinary Close keeps refusing when the detach is refused', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1']);
+  apiMock.scene.commit.mockRejectedValue(carrierGone());
+  await expect(closeScenario(test.request)).rejects.toThrow('Detach of held.1 was refused or is unconfirmed');
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+});
+
+it('item 38: a transport failure of the detach still stops Force close', async () => {
+  const test = stuckFixture(uncertainOutput, ['held.1']);
+  apiMock.scene.commit.mockRejectedValue(new Error('network down'));
+  const caught = await forceCloseScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(errorMessage(caught, '')).toContain('network down');
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+  expect(apiMock.manager.prepareCanonicalEmpty).not.toHaveBeenCalled();
+  // SX-616: the attempt ends on the server too, so no bypass outlives it.
+  expect(apiMock.execution.forceClose.mock.calls.map(([request]) => request.step)).toEqual(['stop', 'close_operations', 'end']);
+});
+
+it('SX-616: a failed empty preparation still ends the Force close attempt', async () => {
+  const test = stuckFixture(uncertainOutput, ['held.1']);
+  apiMock.scene.commit.mockRejectedValue(carrierGone());
+  apiMock.manager.prepareCanonicalEmpty.mockRejectedValue(new Error('preparation failed'));
+  const caught = await forceCloseScenario(test.request).then(() => null, (error: unknown) => error);
+  expect(errorMessage(caught, '')).toContain('preparation failed');
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+  expect(apiMock.execution.forceClose.mock.calls.map(([request]) => request.step)).toEqual(['stop', 'close_operations', 'end']);
+  const end = apiMock.execution.forceClose.mock.calls[2][0];
+  expect(end).not.toHaveProperty('expected_stop_generation');
+});
+
+it('SX-616: a lost end reply does not change the Force close outcome', async () => {
+  const test = stuckFixture(uncertainOutput);
+  apiMock.execution.forceClose.mockImplementation(async (request: { step: string }) => {
+    if (request.step === 'end') throw new Error('end lost');
+    return { step: request.step, stopGeneration: 5, motionBlockCleared: false, operations: [] };
+  });
+  expect(await forceCloseScenario(test.request)).toEqual(empty);
 });

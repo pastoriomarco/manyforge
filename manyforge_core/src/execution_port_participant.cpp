@@ -5,11 +5,16 @@
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/execution_sample_association.hpp>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
+#include <manyforge_core/robot_at_target.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace manyforge::core {
 namespace {
@@ -129,6 +134,64 @@ StopStageDispatchedGoalDTO stop_goal_for(const PreparedOperationParticipantDTO& 
                                     participant.controller().stop_evidence_policy_id,
                                     participant.controller().stop_evidence_policy_revision,
                                     std::move(stop_plans)};
+}
+
+/// M6b (maintainer rule): a Stop stage that names a goal this participant
+/// never sent, with no goal of it live and no other Stop stage running, has
+/// nothing to stop: contained, no further checks (no fresh sample, no rest).
+/// The caller's dispatch fence keeps that goal from ever going out. The
+/// evidence is that fence observation itself: `fence_sequence` (the
+/// participant's Stop-stage count, nonzero) at age 0. nullopt only for a
+/// stage outside its plan or naming another runtime epoch; the ordinary
+/// stage then runs (and refuses as before).
+std::optional<ParticipantStopStageResultDTO> no_goal_containment(
+    const ResolvedParticipantStopStageDTO& stage, const IClock& clock,
+    const TimePoint received_at, const std::uint64_t fence_sequence) {
+  if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size()) return std::nullopt;
+  const auto& command = stage.participant_stop_plan.stage_commands[stage.stage_index];
+  const auto& requirements = command.resolved_stage.evidence_requirements;
+  if (requirements.empty() || fence_sequence == 0U) return std::nullopt;
+  const auto epoch = command.resolved_stage.command_target.provider_runtime_epoch;
+  ParticipantStopStageResultDTO result{stage,
+                                       StopStageAttemptDispositionDTO::kDispatched,
+                                       ParticipantStopStageOutcomeDTO::kSucceeded,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       epoch,
+                                       fence_sequence,
+                                       std::max<std::int64_t>(0, clock.now() - received_at),
+                                       {},
+                                       std::nullopt};
+  for (const auto& requirement : requirements) {
+    if (requirement.resolved_source.runtime_target.provider_runtime_epoch != epoch)
+      return std::nullopt;
+    if (requirement.requirement.evidence_kind ==
+        StopEvidenceRequirementKind::kControllerGoalTerminal)
+      result.controller_acknowledgement_sequence = fence_sequence;
+    result.evidence_items.push_back(StopEvidenceItemDTO{
+        requirement.requirement.evidence_item_id, requirement.requirement.evidence_kind,
+        StopEvidenceItemStateDTO::kSatisfied, requirement.resolved_source, epoch, fence_sequence,
+        0,
+        JsonValueDTO{JsonObjectDTO{
+            {"finish_basis", JsonValueDTO{std::string("no_goal_dispatched")}},
+            {"fence_sequence", JsonValueDTO{std::to_string(fence_sequence)}}}},
+        std::nullopt});
+  }
+  // A controlled stage reports its requested mode: nothing was substituted.
+  if (command.validated_contract_parameters) {
+    const auto mode = command.validated_contract_parameters->find("stop_mode");
+    const auto* text = mode == command.validated_contract_parameters->end()
+                           ? nullptr
+                           : std::get_if<std::string>(&mode->second.value);
+    for (const auto candidate :
+         {MotionControlledStopMode::kSoftOnPath, MotionControlledStopMode::kSpringBackHold,
+          MotionControlledStopMode::kHardDeceleration, MotionControlledStopMode::kSpringBackFast}) {
+      if (text != nullptr && *text == to_string(candidate))
+        result.actual_provider_contract_mode = candidate;
+    }
+  }
+  return result;
 }
 
 }  // namespace
@@ -1161,6 +1224,47 @@ ExecutionHandle ExecutionPortParticipant::RejectedHandle(
                          participant.prepared_contract_digest};
 }
 
+Result<void> ExecutionPortParticipant::ApplyToolContext(
+    const PreparedOperationParticipantDTO& participant) {
+  const auto refused = [](std::string reason, std::map<std::string, std::string> details = {}) {
+    return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
+                                   "Execution port participant refused the tool-context action",
+                                   std::move(reason), std::move(details)));
+  };
+  if (!config_.apply_tool_context ||
+      !std::holds_alternative<PreparedMotionExecutionDTO>(participant.payload))
+    return Result<void>::Ok();
+  // TOOLCTX (M6b: its own action, before the motion is sent and counts as
+  // running): no goal or Stop is in flight, so the robot is at rest. The lane
+  // sends what changed and waits until the robot settled; a tool context the
+  // robot did not confirm refuses this motion (fail closed). The vendor send
+  // may be slow, so it runs WITHOUT the participant lock: a Stop pressed
+  // meanwhile enters at once, and a Stop that started since the action began
+  // wins, here or at Dispatch (no goal is sent). A TCP offset send rebinds
+  // the lane on a new port; Dispatch reads readiness, a fresh sample and the
+  // start state there (a moved robot still refuses).
+  std::unique_lock lock(mutex_);
+  if (!prepared_membership_.matches(participant))
+    return refused("prepared_participant_not_admitted");
+  if (execution_ && !execution_->terminal) return refused("execution_port_execution_in_flight");
+  if (stop_stages_in_flight_ != 0U) return refused("execution_port_stop_in_flight");
+  const auto stops_before = stop_stages_started_;
+  tool_context_stops_before_ = stops_before;
+  lock.unlock();
+  const auto applied = config_.apply_tool_context(participant);
+  if (!applied.ok()) {
+    std::map<std::string, std::string> details;
+    for (const auto& [name, value] : applied.error().details)
+      details[name == "reason" ? "cause" : name] = value;
+    details["port_error"] = applied.error().message;
+    return refused("tool_context_not_applied", std::move(details));
+  }
+  lock.lock();
+  if (stop_stages_in_flight_ != 0U || stop_stages_started_ != stops_before)
+    return refused("execution_port_stop_in_flight");
+  return Result<void>::Ok();
+}
+
 ExecutionHandle ExecutionPortParticipant::Dispatch(
     const PreparedOperationParticipantDTO& participant, const ControllerGoalId& controller_goal_id,
     const ControllerGoalGeneration controller_goal_generation) {
@@ -1175,6 +1279,13 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   std::unique_lock lock(mutex_);
   if (controller_goal_id.empty() || !controller_goal_generation.nonzero()) {
     return rejected("controller_goal_identity_invalid");
+  }
+  // M6b: a Stop stage found this goal unsent and contained it; it never goes
+  // out afterwards (also when that Stop ran during the fresh-sample wait
+  // above, before this lock).
+  if (stopped_before_dispatch_ ==
+      ExecutionGoalKey{controller_goal_id, controller_goal_generation}) {
+    return rejected("execution_port_stop_in_flight");
   }
   if (const auto invalid = BindingFieldError(participant)) return rejected(std::string(*invalid));
   if (!prepared_membership_.matches(participant)) {
@@ -1191,16 +1302,21 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
   }
   if (execution_ && !execution_->terminal) return rejected("execution_port_execution_in_flight");
   if (stop_stages_in_flight_ != 0U) return rejected("execution_port_stop_in_flight");
+  // M6b: the tool-context action ran before this dispatch without the lock
+  // (`ApplyToolContext`); a Stop that started since then wins: no goal.
+  if (const auto stops_before = std::exchange(tool_context_stops_before_, std::nullopt);
+      stops_before && stop_stages_started_ != *stops_before)
+    return rejected("execution_port_stop_in_flight");
 
   // §3.2: positions, velocities and accelerations in path time. A prepared
   // trajectory carries its runtime-scale bounds (item 6, checked at Prepare),
   // which the prepared codec admits only with complete derivatives.
   const auto& motion = std::get<PreparedMotionExecutionDTO>(participant.payload);
-  auto& port = *port_;
-  const auto readiness = port.ReadReadiness();
+  auto* port = port_.get();
+  auto readiness = port->ReadReadiness();
   if (!ready(readiness)) return rejected("execution_port_not_ready");
   const ExecutionGoalKey key{controller_goal_id, controller_goal_generation};
-  const auto baseline = port.ReadSample();
+  auto baseline = port->ReadSample();
   if (measured) {
     if (auto refusal = StartStateError(baseline, readiness.binding_epoch, motion.trajectory)) {
       return RejectedHandle(participant, controller_goal_id, controller_goal_generation,
@@ -1211,7 +1327,7 @@ ExecutionHandle ExecutionPortParticipant::Dispatch(
     try { config_.observe_goal_context(key, participant, readiness.binding_epoch); } catch (...) {}
   }
   const auto dispatched_at = clock_.now();
-  const auto sent = port.Submit(key, motion.trajectory);
+  const auto sent = port->Submit(key, motion.trajectory);
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     std::map<std::string, std::string> details;
     if (sent.refusal) details["port_refusal"] = refusal_name(*sent.refusal);
@@ -1336,9 +1452,12 @@ std::optional<ErrorDTO> ExecutionPortParticipant::StartStateError(
     }
   }
   if (max_error <= *config_.start_tolerance_rad) return std::nullopt;
+  // M6 ADAPTERM: e.g. a jog or Move-to target computed before the robot was
+  // moved from its own interface. Refused before effect.
   return fault(ErrorCode::kStartStateMismatch,
-               "Start state mismatch: max joint error " + format(max_error) +
-                   " rad exceeds tolerance " + format(*config_.start_tolerance_rad),
+               "Start state mismatch: the robot is not where this motion starts "
+               "(max joint error " + format(max_error) + " rad exceeds tolerance " +
+                   format(*config_.start_tolerance_rad) + "); preview again",
                "start_state_mismatch",
                {{"max_joint_error_rad", format(max_error)},
                 {"start_tolerance_rad", format(*config_.start_tolerance_rad)},
@@ -1744,7 +1863,10 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
                   {"mechanism_goal_id", goal->mechanism_goal_id.value()}}));
     return;
   }
-  // Completion (§4.1): kSucceeded plus `main`'s authority check.
+  // Completion (§4.1): kSucceeded plus `main`'s authority check. Every lane
+  // keeps its arrival tolerance as the JTC `goal` constraint, so kSucceeded
+  // already means finished and within it; a commanded lane needs no second
+  // check, the measured lane keeps `main`'s terminal gate on its own sample.
   const auto& final_positions = execution.trajectory.waypoints.back().positions_rad;
   if (!measured) {
     execution.snapshot.joint_positions_rad = final_positions;
@@ -1760,12 +1882,18 @@ void ExecutionPortParticipant::Evaluate(Execution& execution) {
       execution.association->NewerThanEvidence(*sample)) {
     const auto positions =
         reorder(sample->measured_positions_rad, lane_.joint_names, execution.trajectory.joint_names);
-    double max_error = 0.0;
-    for (std::size_t index = 0U; positions && index < positions->size(); ++index) {
-      max_error = std::max(max_error, std::abs((*positions)[index] - final_positions[index]));
-    }
+    // The one "robot at target" rule: the controller reported success (it
+    // checked the same arrival tolerance as its `goal` constraint) and this
+    // fresh measured sample lies within the lane's arrival tolerance.
+    // TODO(merge 6 ARRIVE): remove this measured re-check after the live
+    // validation of the kept JTC goal tolerance on Real (maintainer
+    // 2026-10-28); until then it stays, reading the same lane value.
+    const auto at_target =
+        positions ? robot_at_target(true, *positions, final_positions, *config_.final_tolerance_rad)
+                  : RobotAtTargetDTO{};
+    const double max_error = at_target.max_error_rad;
     if (positions) execution.snapshot.joint_positions_rad = *positions;
-    if (positions && max_error <= *config_.final_tolerance_rad) {
+    if (at_target.arrived) {
       Finish(execution, ExecutionState::kCompleted, std::nullopt);
     } else {
       Finish(execution, ExecutionState::kFailed,
@@ -1812,12 +1940,30 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
   auto timed_budget = budget;
   std::shared_ptr<ParticipantStopStageHelper> helper;
   std::shared_ptr<Execution> execution;
+  std::optional<std::uint64_t> fence_sequence;
   {
     std::lock_guard lock(mutex_);
     helper = helper_;
     execution = execution_;
     ++stop_stages_in_flight_;
+    ++stop_stages_started_;
     if (execution && !execution->terminal) execution->stopping = true;
+    // M6b: no live execution and none for this stage's goal: that goal was
+    // never sent. Fence it under this lock (Dispatch rechecks it, and the
+    // started count across its unlocked tool-context send), so it never goes
+    // out after this Stop. No other Stop stage of this participant runs.
+    const ExecutionGoalKey stage_goal{stage.controller_goal_id, stage.controller_goal_generation};
+    if ((!execution || (execution->terminal && execution->key != stage_goal)) && !replacement_) {
+      stopped_before_dispatch_ = stage_goal;
+      if (stop_stages_in_flight_ == 1U) fence_sequence = stop_stages_started_;
+    }
+  }
+  if (fence_sequence && helper && !cancellation.stop_requested() && !helper->HasLiveGoal()) {
+    if (auto contained = no_goal_containment(stage, clock_, received_at, *fence_sequence)) {
+      std::lock_guard lock(mutex_);
+      --stop_stages_in_flight_;
+      return std::move(*contained);
+    }
   }
   // The helper's trip and occurrence remain in its physical delivery clock.
   // Only this participant owns the exact mapping back to the sealed curve.

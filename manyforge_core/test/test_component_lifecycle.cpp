@@ -201,7 +201,8 @@ BrandLifecyclePrimitiveIntentDTO primitive_intent() {
           LifecyclePrimitiveId("enable-control"),
           LifecyclePrimitiveAttemptId("attempt-1"),
           5U,
-          1'000'000};
+          1'000'000,
+          ComponentLifecycleStateDTO::kPrepared};
 }
 
 BrandLifecyclePrimitiveResultDTO known_success_result() {
@@ -219,9 +220,7 @@ BrandLifecyclePrimitiveResultDTO known_success_result() {
           primitive.lifecycle_primitive_id,
           primitive.lifecycle_primitive_attempt_id,
           primitive.expected_observation_generation,
-          LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
-          LifecyclePrimitiveEffectDTO::kObserved,
-          LifecyclePrimitiveKnownResultDTO::kSucceeded,
+          LifecycleTransitionOutcomeDTO::kSucceeded,
           std::nullopt};
 }
 
@@ -237,9 +236,7 @@ ComponentLifecycleStatusDTO prepared_recovery_status() {
                                            ComponentLifecycleStateDTO::kDeclared,
                                            requested,
                                            ComponentLifecycleDomainActionStateDTO::kExecuting,
-                                           ComponentLifecycleDomainEffectDTO::kNone,
                                            {},
-                                           std::nullopt,
                                            std::nullopt};
   return {acceptance(),
           lifecycle_intent,
@@ -281,9 +278,7 @@ ComponentLifecycleDomainStatusDTO successful_domain_status(
           *requested.state,
           requested,
           ComponentLifecycleDomainActionStateDTO::kSucceeded,
-          ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
           {},
-          std::nullopt,
           std::nullopt};
 }
 
@@ -392,7 +387,7 @@ ComponentLifecycleStatusDTO ordinary_codec_status() {
           {{ControlDomainId("domain-1"), lifecycle_intent.expected_control_domains.front(),
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, requested,
             ComponentLifecycleDomainActionStateDTO::kReserved,
-            ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt}},
+            {}, std::nullopt}},
           false, std::nullopt, std::nullopt, kAcceptedAtNs, kAcceptedAtNs, kTimeoutNs};
 }
 
@@ -558,34 +553,82 @@ TEST(ComponentLifecycleObservation, RequiresCanonicalFreshFactsAndExactProviderR
   EXPECT_FALSE(noncanonical.locally_valid());
 }
 
-TEST(ComponentLifecyclePrimitiveResult, DistinguishesNoDispatchKnownAndUncertainEffects) {
+// V-B2 (V2-4): a transition result is succeeded, failed or connection lost;
+// an error is required unless it succeeded. Substeps are a bounded record.
+TEST(ComponentLifecyclePrimitiveResult, HasThreeOutcomesWithAnErrorUnlessSucceeded) {
   const auto primitive = primitive_intent();
-  auto known = known_success_result();
-  ASSERT_TRUE(known.locally_valid());
-  EXPECT_TRUE(known.matches(primitive));
+  auto succeeded = known_success_result();
+  ASSERT_TRUE(succeeded.locally_valid());
+  EXPECT_TRUE(succeeded.matches(primitive));
+  succeeded.error = ErrorDTO{"unexpected", "a success carries no error", {}};
+  EXPECT_FALSE(succeeded.locally_valid());
 
-  auto refused = known;
-  refused.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kNotDispatched;
-  refused.effect = LifecyclePrimitiveEffectDTO::kNone;
-  refused.known_result.reset();
-  refused.error = ErrorDTO{"primitive_refused", "not accepted", {}};
-  EXPECT_TRUE(refused.locally_valid());
+  for (const auto outcome :
+       {LifecycleTransitionOutcomeDTO::kFailed, LifecycleTransitionOutcomeDTO::kConnectionLost}) {
+    auto failed = known_success_result();
+    failed.outcome = outcome;
+    EXPECT_FALSE(failed.locally_valid());
+    failed.error = ErrorDTO{"ros2_control_hardware_activation_refused", "refused", {}};
+    EXPECT_TRUE(failed.locally_valid());
+    EXPECT_TRUE(failed.matches(primitive));
+  }
 
-  auto uncertain = refused;
-  uncertain.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain;
-  uncertain.effect = LifecyclePrimitiveEffectDTO::kPossible;
-  uncertain.error = ErrorDTO{"dispatch_uncertain", "response lost", {}};
-  EXPECT_TRUE(uncertain.locally_valid());
+  auto recorded = known_success_result();
+  const LifecycleSubstepResultDTO step{LifecyclePrimitiveId("device.clear_error"), std::nullopt,
+                                       LifecycleTransitionOutcomeDTO::kSucceeded, 10, 20,
+                                       std::nullopt};
+  recorded.substeps.assign(kMaxLifecycleSubsteps, step);
+  EXPECT_TRUE(recorded.locally_valid());
+  recorded.substeps.push_back(step);
+  EXPECT_FALSE(recorded.locally_valid());
+  recorded.substeps.assign(1U, step);
+  recorded.substeps.front().error = ErrorDTO{"unexpected", "a succeeded substep has no error", {}};
+  EXPECT_FALSE(recorded.locally_valid());
 
-  uncertain.effect = LifecyclePrimitiveEffectDTO::kNone;
-  EXPECT_FALSE(uncertain.locally_valid());
+  succeeded = known_success_result();
+  succeeded.provider_manifest_revision = ProviderManifestRevision("stale");
+  EXPECT_TRUE(succeeded.locally_valid());
+  EXPECT_FALSE(succeeded.matches(primitive));
+}
 
-  refused.error.reset();
-  EXPECT_FALSE(refused.locally_valid());
+TEST(ComponentLifecycleSubstep, ResultEventAndObservationRecordsAreClosed) {
+  LifecycleSubstepResultDTO nested{LifecyclePrimitiveId("device.tool_context.sync"),
+                                   LifecyclePrimitiveId("ros2_control.controller.activate"),
+                                   LifecycleTransitionOutcomeDTO::kFailed, 10, 20,
+                                   ErrorDTO{"execution_rejected", "not applied", {}}};
+  EXPECT_TRUE(nested.locally_valid());
+  nested.finished_at_ns = 9;
+  EXPECT_FALSE(nested.locally_valid());
+  nested.finished_at_ns = 20;
+  nested.error.reset();
+  EXPECT_FALSE(nested.locally_valid());
 
-  known.provider_manifest_revision = ProviderManifestRevision("stale");
-  EXPECT_TRUE(known.locally_valid());
-  EXPECT_FALSE(known.matches(primitive));
+  LifecycleSubstepEventDTO started{LifecyclePrimitiveAttemptId("attempt-1"),
+                                   LifecyclePrimitiveId("device.clear_error"), std::nullopt,
+                                   LifecycleSubstepEventDTO::Phase::kStarted, 10, std::nullopt,
+                                   std::nullopt};
+  EXPECT_TRUE(started.locally_valid());
+  started.outcome = LifecycleTransitionOutcomeDTO::kSucceeded;
+  EXPECT_FALSE(started.locally_valid());
+  auto finished = started;
+  finished.phase = LifecycleSubstepEventDTO::Phase::kFinished;
+  EXPECT_TRUE(finished.locally_valid());
+  finished.outcome = LifecycleTransitionOutcomeDTO::kConnectionLost;
+  finished.error_code = "robot_controller_unresponsive";
+  EXPECT_TRUE(finished.locally_valid());
+  finished.outcome.reset();
+  EXPECT_FALSE(finished.locally_valid());
+
+  const auto recorded = RecordLifecycleTransitionObservation(observation());
+  EXPECT_TRUE(recorded.locally_valid());
+  EXPECT_EQ(recorded.observed_state, observation().observed_state);
+  EXPECT_EQ(recorded.facts, observation().facts);
+  EXPECT_EQ(recorded.observation_generation, observation().observation_generation);
+  EXPECT_EQ(recorded.source_sequence, observation().source_sequence);
+  EXPECT_EQ(recorded.at_ns, observation().received_timestamp_ns);
+  auto unsequenced = recorded;
+  unsequenced.source_sequence = 0U;
+  EXPECT_FALSE(unsequenced.locally_valid());
 }
 
 TEST(ComponentLifecycleResolvedScope, MatchesExactTopologyBindingRouteAndConfiguration) {
@@ -704,14 +747,70 @@ TEST(ComponentLifecycleStatus, AcceptsAlreadySatisfiedSuccessWithoutPrimitiveAtt
   status.domains[0].current_state = ComponentLifecycleStateDTO::kDeclared;
   EXPECT_FALSE(status.locally_valid());
   status.domains[0].current_state = ComponentLifecycleStateDTO::kPrepared;
-  status.domains[0].effect = ComponentLifecycleDomainEffectDTO::kEffectUncertain;
+  status.domains[0].error = ErrorDTO{"unexpected", "a succeeded domain has no error", {}};
   EXPECT_FALSE(status.locally_valid());
 }
 
-TEST(ComponentLifecycleStatus, RecoverMayFailUnresolvedOnlyWithKnownNoEffect) {
+// M6: a Prepare that finds a domain Active succeeds there (Active is above
+// Prepared); every other non-Recover difference, and a fault, stays invalid.
+TEST(ComponentLifecycleStatus, PrepareMaySucceedAtAnActiveDomainOnly) {
+  const auto prepare = intent();
+  const auto prepared = resolved_requested(ComponentLifecycleStateDTO::kPrepared);
+  ComponentLifecycleStatusDTO status{
+      acceptance(),
+      prepare,
+      1U,
+      prepare.request_context.request_owner_epoch,
+      ComponentLifecycleStateDTO::kDeclared,
+      ComponentLifecycleStateDTO::kPrepared,
+      prepared,
+      ComponentLifecycleTransactionPhaseDTO::kSucceeded,
+      {successful_domain_status(prepare.expected_control_domains[0], prepared)},
+      false,
+      ComponentLifecycleTerminalResultDTO::kSucceeded,
+      std::nullopt,
+      kAcceptedAtNs,
+      kAcceptedAtNs + 10,
+      0};
+  status.domains[0].current_state = ComponentLifecycleStateDTO::kActive;
+  EXPECT_TRUE(status.locally_valid());
+  for (const auto state : {ComponentLifecycleStateDTO::kDegraded, ComponentLifecycleStateDTO::kFaulted,
+                           ComponentLifecycleStateDTO::kDisabled, ComponentLifecycleStateDTO::kDeclared}) {
+    status.domains[0].current_state = state;
+    EXPECT_FALSE(status.locally_valid());
+  }
+
+  // Other intents keep observed == requested: an Enable domain at Prepared.
+  const auto enable = intent(ComponentLifecycleIntentKindDTO::kEnable);
+  const auto active = resolved_requested(ComponentLifecycleStateDTO::kActive);
+  ComponentLifecycleStatusDTO enabled{
+      acceptance(),
+      enable,
+      1U,
+      enable.request_context.request_owner_epoch,
+      ComponentLifecycleStateDTO::kPrepared,
+      ComponentLifecycleStateDTO::kActive,
+      active,
+      ComponentLifecycleTransactionPhaseDTO::kSucceeded,
+      {successful_domain_status(enable.expected_control_domains[0], active)},
+      false,
+      ComponentLifecycleTerminalResultDTO::kSucceeded,
+      std::nullopt,
+      kAcceptedAtNs,
+      kAcceptedAtNs + 10,
+      0};
+  EXPECT_TRUE(enabled.locally_valid());
+  enabled.domains[0].current_state = ComponentLifecycleStateDTO::kPrepared;
+  EXPECT_FALSE(enabled.locally_valid());
+}
+
+// V-B2 (V2-4): a failed transaction ends failed or connection lost, always
+// with its typed error; a succeeded phase pairs only with a succeeded result.
+TEST(ComponentLifecycleStatus, FailedTerminalIsFailedOrConnectionLostWithAnError) {
   const auto lifecycle_intent = intent(ComponentLifecycleIntentKindDTO::kRecover);
   const auto requested = unresolved_requested();
   const auto scope = current_scope(lifecycle_intent.expected_control_domains[0]);
+  const ErrorDTO error{"recover_target_ambiguous", "no unique plan", {}};
   ComponentLifecycleDomainStatusDTO domain{
       lifecycle_intent.expected_control_domains[0].control_domain_id,
       lifecycle_intent.expected_control_domains[0],
@@ -721,10 +820,8 @@ TEST(ComponentLifecycleStatus, RecoverMayFailUnresolvedOnlyWithKnownNoEffect) {
       ComponentLifecycleStateDTO::kFaulted,
       requested,
       ComponentLifecycleDomainActionStateDTO::kFailed,
-      ComponentLifecycleDomainEffectDTO::kNone,
       {},
-      std::nullopt,
-      ErrorDTO{"recover_target_ambiguous", "no unique plan", {}}};
+      error};
   ComponentLifecycleStatusDTO status{acceptance(),
                                      lifecycle_intent,
                                      1U,
@@ -735,15 +832,21 @@ TEST(ComponentLifecycleStatus, RecoverMayFailUnresolvedOnlyWithKnownNoEffect) {
                                      ComponentLifecycleTransactionPhaseDTO::kFailed,
                                      {domain},
                                      false,
-                                     ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect,
-                                     ErrorDTO{"recover_target_ambiguous", "no unique plan", {}},
+                                     ComponentLifecycleTerminalResultDTO::kFailed,
+                                     error,
                                      kAcceptedAtNs,
                                      kAcceptedAtNs + 10,
                                      0};
-
   EXPECT_TRUE(status.locally_valid());
-
-  status.domains[0].effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kConnectionLost;
+  EXPECT_TRUE(status.locally_valid());
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
+  EXPECT_FALSE(status.locally_valid());
+  status.terminal_result = ComponentLifecycleTerminalResultDTO::kFailed;
+  status.error.reset();
+  EXPECT_FALSE(status.locally_valid());
+  status.error = error;
+  status.domains[0].error.reset();
   EXPECT_FALSE(status.locally_valid());
 }
 
@@ -773,9 +876,7 @@ TEST(ComponentLifecycleStatus, DisableUsesExpectedAndCurrentDomainUnionWithoutWi
                                              observed_state,
                                              requested,
                                              ComponentLifecycleDomainActionStateDTO::kReserved,
-                                             ComponentLifecycleDomainEffectDTO::kNone,
                                              {},
-                                             std::nullopt,
                                              std::nullopt};
   };
 
@@ -807,45 +908,6 @@ TEST(ComponentLifecycleStatus, DisableUsesExpectedAndCurrentDomainUnionWithoutWi
   status.acceptance.component_lifecycle_generation = ComponentLifecycleGeneration(4U);
 
   status.domains.erase(status.domains.begin() + 1);
-  EXPECT_FALSE(status.locally_valid());
-}
-
-TEST(ComponentLifecycleStatus, UnknownDisableOutcomeRequiresReconciliation) {
-  auto disable_intent = intent(ComponentLifecycleIntentKindDTO::kDisable, {expected_domain()});
-  const auto requested = resolved_requested(ComponentLifecycleStateDTO::kDisabled);
-  const ErrorDTO uncertainty{
-      "disable_outcome_unknown", "uncertain Disable primitive requires reconciliation", {}};
-  const auto scope = current_scope(disable_intent.expected_control_domains.front());
-  ComponentLifecycleDomainStatusDTO domain{ControlDomainId("domain-1"),
-                                           disable_intent.expected_control_domains.front(),
-                                           scope,
-                                           provider_occurrence(scope),
-                                           ComponentLifecycleStateDTO::kActive,
-                                           ComponentLifecycleStateDTO::kActive,
-                                           requested,
-                                           ComponentLifecycleDomainActionStateDTO::kOutcomeUnknown,
-                                           ComponentLifecycleDomainEffectDTO::kEffectUncertain,
-                                           {},
-                                           std::nullopt,
-                                           uncertainty};
-  ComponentLifecycleStatusDTO status{acceptance(),
-                                     disable_intent,
-                                     2U,
-                                     RequestOwnerEpoch("replacement-owner-epoch"),
-                                     ComponentLifecycleStateDTO::kActive,
-                                     ComponentLifecycleStateDTO::kDisabling,
-                                     requested,
-                                     ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown,
-                                     {domain},
-                                     true,
-                                     std::nullopt,
-                                     uncertainty,
-                                     kAcceptedAtNs,
-                                     kAcceptedAtNs + 10,
-                                     0};
-
-  EXPECT_TRUE(status.locally_valid());
-  status.reconciliation_required = false;
   EXPECT_FALSE(status.locally_valid());
 }
 
@@ -892,9 +954,7 @@ TEST(ComponentLifecycleStatus, UnresolvedScopeDisableDoesNotInventObservedState)
       std::nullopt,
       requested,
       ComponentLifecycleDomainActionStateDTO::kReserved,
-      ComponentLifecycleDomainEffectDTO::kNone,
       {},
-      std::nullopt,
       std::nullopt};
   ComponentLifecycleStatusDTO status{acceptance(),
                                      lifecycle_intent,
@@ -1004,38 +1064,45 @@ class FakeBrandLifecyclePort final : public IBrandLifecyclePort {
     return Result<BrandLifecycleObservationDTO>::Ok(std::move(sample));
   }
 
+  const ILifecycleAdmission& Admission() const override { return admission_; }
+
   BrandLifecyclePrimitiveResultDTO Dispatch(const BrandLifecyclePrimitiveIntentDTO& request,
+                                            const LifecycleSubstepFeedbackSink&,
                                             std::stop_token cancellation) override {
     auto result = known_success_result();
     if (cancellation.stop_requested()) {
-      result.dispatch_state = LifecyclePrimitiveDispatchStateDTO::kNotDispatched;
-      result.effect = LifecyclePrimitiveEffectDTO::kNone;
-      result.known_result.reset();
+      result.outcome = LifecycleTransitionOutcomeDTO::kFailed;
       result.error = ErrorDTO{"cancelled_before_dispatch", "cancelled", {}};
     }
     EXPECT_TRUE(result.matches(request));
     return result;
   }
+
+ private:
+  CatalogLifecycleAdmission admission_{BrandLifecyclePlanCatalogDTO{
+      ProviderManifestId("manifest-1"), ProviderManifestRevision("manifest-revision-1"),
+      ContentDigest(std::string("sha256:") + std::string(64U, 'c')), {}}};
 };
 
 TEST(ComponentLifecycleCodec, PreservesExactOrdinaryProgramAndRouteBytes) {
   // Frozen independently spelled V1/V2 payload fingerprints; adding selected
   // records must not append even an absent optional tag to ordinary bytes.
+  // M7 VB2 (Q8): the two status fingerprints recomputed from the actual bytes.
   auto ordinary = ordinary_codec_status();
   ASSERT_TRUE(ordinary.locally_valid());
   const auto ordinary_bytes = detail::EncodeComponentLifecycleStatus(ordinary);
-  EXPECT_EQ(ordinary_bytes.size(), 549U);
+  EXPECT_EQ(ordinary_bytes.size(), 553U);
   EXPECT_EQ(content_identity::sha256_digest(ordinary_bytes),
-            "sha256:62766c852d31bb58ae019f76ea484829d9931c4474c65a286b8adeebef4dc816");
+            "sha256:e7acc3b6e264127a02bdf12583dccda0557610523aa798ebc6bf9a25ab3f51e9");
   EXPECT_EQ(detail::DecodeComponentLifecycleStatus(ordinary_bytes), ordinary);
   ordinary.accepted_intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
       RequestOwnerEpoch("runner-epoch"), ProgramRunId("run-1"), CellAdmissionClaimGeneration(11U),
       "node-1", "attempt-1", "cclc.lifecycle"};
   ASSERT_TRUE(ordinary.locally_valid());
   const auto program_bytes = detail::EncodeComponentLifecycleStatus(ordinary);
-  EXPECT_EQ(program_bytes.size(), 655U);
+  EXPECT_EQ(program_bytes.size(), 659U);
   EXPECT_EQ(content_identity::sha256_digest(program_bytes),
-            "sha256:fe100787f2b80b06c190e3ad4a4e642413f138215071b087879333110a76c6c4");
+            "sha256:29cdddd9946e1c8aeb3d3620a623b908cb602f9025b1a14685812c1e99f73bb1");
   EXPECT_EQ(detail::DecodeComponentLifecycleStatus(program_bytes), ordinary);
   const CellAdmissionConfigurationScopeDTO configuration{ControlDomainId("domain-1"),
       ActiveControlConfigurationId("configuration-1"), ActiveControlConfigurationGeneration(7U)};
@@ -1305,8 +1372,17 @@ TEST(SelectedBringUpStatus, RefusesBrokenClaimFenceOccurrenceAndCandidateJoins) 
   // A fenced controller domain needs its adopted predecessor configuration.
   check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.scope.configurations.clear(); });
   check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.scope.resources.clear(); });
-  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.acquired_admission_generation =
-      AdmissionGeneration(2U); });
+  // M6 S1 (decision 5): the acquired admission generation is claim evidence,
+  // never compared with the expected one, so a different value stays valid.
+  {
+    auto acquired_later = status;
+    acquired_later.selected_bring_up->selected_claim.acquired_admission_generation =
+        AdmissionGeneration(2U);
+    EXPECT_TRUE(acquired_later.locally_valid());
+    EXPECT_EQ(detail::DecodeComponentLifecycleStatus(
+                  detail::EncodeComponentLifecycleStatus(acquired_later)),
+              acquired_later);
+  }
   check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.resources =
       {ResourceId("other")}; });
   check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.controllable_component_ids =
@@ -1379,7 +1455,7 @@ TEST(SelectedBringUpStatus, AcceptedRequiresExactPredecessorConfigurationAndObse
   accepted.domains.push_back({expected.control_domain_id, expected, scope, provider_occurrence(scope),
       ComponentLifecycleStateDTO::kPrepared, ComponentLifecycleStateDTO::kPrepared,
       accepted.requested_state, ComponentLifecycleDomainActionStateDTO::kNotStarted,
-      ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt});
+      {}, std::nullopt});
   auto& evidence = *accepted.selected_bring_up;
   evidence.predecessor_occurrence.domains.push_back({expected.control_domain_id, 40U});
   evidence.successor_occurrence.domains.push_back({expected.control_domain_id, 41U});
@@ -1401,8 +1477,7 @@ TEST(SelectedBringUpStatus, AcceptedNewDomainHasNoObservationAndLaterSameRevisio
   accepted.accepted_intent.expected_control_domains.push_back(added);
   accepted.domains.push_back({added.control_domain_id, added, std::nullopt, std::nullopt,
       std::nullopt, std::nullopt, accepted.requested_state,
-      ComponentLifecycleDomainActionStateDTO::kNotStarted, ComponentLifecycleDomainEffectDTO::kNone,
-      {}, std::nullopt, std::nullopt});
+      ComponentLifecycleDomainActionStateDTO::kNotStarted, {}, std::nullopt});
   auto& evidence = *accepted.selected_bring_up;
   evidence.successor_occurrence.domains.push_back({added.control_domain_id, 1U});
   evidence.accepted_fence.captured_scope.domains.push_back({added.control_domain_id,
@@ -1443,8 +1518,7 @@ TEST(SelectedBringUpStatus, RetainsGripperRemovalAdditionAndChangedPredecessorFa
   status.domains.push_back({removed.control_domain_id, std::nullopt, removed_scope,
       provider_occurrence(removed_scope), ComponentLifecycleStateDTO::kPrepared,
       ComponentLifecycleStateDTO::kPrepared, status.requested_state,
-      ComponentLifecycleDomainActionStateDTO::kNotStarted, ComponentLifecycleDomainEffectDTO::kKnownNoEffect,
-      {}, std::nullopt, std::nullopt});
+      ComponentLifecycleDomainActionStateDTO::kNotStarted, {}, std::nullopt});
   evidence.predecessor_occurrence.domains.push_back({removed.control_domain_id, 40U});
   fenced.domains.push_back({removed.control_domain_id, removed.control_domain_revision, std::nullopt});
   fenced.bindings.push_back({ControlBindingId("binding-2"), ControlBindingRevision("binding-revision-1"), std::nullopt});
@@ -1456,7 +1530,7 @@ TEST(SelectedBringUpStatus, RetainsGripperRemovalAdditionAndChangedPredecessorFa
   status.accepted_intent.expected_control_domains.push_back(added);
   status.domains.push_back({added.control_domain_id, added, std::nullopt, std::nullopt, std::nullopt,
       std::nullopt, status.requested_state, ComponentLifecycleDomainActionStateDTO::kNotStarted,
-      ComponentLifecycleDomainEffectDTO::kNone, {}, std::nullopt, std::nullopt});
+      {}, std::nullopt});
   evidence.successor_occurrence.domains.push_back({added.control_domain_id, 1U});
   fenced.domains.push_back({added.control_domain_id, std::nullopt, added.control_domain_revision});
   fenced.bindings.push_back({ControlBindingId("binding-3"), std::nullopt, ControlBindingRevision("binding-revision-1")});
@@ -1480,7 +1554,6 @@ TEST(SelectedBringUpStatus, RetainsGripperRemovalAdditionAndChangedPredecessorFa
     domain.previous_state = ComponentLifecycleStateDTO::kPrepared;
     domain.current_state = ComponentLifecycleStateDTO::kActive;
     domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
-    domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
   }
   status.current_state = ComponentLifecycleStateDTO::kActive;
   status.phase = ComponentLifecycleTransactionPhaseDTO::kSucceeded;
@@ -1619,8 +1692,17 @@ TEST(ApplyDelegatedComponentLifecycleStatus, RefusesForeignParentScopeAndOrigina
   };
   invalid([](auto& value) { value.apply_bring_up->parent_authority.parent.plan_digest =
       ContentDigest(std::string("sha256:") + std::string(64U, 'd')); });
-  invalid([](auto& value) { value.apply_bring_up->parent_authority.parent_claim.acquired_admission_generation =
-      AdmissionGeneration(10U); });
+  // M6 S1 (decision 5): the acquired admission generation is claim evidence
+  // only; a parent claim acquired at a later generation stays valid.
+  {
+    auto acquired_later = status;
+    acquired_later.apply_bring_up->parent_authority.parent_claim.acquired_admission_generation =
+        AdmissionGeneration(10U);
+    EXPECT_TRUE(acquired_later.locally_valid());
+    EXPECT_EQ(detail::DecodeComponentLifecycleStatus(
+                  detail::EncodeComponentLifecycleStatus(acquired_later)),
+              acquired_later);
+  }
   invalid([](auto& value) { value.apply_bring_up->parent_authority.parent_claim.intent.claim_kind =
       CellAdmissionClaimKindDTO::kInterventionOrRecovery; });
   invalid([](auto& value) { value.apply_bring_up->parent_authority.held_fence_query.owner_transaction.apply_id =
@@ -1719,7 +1801,6 @@ TEST(ApplyDelegatedComponentLifecycleStatus, NewAcceptedDomainHasNoInventedObser
   status.current_state = ComponentLifecycleStateDTO::kActive;
   domain.current_state = ComponentLifecycleStateDTO::kActive;
   domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
-  domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
   ASSERT_TRUE(status.locally_valid());
   EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(status)), status);
 }
@@ -1790,7 +1871,6 @@ TEST(ApplyDelegatedComponentLifecycleStatus, InitialInstalledDomainsKeepUnknownA
   status.remaining_duration_ns = 0;
   for (auto& domain : status.domains) {
     domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
-    domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
   }
   ASSERT_TRUE(status.locally_valid());
   status.current_state.reset();
@@ -1859,10 +1939,13 @@ TEST(ApplyComponentBringUpAuthorityCodec, ReusesExactParentGrammarAndRejectsInco
   auto foreign = authority;
   foreign.parent_claim.intent.owner_transaction_id = "another-Apply";
   EXPECT_THROW((void)EncodeApplyComponentBringUpAuthority(foreign), std::invalid_argument);
+  // M6 S1 (decision 5): the acquired admission generation is evidence only,
+  // never compared with the expected one; a later one encodes exactly.
   foreign = authority;
   foreign.parent_claim.acquired_admission_generation = AdmissionGeneration(
       foreign.parent_claim.acquired_admission_generation.value() + 1U);
-  EXPECT_THROW((void)EncodeApplyComponentBringUpAuthority(foreign), std::invalid_argument);
+  EXPECT_EQ(DecodeApplyComponentBringUpAuthority(EncodeApplyComponentBringUpAuthority(foreign)),
+            foreign);
 }
 
 TEST(SelectedControllerOccurrence, AdvancesContinuingDomainsAndSeedsNewMembership) {
@@ -1919,9 +2002,9 @@ TEST(BrandLifecyclePort, PreservesExactObservationAndCancellationBoundaries) {
 
   std::stop_source source;
   source.request_stop();
-  const auto result = port.Dispatch(primitive_intent(), source.get_token());
-  EXPECT_EQ(result.dispatch_state, LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
-  EXPECT_EQ(result.effect, LifecyclePrimitiveEffectDTO::kNone);
+  const auto result = port.Dispatch(primitive_intent(), {}, source.get_token());
+  EXPECT_EQ(result.outcome, LifecycleTransitionOutcomeDTO::kFailed);
+  EXPECT_TRUE(result.substeps.empty());
   EXPECT_TRUE(result.locally_valid());
 }
 

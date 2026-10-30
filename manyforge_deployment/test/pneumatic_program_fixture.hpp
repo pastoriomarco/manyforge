@@ -31,8 +31,9 @@ inline PneumaticProgramFixture compile_pneumatic_program_fixture(
   V::Object targets;
   V::Array children;
   core::ProgramRoleAssignmentDTO assignment;
+  // The gripper is its own component since the M6 tool split.
   assignment.component_roles.push_back({core::ComponentRoleId("tool"),
-                                        core::ControllableComponentId("lite6_robot")});
+                                        core::ControllableComponentId("lite_gripper")});
   const auto &gripper_target = Member(Member(source, "target_roles"), "gripper");
   for (unsigned i = 0; i < grippers; ++i) {
     const auto name = "gripper_" + std::to_string(i);

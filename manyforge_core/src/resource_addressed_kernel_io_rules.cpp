@@ -694,6 +694,7 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
       const GlobalInterruptStopSelection* global_winner = nullptr;
       const GlobalInterruptStopSelection* global_loss_winner = nullptr;
       bool global_source_failure = false;
+      std::size_t global_candidates = 0U;
       for (const auto& candidate : transaction.global_interrupt_winners) {
         const bool member = std::any_of(candidate.participants.begin(), candidate.participants.end(),
             [&](const auto& value) {
@@ -702,27 +703,31 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
                      value.controller_goal_generation == row->command_generation;
             });
         if (!member) continue;
-        global_source_failure = global_source_failure || !candidate.evidence.source_losses.empty();
+        ++global_candidates;
+        const bool candidate_source_failure = candidate.watch_error ||
+            (candidate.evidence && !candidate.evidence->source_losses.empty());
+        global_source_failure = global_source_failure || candidate_source_failure;
         const auto precedes = [&](const auto& left, const auto& right) {
           if (left.priority != right.priority) return left.priority > right.priority;
           if (left.scope_resources != right.scope_resources)
             return left.scope_resources < right.scope_resources;
-          const auto left_source = rule_source_order(left.evidence);
-          const auto right_source = rule_source_order(right.evidence);
+          const auto left_source = left.evidence ? rule_source_order(*left.evidence) : std::nullopt;
+          const auto right_source = right.evidence ? rule_source_order(*right.evidence) : std::nullopt;
           if (left_source && right_source) {
             if (source_order_less(*left_source, *right_source)) return true;
             if (source_order_less(*right_source, *left_source)) return false;
           } else if (left_source.has_value() != right_source.has_value()) {
             return left_source.has_value();
           }
-          return left.registration.policy_id < right.registration.policy_id;
+          return left.policy_id < right.policy_id;
         };
         if (!global_winner || precedes(candidate, *global_winner)) global_winner = &candidate;
-        if (!candidate.evidence.source_losses.empty() &&
+        if (candidate_source_failure &&
             (!global_loss_winner || precedes(candidate, *global_loss_winner)))
           global_loss_winner = &candidate;
       }
-      const bool global_fault_winner = global_winner && global_winner->evidence.trip &&
+      const bool global_fault_winner = global_winner && global_winner->evidence &&
+          global_winner->evidence->trip &&
           (!winner || global_winner->priority >= winner->priority);
       ErrorDTO global_fault_error{};
       const auto* diagnostic_winner = global_source_failure ? global_loss_winner : global_winner;
@@ -732,7 +737,13 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
                                 : "Global interrupt rule matched",
           {{"reason", global_source_failure ? "io_global_rule_source_lost"
                                             : "io_global_rule_fault_terminal"},
-           {"rule_id", diagnostic_winner ? diagnostic_winner->registration.policy_id.value() : ""}}};
+           {"rule_id", diagnostic_winner ? diagnostic_winner->policy_id.value() : ""}}};
+      if (diagnostic_winner && diagnostic_winner->watch_error) {
+        global_fault_error.details.emplace("watch_error_code", diagnostic_winner->watch_error->code);
+        const auto reason = diagnostic_winner->watch_error->details.find("reason");
+        if (reason != diagnostic_winner->watch_error->details.end())
+          global_fault_error.details.emplace("watch_error_reason", reason->second);
+      }
       const bool fault_winner =
           winner && winner->evidence.trip &&
           winner->action == InterruptPreemptionAction::kPreemptTrajectory &&
@@ -900,11 +911,49 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
               kErrorMotionInterruptBackendStopFailed, "io_rule_nominal_stop_not_proved"));
         }
       }
+      // Spec 260 §2.8.4: a Stop the Program's own configuration requested
+      // (gate trip, carried object lost), settled at its first stage, is the
+      // Program's ordinary failure. The row keeps its actual Stopped outcome;
+      // an escalated, latched, joined or uncertain Stop is relabelled Failed
+      // and held as before.
+      const bool this_stop = operation->state.active_stop_id == certificate.stop_id &&
+                             operation->state.active_stop_generation == certificate.stop_generation;
+      const bool ordinary_program_stop =
+          operation->program_requested_stop && this_stop &&
+          certificate.result == StopCertificateResultDTO::kSucceededNominal &&
+          !certificate.terminal_error && !certificate.fault_latch_id && !transaction.fault_latch &&
+          row->state == OperationStateKind::kStopped && row->terminal_fact &&
+          row->terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
+          row->terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled;
+      const auto sole_gate = [&] {
+        if (!global_winner || global_source_failure || source_failure || winner ||
+            global_candidates != 1U || transaction.full_stop || global_winner->everything ||
+            !global_io_rule_catalog_ ||
+            std::any_of(row->io_rule_outcomes.begin(), row->io_rule_outcomes.end(),
+                        [](const auto& outcome) { return outcome.evidence.trip.has_value(); }))
+          return false;
+        const auto& rules = global_io_rule_catalog_->rules;
+        const auto rule = std::find_if(rules.begin(), rules.end(), [&](const auto& value) {
+          return value.policy_id == global_winner->policy_id;
+        });
+        return rule != rules.end() && rule->post_latch_disposition ==
+                                          InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
+      };
       if ((global_source_failure || global_fault_winner) &&
           row->state == OperationStateKind::kStopped) {
-        row->state = OperationStateKind::kFailed;
+        // An ordinary gate Stop keeps Stopped and its settled fact, with the
+        // rule's typed cause as the carried-object-lost Stop keeps its own.
+        if (global_source_failure || !ordinary_program_stop || !sole_gate())
+          row->state = OperationStateKind::kFailed;
+        else
+          row->terminal_fact->error = global_fault_error;
         row->terminal_error = global_fault_error;
       }
+      // The carried-object-lost Stop left its settled row Stopped with the
+      // typed cause; only its ordinary outcome stays Stopped.
+      if (this_stop && row->state == OperationStateKind::kStopped && row->terminal_error &&
+          row->terminal_error->code == "carried_object_lost" && !ordinary_program_stop)
+        row->state = OperationStateKind::kFailed;
     }
     if (operation->state.state != OperationStateKind::kInterventionRequired)
       operation->state.state =

@@ -5,7 +5,9 @@
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <map>
 #include <optional>
 #include <set>
 
@@ -122,7 +124,7 @@ TEST(
   ASSERT_NE(graph.control_domains.front().provider(), nullptr);
   EXPECT_EQ(
       graph.control_domains.front().provider()->lifecycle_command_timeout_ns,
-      30'000'000'000LL);
+      10'000'000'000LL);
   EXPECT_EQ(graph.control_domains.front().provider()->provider_runtime_unit_id,
             graph.runtime_units.front().runtime_unit_id);
   EXPECT_TRUE(bundle.value().desired_control_configurations.empty());
@@ -199,6 +201,32 @@ TEST(ActivationIoProvider,
   EXPECT_EQ((std::set<c::Duration>{first->lifecycle_command_timeout_ns,
                                    second->lifecycle_command_timeout_ns}),
             (std::set<c::Duration>{7'000'000'000LL, 19'000'000'000LL}));
+}
+
+// Per-component time budget: an I/O device's budget is its
+// io_provider_devices `lifecycle_command_timeout_s` (default 10 s); it cannot
+// also be authored at the component level.
+TEST(ActivationIoProvider, DeviceLimitIsTheComponentsLifecycleBudget) {
+  const auto intent = detail::parse_activation_deployment_intent(
+      Intent(Array{Device("station_a", 7.0), Device("station_b")}), {});
+  const auto root = std::filesystem::path(MANYFORGE_WORKSPACE_ROOT);
+  const auto profiles =
+      detail::resolve_activation_component_profiles(root, intent);
+  const auto materialized = detail::materialize_prepared_activation(
+      root, {}, intent, c::CellId("authored_io_pair"), profiles, false);
+  ASSERT_NE(materialized.bundle, nullptr);
+  EXPECT_EQ(d::ros2_control_execution_runtime_contract::component_lifecycle_budgets_ns(
+                materialized.bundle->value().cell_graph),
+            (std::map<std::string, std::int64_t, std::less<>>{
+                {"station_a", 7'000'000'000LL}, {"station_b", 10'000'000'000LL}}));
+
+  auto device = Device("station");
+  device = With(device, "configuration",
+                With(*device.find_object_member("configuration"),
+                     "lifecycle_command_timeout_s", Value(120.0)));
+  EXPECT_THROW(
+      detail::parse_activation_deployment_intent(Intent(Array{device}), {}),
+      std::invalid_argument);
 }
 
 TEST(ActivationIoProvider,

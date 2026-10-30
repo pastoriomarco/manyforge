@@ -10,9 +10,18 @@ from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from manyforge_headless_api.cell_recover import CELL_RECOVER_REFERENCE_NOTE
+from manyforge_headless_api.cell_recover import (
+    CELL_RECOVER_ABORT_REFERENCE_NOTE,
+    CELL_RECOVER_REFERENCE_NOTE,
+)
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
-from manyforge_headless_api.close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetirementIntent
+from manyforge_headless_api.close_wire import (
+    SCENARIO_CLOSE_REFERENCE_NOTE,
+    SCENARIO_FORCE_CLOSE_REFERENCE_NOTE,
+    LifecycleOwnerSettlementRequest,
+    LifecycleTargetRetirementIntent,
+    ScenarioForceCloseRequest,
+)
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -25,6 +34,7 @@ from manyforge_headless_api.models import (
     CanonicalEmptyActivationPreparationRequest,
     ManagerDeploymentCandidatePreviewRequest,
     ManagerApplyRequest,
+    ManagerApplyAcknowledgementRequest,
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
@@ -45,6 +55,7 @@ from manyforge_headless_api.models import (
     RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
+    CellRecoverAbortRequest,
     CellRecoverRequest,
     StopFaultRecoveryRequest,
     ProgramRunStartRequest,
@@ -166,6 +177,7 @@ def _translate(error: HeadlessClientError) -> HTTPException:
             "code": error.code,
             "details": error.details,
             "message": str(error),
+            "producer": error.producer,
         },
     )
 
@@ -334,7 +346,10 @@ def create_headless_router(
     def manager_status() -> dict[str, Any]:
         return _call(client.manager_status)
 
-    @router.post("/api/activation-preparations")
+    @router.post(
+        "/api/activation-preparations",
+        openapi_extra={"x-manyforge-reference-note": SCENARIO_CLOSE_REFERENCE_NOTE},
+    )
     def prepare_canonical_empty(body: CanonicalEmptyActivationPreparationRequest) -> dict[str, Any]:
         return _call(lambda: client.prepare_activation(body.model_dump(mode="json")))
 
@@ -421,6 +436,10 @@ def create_headless_router(
             payload.pop("close_incident_recovery", None)
         if payload.get("program_node_evidence") is None:
             payload.pop("program_node_evidence", None)
+        if payload.get("acknowledge_incident") is None:
+            payload.pop("acknowledge_incident", None)
+        if payload.get("expected_incident_id") is None:
+            payload.pop("expected_incident_id", None)
         return _call(lambda: client.submit_component_lifecycle(payload))
 
     @router.get("/api/cclc/lifecycle/transactions/{transaction_id}")
@@ -811,6 +830,20 @@ def create_headless_router(
     ) -> dict[str, Any]:
         return _call(lambda: client.manager_apply_status(apply_id, apply_generation))
 
+    @router.post("/api/manager/apply/acknowledge")
+    def manager_apply_acknowledge(
+        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_generation: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        body: ManagerApplyAcknowledgementRequest,
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.manager_apply_acknowledge(
+                apply_id,
+                apply_generation,
+                body.request_context.model_dump(mode="json", exclude_none=True),
+            )
+        )
+
     @router.get("/api/execution/diagnostics")
     def execution_diagnostics() -> dict[str, Any]:
         return _call(client.execution_diagnostics)
@@ -992,6 +1025,26 @@ def create_headless_router(
         # Recover cell runs in Headless; Composer forwards only the caller identity.
         return await control_call(
             lambda: client.cell_recover(body.model_dump(mode="json"))
+        )
+
+    @router.post(
+        "/api/execution/cell-recover/abort",
+        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_ABORT_REFERENCE_NOTE},
+    )
+    async def execution_cell_recover_abort(body: CellRecoverAbortRequest) -> dict[str, Any]:
+        # SX-679: the abort runs in Headless; Composer forwards the caller identity.
+        return await control_call(
+            lambda: client.cell_recover_abort(body.model_dump(mode="json"))
+        )
+
+    @router.post(
+        "/api/execution/force-close",
+        openapi_extra={"x-manyforge-reference-note": SCENARIO_FORCE_CLOSE_REFERENCE_NOTE},
+    )
+    async def execution_force_close(body: ScenarioForceCloseRequest) -> dict[str, Any]:
+        # Force close steps run in Headless; Composer forwards them unchanged.
+        return await control_call(
+            lambda: client.force_close(body.model_dump(mode="json"))
         )
 
     @router.post("/api/execution/runtime-scale-control")

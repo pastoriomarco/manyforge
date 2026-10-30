@@ -57,8 +57,9 @@ struct StructuralModelOccurrence final {
 
 /// One type-scoped frame role resolved through an exact model occurrence.
 ///
-/// `source_link_name` is still the source symbol. No generated name or scene
-/// frame is claimed by this structural phase.
+/// `source_link_name` is still the source symbol (for an offset frame, the
+/// name of its generated link). No generated name or scene frame is claimed
+/// by this structural phase.
 struct StructuralFrameResolution final {
   StructuralModelOccurrence model;
   core::FrameRoleId frame_role_id;
@@ -137,6 +138,9 @@ struct StructuralCommandTargetResolution final {
   std::vector<StructuralResourceResolution> resources;
   std::vector<StructuralTargetFrameResolution> frames;
   std::vector<StructuralCollisionBodyResolution> collision_bodies;
+  // The type's default TCP; a target with one also exposes the component's
+  // Deployment custom TCPs.
+  std::optional<core::FrameRoleId> default_tcp_frame_role_id{};
 
   friend bool operator==(const StructuralCommandTargetResolution&,
                          const StructuralCommandTargetResolution&) = default;

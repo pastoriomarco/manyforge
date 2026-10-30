@@ -253,6 +253,66 @@ export function PersistentKeyValuesView({
   );
 }
 
+/** One stored value a Reset with Reload initial scene returns to `initial:`. */
+export interface PersistentKeyResetRow {
+  key: string;
+  current: string;
+  next: string;
+}
+
+/**
+ * The stored values that Reload initial scene resets, as the Reset
+ * confirmation lists them; a value already equal to `initial:` is not a change.
+ */
+export function persistentKeyResetRows(values: PersistentKeyValues): PersistentKeyResetRow[] {
+  return values.keys
+    .filter((row) => row.stored && JSON.stringify(row.value) !== JSON.stringify(row.initial))
+    .map((row) => ({
+      key: row.key,
+      current: formatBlackboardValue(row.type, row.value),
+      next: initialLabel(row),
+    }));
+}
+
+export function PersistentKeyResetList({ rows }: { rows: readonly PersistentKeyResetRow[] }) {
+  if (rows.length === 0) return null;
+  return (
+    <div>
+      <p>Stored values reset to their initial values:</p>
+      <ul>
+        {rows.map((row) => (
+          <li key={row.key}><code>{row.key}</code>: {row.current} → {row.next}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** Reads the stored values for the Reset confirmation while Reload initial scene is chosen. */
+export function PersistentKeyResetNotice({
+  client,
+}: {
+  client: ProgramRuntimeController['persistentValues'];
+}) {
+  const [rows, setRows] = useState<PersistentKeyResetRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    client.read(controller.signal)
+      .then((values) => {
+        if (!controller.signal.aborted) setRows(persistentKeyResetRows(values));
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) setError(errorMessage(reason, 'Stored values are unavailable.'));
+      });
+    return () => controller.abort();
+  }, [client]);
+  if (error !== null) {
+    return <p className="hint">Stored values could not be read ({error}); persistent keys are still reset to their initial values.</p>;
+  }
+  return rows === null ? null : <PersistentKeyResetList rows={rows} />;
+}
+
 export interface PersistentKeyValuesSectionProps {
   /** The Applied Scenario project folder: the values follow it. */
   projectPath: string;

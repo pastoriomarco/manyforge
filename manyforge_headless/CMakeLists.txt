@@ -511,7 +511,7 @@ if(BUILD_TESTING)
     set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/generated/robotiq_2f_85_structural")
     set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_CATALOG_PATH
-      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/maintained/model_assets/robotiq_2f_85.model_asset.json")
+      "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/resources/maintained/model_sources/robotiq_2f_85/robotiq_2f_85.model_asset.json")
     file(GLOB_RECURSE MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_INPUTS
       CONFIGURE_DEPENDS LIST_DIRECTORIES false
       "${MANYFORGE_HEADLESS_TEST_ROBOTIQ_RESOURCE_ROOT}/meshes/robotiq_2f_85/*")

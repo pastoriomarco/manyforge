@@ -25,6 +25,7 @@ from manyforge_program_runner.bbkey_publication import (
     ProgramBlackboardKeyPublisher,
     ProgramBlackboardPublicationScope,
 )
+from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror
 from manyforge_program_runner.execution_transport import (
     ProgramRunnerExecutionTransport,
 )
@@ -362,18 +363,34 @@ def test_unknown_reply_latches_once_and_never_resends() -> None:
     assert publisher.pending_sequences() == ()
 
 
-def test_wrong_ack_sequence_is_a_fault() -> None:
+def test_wrong_reply_kind_is_a_fault() -> None:
     events: list[Any] = []
     store = _store()
     host, queue = _Host(), _Queue()
 
     def wrong(request: dict[str, Any]) -> dict[str, Any]:
-        return {**host(request), "accepted_sequence": "9"}
+        return {**host(request), "command": "events"}
 
     publisher = _publisher(wrong, queue, events=events)  # type: ignore[arg-type]
     publisher.start(store, _KEYS)
     queue.run()
     assert [event[0] for event in events] == ["stop", "fault"]
+
+
+def test_ack_echo_is_not_compared() -> None:
+    """Each exchange is its own connection: the echoed sequence is not compared."""
+
+    events: list[Any] = []
+    store = _store()
+    host, queue = _Host(), _Queue()
+
+    def echo(request: dict[str, Any]) -> dict[str, Any]:
+        return {**host(request), "accepted_sequence": "9"}
+
+    publisher = _publisher(echo, queue, events=events)  # type: ignore[arg-type]
+    publisher.start(store, _KEYS)
+    queue.run()
+    assert events == [] and publisher.pending_sequences() == ()
 
 
 def test_pending_frame_overflow_fails_closed() -> None:
@@ -572,15 +589,6 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
     assert sent[0]["command"] == "publish_program_bbkeys"
     assert sent[0]["request"] == frame
     assert len(sent[0]["request"]) == 12  # The closed bb-wire-shapes03 request.
-    for field, wrong in (
-        ("program_binding_id", "sha256:" + "e" * 64),
-        ("active_publication_generation", 6),
-        ("cycle_generation", 8),
-        ("owner_epoch", "other-owner"),
-    ):
-        with pytest.raises(HeadlessApiError):  # Not this frame's occurrence.
-            transport._exchange = lambda command, f=field, w=wrong: {**reply, f: w}  # type: ignore[method-assign]  # noqa: SLF001
-            transport.publish_program_bbkeys(frame)
     for bad_reply in (
         {k: v for k, v in reply.items() if k != "status"},
         {k: v for k, v in reply.items() if k != "cycle_generation"},
@@ -610,13 +618,9 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
     }
     transport._exchange = lambda command: dict(superseded)  # type: ignore[method-assign]  # noqa: SLF001
     assert transport.publish_program_bbkeys(frame)["status"] == "superseded"
-    for bad_reply in (
-        {**superseded, "accepted_sequence": "2"},
-        {**reply, "status": "superseded", "accepted_sequence": None},
-    ):
-        transport._exchange = lambda command, r=bad_reply: dict(r)  # type: ignore[method-assign]  # noqa: SLF001
-        with pytest.raises(HeadlessApiError):
-            transport.publish_program_bbkeys(frame)
+    transport._exchange = lambda command: {**superseded, "accepted_sequence": "2"}  # type: ignore[method-assign]  # noqa: SLF001
+    with pytest.raises(HeadlessApiError):
+        transport.publish_program_bbkeys(frame)
     transport._exchange = lambda command: sent.append(command) or dict(reply)  # type: ignore[method-assign]  # noqa: SLF001
     unset = {**frame, "values": [{"name": "label", "value_type": "string", "value": None}]}
     assert transport.publish_program_bbkeys(unset)["accepted_sequence"] == "2"
@@ -632,16 +636,14 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
         with pytest.raises(HeadlessApiError):
             transport.publish_program_bbkeys({**frame, **bad})
     between_runs = {**frame, "claim_generation": None, "program_run_id": None}
-    with pytest.raises(HeadlessApiError):  # The reply names a Run.
-        transport.publish_program_bbkeys(between_runs)
     reply["program_run_id"] = None
     assert transport.publish_program_bbkeys(between_runs)["program_run_id"] is None
     with pytest.raises(HeadlessApiError):  # Claim and Run go together.
         transport.publish_program_bbkeys({**frame, "claim_generation": None})
-    reply["program_run_id"] = "run-1"
-    reply["accepted_sequence"] = "3"
-    with pytest.raises(HeadlessApiError):
+    transport._exchange = lambda command: {**reply, "command": "events"}  # type: ignore[method-assign]  # noqa: SLF001
+    with pytest.raises(HeadlessApiError) as invalid:  # Wrong reply kind.
         transport.publish_program_bbkeys(frame)
+    assert invalid.value.code == "execution_command_response_invalid"
 
 
 def test_cell_level_source_between_runs_has_no_run_and_never_stops_one() -> None:
@@ -758,6 +760,9 @@ class _Applied:
         self.reads += 1
         return {
             "program": deepcopy(self.document),
+            "program_binding": {"target_role_bindings": [{
+                "controllable_component_id": "robot", "target_role_id": "arm", "robot_tcps": [],
+            }]},
             "program_binding_id": self.binding,
             "scenario_id": "scenario-1",
             "project_path": "/projects/scenario-1.scenario",
@@ -793,6 +798,9 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
     runtime._bbkey_publishers = {}  # noqa: SLF001
     runtime._bbkey_idle_store = None  # noqa: SLF001
     runtime._bbkey_publishers_lock = threading.RLock()  # noqa: SLF001
+    runtime._active_tcp_stores_lock = threading.Lock()  # noqa: SLF001
+    runtime._active_tcp_stores = {}  # noqa: SLF001
+    runtime._active_tcp_mirror = ActiveTcpMirror(on_change=runtime._write_active_tcp)  # noqa: SLF001
     runtime._bbkey_source_lock = threading.RLock()  # noqa: SLF001
     runtime._bbkey_fence_lock = threading.Lock()  # noqa: SLF001
     runtime._bbkey_open_losses = {}  # noqa: SLF001
@@ -858,6 +866,17 @@ def test_every_new_applied_publication_is_a_new_between_run_source() -> None:
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     assert len(hosts) == 2 and hosts[1].frames[0]["active_publication_generation"] == 6
     assert runtime._bbkey_publishers[None].scope.active_publication_generation == 6  # noqa: SLF001
+
+
+def test_w0_keeps_an_idle_active_tcp_store_without_a_bb_publisher() -> None:
+    applied, journal = _Applied(), _Journal()
+    runtime, hosts = _runtime(applied, journal)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert hosts == []
+    assert None in runtime._active_tcp_stores  # noqa: SLF001
+    store, roles = runtime._active_tcp_stores[None]  # noqa: SLF001
+    assert roles == {"robot": ("arm",)}
+    assert "active_tcp.arm" in store.program.blackboard_keys
 
 
 def test_unchanged_identity_keeps_its_source_and_never_resends_its_baseline() -> None:

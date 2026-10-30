@@ -27,8 +27,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v19";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 19;
+    "manyforge.internal.component-manager.apply-journal.h1a.v20";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 20;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -409,6 +409,18 @@ struct ManagerApplyTerminalOutcomeWriteResult final {
   bool inserted;
 };
 
+/// The operator's acknowledgement and its single fence-release attempt.
+/// A missing receipt means the release outcome is not established.
+struct PersistedFailedApplyRelease final {
+  manyforge::core::ContentDigest terminal_outcome_digest;
+  manyforge::core::ContentDigest fence_acceptance_digest;
+  manyforge::core::RequestId acknowledgement_request_id;
+  std::string acknowledgement_source_label;
+  manyforge::core::ConfigurationFenceReleaseDTO request;
+  std::optional<manyforge::core::ConfigurationFenceReleasedDTO> released;
+  bool acknowledged{};
+};
+
 /// One transactionally consistent, immutable view of every durable record for
 /// one Apply generation. Missing members mean that the corresponding phase
 /// has not been durably reached; no mutable phase label is stored or inferred
@@ -431,6 +443,11 @@ struct PersistedManagerApplyStatus final {
   std::optional<PersistedManagerApplyBringUpPlan> bring_up_plan;
   std::vector<PersistedManagerApplyBringUpChildProof> bring_up_child_proofs;
 };
+
+/// Whether the recorded failure is in the currently supported before-effect
+/// scope. This is advisory; the owner must recheck its held fence and claim.
+[[nodiscard]] bool FailedApplyAcknowledgementEligible(
+    const PersistedManagerApplyStatus &status) noexcept;
 
 /// Last real progress for one Apply generation: the deepest durably reached
 /// milestone and the exact evidence digest that established it.
@@ -476,8 +493,22 @@ struct ManagerApplyJournalIntegrityReport final {
 /// Each Apply generation may append only the exact parent-linked records for
 /// affected scope, fence admission, runtime staged readiness, selected-bundle
 /// publication, fence release, and terminal success. Scene maintenance is
-/// durably owned by Scene. Conflicts, gaps, corruption, foreign-cell databases, and
+/// durably owned by Scene. Conflicts, gaps, corruption in requested/touched
+/// records or their required provenance, foreign-cell databases, and
 /// resource-limit exhaustion fail before another journal write.
+///
+/// Construction/open performs a full integrity verification, including when
+/// startup reopens the journal after a crash. `VerifyIntegrity()` explicitly
+/// performs the same full verification. Ordinary reads and writes validate
+/// the records they request or touch and the identity, generation, and
+/// provenance chain needed for that operation. Full-history decoding does not
+/// occur per write, though numeric SQL `COUNT` ceiling checks may count
+/// historical rows. For generation continuity, a write checks the touched
+/// generation and its immediate predecessor; older generations are checked by
+/// full verification. Corruption outside the records and provenance checked
+/// by an operation may remain undetected until the next open or explicit full
+/// verification. Existing record-count and database page-image limits remain
+/// in force.
 ///
 /// This journal owns no mutable phase row and performs no external Kernel,
 /// process, scene, publication, or robot effect. Those semantic owners return
@@ -522,7 +553,8 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadIntent(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
-  /// Every durable Apply status, each record digest-verified.
+  /// Every durable Apply status in the requested inventory, each record
+  /// digest-verified as it is read.
   ///
   /// All Read* operations reuse records they already decoded and verified
   /// only while the database is provably unchanged: the same SQLite
@@ -533,8 +565,8 @@ public:
   /// always verifies the complete database.
   [[nodiscard]] std::vector<PersistedManagerApplyStatus>
   ReadStatusInventory() const;
-  /// Number of records decoded and digest-verified from SQLite (a diagnostic
-  /// for change-gated reuse; reuse does not advance it).
+  /// Number of uncached verified-record lookups, including misses, and
+  /// selected manual predecessor decodes.
   [[nodiscard]] std::uint64_t record_verification_count() const;
   /// One transactionally consistent immutable view of every durable record for
   /// exactly one Apply generation, or nullopt when that identity is unknown.
@@ -613,11 +645,39 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyTerminalOutcome>
   ReadTerminalOutcome(const manyforge::core::ApplyId &apply_id,
                       manyforge::core::ApplyGeneration apply_generation) const;
+
+  /// Store the acknowledged release request before contacting the Kernel.
+  /// One row permits one attempt and one completion; it never alters the
+  /// original failed terminal outcome.
+  void BeginFailedApplyRelease(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      const manyforge::core::RequestId &acknowledgement_request_id,
+      const std::string &acknowledgement_source_label,
+      const manyforge::core::ConfigurationFenceReleaseDTO &request);
+  void CompleteFailedApplyRelease(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      const manyforge::core::ConfigurationFenceReleasedDTO &released);
+  /// Record that the already-released fence's admission claim also settled.
+  void CompleteFailedApplyAcknowledgement(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation);
+  [[nodiscard]] std::optional<PersistedFailedApplyRelease> ReadFailedApplyRelease(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation) const;
+  /// Perform full integrity verification over the Apply journal.
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();
 
 private:
+  // Narrow test seam for the same independent read-only proof path.
+  friend manyforge::core::Result<PersistedManagerApplyStatus>
+  ReadManagerApplyStatusReadOnlyForTesting(
+      const std::filesystem::path &, const manyforge::core::CellId &,
+      const manyforge::core::NamedApplyPublicationTransactionDTO &,
+      std::uint64_t *);
   friend manyforge::core::Result<PersistedManagerApplyStatus>
   ReadManagerApplyStatusReadOnly(
       const std::filesystem::path &, const manyforge::core::CellId &,
@@ -640,6 +700,11 @@ private:
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::NamedApplyPublicationTransactionDTO &,
       const manyforge::core::CellAdmissionClaimDTO &);
+  friend manyforge::core::Result<void>
+  ValidateManagerApplyCellAdmissionSettlementReadOnly(
+      const std::filesystem::path &, const manyforge::core::CellId &,
+      const manyforge::core::CellAdmissionClaimDTO &,
+      const manyforge::core::CellAdmissionClaimReleaseDTO &);
   friend manyforge::core::Result<void>
   ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
       const std::filesystem::path &, const manyforge::core::CellId &,

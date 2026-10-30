@@ -1919,6 +1919,8 @@ TEST(ManagerDaemonProcess, ProcessStopDecoderPreservesActualMultilineLaunchIdent
       EXPECT_EQ(RequiredMember(response, "ok"), CanonicalValue(false));
       const auto &error = RequiredMember(response, "error");
       EXPECT_EQ(RequiredText(error, "code"), "manager_command_rejected");
+      // A refusal after decoding names its producer.
+      EXPECT_EQ(RequiredText(error, "producer"), "component_manager");
       // Reaching the original Manager occurrence guard proves complete decoding;
       // the foreign Manager epoch prevents forwarding or any Stop effect.
       EXPECT_EQ(RequiredText(error, "message"),
@@ -1968,13 +1970,43 @@ TEST(ManagerDaemonProcess, ProcessStopOfferReturnsKnownEmptyInventoryAndIsPassiv
     const auto rejected_bytes = SendCommand(directory.socket_path(), request);
     const auto rejected = deployment::parse_strict_json_model_yaml(rejected_bytes).root();
     EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false)) << rejected_bytes;
-    EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
-        CanonicalValue("manager_command_rejected")) << rejected_bytes;
+    // A command that does not decode is one request-validation refusal.
+    const auto &error = RequiredMember(rejected, "error");
+    EXPECT_EQ(RequiredMember(error, "code"), CanonicalValue("invalid_request")) << rejected_bytes;
+    EXPECT_EQ(RequiredMember(RequiredMember(error, "details"), "command"),
+              CanonicalValue("invalid")) << rejected_bytes;
+    EXPECT_EQ(RequiredMember(error, "producer"), CanonicalValue("component_manager"))
+        << rejected_bytes;
   }
   const auto after = manager_source.Read();
   ASSERT_TRUE(after);
   EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
   EXPECT_EQ(RequiredMember(after->payload, "active"), RequiredMember(before->payload, "active"));
+}
+
+TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
+  using content_identity::CanonicalValue;
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  const auto valid = SendCommand(directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","request_context":{"request_id":"ack.1","source_label":"composer"}})");
+  const auto accepted_shape = deployment::parse_strict_json_model_yaml(valid).root();
+  EXPECT_EQ(RequiredMember(RequiredMember(accepted_shape, "error"), "code"),
+            CanonicalValue("apply_status_not_found")) << valid;
+  EXPECT_EQ(RequiredMember(RequiredMember(RequiredMember(accepted_shape, "error"), "details"), "effect"),
+            CanonicalValue("none")) << valid;
+  for (const auto *request : {
+      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge"})",
+      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","extra":true,"request_context":{"request_id":"ack.1","source_label":"composer"}})",
+      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_acknowledge","request_context":{"extra":true,"request_id":"ack.1","source_label":"composer"}})"}) {
+    const auto bytes = SendCommand(directory.socket_path(), request);
+    const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
+    EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
+              CanonicalValue("invalid_request")) << bytes;
+    EXPECT_EQ(RequiredMember(RequiredMember(RequiredMember(rejected, "error"), "details"), "effect"),
+              CanonicalValue("none")) << bytes;
+  }
 }
 
 TEST(ManagerDaemonProcess, CanonicalEmptySelectionIsClosedAndPassive) {
@@ -2035,7 +2067,7 @@ TEST(ManagerDaemonProcess, CanonicalEmptySelectionIsClosedAndPassive) {
     EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false))
         << rejected_bytes;
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
-              CanonicalValue("manager_command_rejected"))
+              CanonicalValue("invalid_request"))
         << rejected_bytes;
   }
   const auto after = manager_source.Read();
@@ -2269,10 +2301,19 @@ TEST(ManagerDaemonProcess,
         directory.publication_root(), "scene-runtime-source.json");
     AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
                                              "logical-scene-source.json");
+    AtomicSourceSnapshotChannel viewer_sessions(
+        directory.publication_root(), "viewer-pose-sessions.json");
     const auto initial = scene_runtime_source.Read();
     const auto initial_scene = scene_source.Read();
     ASSERT_TRUE(initial.has_value());
     ASSERT_TRUE(initial_scene.has_value());
+    const auto initial_sessions = viewer_sessions.Read();
+    ASSERT_TRUE(initial_sessions.has_value());
+    EXPECT_EQ(initial_sessions->source_owner_id, initial->source_owner_id);
+    EXPECT_EQ(initial_sessions->source_owner_epoch, initial->source_owner_epoch);
+    EXPECT_EQ(RequiredMember(initial_sessions->payload, "runtime_identity"),
+              SceneRuntimeIdentityValue(*initial));
+    EXPECT_TRUE(RequiredMember(initial_sessions->payload, "sessions").as_array().empty());
 
     const auto owner_read = SendCommand(
         directory.socket_path(),
@@ -2330,11 +2371,29 @@ TEST(ManagerDaemonProcess,
               std::string::npos)
         << crossed_latch;
 
+    const auto viewer_path = directory.publication_root() / "viewer-pose-sessions.json";
+    const auto saved_viewer_path = directory.publication_root() / "viewer-pose-sessions.saved";
+    std::filesystem::rename(viewer_path, saved_viewer_path);
+    std::filesystem::create_directory(viewer_path);
     const auto opened_first = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
+    std::filesystem::remove(viewer_path);
+    std::filesystem::rename(saved_viewer_path, viewer_path);
     EXPECT_NE(opened_first.find("\"source_epoch_order\":1"), std::string::npos)
         << opened_first;
+    const auto retry_open = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
+    EXPECT_NE(retry_open.find("\"source_epoch_order\":1"), std::string::npos)
+        << retry_open;
+    const auto opened_sessions = viewer_sessions.Read();
+    ASSERT_TRUE(opened_sessions.has_value());
+    const auto &opened_rows = RequiredMember(opened_sessions->payload, "sessions").as_array();
+    ASSERT_EQ(opened_rows.size(), 1U);
+    EXPECT_EQ(RequiredMember(opened_rows.front(), "source_id").as_string(), "isaac.observer");
+    EXPECT_EQ(RequiredMember(opened_rows.front(), "source_epoch").as_string(), "observer-epoch-1");
+    EXPECT_EQ(RequiredMember(opened_rows.front(), "source_epoch_order").as_number(), 1.0);
     // Eligible object bindings observe as "scene"; the application policy
     // is the Deployment link row only.
     const auto policy_named_binding =
@@ -2342,7 +2401,7 @@ TEST(ManagerDaemonProcess,
                     SceneRuntimeObserverOpenRequest(
                         *initial, "observer-epoch-1", "isaac.observer",
                         "scene_object", "continuous_unattached", true));
-    EXPECT_NE(policy_named_binding.find("manager_command_rejected"),
+    EXPECT_NE(policy_named_binding.find("invalid_request"),
               std::string::npos)
         << policy_named_binding;
     const auto changed_registration =
@@ -2531,6 +2590,16 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(opened_replacement.find("\"source_epoch_order\":2"),
               std::string::npos)
         << opened_replacement;
+    const auto replaced_sessions = viewer_sessions.Read();
+    ASSERT_TRUE(replaced_sessions.has_value());
+    const auto &replaced_rows = RequiredMember(replaced_sessions->payload, "sessions").as_array();
+    const auto replaced = std::find_if(replaced_rows.begin(), replaced_rows.end(),
+        [](const auto &row) {
+          return RequiredMember(row, "source_id").as_string() == "isaac.observer";
+        });
+    ASSERT_NE(replaced, replaced_rows.end());
+    EXPECT_EQ(RequiredMember(*replaced, "source_epoch").as_string(), "observer-epoch-2");
+    EXPECT_EQ(RequiredMember(*replaced, "source_epoch_order").as_number(), 2.0);
     const auto stale = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserveRequest(*initial, "observer-epoch-1", 2U));
@@ -2571,6 +2640,13 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(content_identity::canonical_json(replacement_snapshot->payload)
                 .find("\"source_id\":\"isaac.observer\""),
             std::string::npos);
+  AtomicSourceSnapshotChannel viewer_sessions(directory.publication_root(),
+                                             "viewer-pose-sessions.json");
+  const auto restarted_sessions = viewer_sessions.Read();
+  ASSERT_TRUE(restarted_sessions.has_value());
+  EXPECT_EQ(restarted_sessions->source_owner_epoch,
+            replacement_snapshot->source_owner_epoch);
+  EXPECT_TRUE(RequiredMember(restarted_sessions->payload, "sessions").as_array().empty());
   const auto stale_after_owner_loss =
       SendCommand(directory.socket_path(),
                   SceneRuntimeObserveRequest(*replacement_snapshot,
@@ -2948,6 +3024,9 @@ TEST(ManagerDaemonProcess,
   ASSERT_NE(applied.find("\"state\":\"succeeded\""),
             std::string::npos)
       << applied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
+  const auto applied_status = SendCommand(directory.socket_path(), status_request);
+  EXPECT_NE(applied_status.find("\"failure_acknowledgement\":\"unavailable\""),
+            std::string::npos);
   const auto ready = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
   EXPECT_FALSE(ready.owner_epoch.empty());
@@ -3421,7 +3500,8 @@ TEST(ManagerDaemonProcess,
             content_identity::CanonicalValue(false));
   const auto &replay_error = RequiredMember(replay, "error");
   EXPECT_EQ(RequiredText(replay_error, "code"), "apply_rejected");
-  EXPECT_EQ(replay_error.find_object_member("details"), nullptr)
+  // Error responses always carry details; this refusal carries no effect.
+  EXPECT_EQ(RequiredMember(replay_error, "details").find_object_member("effect"), nullptr)
       << content_identity::canonical_json(replay);
 }
 
@@ -4076,7 +4156,7 @@ TEST(ManagerDaemonProcess,
       const auto rejected =
           submit_parent(replace(claim, field, CanonicalValue(0.0)));
       EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "code"),
-                "manager_command_rejected");
+                "invalid_request");
       EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "message"),
                 "Manager daemon: parent " + std::string(field) +
                     " must be one positive safe integer");
@@ -4084,7 +4164,7 @@ TEST(ManagerDaemonProcess,
     const auto bad_timestamp = submit_parent(
         replace(claim, "accepted_at_ns", CanonicalValue("not-a-timestamp")));
     EXPECT_EQ(RequiredText(RequiredMember(bad_timestamp, "error"), "code"),
-              "manager_command_rejected");
+              "invalid_request");
     EXPECT_EQ(RequiredText(RequiredMember(bad_timestamp, "error"), "message"),
               "exact nonnegative int64 scalar required");
     // An earlier claim generation still wins over a malformed final timestamp.
@@ -4277,9 +4357,9 @@ TEST(ManagerDaemonProcess,
     CanonicalValue payload(CanonicalValue::Object{
         {"kind", CanonicalValue("motion")}, {"move_id", CanonicalValue(request_id + ".hold")},
         {"base_frame_role_id", RequiredMember(command, "base_frame_role_id")},
+        // Active TCP (M7): Robot control moves at the robot's Active TCP.
         {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
-            {"target_role_id", RequiredMember(command, "target_role_id")},
-            {"frame_role_id", RequiredMember(command, "tcp_frame_role_id")}})},
+            {"kind", CanonicalValue("current")}})},
         {"tolerances", CanonicalValue(CanonicalValue::Object{
             {"joint_position_tol_rad", CanonicalValue(0.01)}, {"translation_tol_m", CanonicalValue(0.001)},
             {"rotation_tol_rad", CanonicalValue(0.01)}})},

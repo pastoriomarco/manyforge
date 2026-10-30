@@ -210,7 +210,8 @@ _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
 # CP8 step 1: the Real lane reuses the Mock example values unchanged; only the
 # vendor controller profile is a maintainer decision. The arm reports measured
 # state; the gripper is Mock's pneumatic target with no output (display only)
-# and no gripper_feedback stream (maintainer decision 2026-10-27).
+# and no gripper_feedback stream (maintainer decision 2026-10-27). V-B4: the
+# robot row declares its vendor adapter family.
 _REAL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     **{
         field: source
@@ -218,6 +219,7 @@ _REAL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
         if field != "mock_profile"
     },
     "real_profile": "maintainer_decision.CP8_step1.real_lane_vendor_profile",
+    "adapter_family": "maintainer_decision.M7_VB4.real_adapter_family",
 }
 _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
@@ -303,34 +305,34 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "28b47a00f2ae915e3281bc6a58c0927f164aaa8a8d4a4635a997a49e6436f6b1"
     ),
     "lite6_isaac_commanded_v0": (
-        "7af7704209054402d706fe67877821bbd29d20ebea7a04b9089e586ef7e57cc9"
+        "d780568a0f3a415dce72dc93086053a3d0e8475f0dcf9a90b16b1931ea6bb019"
     ),
     "lite6_mock_commanded_v0": (
-        "f1ff9fe2d962b6efd85f35654d4a92ab4ee3e41c3d0ac1d045040279120c746d"
+        "4dede265d1cf030d02f5f29add60fbbae64a76ac57d52b840d58cd8aa61f530a"
     ),
     "lite6_real_measured_v0": (
-        "bd34d00e6fddef5ddb86d2e644341a05e84b2d70afeff1ad53c805ae6a29e4cd"
+        "ee18feb0372548d9068267f865bc8cbb3c3eabd47c407b47bd00ee59a77f201d"
     ),
     "pose_source_v0": (
         "a28e7e7a46931cb858ad4bc15c45ac13a5e42eb9d76be318ff28e75600e7ec58"
     ),
-    "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "8cd6035fd0b4a781a779290b43b87a6829a99e19840a8441fd4121a533685a49"
+    "ur10e_assistant_isaac_commanded_v0": (
+        "00916eadf4c9f8d3e2057e415954b10281de8af61a9608671a15fe739650ce17"
     ),
-    "ur10e_robotiq_assistant_mock_commanded_v0": (
-        "7fd76b2afa80b3b57acf6a4c099ac9bd78c82e3fa6b36376564eb1e7005b5ecf"
+    "ur10e_assistant_mock_commanded_v0": (
+        "0dbd730529b24dab35c2edd6220b56ab94d6853fa02b85068a2e7b2cce0c2bd3"
     ),
-    "ur10e_robotiq_isaac_commanded_v0": (
-        "f83e6fb244841ba9ab4b996dd638a786c24a9dbb86e940ebadb0b3a740e1b999"
+    "ur10e_isaac_commanded_v0": (
+        "a60b328b8a5a9bc6dbe2ca93333340aba1613ec18c97c02fb8a83500d2c3341e"
     ),
-    "ur10e_robotiq_mock_commanded_v0": (
-        "30319bf8b9bfa9735acb2ac1c08c3cc7db4873bfdab4cd8874268f2422a2de05"
+    "ur10e_mock_commanded_v0": (
+        "49aa63cddd6e85160c94ae5d11784262c7558bf7c0947c54880e86ae881c592c"
     ),
     "ur5_mock_commanded_v0": (
         "6d510e8311d1af79c24e3c9ff7b5ddd62be1da0552f133f7da67103224a98de6"
     ),
-    "ur5e_robotiq_mock_commanded_v0": (
-        "f01881be78f8fe572c85b186c07c4e2e60fc73397c7b588b43d8c4020a01d445"
+    "ur5e_mock_commanded_v0": (
+        "2726153a6b559343ebb40d31c7d88eb54c3c0ba12cae0d26aca95bf14e2e5995"
     ),
 }
 # Model-free component profiles: runtime member -> exact profile id.
@@ -339,42 +341,44 @@ _MODEL_FREE_PROFILE_IDS: Final = {
     "io_provider_runtime": "io_device_v0",
     "pose_source_runtime": "pose_source_v0",
 }
+# Merge 6 (D5): robot profiles name arm-only families; tool profiles are
+# checked by structure (`_validate_tool_profile`), not pinned.
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
-    "lite6_isaac_commanded_v0": "lite6_lite_gripper",
-    "lite6_mock_commanded_v0": "lite6_lite_gripper",
-    "lite6_real_measured_v0": "lite6_lite_gripper",
-    "ur10e_robotiq_assistant_isaac_commanded_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_assistant_mock_commanded_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
-    "ur10e_robotiq_mock_commanded_v0": "ur10e_robotiq_2f_140",
+    "lite6_isaac_commanded_v0": "lite6",
+    "lite6_mock_commanded_v0": "lite6",
+    "lite6_real_measured_v0": "lite6",
+    "ur10e_assistant_isaac_commanded_v0": "ur10e",
+    "ur10e_assistant_mock_commanded_v0": "ur10e",
+    "ur10e_isaac_commanded_v0": "ur10e",
+    "ur10e_mock_commanded_v0": "ur10e",
     "ur5_mock_commanded_v0": "ur5_roboplan",
-    "ur5e_robotiq_mock_commanded_v0": "ur5e_robotiq_2f_85",
+    "ur5e_mock_commanded_v0": "ur5e",
 }
 _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": (
-        "ur10e_robotiq_assistant_mock_commanded_v0"
+        "ur10e_assistant_mock_commanded_v0"
     ),
     "examples/lite6_lite_gripper_pick_and_place.deployment.yaml": (
         "lite6_mock_commanded_v0"
     ),
     "examples/pick_and_place.deployment.yaml": "ur5_mock_commanded_v0",
     "examples/pick_and_place_ur10e_robotiq.deployment.yaml": (
-        "ur10e_robotiq_mock_commanded_v0"
+        "ur10e_mock_commanded_v0"
     ),
-    "examples/semantic_shape_pick.deployment.yaml": "ur5e_robotiq_mock_commanded_v0",
-    "examples/vision_guided_bin_pick.deployment.yaml": "ur5e_robotiq_mock_commanded_v0",
+    "examples/semantic_shape_pick.deployment.yaml": "ur5e_mock_commanded_v0",
+    "examples/vision_guided_bin_pick.deployment.yaml": "ur5e_mock_commanded_v0",
     "examples/vision_guided_pose_pick.deployment.yaml": "ur5_mock_commanded_v0",
     "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml": (
         "lite6_isaac_commanded_v0"
     ),
     "examples/isaac_manipulator_scene_light_assistant.deployment.yaml": (
-        "ur10e_robotiq_assistant_isaac_commanded_v0"
+        "ur10e_assistant_isaac_commanded_v0"
     ),
     "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml": (
-        "ur10e_robotiq_isaac_commanded_v0"
+        "ur10e_isaac_commanded_v0"
     ),
     "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml": (
-        "ur10e_robotiq_isaac_commanded_v0"
+        "ur10e_isaac_commanded_v0"
     ),
     "examples/trocar_lite6_foundationpose_pick.deployment.yaml": (
         "lite6_isaac_commanded_v0"
@@ -722,7 +726,7 @@ _EXPECTED_MODEL_FAMILIES: Final = {
     "ur10e_robotiq_2f_140": {
         "frames": {
             "base": "base_link",
-            "flange": "flange",
+            "flange": "tool0",
             "gripper_tcp": "grasp_frame",
             "tcp": "grasp_frame",
             "tool_mount": "tool0",
@@ -775,10 +779,43 @@ _EXPECTED_MODEL_FAMILIES: Final = {
             "urdf_projection_kind": "remove_unsupported_collision_materials",
         },
     },
+    # Merge 6: the tool cut from the UR10e bundle keeps its `.structural`
+    # projection (the two collision materials and the HPP gripper are its own).
+    "robotiq_2f_140": {
+        "frames": {"mount": "robotiq_2f_140_mount", "tcp": "grasp_frame"},
+        "groups": {"gripper": "gripper"},
+        "resources": {"fingers": ("finger_joint",)},
+        "collisions": {
+            "gripper_collision": (
+                "left_inner_finger",
+                "left_inner_finger_pad",
+                "left_inner_knuckle",
+                "left_outer_finger",
+                "left_outer_knuckle",
+                "right_inner_finger",
+                "right_inner_finger_pad",
+                "right_inner_knuckle",
+                "right_outer_finger",
+                "right_outer_knuckle",
+                "robotiq_base_link",
+            ),
+        },
+        "root": "mount",
+        "source": {
+            "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur10e_robotiq_2f_140/",
+            "historical_srdf_path": "manyforge_example_models/models/robotiq_2f_140/robotiq_2f_140.srdf",
+            "historical_urdf_path": "manyforge_example_models/models/robotiq_2f_140/robotiq_2f_140.urdf",
+            "resource_root": "manyforge_example_models/models/ur10e_robotiq_2f_140",
+            "srdf_path": "manyforge_example_models/models/robotiq_2f_140/robotiq_2f_140.structural.srdf",
+            "srdf_projection_kind": "remove_hpp_gripper_extension",
+            "urdf_path": "manyforge_example_models/models/robotiq_2f_140/robotiq_2f_140.structural.urdf",
+            "urdf_projection_kind": "remove_unsupported_collision_materials",
+        },
+    },
     "ur5_roboplan": {
         "frames": {
             "base": "base_link",
-            "flange": "ee_link",
+            "flange": "tool0",
             "gripper_tcp": "tool0",
             "root": "world",
             "tcp": "tool0",
@@ -822,7 +859,7 @@ _EXPECTED_MODEL_FAMILIES: Final = {
     "ur5e_robotiq_2f_85": {
         "frames": {
             "base": "base_link",
-            "flange": "flange",
+            "flange": "tool0",
             "gripper_tcp": "robotiq_85_base_link",
             "root": "world",
             "tcp": "tool0",
@@ -916,6 +953,56 @@ def _exact(
             f"{path} has wrong fields; missing={missing}, unknown={unknown}"
         )
     return row
+
+
+def _offset_pose(
+    value: object, *, path: str
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """`{position_m: [3], orientation_xyzw: [4]}`, finite, unit quaternion."""
+
+    pose = _exact(value, required=frozenset({"position_m", "orientation_xyzw"}), path=path)
+    parts = []
+    for field, length in (("position_m", 3), ("orientation_xyzw", 4)):
+        numbers = pose[field]
+        if (
+            type(numbers) is not list
+            or len(numbers) != length
+            or any(
+                type(item) not in {int, float} or not math.isfinite(item)
+                for item in numbers
+            )
+        ):
+            raise SourceDescriptionError(
+                f"{path}.{field} must hold {length} finite numbers"
+            )
+        parts.append(tuple(float(item) for item in numbers))
+    if abs(sum(item * item for item in parts[1]) - 1.0) > 1e-6:
+        raise SourceDescriptionError(f"{path}.orientation_xyzw must be a unit quaternion")
+    return parts[0], parts[1]
+
+
+def _model_payload(
+    value: object, *, path: str
+) -> tuple[float, tuple[float, ...]]:
+    """A model's own payload: mass in [0, 100] kg, centre of mass [3] in [-2, 2] m."""
+
+    payload = _exact(value, required=frozenset({"mass_kg", "center_of_mass_m"}), path=path)
+    mass = payload["mass_kg"]
+    if type(mass) not in {int, float} or not math.isfinite(mass) or not 0 <= mass <= 100:
+        raise SourceDescriptionError(f"{path}.mass_kg must be a finite number in [0, 100]")
+    center = payload["center_of_mass_m"]
+    if (
+        type(center) is not list
+        or len(center) != 3
+        or any(
+            type(item) not in {int, float} or not math.isfinite(item) or not -2 <= item <= 2
+            for item in center
+        )
+    ):
+        raise SourceDescriptionError(
+            f"{path}.center_of_mass_m must hold 3 finite numbers in [-2, 2]"
+        )
+    return float(mass), tuple(float(item) for item in center)
 
 
 def _text(value: object, *, path: str) -> str:
@@ -1412,8 +1499,18 @@ def _validate_model_semantics(
                 "resource_role_bindings",
                 "root_frame_role_id",
             }
+        )
+        | (
+            frozenset({"payload"})
+            if type(value) is dict and "payload" in value
+            else frozenset()
         ),
         path=path,
+    )
+    payload = (
+        _model_payload(semantics["payload"], path=f"{path}.payload")
+        if "payload" in semantics
+        else None
     )
     if semantics["instance_cardinality"] != "multiple_per_cell":
         raise SourceDescriptionError(
@@ -1422,13 +1519,19 @@ def _validate_model_semantics(
 
     frame_roles: list[str] = []
     frame_bindings: dict[str, str] = {}
+    frame_offsets: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {}
     for index, raw_binding in enumerate(
         _array(semantics["frame_role_bindings"], path=f"{path}.frame_role_bindings")
     ):
         binding_path = f"{path}.frame_role_bindings[{index}]"
         binding = _exact(
             raw_binding,
-            required=frozenset({"frame_role_id", "source_link_name"}),
+            required=frozenset({"frame_role_id", "source_link_name"})
+            | (
+                frozenset({"pose_in_source_link"})
+                if type(raw_binding) is dict and "pose_in_source_link" in raw_binding
+                else frozenset()
+            ),
             path=binding_path,
         )
         frame_role = _identifier(
@@ -1438,7 +1541,20 @@ def _validate_model_semantics(
         frame_bindings[frame_role] = _source_symbol(
             binding["source_link_name"], path=f"{binding_path}.source_link_name"
         )
+        if "pose_in_source_link" in binding:
+            frame_offsets[frame_role] = _offset_pose(
+                binding["pose_in_source_link"],
+                path=f"{binding_path}.pose_in_source_link",
+            )
     _canonical_unique(frame_roles, path=f"{path}.frame_role_bindings")
+    # An offset frame (TCP-A) is a generated link named after its role: its
+    # parent is a source link, never another offset frame.
+    for frame_role in frame_offsets:
+        if frame_bindings[frame_role] in frame_offsets:
+            raise SourceDescriptionError(
+                f"{path}.frame_role_bindings: offset frame {frame_role!r} chains "
+                "onto another offset frame"
+            )
 
     group_roles: list[str] = []
     group_bindings: dict[str, str] = {}
@@ -1540,7 +1656,7 @@ def _validate_model_semantics(
         semantics["root_frame_role_id"], path=f"{path}.root_frame_role_id"
     )
     # E1: a family added as data has no pin; its roles are checked against its
-    # URDF/SRDF by scripts/robots/check_robot.py.
+    # URDF/SRDF by `manyforge component check` (its component.yaml).
     expected = _EXPECTED_MODEL_FAMILIES.get(family_id)
     if expected is None:
         if root_frame_role not in frame_roles:
@@ -1550,6 +1666,8 @@ def _validate_model_semantics(
         return
     if (
         frame_bindings != expected["frames"]
+        or frame_offsets != expected.get("offsets", {})
+        or payload != expected.get("payload")
         or group_bindings != expected["groups"]
         or resource_bindings != expected["resources"]
         or collision_bindings != expected["collisions"]
@@ -1563,7 +1681,7 @@ def _validate_model_semantics(
 
 def _mock_controller_profile_ids(root: Path) -> set[str]:
     """The Mock controller rows a profile added as data may select (E1)."""
-    sys.path.insert(0, str(root / "scripts" / "robots"))
+    sys.path.insert(0, str(root / "scripts" / "components"))
     try:
         import mock_controller_profiles
     finally:
@@ -1575,6 +1693,103 @@ def _mock_controller_profile_ids(root: Path) -> set[str]:
     except (OSError, mock_controller_profiles.MockControllerProfileError) as error:
         raise SourceDescriptionError(str(error)) from error
     return {row.mock_profile for row in rows}
+
+
+# Isaac profile ids of retained_isaac_ros2_control_profile.cpp; a tool id
+# selects the gripper facts of its robot's articulation (merge 6).
+_ISAAC_TOOL_PROFILE_IDS: Final = frozenset({"lite_gripper", "robotiq_2f_140"})
+
+
+def _validate_tool_profile(
+    profile: dict[str, Any], *, root: Path, path: str
+) -> str:
+    """A tool component profile (merge 6): one lane selector or none (D4).
+
+    The minimal Mock form `{mock_profile}` of a profile added as data is
+    accepted. A fuller profile carries its default gripper rows and streams:
+    a tool with a lane declares `gripper_feedback` and `measured_joints`; a
+    lane-free tool declares none.
+    """
+    family_id = _identifier(profile.get("model_family_id"), path=f"{path}.model_family_id")
+    runtime = _object(
+        profile.get("ros2_control_runtime"), path=f"{path}.ros2_control_runtime"
+    )
+    selectors = sorted(set(runtime) & {"isaac_profile", "mock_profile", "real_profile"})
+    if len(selectors) > 1 or selectors == ["real_profile"]:
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime of a tool selects at most one Mock or "
+            "Isaac profile; a Real tool is lane-free"
+        )
+    selector = selectors[0] if selectors else None
+    if selector == "mock_profile" and runtime["mock_profile"] not in (
+        _mock_controller_profile_ids(root)
+    ):
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime.mock_profile has no row in "
+            "manyforge_ros_bringup/config/mock_controller_profiles.yaml"
+        )
+    if selector == "isaac_profile" and runtime["isaac_profile"] not in (
+        _ISAAC_TOOL_PROFILE_IDS
+    ):
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime.isaac_profile is not an Isaac tool profile"
+        )
+    if profile["stop_profiles"] != {} or profile["acceptance_obligations"] != []:
+        raise SourceDescriptionError(
+            f"{path} of a tool keeps stop_profiles empty and acceptance_obligations []"
+        )
+    if set(runtime) == {"mock_profile"} and profile["source_fields"] == {}:
+        return family_id
+    unknown = set(runtime) - {"component_streams", "gripper_target_configurations"} - {
+        selector
+    }
+    if unknown:
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime of a tool has unexpected fields {sorted(unknown)}"
+        )
+    expected_source_fields = {
+        "component_streams": "maintainer_decision.CP9.component_stream_defaults",
+        "gripper_target_configurations": "grippers",
+    }
+    if selector == "mock_profile":
+        expected_source_fields["mock_profile"] = _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS[
+            "mock_profile"
+        ]
+    elif selector == "isaac_profile":
+        expected_source_fields["isaac_profile"] = (
+            _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS["isaac_profile"]
+        )
+    if profile["source_fields"] != expected_source_fields:
+        raise SourceDescriptionError(
+            f"{path}.source_fields of a tool maps its streams, grippers and selector"
+        )
+    stream_ids = [
+        _object(row, path=f"{path}.ros2_control_runtime.component_streams[]").get(
+            "stream_id"
+        )
+        for row in _array(
+            runtime.get("component_streams"),
+            path=f"{path}.ros2_control_runtime.component_streams",
+        )
+    ]
+    expected_stream_ids = ["gripper_feedback", "measured_joints"] if selector else []
+    if stream_ids != expected_stream_ids:
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime.component_streams must declare exactly "
+            "the tool's streams"
+        )
+    owners = {
+        _object(row, path=f"{path}.ros2_control_runtime[]").get(
+            "controllable_component_id"
+        )
+        for key in ("component_streams", "gripper_target_configurations")
+        for row in _array(runtime.get(key), path=f"{path}.ros2_control_runtime.{key}")
+    }
+    if len(owners) != 1:
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime rows of a tool name one component"
+        )
+    return family_id
 
 
 def _validate_data_profile(
@@ -1649,6 +1864,7 @@ def _validate_role_assignment(
     *,
     root: Path,
     component_occurrence_id: str,
+    tool_occurrence_id: str | None,
     path: str,
 ) -> tuple[str, tuple[str, ...]]:
     row = _exact(
@@ -1691,9 +1907,16 @@ def _validate_role_assignment(
         )
     for role, occurrence in components.items():
         _identifier(role, path=f"{path}.component_roles key")
-        if occurrence != component_occurrence_id:
+        # Merge 6: a mounted tool owns the gripper, so role `tool` selects it.
+        expected = (
+            tool_occurrence_id
+            if role == "tool" and tool_occurrence_id is not None
+            else component_occurrence_id
+        )
+        if occurrence != expected:
             raise SourceDescriptionError(
-                f"{path}.component_roles.{role} must select the deployment occurrence"
+                f"{path}.component_roles.{role} must select the deployment "
+                + ("tool" if expected == tool_occurrence_id else "occurrence")
             )
 
     targets = _object(row["target_roles"], path=f"{path}.target_roles")
@@ -1794,7 +2017,11 @@ def _validate_ai_model(
 
 
 def _validate_pose_source(
-    value: object, *, component_occurrence_id: object, path: str
+    value: object,
+    *,
+    component_occurrence_id: object,
+    gripper_component_id: object,
+    path: str,
 ) -> None:
     """Shape of the model-free pose-source component of an Isaac Deployment.
 
@@ -1862,6 +2089,11 @@ def _validate_pose_source(
             raise SourceDescriptionError(
                 f"{path}.runtime_configuration.simulation.relative_references[{index}] "
                 "must name a controllable component and gripper target"
+            )
+        if reference["controllable_component_id"] != gripper_component_id:
+            raise SourceDescriptionError(
+                f"{path}.runtime_configuration.simulation.relative_references[{index}] "
+                "must name the component that owns the gripper (the mounted tool)"
             )
         gripper_link = reference.get("gripper_link")
         if gripper_link is not None and not isinstance(gripper_link, str):
@@ -1987,6 +2219,17 @@ def validate(source: Path, root: Path) -> None:
         )
 
     family_ids: list[str] = []
+    # Merge 6: a family without arm joints is a tool.
+    tool_family_ids = {
+        family["model_family_id"]
+        for family in _array(top["model_families"], path="$.model_families")
+        if isinstance(family, dict)
+        and isinstance(family.get("semantics"), dict)
+        and not any(
+            isinstance(row, dict) and row.get("resource_role_id") == "arm_joints"
+            for row in family["semantics"].get("resource_role_bindings", [])
+        )
+    }
     for index, raw_family in enumerate(
         _array(top["model_families"], path="$.model_families")
     ):
@@ -2001,6 +2244,13 @@ def validate(source: Path, root: Path) -> None:
                     "semantics",
                     "source",
                 }
+            )
+            # A descriptor-registered family may record its TCPs, the default
+            # first (`manyforge component register`).
+            | (
+                frozenset({"tcp_frame_role_ids"})
+                if type(raw_family) is dict and "tcp_frame_role_ids" in raw_family
+                else frozenset()
             ),
             path=path,
         )
@@ -2029,6 +2279,27 @@ def validate(source: Path, root: Path) -> None:
         _validate_model_semantics(
             family["semantics"], family_id=family_id, path=f"{path}.semantics"
         )
+        if "tcp_frame_role_ids" in family:
+            tcp_path = f"{path}.tcp_frame_role_ids"
+            tcps = [
+                _identifier(role, path=f"{tcp_path}[{index}]")
+                for index, role in enumerate(
+                    _array(family["tcp_frame_role_ids"], path=tcp_path)
+                )
+            ]
+            frame_roles = {
+                row["frame_role_id"]
+                for row in family["semantics"]["frame_role_bindings"]
+            }
+            if (
+                not tcps
+                or len(set(tcps)) != len(tcps)
+                or not set(tcps) <= frame_roles
+            ):
+                raise SourceDescriptionError(
+                    f"{tcp_path} must name distinct frame role bindings, "
+                    "the default first"
+                )
         model_source = _exact(
             family["source"],
             required=frozenset(
@@ -2179,6 +2450,14 @@ def validate(source: Path, root: Path) -> None:
         runtime_profile_ids.append(profile_id)
         if (
             model_free_runtime is None
+            and profile.get("model_family_id") in tool_family_ids
+        ):
+            runtime_profile_families[profile_id] = _validate_tool_profile(
+                profile, root=root, path=path
+            )
+            continue
+        if (
+            model_free_runtime is None
             and profile_id not in _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS
         ):
             runtime_profile_families[profile_id] = _validate_data_profile(
@@ -2218,20 +2497,6 @@ def validate(source: Path, root: Path) -> None:
             if is_ros2_control
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
         )
-        if profile_id in {
-            "lite6_isaac_commanded_v0",
-            "lite6_mock_commanded_v0",
-            "lite6_real_measured_v0",
-            "ur10e_robotiq_assistant_isaac_commanded_v0",
-            "ur10e_robotiq_assistant_mock_commanded_v0",
-            "ur10e_robotiq_isaac_commanded_v0",
-            "ur10e_robotiq_mock_commanded_v0",
-            "ur5e_robotiq_mock_commanded_v0",
-        }:
-            expected_source_fields = {
-                **expected_source_fields,
-                "gripper_target_configurations": "grippers",
-            }
         if is_ros2_control:
             # CP9: the component's declared streams with their defaults.
             expected_source_fields = {
@@ -2270,7 +2535,7 @@ def validate(source: Path, root: Path) -> None:
             if is_ros2_control and not is_mock
             else _RUNTIME_RESTORATION_ACCEPTANCE
         )
-        if profile_id == "ur5e_robotiq_mock_commanded_v0":
+        if profile_id == "ur5e_mock_commanded_v0":
             expected_acceptance = _UI6I_RUNTIME_RESTORATION_ACCEPTANCE
         if profile["acceptance_obligations"] != expected_acceptance:
             raise SourceDescriptionError(
@@ -2322,6 +2587,8 @@ def validate(source: Path, root: Path) -> None:
             "component_occurrence_id",
             "program_role_assignments",
         }
+        if "tool" in raw_deployment_object:
+            deployment_fields.add("tool")
         if "ai_models" in raw_deployment_object:
             deployment_fields.add("ai_models")
             if "assistant_model_components" in raw_deployment_object:
@@ -2431,6 +2698,42 @@ def validate(source: Path, root: Path) -> None:
                 )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
+        # Merge 6: the gripper is a separate tool, mounted on the robot's
+        # flange; its profile belongs to its own (tool) model family.
+        tool_occurrence_id: str | None = None
+        if "tool" in row:
+            tool = _exact(
+                row["tool"],
+                required=frozenset(
+                    {
+                        "component_occurrence_id",
+                        "model_family_id",
+                        "runtime_restoration_profile_id",
+                    }
+                ),
+                path=f"{path}.tool",
+            )
+            tool_occurrence_id = _identifier(
+                tool["component_occurrence_id"],
+                path=f"{path}.tool.component_occurrence_id",
+            )
+            tool_profile_id = _identifier(
+                tool["runtime_restoration_profile_id"],
+                path=f"{path}.tool.runtime_restoration_profile_id",
+            )
+            if tool_occurrence_id == row["component_occurrence_id"]:
+                raise SourceDescriptionError(
+                    f"{path}.tool.component_occurrence_id must differ from the robot"
+                )
+            if (
+                tool["model_family_id"] not in family_ids
+                or runtime_profile_families.get(tool_profile_id)
+                != tool["model_family_id"]
+            ):
+                raise SourceDescriptionError(
+                    f"{path}.tool.runtime_restoration_profile_id must select a "
+                    "profile of the tool's model family"
+                )
         if "ai_models" in row:
             _validate_ai_models(
                 row["ai_models"],
@@ -2442,6 +2745,9 @@ def validate(source: Path, root: Path) -> None:
             _validate_pose_source(
                 row["pose_source"],
                 component_occurrence_id=row["component_occurrence_id"],
+                gripper_component_id=(
+                    tool_occurrence_id or row["component_occurrence_id"]
+                ),
                 path=f"{path}.pose_source",
             )
         runtime_profile_id = _identifier(
@@ -2472,6 +2778,7 @@ def validate(source: Path, root: Path) -> None:
                 assignment,
                 root=root,
                 component_occurrence_id=occurrence,
+                tool_occurrence_id=tool_occurrence_id,
                 path=f"{path}.program_role_assignments[{assignment_index}]",
             )
             for identifier in (scenario_id, *scenario_aliases):

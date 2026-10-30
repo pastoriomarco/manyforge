@@ -7,35 +7,19 @@
   },
   "description": "Mock pneumatic Lite6 pick and place. The separate Mock I/O device echoes the valve command to a synthetic workpiece input after 100 ms; this is not physical grasp evidence.",
   "members": {
-    "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
-    "deployment.yaml": "sha256:3e8d28f583d34f4ad6fbefea52a0563ea50a76266190594dd6d6114d3f2a65bf",
-    "program.yaml": "sha256:cd8564a4006fcff932368c55dec167b017996ac27fe09a710e7a1ab8faab4b14"
+    "assignment.yaml": "sha256:93bdcf8158dba12c73f5703fd35335a0aaf83a240e71a6296aa87e7431659d17",
+    "deployment.yaml": "sha256:0985db5900b35da2d5ff6c742b7d28d332ae0369b73eb1202e005efb75aed0c3",
+    "program.yaml": "sha256:813f828cae07d935b8497ce8dec569d3bb8abfbb267bf9308a5ffafc565cf482"
   },
   "name": "lite6_pneumatic_mock",
   "saved_status": {
-    "checked_content_digest": "sha256:0e20568c7499c5500a24326bf21d326778b65d1d28d5cefa06c228345b14da19",
+    "checked_content_digest": "sha256:e49ed393ef1808bd9b12d9ed0f076bfe76f636da599e8531d439de4e1950dba4",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
   "scenario_id": "lite6_pneumatic_mock",
   "source_snapshot": {
     "entries": [
-      {
-        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
-      },
-      {
-        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
-      },
-      {
-        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
-      },
-      {
-        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
-        "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
-      },
       {
         "content_digest": "sha256:ac91231b9338ecc99dc4f318854f3288d427dbf7d36d5f1a916b7cdb00e0ee8b",
         "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/collision/link1.stl"
@@ -93,12 +77,36 @@
         "source_id": "component:lite6_robot:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/lite6/visual/link_base.stl"
       },
       {
-        "content_digest": "sha256:c205bbe075021433ac03ead6e322d8567b65c8fc98d61a057faffec76b51c787",
+        "content_digest": "sha256:a4be77f1dc363ff0dfd0102f7921a81e09c838ca2d0e2581a829e081ee2f4f9e",
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
+        "content_digest": "sha256:71ab0f5c34f27aebd8dd84ef7da1fb80e6bd250bff0926d801d1dc5578b91349",
         "source_id": "component:lite6_robot:urdf"
+      },
+      {
+        "content_digest": "sha256:2a153d0e80df1f94240904daa83bed8e95e35a4b23aa81936828c49b57b13dbc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:dde70561a6ad271f8482971079a0df3624c03e66b53a957a3b38fb27aaf1a9ff",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/collision/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8a5d093619ff306ba55453158e76b2fc0c15c895f1f175da0bf9d434c6f2aabc",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_body.stl"
+      },
+      {
+        "content_digest": "sha256:5ef3546569f512f8c39b7b2b8d9c5f3bb1a61feb64ad50f3603c7676a001c66e",
+        "source_id": "component:lite_gripper:resource:package://manyforge_example_models/models/lite6_lite_gripper/meshes/gripper/lite/visual/gripper_lite_finger.stl"
+      },
+      {
+        "content_digest": "sha256:8f8b5daf8860c6a63f6806bab50772f914ba3503c322ffc96a8af303da41ab90",
+        "source_id": "component:lite_gripper:srdf"
+      },
+      {
+        "content_digest": "sha256:7b1d335778d48bf01e24c96a6ef1281f24f4efd105eb27b49bb9c29e6a3e573b",
+        "source_id": "component:lite_gripper:urdf"
       }
     ],
     "schema_version": "manyforge.scenario.source_snapshot.v1"

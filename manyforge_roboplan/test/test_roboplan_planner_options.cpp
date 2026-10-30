@@ -46,6 +46,44 @@ TEST(RoboPlanCompatibilityOptionsTest,
     EXPECT_DOUBLE_EQ(retry_rrt.collision_check_step_size, 0.01);
     EXPECT_DOUBLE_EQ(retry_shortcut.max_step_size, 0.01);
     EXPECT_EQ(retry_shortcut.seed, 42);
+  }
+}
+
+TEST(RoboPlanCompatibilityOptionsTest,
+     ConfiguredCollisionCheckStepDrivesTheFirstAttemptAndBoundsRetries) {
+  // M6 decision 18: the step is settable (Deployment collision_check_step_rad)
+  // and validation uses the same value. Retries keep the finer of it and 0.01.
+  EXPECT_DOUBLE_EQ(kDefaultCollisionCheckStepRad, 0.05);
+  const auto coarse = production_rrt_options("arm", 2.5, 0U, 0.08);
+  EXPECT_DOUBLE_EQ(coarse.collision_check_step_size, 0.08);
+  EXPECT_DOUBLE_EQ(production_shortcutting_options("arm", 42U, 0U, 0.08).max_step_size,
+                   0.08);
+  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 1U, 0.08).collision_check_step_size,
+                   0.01);
+  const auto fine = production_rrt_options("arm", 2.5, 0U, 0.004);
+  EXPECT_DOUBLE_EQ(fine.collision_check_step_size, 0.004);
+  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 2U, 0.004).collision_check_step_size,
+                   0.004);
+  EXPECT_DOUBLE_EQ(production_shortcutting_options("arm", 42U, 1U, 0.004).max_step_size,
+                   0.004);
+  // One rule, shared with validation of the attempt's trajectory.
+  for (const std::uint32_t attempt : {0U, 1U, 5U}) {
+    for (const double step : {0.08, 0.004}) {
+      EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, attempt, step).collision_check_step_size,
+                       collision_check_step_for_attempt(step, attempt));
+    }
+  }
+}
+
+TEST(RoboPlanCompatibilityOptionsTest,
+     FirstValidationRetryShortcutsAndLaterRetriesKeepTheDetour) {
+  // M6 clearance: validation with the clearance margin rejects a shortcut
+  // that skims an obstacle at a checked sample, so the first retry (attempt
+  // 1) shortcuts its 0.01-step detour; only a retry after that keeps the raw
+  // detour.
+  EXPECT_TRUE(shortcut_candidate_for_attempt(0U));
+  EXPECT_TRUE(shortcut_candidate_for_attempt(1U));
+  for (const std::uint32_t attempt : {2U, 3U, 17U}) {
     EXPECT_FALSE(shortcut_candidate_for_attempt(attempt));
   }
 }

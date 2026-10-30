@@ -2,6 +2,7 @@
 #include <cmath>
 #include <manyforge_core/stop_timing.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/timeouts.hpp>
 #include <limits>
 #include <map>
 #include <string>
@@ -31,6 +32,16 @@ Duration controlled_stop_deadline_ns(const MotionInterruptStopProfileDTO& profil
   const auto deceleration_ns = static_cast<Duration>(
       motion_interrupt_deceleration_time_or_default(profile) * 1e9);
   return deceleration_ns + std::max<Duration>(0, completion_tolerance_ns);
+}
+
+Duration stop_trajectory_no_report_ns(const double duration_s) {
+  return static_cast<Duration>(
+      std::llround(trajectory_execution_budget_s(std::max(0.0, duration_s)) * 1e9));
+}
+
+Duration controlled_stage_watchdog_ns(const Duration controlled_deadline_ns) {
+  return controlled_deadline_ns +
+         stop_trajectory_no_report_ns(static_cast<double>(controlled_deadline_ns) / 1e9);
 }
 
 Result<std::int64_t> authored_stop_duration_ns(const double seconds) {

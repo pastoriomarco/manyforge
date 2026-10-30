@@ -3787,6 +3787,34 @@
             ],
             "type": "object"
           },
+          "s_3864f0f550c9649f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_3eb46c08a10d222d": {
             "additionalProperties": false,
             "properties": {
@@ -4400,24 +4428,6 @@
               "$ref": "#/$defs/s_c4f541583e8cb501"
             }
           },
-          "s_8af27704f354f631": {
-            "additionalProperties": false,
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "target_role",
-              "frame_role"
-            ],
-            "type": "object"
-          },
           "s_91b394d4a0634330": {
             "allOf": [
               {
@@ -4676,6 +4686,11 @@
             ],
             "type": "object"
           },
+          "s_c17895f8dfef1072": {
+            "not": {
+              "$ref": "#/$defs/s_3864f0f550c9649f"
+            }
+          },
           "s_c4f541583e8cb501": {
             "allOf": [
               {
@@ -4736,6 +4751,135 @@
             "not": {
               "$ref": "#/$defs/s_fa490c14f1bfb3c5"
             }
+          },
+          "s_d1950a9c0295c58c": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "default_of_role"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "entry"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "default_of_role"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "current",
+                  "default_of_role",
+                  "entry"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           },
           "s_d6afc6287efb6c77": {
             "not": {
@@ -5836,6 +5980,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -6155,6 +6302,11 @@
                         ],
                         "type": "string"
                       },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "contact_policy_id": {
                         "type": "string"
                       },
@@ -6262,7 +6414,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "exclusiveMinimum": 0.0,
@@ -6290,6 +6442,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -6387,6 +6542,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -6459,6 +6617,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -6544,7 +6707,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -6572,6 +6735,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -6637,6 +6803,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
                   },
                   {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
@@ -6748,6 +6917,11 @@
                         ],
                         "type": "string"
                       },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "contact_policy_id": {
                         "type": "string"
                       },
@@ -6819,7 +6993,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -6847,6 +7021,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -7153,6 +7330,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "grasp_lost_rotation_rad"
                               ]
                             }
@@ -7277,6 +7484,21 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
+                      "carrier_frame": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "active_tcp"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
                       "carrier_frame_role": {
                         "type": "string",
                         "x-manyforge-semantic-scope-parameter": "target_role",
@@ -7341,6 +7563,9 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "carrier_frame": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "grasp_lost_rotation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -8791,6 +9016,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -9102,9 +9330,6 @@
                         ]
                       }
                     ]
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -9153,6 +9378,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -9261,7 +9491,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "exclusiveMinimum": 0.0,
@@ -9293,6 +9523,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -9392,6 +9625,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -9429,9 +9665,6 @@
                   },
                   {
                     "$ref": "#/$defs/s_9850a7b14b985051"
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -9480,6 +9713,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -9565,7 +9803,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -9598,6 +9836,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -9665,6 +9906,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
                   },
                   {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
@@ -9768,9 +10012,6 @@
                         ]
                       }
                     ]
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -9819,6 +10060,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -9891,7 +10137,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -9923,6 +10169,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -10300,6 +10549,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "grasp_lost_rotation_rad"
                               ]
                             }
@@ -10468,6 +10747,21 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
+                      "carrier_frame": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "active_tcp"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
                       "carrier_frame_role": {
                         "type": "string",
                         "x-manyforge-semantic-scope-parameter": "target_role",
@@ -10527,7 +10821,6 @@
                       }
                     },
                     "required": [
-                      "carrier_frame_role",
                       "target_role"
                     ],
                     "type": "object"
@@ -10536,6 +10829,9 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "carrier_frame": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "grasp_lost_rotation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -11508,34 +11804,6 @@
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
             }
           },
-          "s_2cb75010dc818a72": {
-            "oneOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "tcp_endpoint"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "tcp_endpoint"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -11783,6 +12051,34 @@
               "type"
             ],
             "type": "object"
+          },
+          "s_3864f0f550c9649f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_3eb46c08a10d222d": {
             "additionalProperties": false,
@@ -12425,24 +12721,6 @@
               "$ref": "#/$defs/s_c4f541583e8cb501"
             }
           },
-          "s_8af27704f354f631": {
-            "additionalProperties": false,
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "target_role",
-              "frame_role"
-            ],
-            "type": "object"
-          },
           "s_91b394d4a0634330": {
             "allOf": [
               {
@@ -12729,6 +13007,11 @@
             ],
             "type": "object"
           },
+          "s_c17895f8dfef1072": {
+            "not": {
+              "$ref": "#/$defs/s_3864f0f550c9649f"
+            }
+          },
           "s_c4f541583e8cb501": {
             "allOf": [
               {
@@ -12789,6 +13072,135 @@
             "not": {
               "$ref": "#/$defs/s_fa490c14f1bfb3c5"
             }
+          },
+          "s_d1950a9c0295c58c": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "default_of_role"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "entry"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "default_of_role"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "current",
+                  "default_of_role",
+                  "entry"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           },
           "s_d6afc6287efb6c77": {
             "not": {
@@ -14148,6 +14560,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -14459,9 +14874,6 @@
                         ]
                       }
                     ]
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -14510,6 +14922,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -14618,7 +15035,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "exclusiveMinimum": 0.0,
@@ -14650,6 +15067,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -14749,6 +15169,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
+                  },
+                  {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
                   },
                   {
@@ -14786,9 +15209,6 @@
                   },
                   {
                     "$ref": "#/$defs/s_9850a7b14b985051"
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -14837,6 +15257,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -14922,7 +15347,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -14955,6 +15380,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -15022,6 +15450,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "$ref": "#/$defs/s_c17895f8dfef1072"
                   },
                   {
                     "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
@@ -15125,9 +15556,6 @@
                         ]
                       }
                     ]
-                  },
-                  {
-                    "$ref": "#/$defs/s_2cb75010dc818a72"
                   }
                 ],
                 "properties": {
@@ -15176,6 +15604,11 @@
                           "disable"
                         ],
                         "type": "string"
+                      },
+                      "clearance_m": {
+                        "maximum": 0.05,
+                        "minimum": 0.0,
+                        "type": "number"
                       },
                       "contact_policy_id": {
                         "type": "string"
@@ -15248,7 +15681,7 @@
                         "x-manyforge-semantic-type": "target_role"
                       },
                       "tcp_endpoint": {
-                        "$ref": "#/$defs/s_8af27704f354f631"
+                        "$ref": "#/$defs/s_d1950a9c0295c58c"
                       },
                       "translation_tol_m": {
                         "minimum": 0.0,
@@ -15280,6 +15713,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "clearance_m": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "contact_scene_resource_id": {
@@ -15657,6 +16093,36 @@
                           "properties": {
                             "parameters": {
                               "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "carrier_frame"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
                                 "grasp_lost_rotation_rad"
                               ]
                             }
@@ -15825,6 +16291,21 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {
+                      "carrier_frame": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "active_tcp"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
                       "carrier_frame_role": {
                         "type": "string",
                         "x-manyforge-semantic-scope-parameter": "target_role",
@@ -15884,7 +16365,6 @@
                       }
                     },
                     "required": [
-                      "carrier_frame_role",
                       "target_role"
                     ],
                     "type": "object"
@@ -15893,6 +16373,9 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "carrier_frame": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "grasp_lost_rotation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -16865,34 +17348,6 @@
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
             }
           },
-          "s_2cb75010dc818a72": {
-            "oneOf": [
-              {
-                "properties": {
-                  "parameters": {
-                    "required": [
-                      "tcp_endpoint"
-                    ]
-                  }
-                },
-                "required": [
-                  "parameters"
-                ]
-              },
-              {
-                "properties": {
-                  "value_sources": {
-                    "required": [
-                      "tcp_endpoint"
-                    ]
-                  }
-                },
-                "required": [
-                  "value_sources"
-                ]
-              }
-            ]
-          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -17140,6 +17595,34 @@
               "type"
             ],
             "type": "object"
+          },
+          "s_3864f0f550c9649f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_3eb46c08a10d222d": {
             "additionalProperties": false,
@@ -17782,24 +18265,6 @@
               "$ref": "#/$defs/s_c4f541583e8cb501"
             }
           },
-          "s_8af27704f354f631": {
-            "additionalProperties": false,
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "target_role",
-              "frame_role"
-            ],
-            "type": "object"
-          },
           "s_91b394d4a0634330": {
             "allOf": [
               {
@@ -18086,6 +18551,11 @@
             ],
             "type": "object"
           },
+          "s_c17895f8dfef1072": {
+            "not": {
+              "$ref": "#/$defs/s_3864f0f550c9649f"
+            }
+          },
           "s_c4f541583e8cb501": {
             "allOf": [
               {
@@ -18146,6 +18616,135 @@
             "not": {
               "$ref": "#/$defs/s_fa490c14f1bfb3c5"
             }
+          },
+          "s_d1950a9c0295c58c": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "default_of_role"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "entry"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "default_of_role"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "current",
+                  "default_of_role",
+                  "entry"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           },
           "s_d6afc6287efb6c77": {
             "not": {
@@ -18911,6 +19510,34 @@
             ],
             "type": "object"
           },
+          "s_3864f0f550c9649f": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "clearance_m"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_3eebdde204507495": {
             "additionalProperties": false,
             "allOf": [
@@ -19631,24 +20258,6 @@
               "$ref": "#/$defs/s_c4f541583e8cb501"
             }
           },
-          "s_8af27704f354f631": {
-            "additionalProperties": false,
-            "properties": {
-              "frame_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "target_role": {
-                "type": "string",
-                "x-manyforge-semantic-type": "target_role"
-              }
-            },
-            "required": [
-              "target_role",
-              "frame_role"
-            ],
-            "type": "object"
-          },
           "s_91b394d4a0634330": {
             "allOf": [
               {
@@ -19921,6 +20530,11 @@
             ],
             "type": "object"
           },
+          "s_c17895f8dfef1072": {
+            "not": {
+              "$ref": "#/$defs/s_3864f0f550c9649f"
+            }
+          },
           "s_c4f541583e8cb501": {
             "allOf": [
               {
@@ -19981,6 +20595,135 @@
             "not": {
               "$ref": "#/$defs/s_fa490c14f1bfb3c5"
             }
+          },
+          "s_d1950a9c0295c58c": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "default_of_role"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "entry"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role",
+                    "target_role"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "default_of_role"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "role"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "kind": {
+                        "const": "entry"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "target_role"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "frame_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "kind": {
+                "enum": [
+                  "current",
+                  "default_of_role",
+                  "entry"
+                ],
+                "type": "string"
+              },
+              "role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              },
+              "target_role": {
+                "type": "string",
+                "x-manyforge-semantic-type": "target_role"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           },
           "s_d6afc6287efb6c77": {
             "not": {
@@ -21336,6 +22079,9 @@
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
               },
               {
+                "$ref": "#/$defs/s_c17895f8dfef1072"
+              },
+              {
                 "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
               },
               {
@@ -21684,6 +22430,11 @@
                     ],
                     "type": "string"
                   },
+                  "clearance_m": {
+                    "maximum": 0.05,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
                   "contact_policy_id": {
                     "type": "string"
                   },
@@ -21791,7 +22542,7 @@
                     "x-manyforge-semantic-type": "target_role"
                   },
                   "tcp_endpoint": {
-                    "$ref": "#/$defs/s_8af27704f354f631"
+                    "$ref": "#/$defs/s_d1950a9c0295c58c"
                   },
                   "translation_tol_m": {
                     "exclusiveMinimum": 0.0,
@@ -21819,6 +22570,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "clearance_m": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "contact_scene_resource_id": {
@@ -21914,6 +22668,9 @@
               },
               {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
+              },
+              {
+                "$ref": "#/$defs/s_c17895f8dfef1072"
               },
               {
                 "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
@@ -22018,6 +22775,11 @@
                     ],
                     "type": "string"
                   },
+                  "clearance_m": {
+                    "maximum": 0.05,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
                   "contact_policy_id": {
                     "type": "string"
                   },
@@ -22102,7 +22864,7 @@
                     "x-manyforge-semantic-type": "target_role"
                   },
                   "tcp_endpoint": {
-                    "$ref": "#/$defs/s_8af27704f354f631"
+                    "$ref": "#/$defs/s_d1950a9c0295c58c"
                   },
                   "translation_tol_m": {
                     "minimum": 0.0,
@@ -22130,6 +22892,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "clearance_m": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "contact_scene_resource_id": {
@@ -22195,6 +22960,9 @@
               },
               {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
+              },
+              {
+                "$ref": "#/$defs/s_c17895f8dfef1072"
               },
               {
                 "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
@@ -22335,6 +23103,11 @@
                     ],
                     "type": "string"
                   },
+                  "clearance_m": {
+                    "maximum": 0.05,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
                   "contact_policy_id": {
                     "type": "string"
                   },
@@ -22406,7 +23179,7 @@
                     "x-manyforge-semantic-type": "target_role"
                   },
                   "tcp_endpoint": {
-                    "$ref": "#/$defs/s_8af27704f354f631"
+                    "$ref": "#/$defs/s_d1950a9c0295c58c"
                   },
                   "translation_tol_m": {
                     "minimum": 0.0,
@@ -22434,6 +23207,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "clearance_m": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "contact_scene_resource_id": {
@@ -22856,6 +23632,36 @@
                       "properties": {
                         "parameters": {
                           "required": [
+                            "carrier_frame"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "carrier_frame"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
                             "grasp_lost_rotation_rad"
                           ]
                         }
@@ -23009,6 +23815,21 @@
               "parameters": {
                 "additionalProperties": false,
                 "properties": {
+                  "carrier_frame": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "active_tcp"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
                   "carrier_frame_role": {
                     "type": "string",
                     "x-manyforge-semantic-scope-parameter": "target_role",
@@ -23073,6 +23894,9 @@
                 "additionalProperties": false,
                 "minProperties": 1,
                 "properties": {
+                  "carrier_frame": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "grasp_lost_rotation_rad": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },

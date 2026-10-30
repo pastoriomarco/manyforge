@@ -12,9 +12,11 @@ from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.value_path import ValuePathError, parse_value_path
+from manyforge_behavior.tcp_migration import migrate_tcp_selectors
 from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
+    TcpEndpointAliasAmbiguous,
     catalog_version_compatible,
     check_draft_formulas,
 )
@@ -74,6 +76,14 @@ def adopt_active_catalog(authoring: dict[str, Any], catalog: NodeCatalog) -> Non
             selected.get("content_version"), catalog.content_version
         )
     ):
+        if selected.get("content_version") == "2.8.0" and catalog.content_version == "2.9.0":
+            roots = authoring.get("forest")
+            if type(roots) is list and all(type(root) is dict for root in roots):
+                ambiguous = migrate_tcp_selectors(
+                    (node for node, _path, _parent in _walk(roots)), authoring
+                )
+                if ambiguous:
+                    raise TcpEndpointAliasAmbiguous(ambiguous)
         selected["content_version"] = catalog.content_version
 
 

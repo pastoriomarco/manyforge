@@ -108,7 +108,7 @@ export function scenarioCloseUncertainOutputRefusal(outputs: readonly UncertainO
   if (outputs.length === 0) return null;
   return `Output write(s) with unknown acceptance are retained: ${outputs.map((output) => output.label).join(', ')}. `
     + 'Close never acknowledges them. Disable and Enable the I/O device, then Reset each operation and confirm each output '
-    + `(${UNCERTAIN_OUTPUT_WARNING.toLowerCase()}), and Close again.`;
+    + `(${UNCERTAIN_OUTPUT_WARNING.toLowerCase()}), and Close again. If the device cannot be re-synced, use Force close.`;
 }
 
 export function allUncertainOutputsApproved(

@@ -146,7 +146,7 @@ struct RouteReadinessPublicationRowDTO final {
     const RouteReadinessPublicationRowDTO& lhs,
     const RouteReadinessPublicationRowDTO& rhs) noexcept;
 
-/// Receipt returned only after configuration, base-plan repository, sealed
+/// Receipt returned only after configuration, resolved base plan, sealed
 /// readiness, and Kernel registration readback all agree.
 struct RouteReadinessPublicationReceiptDTO final {
   RouteSelectionTransactionId route_selection_transaction_id;

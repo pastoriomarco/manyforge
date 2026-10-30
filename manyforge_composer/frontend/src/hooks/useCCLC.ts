@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api, ApiError } from '../api/client';
+import { api, ApiError, apiErrorCode } from '../api/client';
 import type {
   CCLCExpectedActiveConfiguration,
   CCLCComponentSnapshot,
@@ -13,6 +13,7 @@ import type {
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
+import type { DeploymentWorkspaceResponse } from '../types/api';
 import type { ExecutionIdentity } from '../types/robotControl';
 import { readinessBlockerPresentation } from '../state/componentLifecyclePresentation';
 
@@ -29,9 +30,16 @@ class ComponentReadChanged extends Error {
 }
 
 export interface ActivationSequenceObservation {
-  /** Applied configuration, configured IDs, CCLC/execution owners and publication. */
+  /** GUI-owned identity used by Execute, or the existing deactivation fence. */
   identity: string;
+  activationOrder: AppliedActivationOrder;
   components: CCLCComponentSnapshot[];
+}
+
+export type AppliedActivationOrder = NonNullable<DeploymentWorkspaceResponse['managerApplied']['activationOrder']>;
+
+function activationOrderIdentity(order: AppliedActivationOrder): string {
+  return JSON.stringify([order.retainedBundleId, order.graphRevision, order.componentIds]);
 }
 
 export interface CCLCController {
@@ -50,14 +58,16 @@ export interface CCLCController {
   dismissError: () => void;
   submitLifecycle: (intent: CCLCLifecycleIntent) => Promise<void>;
   activate: () => Promise<void>;
-  activateSequence: (expectedIdentity?: string) => Promise<boolean>;
+  activateSequence: (expectedIdentity?: string, activationOrder?: AppliedActivationOrder) => Promise<boolean>;
   /** Ordinary Disable of each listed component, in the given order, each with a
    * positive Disabled observation; stops at the first failure (Q107 Apply).
    * On success, `consumedAdmissionGeneration` is the authoring admission the
    * last Disable used (null when nothing was disabled): a following request
    * must wait for a newer one. */
   deactivateComponents: (componentIds: readonly string[], expectedIdentity: string) => Promise<DeactivationResult>;
-  readActivationSequence: (signal?: AbortSignal) => Promise<ActivationSequenceObservation>;
+  readActivationSequence: (
+    signal?: AbortSignal, purpose?: 'execute' | 'deactivation',
+  ) => Promise<ActivationSequenceObservation>;
   cancelActivation: () => void;
   activationProgress: string | null;
   componentHealth: Record<string, { snapshot: CCLCComponentSnapshot | null; error: string | null }>;
@@ -221,15 +231,8 @@ export async function activateThroughOrdinaryLifecycle(
   const initial = await read();
   const check = async () => {
     const current = await read();
-    if (current.ownerEpoch !== initial.ownerEpoch
-      || current.snapshot.controllableComponentId !== initial.snapshot.controllableComponentId
-      || current.snapshot.retainedBundleId !== initial.snapshot.retainedBundleId
-      || current.snapshot.graphRevision !== initial.snapshot.graphRevision) {
-      throw new Error('Activation stopped: owner or applied configuration changed.');
-    }
-    if (current.snapshot.publicationGeneration !== initial.snapshot.publicationGeneration
-      || current.snapshot.activePublicPointerDigest !== initial.snapshot.activePublicPointerDigest) {
-      throw new Error('Activation stopped: applied publication changed.');
+    if (current.snapshot.controllableComponentId !== initial.snapshot.controllableComponentId) {
+      throw new Error('Activation stopped: the component changed.');
     }
     return current.snapshot;
   };
@@ -326,6 +329,7 @@ export function useCCLC(
   const activationAbort = useRef<AbortController | null>(null);
   const passiveAbort = useRef<AbortController | null>(null);
   const admissionRef = useRef(admissionGeneration);
+  const lastKnownAdmissionGeneration = useRef<number | null>(admissionGeneration);
   const selectedRef = useRef(controllableComponentId);
   selectedRef.current = controllableComponentId;
   const configuredKey = JSON.stringify(configuredComponentIds ?? (controllableComponentId ? [controllableComponentId] : []));
@@ -336,10 +340,19 @@ export function useCCLC(
     setComponentHealth((previous) => Object.fromEntries(ids.map((id) => [id,
       previous[id] ?? { snapshot: null, error: 'Current component health has not been read.' }])));
   }
-  const configuredRef = useRef(configuredKey);
+  // Keep the last explicitly observed Deployment component set across an
+  // unavailable (`undefined`) projection. An explicit empty list is known.
+  const configuredRef = useRef<string | null>(
+    configuredComponentIds === undefined ? null : configuredKey,
+  );
+  const activationConfiguredRef = useRef<string | null>(null);
   const currentReads = useRef(new Map<string, object>());
-  configuredRef.current = configuredKey;
+  if (configuredComponentIds !== undefined) {
+    configuredRef.current = JSON.stringify(configuredComponentIds);
+  }
+  const configuredSequenceKey = configuredRef.current;
   admissionRef.current = admissionGeneration;
+  if (admissionGeneration !== null) lastKnownAdmissionGeneration.current = admissionGeneration;
   useEffect(() => () => activationAbort.current?.abort(new Error('Activation stopped: client disconnected.')), [enabled]);
 
   const setControllableComponentId = useCallback((value: string) => {
@@ -352,8 +365,9 @@ export function useCCLC(
 
   const readCurrent = useCallback(async (
     signal?: AbortSignal, addressedComponent?: string, publishSelected = true,
-    validate?: (snapshot: CCLCComponentSnapshot, ownerEpoch: string, executionOwnerEpoch: string) => void,
+    validate?: (snapshot: CCLCComponentSnapshot, ownerEpoch: string, executionOwnerEpoch: string | null) => void,
     observeComponentReadChanges = false,
+    skipExecutionIdentity = false,
   ) => {
     if (!enabled) throw new Error('CCLC client is unavailable');
     const identity = (addressedComponent ?? controllableComponentId).trim();
@@ -361,12 +375,14 @@ export function useCCLC(
     const marker = {};
     currentReads.current.set(identity, marker);
     try {
-      const execution = await api.execution.identity(signal);
+      const execution = skipExecutionIdentity ? null : await api.execution.identity(signal);
       signal?.throwIfAborted();
-      const unavailableReason = cclcControlModeUnavailableReason(
-        execution.controlManagementMode,
-      );
-      if (unavailableReason !== null) throw new Error(unavailableReason);
+      if (execution !== null) {
+        const unavailableReason = cclcControlModeUnavailableReason(
+          execution.controlManagementMode,
+        );
+        if (unavailableReason !== null) throw new Error(unavailableReason);
+      }
       const [owner, nextSnapshot] = await Promise.all([
         api.cclc.owner(signal),
         observeComponentReadChanges ? api.cclc.component(identity, signal).catch((reason: unknown) => {
@@ -379,9 +395,12 @@ export function useCCLC(
         }) : api.cclc.component(identity, signal),
       ]);
       signal?.throwIfAborted();
-      const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
+      // L3 applies only to activation verify; other reads keep their old
+      // torn-projection check and typed refusal.
+      const ownerEpoch = skipExecutionIdentity
+        ? owner.requestOwnerEpoch : cclcRequestOwnerEpoch(owner, nextSnapshot, execution!);
       if (nextSnapshot.controllableComponentId !== identity) throw new Error('CCLC component identity does not match its request');
-      validate?.(nextSnapshot, ownerEpoch, execution.ownerEpoch);
+      validate?.(nextSnapshot, ownerEpoch, execution?.ownerEpoch ?? null);
       let nextTemplates: CCLCRouteTemplateSet = {
         controllableComponentId: nextSnapshot.controllableComponentId,
         retainedBundleId: nextSnapshot.retainedBundleId,
@@ -404,9 +423,10 @@ export function useCCLC(
       if (publishSelected && selectedRef.current === identity) {
         setSnapshot(nextSnapshot);
         setRouteTemplates(nextTemplates);
-        setReadUnavailableReason(null);
+        if (!skipExecutionIdentity) setReadUnavailableReason(null);
       }
-      return { snapshot: nextSnapshot, templates: nextTemplates, ownerEpoch, executionOwnerEpoch: execution.ownerEpoch };
+      return { snapshot: nextSnapshot, templates: nextTemplates, ownerEpoch,
+        executionOwnerEpoch: execution?.ownerEpoch ?? null };
     } catch (reason) {
       if (!(reason instanceof ComponentReadChanged)
         && !signal?.aborted && currentReads.current.get(identity) === marker) {
@@ -446,18 +466,22 @@ export function useCCLC(
     setBusy(true);
     setError(null);
     try {
-      if (admissionGeneration === null) {
-        throw new Error('Current authoring admission is unavailable');
-      }
+      // M6 (item 36): Recover acknowledges only the incident on screen.
+      const shown = snapshot?.lifecycleProgress?.incident ?? null;
       const current = await readCurrent();
-      const result = await api.cclc.submitLifecycle(
-        lifecycleRequestFromSnapshot(
-          current.snapshot,
-          intent,
-          requestContext(current.ownerEpoch, `lifecycle:${intent}`),
-          admissionGeneration,
-        ),
+      const generation = admissionRef.current ?? lastKnownAdmissionGeneration.current;
+      if (generation === null) throw new Error('Current authoring admission is unavailable.');
+      const request = lifecycleRequestFromSnapshot(
+        current.snapshot,
+        intent,
+        requestContext(current.ownerEpoch, `lifecycle:${intent}`),
+        generation,
       );
+      if (intent === 'recover' && shown !== null
+        && snapshot?.controllableComponentId === current.snapshot.controllableComponentId) {
+        request.expected_incident_id = shown.incidentId;
+      }
+      const result = await api.cclc.submitLifecycle(request);
       if (result.incidentRecovery !== null) {
         // Authorization-only Recover of an open incident: nothing to track;
         // re-read the closed incident and retained evidence.
@@ -472,16 +496,26 @@ export function useCCLC(
       setTransaction(result.status);
       setPendingTransaction({ kind: 'lifecycle', id: result.transactionId });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Lifecycle request failed');
+      if (apiErrorCode(reason) === 'cclc_incident_changed') {
+        // Nothing was acknowledged; show the current incident instead.
+        setError('The incident changed since it was shown. Review the current incident, '
+          + 'then press Recover again.');
+        await readCurrent().catch(() => undefined);
+      } else {
+        setError(reason instanceof Error ? reason.message : 'Lifecycle request failed');
+      }
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [admissionGeneration, readCurrent]);
+  }, [admissionGeneration, readCurrent, snapshot]);
 
   // A finite, fresh read of ALL Applied components; never infer readiness from
   // the passive display cache or retry a stale read on the Execute path.
-  const readActivationSequence = useCallback(async (signal?: AbortSignal): Promise<ActivationSequenceObservation> => {
+  const readActivationSequence = useCallback(async (
+    signal?: AbortSignal,
+    purpose: 'execute' | 'deactivation' = 'deactivation',
+  ): Promise<ActivationSequenceObservation> => {
     if (activationAbort.current !== null || activationRequest.current !== null || acceptedActivation.current !== null
       || (pendingTransaction !== null && (transaction?.terminalResult == null || transaction.reconciliationRequired)) || busyRef.current) {
       throw new Error('Component lifecycle work is busy or requires reconciliation.');
@@ -490,41 +524,76 @@ export function useCCLC(
     busyRef.current = true;
     setBusy(true);
     try {
-      const configured = configuredRef.current;
+      const configuredAtStart = configuredRef.current;
       const applied = (await api.deploymentWorkspace.get(signal)).managerApplied;
       const order = applied.activationOrder;
       if (order === null) throw new Error('Applied activation order is unavailable; no captured Deployment.');
-      const owner = await api.cclc.owner(signal);
+      const configured = purpose === 'execute' && configuredAtStart === null
+        ? JSON.stringify(order.componentIds) : configuredAtStart;
+      if (purpose === 'execute' && configuredAtStart === null
+        && configuredRef.current !== null && configuredRef.current !== configured) {
+        throw new Error('Activation stopped: configured components changed.');
+      }
+      const owner = purpose === 'deactivation' ? await api.cclc.owner(signal) : null;
       let executionOwnerEpoch: string | null = null;
       let publication: { generation: number; pointerDigest: string } | null = null;
       const components: CCLCComponentSnapshot[] = [];
       for (const id of order.componentIds) {
         const current = await readCurrent(signal, id, false, (next, ownerEpoch, hostOwnerEpoch) => {
-          if (ownerEpoch !== owner.requestOwnerEpoch || next.retainedBundleId !== order.retainedBundleId
-            || next.graphRevision !== order.graphRevision
+          if (next.controllableComponentId !== id
+            || next.retainedBundleId !== order.retainedBundleId
+            || next.graphRevision !== order.graphRevision) {
+            throw new Error('Activation stopped: the component or applied configuration changed.');
+          }
+          if (purpose === 'deactivation' && (ownerEpoch !== owner?.requestOwnerEpoch
             || (executionOwnerEpoch !== null && executionOwnerEpoch !== hostOwnerEpoch)
             || (publication !== null && (next.publicationGeneration !== publication.generation
-              || next.activePublicPointerDigest !== publication.pointerDigest))) {
+              || next.activePublicPointerDigest !== publication.pointerDigest)))) {
             throw new Error('Activation stopped: owner or applied configuration changed.');
           }
-          executionOwnerEpoch ??= hostOwnerEpoch;
-          publication ??= { generation: next.publicationGeneration, pointerDigest: next.activePublicPointerDigest };
-        });
+          if (purpose === 'deactivation') {
+            executionOwnerEpoch ??= hostOwnerEpoch;
+            publication ??= { generation: next.publicationGeneration, pointerDigest: next.activePublicPointerDigest };
+          }
+        }, false);
         components.push(current.snapshot);
       }
       const fresh = (await api.deploymentWorkspace.get(signal)).managerApplied;
       signal?.throwIfAborted();
-      if (configuredRef.current !== configured || JSON.stringify(fresh) !== JSON.stringify(applied)) {
-        throw new Error('Activation stopped: applied configuration changed.');
+      if ((configuredRef.current !== null && configuredRef.current !== configured)
+        || (purpose === 'deactivation' && configuredRef.current !== configured)) {
+        throw new Error('Activation stopped: configured components changed.');
       }
-      return { identity: JSON.stringify([configured, applied, owner.requestOwnerEpoch, executionOwnerEpoch, publication]), components };
+      if (purpose === 'deactivation') {
+        if (JSON.stringify(fresh) !== JSON.stringify(applied)) {
+          throw new Error('Activation stopped: applied configuration changed.');
+        }
+      } else {
+        if (fresh.activationOrder === null) {
+          throw new Error('Applied activation order is unavailable; no captured Deployment.');
+        }
+        if (activationOrderIdentity(fresh.activationOrder) !== activationOrderIdentity(order)) {
+          throw new Error('Activation stopped: applied configuration changed.');
+        }
+      }
+      return {
+        identity: purpose === 'execute'
+          ? JSON.stringify([configured, activationOrderIdentity(order)])
+          : JSON.stringify([configured, applied, owner?.requestOwnerEpoch, executionOwnerEpoch, publication]),
+        activationOrder: order,
+        components,
+      };
     } finally {
       busyRef.current = false;
       setBusy(false);
     }
   }, [busy, pendingTransaction, readCurrent, transaction]);
 
-  const runActivation = useCallback(async (sequence: boolean, expectedIdentity?: string): Promise<boolean> => {
+  const runActivation = useCallback(async (
+    sequence: boolean,
+    expectedIdentity?: string,
+    confirmedOrder?: AppliedActivationOrder,
+  ): Promise<boolean> => {
     if (activationAbort.current !== null || activationRequest.current !== null || acceptedActivation.current !== null
       || (pendingTransaction !== null && (transaction?.terminalResult == null || transaction.reconciliationRequired)) || busyRef.current) {
       setError('Component lifecycle work is busy or requires reconciliation.');
@@ -539,72 +608,67 @@ export function useCCLC(
     setActivationRefusal(null);
     let refusal: CCLCController['activationRefusal'] = null;
     try {
-      const applied = sequence ? (await api.deploymentWorkspace.get(abort.signal)).managerApplied : null;
-      const order = applied?.activationOrder ?? null;
+      if (!sequence && snapshot === null) {
+        throw new Error(readUnavailableReason ?? 'Activation stopped: current component state is unavailable.');
+      }
+      const freshOrder = sequence
+        ? (await api.deploymentWorkspace.get(abort.signal)).managerApplied.activationOrder
+        : null;
+      if (sequence && freshOrder === null) {
+        throw new Error('Applied activation order is unavailable; no captured Deployment.');
+      }
+      const order = confirmedOrder ?? freshOrder;
       if (sequence && order === null) throw new Error('Applied activation order is unavailable; no captured Deployment.');
-      const owner = await api.cclc.owner(abort.signal);
       abort.signal.throwIfAborted();
-      const capturedConfigured = configuredRef.current;
+      const capturedConfigured = sequence && order !== null
+        ? configuredRef.current ?? JSON.stringify(order.componentIds)
+        : configuredRef.current;
+      if (sequence && expectedIdentity !== undefined
+        && (confirmedOrder === undefined
+          || expectedIdentity !== JSON.stringify([capturedConfigured, activationOrderIdentity(confirmedOrder)]))) {
+        throw new Error('Activation stopped: the confirmed component set changed.');
+      }
+      if (sequence && confirmedOrder !== undefined && freshOrder !== null
+        && activationOrderIdentity(freshOrder) !== activationOrderIdentity(confirmedOrder)) {
+        throw new Error('Activation stopped: applied configuration changed.');
+      }
+      if (sequence) activationConfiguredRef.current = capturedConfigured;
       const ids = order === null ? [controllableComponentId] : order.componentIds;
-      let executionOwnerEpoch: string | null = null;
-      let publication: { generation: number; pointerDigest: string } | null = null;
+      let lastAdmissionGeneration = admissionRef.current ?? lastKnownAdmissionGeneration.current;
       const finalReads: Array<() => Promise<{ snapshot: CCLCComponentSnapshot }>> = [];
       await activateOrderedComponents(ids, async (id) => {
-        let binding: { controllableComponentId: string; retainedBundleId: string; graphRevision: string; ownerEpoch: string;
-          publicationGeneration: number; activePublicPointerDigest: string } | null = !sequence && snapshot !== null
-          ? { controllableComponentId: snapshot.controllableComponentId, retainedBundleId: snapshot.retainedBundleId,
-            graphRevision: snapshot.graphRevision, ownerEpoch: snapshot.readiness.requestOwnerEpoch,
-            publicationGeneration: snapshot.publicationGeneration, activePublicPointerDigest: snapshot.activePublicPointerDigest } : null;
+        let binding: Pick<CCLCComponentSnapshot, 'controllableComponentId' | 'retainedBundleId' | 'graphRevision'> | null = !sequence && snapshot !== null
+          ? { controllableComponentId: snapshot.controllableComponentId,
+            retainedBundleId: snapshot.retainedBundleId, graphRevision: snapshot.graphRevision } : null;
         const verify = async () => {
           while (true) {
             try {
               abort.signal.throwIfAborted();
-              if (configuredRef.current !== capturedConfigured) throw new Error('Activation stopped: configured components changed.');
-              if (applied !== null) {
-                const fresh = (await api.deploymentWorkspace.get(abort.signal)).managerApplied;
-                if (JSON.stringify(fresh) !== JSON.stringify(applied)) {
-                  throw new Error('Activation stopped: applied configuration changed.');
-                }
+              if (sequence
+                ? configuredRef.current !== null && configuredRef.current !== capturedConfigured
+                : configuredRef.current !== capturedConfigured) {
+                throw new Error('Activation stopped: configured components changed.');
               }
-              const current = await readCurrent(abort.signal, id, !sequence, (next, ownerEpoch, hostOwnerEpoch) => {
-                if (publication !== null && (next.publicationGeneration !== publication.generation
-                  || next.activePublicPointerDigest !== publication.pointerDigest)) {
-                  throw new Error('Activation stopped: applied publication changed.');
-                }
-                publication ??= { generation: next.publicationGeneration, pointerDigest: next.activePublicPointerDigest };
-                if (executionOwnerEpoch !== null && hostOwnerEpoch !== executionOwnerEpoch) {
-                  throw new Error('Activation stopped: execution owner changed.');
-                }
-                executionOwnerEpoch ??= hostOwnerEpoch;
-                if (ownerEpoch !== owner.requestOwnerEpoch
-                  || (order !== null && (next.retainedBundleId !== order.retainedBundleId
+              const current = await readCurrent(abort.signal, id, !sequence, (next) => {
+                if (order !== null && (next.retainedBundleId !== order.retainedBundleId
                     || next.graphRevision !== order.graphRevision
-                    || !order.componentIds.includes(id)))) {
-                  throw new Error('Activation stopped: owner or component identity changed.');
+                    || !order.componentIds.includes(id))) {
+                  throw new Error('Activation stopped: the component or applied configuration changed.');
                 }
                 const identity = {
                   controllableComponentId: next.controllableComponentId,
                   retainedBundleId: next.retainedBundleId,
                   graphRevision: next.graphRevision,
-                  ownerEpoch,
-                  publicationGeneration: next.publicationGeneration,
-                  activePublicPointerDigest: next.activePublicPointerDigest,
                 };
-                if (binding !== null && (identity.controllableComponentId !== binding.controllableComponentId
-                  || identity.retainedBundleId !== binding.retainedBundleId
-                  || identity.graphRevision !== binding.graphRevision
-                  || identity.ownerEpoch !== binding.ownerEpoch
-                  || identity.publicationGeneration !== binding.publicationGeneration
-                  || identity.activePublicPointerDigest !== binding.activePublicPointerDigest)) {
-                  throw new Error('Activation stopped: owner or applied configuration changed.');
+                if (binding !== null && identity.controllableComponentId !== binding.controllableComponentId) {
+                  throw new Error('Activation stopped: the component changed.');
+                }
+                if (binding !== null && (identity.retainedBundleId !== binding.retainedBundleId
+                    || identity.graphRevision !== binding.graphRevision)) {
+                  throw new Error('Activation stopped: applied configuration changed.');
                 }
                 binding ??= identity;
-                if (expectedIdentity !== undefined
-                  && JSON.stringify([capturedConfigured, applied, owner.requestOwnerEpoch,
-                    executionOwnerEpoch, publication]) !== expectedIdentity) {
-                  throw new Error('Activation stopped: owner or applied configuration changed.');
-                }
-              }, true);
+              }, true, sequence);
               abort.signal.throwIfAborted();
               return current;
             } catch (reason) {
@@ -624,10 +688,15 @@ export function useCCLC(
           }
           if (current.snapshot.readiness.nextIntent !== intent) throw new Error('Activation stopped: lifecycle step changed.');
           abort.signal.throwIfAborted();
-          const generation = admissionRef.current;
-          if (generation === null) throw new Error('Current authoring admission is unavailable.');
+          const currentGeneration = admissionRef.current ?? lastKnownAdmissionGeneration.current;
+          if (currentGeneration !== null) {
+            lastAdmissionGeneration = currentGeneration;
+          }
+          if (lastAdmissionGeneration === null) {
+            throw new Error('Current authoring admission is unavailable.');
+          }
           const request = lifecycleRequestFromSnapshot(
-            current.snapshot, intent, requestContext(current.ownerEpoch, `activate:${id}:${intent}`), generation,
+            current.snapshot, intent, requestContext(current.ownerEpoch, `activate:${id}:${intent}`), lastAdmissionGeneration,
           );
           // Retain the exact readback address BEFORE dispatch; abort is not proof
           // that the owner did not accept the effect.
@@ -647,7 +716,7 @@ export function useCCLC(
           }
           const rememberRefusal = (status: CCLCTransactionStatus | null) => {
             if (intent === 'prepare' && status?.transactionId === result.transactionId
-              && status.terminalResult === 'failed_known_no_effect' && !status.reconciliationRequired
+              && status.terminalResult === 'failed' && !status.reconciliationRequired
               && status.error?.code === 'component_lifecycle_transition_missing'
               && status.error.details.reason === 'no_transition_satisfied') {
               refusal = { controllableComponentId: request.controllable_component_id,
@@ -696,11 +765,12 @@ export function useCCLC(
       setError(refusal !== null ? null : reason instanceof Error ? reason.message : 'Activation outcome is unknown.');
       return false;
     } finally {
+      if (sequence) activationConfiguredRef.current = null;
       activationAbort.current = null;
       busyRef.current = false;
       setBusy(false);
     }
-  }, [busy, controllableComponentId, pendingTransaction, readCurrent, snapshot, transaction]);
+  }, [busy, controllableComponentId, pendingTransaction, readCurrent, readUnavailableReason, snapshot, transaction]);
 
   // The mirror of the activation sequence for a configuration Apply that changes
   // components (Q107): the ordinary Disable per component, never anything else.
@@ -768,7 +838,7 @@ export function useCCLC(
           continue;
         }
         setActivationProgress(`Deactivating ${id}`);
-        const generation = admissionRef.current;
+        const generation = admissionRef.current ?? lastKnownAdmissionGeneration.current;
         if (generation === null) throw new Error('Current authoring admission is unavailable.');
         const request = lifecycleRequestFromSnapshot(
           current.snapshot, 'disable', requestContext(current.ownerEpoch, `deactivate:${id}`), generation,
@@ -826,9 +896,6 @@ export function useCCLC(
     setBusy(true);
     setError(null);
     try {
-      if (admissionGeneration === null) {
-        throw new Error('Current authoring admission is unavailable');
-      }
       const current = await readCurrent();
       const selected = current.templates.templates.find(
         (candidate) => candidate.desired_configuration.control_domain_id
@@ -837,6 +904,8 @@ export function useCCLC(
       if (selected === undefined) {
         throw new Error('Selected route is absent from the fresh projection');
       }
+      const generation = admissionRef.current ?? lastKnownAdmissionGeneration.current;
+      if (generation === null) throw new Error('Current authoring admission is unavailable.');
       const result = await api.cclc.submitRoute(
         routeRequestFromTemplate(
           current.templates,
@@ -845,7 +914,7 @@ export function useCCLC(
             current.ownerEpoch,
             `route:${selected.desired_configuration.control_domain_id}`,
           ),
-          admissionGeneration,
+          generation,
         ),
       );
       if (result.transactionId === null) {
@@ -912,8 +981,15 @@ export function useCCLC(
   const transactionOpen = pendingTransaction !== null && (transaction?.terminalResult == null || transaction.reconciliationRequired);
   const observing = enabled && JSON.parse(configuredKey).length > 0 && !busy && !transactionOpen;
   useEffect(() => {
-    return () => activationAbort.current?.abort(new Error('Activation stopped: configured components changed.'));
-  }, [configuredKey]);
+    const hadKnownConfiguredSet = configuredSequenceKey !== null;
+    return () => {
+      const activeConfiguredSet = activationConfiguredRef.current;
+      if (hadKnownConfiguredSet || (activeConfiguredSet !== null
+        && configuredRef.current !== null && configuredRef.current !== activeConfiguredSet)) {
+        activationAbort.current?.abort(new Error('Activation stopped: configured components changed.'));
+      }
+    };
+  }, [configuredSequenceKey]);
   useEffect(() => {
     if (!observing) return undefined;
     let active = true;
@@ -1002,7 +1078,7 @@ export function useCCLC(
     dismissError: () => setError(null),
     submitLifecycle,
     activate: async () => { await runActivation(false); },
-    activateSequence: (expectedIdentity) => runActivation(true, expectedIdentity),
+    activateSequence: (expectedIdentity, activationOrder) => runActivation(true, expectedIdentity, activationOrder),
     deactivateComponents,
     readActivationSequence,
     cancelActivation: () => activationAbort.current?.abort(new Error('Activation sequence cancelled; accepted work remains observable.')),

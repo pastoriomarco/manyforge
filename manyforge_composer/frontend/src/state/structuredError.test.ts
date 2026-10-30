@@ -34,23 +34,23 @@ describe('structured error display', () => {
   it('does not repeat a reason or reference the owner message already names', () => {
     // describe_owner_failure: the Runner message names details.reason and the reference.
     expect(structuredErrorText({
-      code: 'stale_generation',
-      message: "cell-admission request rejected (expected_generation_stale; reference frame_role 'tool0' of target role 'arm')",
+      code: 'request_ledger_full',
+      message: "cell-admission request rejected (claim_capacity_exhausted; reference frame_role 'tool0' of target role 'arm')",
       details: {
-        reason: 'expected_generation_stale',
+        reason: 'claim_capacity_exhausted',
         reference_type: 'frame_role',
         reference_id: 'tool0',
         target_role_id: 'arm',
       },
       origin: { kind: 'owner', nodeInstanceId: 'move', ownerApi: 'kernel.cell_admission' },
     })).toBe(
-      "cell-admission request rejected (expected_generation_stale; reference frame_role 'tool0' of target role 'arm')"
+      "cell-admission request rejected (claim_capacity_exhausted; reference frame_role 'tool0' of target role 'arm')"
         + " (Origin: kernel.cell_admission for node 'move')",
     );
     // Only a whole-token mention counts as named.
     expect(structuredErrorRows({
-      details: { reason: 'stale' }, origin: null,
-    }, 'expected_generation_stale')).toEqual([{ label: 'Reason', value: 'stale' }]);
+      details: { reason: 'capacity' }, origin: null,
+    }, 'claim_capacity_exhausted')).toEqual([{ label: 'Reason', value: 'capacity' }]);
   });
 
   it('labels a node input failure', () => {

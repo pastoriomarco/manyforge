@@ -27,6 +27,12 @@ also writes a JSONL audit file.
   duration_ms, client) plus service-level INFO/WARNING/ERROR, from
   `manyforge_composer/backend/logging_config.py`. `uvicorn.access` is quieted
   to WARNING. The level is INFO by default (Composer's `--log-level` option).
+- **Lifecycle results**: Prepare, Enable, Disable and Recover return
+  `succeeded`, `failed` with a typed reason, or `connection_lost`. The CCLC
+  result and feedback include the substeps reported by the adapter and their
+  outcomes, for example the clear and controller steps of a Real arm's
+  Prepare. After a dispatched failure, the next lifecycle action is based on
+  the component's current status.
 
 ### Assistant bridge audit
 

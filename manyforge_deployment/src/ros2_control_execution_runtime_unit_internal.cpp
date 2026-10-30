@@ -1,3 +1,4 @@
+#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
@@ -446,16 +447,29 @@ std::string ros2_control_execution_runtime_profile_revision() {
 }
 
 void require_no_exclusive_ros_controller_topic_collision(
-    const CanonicalValue::Array &controller_profiles) {
+    const CanonicalValue::Array &controller_profiles,
+    const CanonicalValue::Array &motion_target_limits) {
   // Existing lite6/ur10e profile facts: both use these global command/state
   // topics. Adding a profile with different topics must extend these facts.
+  // Merge 6: only an arm owns them; a tool (no motion target) declares its
+  // own joints from the robot's shared Isaac joint states.
+  std::set<std::string> arms;
+  for (const auto &row : motion_target_limits) {
+    if (const auto *component = row.find_object_member("controllable_component_id");
+        component != nullptr && component->is_string())
+      arms.insert(component->as_string());
+  }
   std::map<std::string_view, std::string> owners;
   for (const auto &row : controller_profiles) {
     const auto *isaac = row.find_object_member("isaac_profile");
     if (isaac == nullptr)
       continue;
+    // Merge 6: the robot and tool rows of
+    // retained_isaac_ros2_control_profile.cpp.
     if (!isaac->is_string() ||
-        (isaac->as_string() != "lite6" && isaac->as_string() != "ur10e")) {
+        (isaac->as_string() != "lite6" && isaac->as_string() != "ur10e" &&
+         isaac->as_string() != "lite_gripper" &&
+         isaac->as_string() != "robotiq_2f_140")) {
       fail_retained_bundle("unsupported Isaac controller profile");
     }
     const auto *component = row.find_object_member("controllable_component_id");
@@ -463,6 +477,8 @@ void require_no_exclusive_ros_controller_topic_collision(
       fail_retained_bundle(
           "ROS controller profile lacks its component identity");
     }
+    if (!arms.contains(component->as_string()))
+      continue;
     for (const std::string_view topic :
          {"/isaac_joint_commands", "/isaac_joint_states"}) {
       const auto [owner, inserted] =
@@ -498,7 +514,8 @@ std::optional<double> require_ros_gripper_delivery_result_timeout(
   const auto timeout = fields.find("delivery_result_timeout_s");
   const bool present = timeout != fields.end();
   if (fields.size() != 13U + static_cast<std::size_t>(present) +
-                           static_cast<std::size_t>(fields.contains("pneumatic_io"))) {
+                           static_cast<std::size_t>(fields.contains("pneumatic_io")) +
+                           static_cast<std::size_t>(fields.contains("grasp_confirmation"))) {
     fail_retained_bundle(
         "ros2_control runtime has an invalid gripper target configuration");
   }
@@ -577,6 +594,52 @@ using PneumaticIo = ros2_control_execution_runtime_contract::Configuration::Pneu
   return result;
 }
 
+using GraspConfirmation =
+    ros2_control_execution_runtime_contract::Configuration::GraspConfirmation;
+
+// Opt-in grasp confirmation: `{policy: required | not_required,
+// stall_window?: {min_position, max_position}}`. The window is position-only;
+// `required` needs its evidence source (window, or the pneumatic
+// `workpiece_grasped` input).
+[[nodiscard]] std::optional<GraspConfirmation> decode_grasp_confirmation(
+    const core::JsonObjectDTO &fields, std::string_view actuation,
+    const std::optional<PneumaticIo> &pneumatic_io) {
+  const auto found = fields.find("grasp_confirmation");
+  if (found == fields.end()) return std::nullopt;
+  const auto *object = std::get_if<core::JsonObjectDTO>(&found->second.value);
+  const auto *policy = object == nullptr || !object->contains("policy")
+                           ? nullptr
+                           : std::get_if<std::string>(&object->at("policy").value);
+  if (policy == nullptr || (*policy != "required" && *policy != "not_required") ||
+      object->size() != 1U + static_cast<std::size_t>(object->contains("stall_window")))
+    fail_retained_bundle("grasp_confirmation_invalid: policy must be required or not_required");
+  GraspConfirmation result{*policy == "required", std::nullopt};
+  if (const auto window = object->find("stall_window"); window != object->end()) {
+    const auto *bounds = std::get_if<core::JsonObjectDTO>(&window->second.value);
+    const auto number = [&](const std::string_view name) -> const double * {
+      const auto value = bounds->find(name);
+      return value == bounds->end() ? nullptr : std::get_if<double>(&value->second.value);
+    };
+    const auto *low = bounds == nullptr ? nullptr : number("min_position");
+    const auto *high = bounds == nullptr ? nullptr : number("max_position");
+    if (actuation != "position_commanded" || low == nullptr || bounds->size() != 2U ||
+        high == nullptr || !std::isfinite(*low) || !std::isfinite(*high) || *low > *high)
+      fail_retained_bundle(
+          "grasp_confirmation_invalid: stall_window is a finite min_position <= max_position "
+          "of a position gripper");
+    result.stall_window = {*low, *high};
+  }
+  if (result.required && actuation == "position_commanded" && !result.stall_window)
+    fail_retained_bundle(
+        "grasp_confirmation_source_missing: a required position gripper needs stall_window");
+  if (result.required && actuation == "pneumatic" &&
+      (!pneumatic_io || !pneumatic_io->inputs.contains("workpiece_grasped")))
+    fail_retained_bundle(
+        "grasp_confirmation_source_missing: a required pneumatic gripper needs the "
+        "pneumatic_io workpiece_grasped input");
+  return result;
+}
+
 } // namespace
 
 std::vector<ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>
@@ -602,17 +665,19 @@ decode_ros2_control_execution_gripper_target_configurations(
     const auto delivery_timeout =
         require_ros_gripper_delivery_result_timeout(*fields, *kind);
     auto pneumatic_io = decode_pneumatic_io(*fields, *kind, *mode);
+    auto grasp_confirmation = decode_grasp_confirmation(*fields, *kind, pneumatic_io);
     auto common = *fields;
     common.erase("output_mode");
     common.erase("delivery_result_timeout_s");
     common.erase("pneumatic_io");
+    common.erase("grasp_confirmation");
     auto decoded = decode_execution_gripper_target_configurations(
         core::JsonValueDTO::Array{core::JsonValueDTO{std::move(common)}},
         "ros2_control runtime configuration");
     result.push_back(Typed{std::move(decoded.front()), *mode == "none"
                             ? core::GripperOutputMode::kNone
                             : core::GripperOutputMode::kCommanded, delivery_timeout,
-                            std::move(pneumatic_io)});
+                            std::move(pneumatic_io), std::move(grasp_confirmation)});
   }
   std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
     return std::tie(left.controllable_component_id, left.command_target_id) <
@@ -655,20 +720,26 @@ decode_ros2_control_execution_component_streams(
     }
     return *result;
   };
-  // Every hosted component declares its measured joints. A Real pneumatic
-  // gripper has no gripper-feedback stream; other grippers keep theirs.
+  // Every component with a controller profile declares its measured joints.
+  // A pneumatic gripper without its own controller (Real robot, lane-free
+  // tool without a profile) has no gripper-feedback stream; other grippers
+  // keep theirs.
   std::set<Key> required;
+  std::set<std::string> controlled_components;
   std::set<std::string> real_components;
   for (const auto &row : rows("controller_profiles")) {
     const auto component = text(row, "controllable_component_id");
     required.emplace(component,
                      std::string(contract::kMeasuredJointsStreamId));
+    controlled_components.insert(component);
     if (member(row, "real_profile") != nullptr)
       real_components.insert(component);
   }
   for (const auto &row : rows("gripper_target_configurations")) {
     const auto component = text(row, "controllable_component_id");
-    if (!real_components.contains(component) || text(row, "actuation_kind") != "pneumatic")
+    const bool own_controller = controlled_components.contains(component) &&
+                                !real_components.contains(component);
+    if (own_controller || text(row, "actuation_kind") != "pneumatic")
       required.emplace(component, std::string(contract::kGripperFeedbackStreamId));
   }
   std::vector<contract::Configuration::ComponentStream> result;
@@ -705,7 +776,8 @@ decode_ros2_control_execution_component_streams(
     fail_retained_bundle(
         "ros2_control runtime must declare exactly the measured_joints stream of "
         "every hosted component and the gripper_feedback stream of every "
-        "gripper component except a Real pneumatic gripper");
+        "gripper component except a pneumatic gripper without its own "
+        "controller");
   }
   std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
     return std::tie(left.controllable_component_id, left.stream_id) <
@@ -918,7 +990,9 @@ bool require_ros2_control_execution_runtime_required_rows(
             "ros2_control runtime configuration has invalid gripper target semantics");
       }
       (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
-      if (auto io = decode_pneumatic_io(*fields, *kind, *mode))
+      auto io = decode_pneumatic_io(*fields, *kind, *mode);
+      (void)decode_grasp_confirmation(*fields, *kind, io);
+      if (io)
         pneumatic_configs.push_back(std::move(*io));
     }
   }
@@ -1306,28 +1380,20 @@ canonical_from_json(const core::JsonValueDTO &value) {
   return json_value_to_canonical(value);
 }
 
-ros2_control_execution_runtime_contract::Configuration::ToolPayload
-decode_ros2_control_tool_payload(const core::JsonValueDTO &value) {
-  const RetainedBundleError invalid(
-      "ros2_control controller profile has an invalid tool_payload");
-  const auto *payload = std::get_if<core::JsonObjectDTO>(&value.value);
-  if (payload == nullptr || payload->size() != 2U) throw invalid;
-  const auto mass = payload->find("mass_kg");
-  const auto center = payload->find("center_of_mass_m");
-  if (mass == payload->end() || center == payload->end()) throw invalid;
-  const auto *kg = std::get_if<double>(&mass->second.value);
-  const auto *xyz = std::get_if<core::JsonValueDTO::Array>(&center->second.value);
-  if (kg == nullptr || !std::isfinite(*kg) || *kg < 0.0 || xyz == nullptr ||
-      xyz->size() != 3U)
-    throw invalid;
-  ros2_control_execution_runtime_contract::Configuration::ToolPayload result{
-      *kg, {}};
-  for (std::size_t axis = 0U; axis < 3U; ++axis) {
-    const auto *metres = std::get_if<double>(&(*xyz)[axis].value);
-    if (metres == nullptr || !std::isfinite(*metres)) throw invalid;
-    result.center_of_mass_m[axis] = *metres;
-  }
-  return result;
+std::optional<core::StopLeadInAnchor>
+decode_ros2_control_stop_lead_in_anchor(const std::optional<std::string> &value) {
+  if (!value.has_value()) return std::nullopt;
+  if (*value == "commanded") return core::StopLeadInAnchor::kCommanded;
+  if (*value == "measured") return core::StopLeadInAnchor::kMeasured;
+  throw RetainedBundleError(
+      "ros2_control controller profile has an unsupported stop_lead_in_anchor");
+}
+
+bool decode_ros2_control_tcp_offset_sync(const core::JsonValueDTO *value) {
+  if (value == nullptr) return true;
+  if (const auto *flag = std::get_if<bool>(&value->value)) return *flag;
+  throw RetainedBundleError(
+      "ros2_control controller profile controller_tcp_offset_sync must be a boolean");
 }
 
 } // namespace manyforge::deployment::detail
@@ -1637,7 +1703,13 @@ require_configuration(const RetainedBundle &retained_bundle,
       detail::json_object_to_canonical(unit.configuration);
   detail::require_no_exclusive_ros_controller_topic_collision(
       canonical_configuration.find_object_member("controller_profiles")
-          ->as_array());
+          ->as_array(),
+      [&]() -> const CanonicalValue::Array & {
+        static const CanonicalValue::Array none;
+        const auto *limits =
+            canonical_configuration.find_object_member("motion_target_limits");
+        return limits != nullptr ? limits->as_array() : none;
+      }());
   Configuration result;
   // Q68: one controller profile per hosted component, exactly one lane each.
   for (const auto &row : *profiles) {
@@ -1671,24 +1743,39 @@ require_configuration(const RetainedBundle &retained_bundle,
     // CP8 step 1 (temporary): the third selector, with its address reference.
     auto real = text("real_profile");
     auto device_address_ref = text("device_address_ref");
-    // D11: the optional tool payload.
-    std::optional<Configuration::ToolPayload> tool_payload;
+    // V-B4: a Real row's vendor adapter family, required with it.
+    auto adapter_family = text("adapter_family");
+    const auto anchor_text = text("stop_lead_in_anchor");
+    const auto stop_lead_in_anchor =
+        detail::decode_ros2_control_stop_lead_in_anchor(anchor_text);
+    // M6b: optional, a boolean when present (absent: on).
+    const core::JsonValueDTO *tcp_offset_sync = nullptr;
     if (object != nullptr) {
-      if (const auto found = object->find("tool_payload"); found != object->end())
-        tool_payload = detail::decode_ros2_control_tool_payload(found->second);
+      if (const auto found = object->find("controller_tcp_offset_sync"); found != object->end())
+        tcp_offset_sync = &found->second;
     }
+    const bool controller_tcp_offset_sync =
+        detail::decode_ros2_control_tcp_offset_sync(tcp_offset_sync);
     const std::size_t selectors = static_cast<std::size_t>(isaac.has_value()) +
                                   static_cast<std::size_t>(mock.has_value()) +
                                   static_cast<std::size_t>(real.has_value());
     if (!component.has_value() || selectors != 1U ||
         real.has_value() != device_address_ref.has_value() ||
+        real.has_value() != adapter_family.has_value() ||
         object->size() != (object->contains("frame_prefix") ? 3U : 2U) +
-                              (real.has_value() ? 1U : 0U) +
-                              (tool_payload.has_value() ? 1U : 0U) ||
-        (isaac.has_value() && *isaac != "lite6" && *isaac != "ur10e") ||
+                              (real.has_value() ? 2U : 0U) +
+                              (anchor_text.has_value() ? 1U : 0U) +
+                              (tcp_offset_sync != nullptr ? 1U : 0U) ||
+        // Merge 6: split arm and tool families (the schema enum's values);
+        // the combined Mock families stay as test fixtures (D2).
+        (isaac.has_value() && *isaac != "lite6" && *isaac != "ur10e" &&
+         *isaac != "lite_gripper" && *isaac != "robotiq_2f_140") ||
         (mock.has_value() && *mock != "lite6_lite_gripper" &&
          *mock != "ur10e_robotiq_2f_140" && *mock != "ur5_roboplan" &&
-         *mock != "ur5e_robotiq_2f_85") ||
+         *mock != "ur5e_robotiq_2f_85" && *mock != "lite6" &&
+         *mock != "ur10e" && *mock != "ur5e" && *mock != "uf850" &&
+         *mock != "lite_gripper" && *mock != "robotiq_2f_140" &&
+         *mock != "robotiq_2f_85" && *mock != "xarm_gripper") ||
         (real.has_value() && *real != "lite6_real")) {
       throw RetainedBundleError("ros2_control runtime configuration has an "
                                 "unsupported mode, profile, or initial state");
@@ -1698,7 +1785,9 @@ require_configuration(const RetainedBundle &retained_bundle,
         std::move(mock), std::move(frame_prefix)};
     profile.real_profile = std::move(real);
     profile.device_address_ref = std::move(device_address_ref);
-    profile.tool_payload = tool_payload;
+    profile.adapter_family = std::move(adapter_family);
+    profile.stop_lead_in_anchor = stop_lead_in_anchor;
+    profile.controller_tcp_offset_sync = controller_tcp_offset_sync;
     result.controller_profiles.push_back(std::move(profile));
   }
   std::sort(result.controller_profiles.begin(), result.controller_profiles.end(),
@@ -1759,11 +1848,6 @@ require_configuration(const RetainedBundle &retained_bundle,
           "ros2_control runtime repeats a component controller profile");
     }
   }
-  if (profiled_components != hosted_components) {
-    throw RetainedBundleError(
-        "ros2_control runtime must select exactly one controller profile for "
-        "every hosted component and no unknown component");
-  }
   if (const auto found =
           unit.configuration.find("gripper_target_configurations");
       found != unit.configuration.end()) {
@@ -1793,6 +1877,33 @@ require_configuration(const RetainedBundle &retained_bundle,
             "unit does not host");
       }
     }
+  }
+  // D4: a lane-free pneumatic tool selects no controller profile. It hosts
+  // no motion target, and each of its gripper targets is pneumatic with its
+  // lane in referenced I/O (`pneumatic_io`) or no output at all.
+  for (const auto &component : hosted_components) {
+    if (profiled_components.contains(component)) continue;
+    const bool lane_free =
+        std::none_of(expected.begin(), expected.end(), [&](const auto &target) {
+          return target.first == component;
+        }) &&
+        std::all_of(expected_grippers.begin(), expected_grippers.end(), [&](const auto &target) {
+          return target.first != component ||
+                 std::any_of(result.gripper_target_configurations.begin(),
+                             result.gripper_target_configurations.end(), [&](const auto &row) {
+                               return row.controllable_component_id == component &&
+                                      row.command_target_id == target.second &&
+                                      row.actuation_kind == "pneumatic" &&
+                                      (row.pneumatic_io.has_value() ||
+                                       row.output_mode == core::GripperOutputMode::kNone);
+                             });
+        });
+    if (lane_free) profiled_components.insert(component);
+  }
+  if (profiled_components != hosted_components) {
+    throw RetainedBundleError(
+        "ros2_control runtime must select exactly one controller profile for "
+        "every hosted component and no unknown component");
   }
   if (!empty_host && expected.empty()) {
     std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
@@ -1867,6 +1978,8 @@ require_configuration(const RetainedBundle &retained_bundle,
       optional_number("runtime_dynamic_body_max_age_cap_ms");
   result.validation_collision_workers =
       optional_uint32("validation_collision_workers");
+  result.collision_clearance_m = optional_number("collision_clearance_m");
+  result.collision_check_step_rad = optional_number("collision_check_step_rad");
   result.initial_joint_positions_rad.reserve(positions->size());
   for (const auto &position : *positions) {
     const auto *number = std::get_if<double>(&position.value);
@@ -1949,7 +2062,8 @@ CanonicalValue component_configuration_projection(
                  name == "gripper_target_configurations" ||
                  name == "io_signals" || name == "io_provider_devices" ||
                  name == "pose_sources" || name == "ai_models" ||
-                 name == "component_streams") {
+                 name == "component_streams" ||
+                 name == "lifecycle_command_timeouts") {
         CanonicalValue::Array rows;
         for (const auto &row : value.as_array()) {
           const auto *owner = row.find_object_member("controllable_component_id");
@@ -1961,9 +2075,55 @@ CanonicalValue component_configuration_projection(
         value = CanonicalValue(std::move(rows));
       }
     }
+    // Another component's lifecycle budget leaves this one's identity as it
+    // was without any budget (no replacement when only a budget changes).
+    std::erase_if(result, [](const auto &field) {
+      return field.first == "lifecycle_command_timeouts" &&
+             field.second.as_array().empty();
+    });
     return CanonicalValue(std::move(result));
   }
   throw RetainedBundleError("ROS component configuration has no runtime projection");
+}
+
+std::map<std::string, std::int64_t, std::less<>>
+component_lifecycle_budgets_ns(const core::CellGraphDTO &graph) {
+  std::map<std::string, std::int64_t, std::less<>> result;
+  // The closed runtime schema bounds every value to (0, 3600] s.
+  for (const auto &unit : graph.runtime_units) {
+    for (const std::string_view field :
+         {"lifecycle_command_timeouts", "io_provider_devices"}) {
+      const auto found = unit.configuration.find(field);
+      const auto *rows =
+          found == unit.configuration.end()
+              ? nullptr
+              : std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+      if (rows == nullptr) continue;
+      for (const auto &item : *rows) {
+        const auto *row = std::get_if<core::JsonObjectDTO>(&item.value);
+        if (row == nullptr) continue;
+        const auto component = row->find("controllable_component_id");
+        const auto seconds = row->find("lifecycle_command_timeout_s");
+        if (component == row->end() || seconds == row->end()) continue;
+        const auto *id = std::get_if<std::string>(&component->second.value);
+        const auto *value = std::get_if<double>(&seconds->second.value);
+        if (id == nullptr || value == nullptr) continue;
+        result.insert_or_assign(
+            *id, static_cast<std::int64_t>(std::ceil(
+                     static_cast<long double>(*value) * 1'000'000'000.0L)));
+      }
+    }
+  }
+  return result;
+}
+
+std::map<std::string, std::int64_t, std::less<>>
+component_composition_budgets_ns(const core::CellGraphDTO &graph) {
+  auto result = component_lifecycle_budgets_ns(graph);
+  for (const auto &component : graph.controllable_components)
+    result.try_emplace(component.controllable_component_id.value(),
+                       core::kDefaultLifecycleBudgetNs);
+  return result;
 }
 
 std::string

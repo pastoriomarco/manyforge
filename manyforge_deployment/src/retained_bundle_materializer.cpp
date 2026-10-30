@@ -839,11 +839,6 @@ void require_qualified_structural_subset_before_store(
   const auto &inputs = deployment.applicability_inputs().value();
   const auto &compiler = qualified.compiler_ir();
 
-  if (!graph.component_attachments.empty()) {
-    detail::fail_retained_bundle(
-        "retained-bundle materialization excludes component attachments");
-  }
-
   const auto &applicability = compiler.applicability();
   const auto &composition = applicability.composition();
   std::set<std::pair<core::RuntimeProfileId, core::RuntimeProfileRevision>>

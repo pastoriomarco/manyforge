@@ -89,6 +89,7 @@
         }
       ],
       "command_target_id": "arm",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "base",
@@ -96,9 +97,16 @@
           "model_role_id": "arm_model"
         },
         {
+          "asset_frame_role_id": "flange",
+          "frame_role_id": "flange",
+          "model_role_id": "arm_model",
+          "tcp": true
+        },
+        {
           "asset_frame_role_id": "tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -144,11 +152,13 @@
         }
       ],
       "command_target_id": "gripper",
+      "default_tcp_frame_role_id": "tcp",
       "frame_roles": [
         {
           "asset_frame_role_id": "gripper_tcp",
           "frame_role_id": "tcp",
-          "model_role_id": "arm_model"
+          "model_role_id": "arm_model",
+          "tcp": true
         }
       ],
       "model_group_roles": [
@@ -173,7 +183,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "uf850_xarm_gripper.component",
-  "component_type_revision": "sha256:d81166fb03da9956d9f6bcdd53b4e308207d3114fa67caa1d10355cfdf19385e",
+  "component_type_revision": "sha256:cdb3627af46fd7d376c651ee2035faabe4c7c15f3b2c15d658efd8f9efba1c99",
   "model_mounts": [],
   "model_roles": [
     {

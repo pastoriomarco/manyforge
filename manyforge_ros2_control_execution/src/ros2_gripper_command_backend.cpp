@@ -2542,6 +2542,35 @@ core::GripperCommandStatusDTO Ros2GripperCommandBackend::get_gripper_status(
                        runtime->error,
                        {}};
   }
+  // Opt-in stall-window grasp evidence of the current completed command,
+  // derived from this same published state: the measured finger position
+  // (else the terminal one) inside the configured window. It belongs to this
+  // command only and is retired by the next one.
+  const auto terminal_position = status.observed_position.has_value()
+                                     ? status.observed_position
+                                     : runtime->current_position;
+  if (runtime->config.grasp_stall_window &&
+      status.state == core::GripperCommandState::kCompleted &&
+      terminal_position.has_value()) {
+    const auto &window = *runtime->config.grasp_stall_window;
+    core::GripperGraspObservationDTO observation;
+    observation.gripper_id = gripper_id;
+    observation.command_id = runtime->command_id;
+    observation.generation = runtime->generation;
+    observation.expected_status_revision = runtime->revision;
+    observation.confirmed = *terminal_position >= window.min_position &&
+                            *terminal_position <= window.max_position;
+    // The command's own start time keeps this status free of wall time.
+    observation.observed_at_ns = runtime->started_at_ns;
+    observation.attribution = "stall_position_window";
+    // The source is this gripper's own command state, never a foreign binding.
+    status.grasp_evidence = core::GripperGraspEvidenceDTO{
+        core::GraspConfirmationSourceKind::kForceCurrent,
+        core::ControlBindingId(gripper_id),
+        core::ControlBindingRevision("stall_position_window"),
+        core::RuntimeEpoch(std::to_string(runtime->generation)),
+        std::move(observation), std::numeric_limits<core::TimePoint>::max()};
+  }
   return status;
 }
 

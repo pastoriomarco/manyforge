@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
+import type { StructuredError } from '../types/api';
+import { CommandRefusalError, commandRefusalCause } from './commandRefusal';
 
 import {
   GLOBAL_INTERRUPT_GATED,
@@ -10,13 +12,17 @@ import {
   setMotionWaitSourceDescriber,
 } from './motionWaitRefusal';
 
+function refusal(code: string, details: Record<string, string> = {}, message = ''): StructuredError {
+  return { code, message, details, origin: null };
+}
+
 describe('global interrupt source not ready (contract 75)', () => {
   it('names the waiting rule readably', () => {
     const message = motionWaitRefusalMessage(GLOBAL_INTERRUPT_SOURCE_NOT_READY, { rule_id: 'door_rule' });
     expect(message).toBe(
       'Motion waits: global interrupt rule door_rule is waiting for its source. Try again once the source reports.',
     );
-    expect(isMotionWaitRefusal(message)).toBe(true);
+    expect(isMotionWaitRefusal(refusal(GLOBAL_INTERRUPT_SOURCE_NOT_READY, { rule_id: 'door_rule' }))).toBe(true);
     expect(motionWaitRefusalMessage(GLOBAL_INTERRUPT_SOURCE_NOT_READY, {}))
       .toContain('a global interrupt rule is waiting');
   });
@@ -36,7 +42,7 @@ describe('global interrupt source not ready (contract 75)', () => {
         'Motion waits: global interrupt rule door_rule is waiting for signal door_closed of cell_io '
           + '(source door_src: ROS topic /cell/door), which has no fresh reading yet. Try again once it reports.',
       );
-      expect(isMotionWaitRefusal(message)).toBe(true);
+      expect(isMotionWaitRefusal(refusal(GLOBAL_INTERRUPT_SOURCE_NOT_READY, details))).toBe(true);
       // Not declared so in the Applied Deployment: only the owner's source id.
       expect(motionWaitRefusalMessage(GLOBAL_INTERRUPT_SOURCE_NOT_READY, { ...details, signal_name: 'other' }))
         .toContain('signal other of cell_io (source door_src),');
@@ -57,7 +63,7 @@ describe('global interrupt source not ready (contract 75)', () => {
     const owner = motionWaitRefusalMessage('invalid_state_transition',
       { reason: 'global_interrupt_gated', rule_id: 'light_curtain' });
     expect(owner).toBe(expected);
-    expect(isMotionWaitRefusal(owner)).toBe(true);
+    expect(isMotionWaitRefusal(refusal('invalid_state_transition', { reason: GLOBAL_INTERRUPT_GATED }))).toBe(true);
     // A Full Stop latch needs the operator: not a wait.
     expect(motionWaitRefusalMessage('invalid_state_transition',
       { reason: 'global_interrupt_latched', rule_id: 'light_curtain' })).toBeNull();
@@ -66,7 +72,8 @@ describe('global interrupt source not ready (contract 75)', () => {
   it('leaves every other refusal to the existing presentation', () => {
     expect(motionWaitRefusalMessage('operator_alarm_interlock_active', { rule_id: 'x' })).toBeNull();
     expect(motionWaitRefusalMessage(null)).toBeNull();
-    expect(isMotionWaitRefusal('Run failed')).toBe(false);
+    expect(isMotionWaitRefusal(refusal('other_error', {}, 'Motion waits: misleading message'))).toBe(false);
+    expect(isMotionWaitRefusal(refusal('operator_alarm_interlock_active', { reason: GLOBAL_INTERRUPT_GATED }))).toBe(false);
     expect(isMotionWaitRefusal(null)).toBe(false);
   });
 
@@ -75,12 +82,21 @@ describe('global interrupt source not ready (contract 75)', () => {
     const refusal = readFileSync(new URL('./commandRefusal.ts', import.meta.url), 'utf8');
     expect(refusal).toContain('?? motionWaitRefusalMessage(error.code, error.details);');
     const headless = readFileSync(new URL('../hooks/useHeadlessState.ts', import.meta.url), 'utf8');
-    expect(headless).toContain(': commandRefusalText(error));');
-    expect(headless.match(/commandRefusalText\(\s*receiptRefusal\(/g)).toHaveLength(2);
+    expect(headless).toContain('throw new CommandRefusalError(error)');
+    expect(headless.match(/new CommandRefusalError\(\s*receiptRefusal\(/g)).toHaveLength(2);
     const app = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8');
     // A past refusal: a registry warning (Acknowledge), never red or Dismiss.
-    expect(app).toMatch(/title: isMotionWaitRefusal\(programRuntime\.state\.error\)\s*\? 'Motion waiting'/);
-    expect(app).toMatch(/title: isMotionWaitRefusal\(robotOperationalError\)\s*\? 'Motion waiting'/);
+    expect(app).toMatch(/title: isMotionWaitRefusal\(programRuntime\.state\.errorRefusal\)\s*\? 'Motion waiting'/);
+    expect(app).toMatch(/title: isMotionWaitRefusal\(robotControl\.state\.errorRefusal\)\s*\? 'Motion waiting'/);
     expect(app).not.toContain('motion.wait.');
+  });
+
+  it('retains the exact refusal beside the rendered message', () => {
+    const cause = refusal('invalid_state_transition', { reason: GLOBAL_INTERRUPT_GATED, rule_id: 'door' });
+    const error = new CommandRefusalError(cause, { withCode: true });
+    expect(error.message).toContain('Motion waits: global interrupt rule door');
+    expect(commandRefusalCause(error)).toEqual(cause);
+    expect(isMotionWaitRefusal(commandRefusalCause(error))).toBe(true);
+    expect(commandRefusalCause(new Error(error.message))).toBeNull();
   });
 });

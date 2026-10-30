@@ -663,7 +663,8 @@ export interface DeploymentControlledStopProfile {
   stop_mode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast';
   deceleration_time_s: number;
   /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
-   * request; absent uses the deceleration time + 0.5 s. */
+   * request, to start braking; absent uses the deceleration time + 0.5 s.
+   * Once sent, the Stop trajectory finishes like a normal motion (M6). */
   max_stop_time_s?: number;
   /** Ordered fallbacks after `stop_mode`, strictly below it in the fixed order
    * (utils/stopFallbackSequence.ts); hard deceleration always follows and is
@@ -685,6 +686,9 @@ export interface DeploymentControlledStopProfile {
     max_jerk?: { coordinate_kind: string; value: number };
   }>;
 }
+
+/** Points where a motion target's maximum TCP speed is held. */
+export type TcpSpeedCheck = 'active_tcp' | 'active_tcp_and_flange';
 
 export interface DeploymentControlledStopUpdate {
   controllable_component_id: string;
@@ -766,7 +770,12 @@ export interface StructuredError {
   message: string;
   details: FailureDetails | null;
   origin: FailureOrigin | null;
+  /** The owner that produced the error (`headless_api`, `component_manager`, ...), when reported. */
+  producer?: string;
 }
+
+/** The typed `{code, message, details}` carrier without run-origin context. */
+export type ErrorDTO = Pick<StructuredError, 'code' | 'message' | 'details'>;
 
 export interface ProgramRunOwnerIdentity {
   ownerRole: string;
@@ -1046,11 +1055,10 @@ export interface CycleRecoveryAction {
 }
 
 export interface CycleRecoveryOffer {
-  schemaVersion: 'manyforge.cycle_recovery_offer.v4';
+  schemaVersion: 'manyforge.cycle_recovery_offer.v5';
   offerId: string;
   offerRevision: number;
   generatedAtNs: Nanoseconds;
-  validUntilNs: Nanoseconds | null;
   kernelAssessmentRevision: number;
   controlCommandEpoch: number;
   operationId: string | null;
@@ -1103,6 +1111,8 @@ export interface ProgramExecutionSelectionControls {
     groupId: string;
     nodeCount: number;
     heldNodeCount: number;
+    /** Known ordinary held nodes, excluding never-started Ready nodes. */
+    ordinaryHeldNodeCount?: number | null;
     state: 'ready' | 'running' | 'held' | 'mixed' | 'stopping' | 'faulted' | 'unavailable';
     stopAllowed: boolean;
     startAllowed: boolean;
@@ -1166,6 +1176,7 @@ export interface NodeImplementationAvailability {
   executablePackageId: string;
   authoringAvailable: boolean;
   executionAvailable: boolean;
+  reasons: ErrorDTO[];
   reasonCodes: string[];
   restorationGates: string[];
 }
@@ -1282,8 +1293,17 @@ export interface SourceModelTarget {
   target_id: string;
 }
 
+/** One applied component and the parent interface it is mounted on (B6). */
+export interface SourceModelComponent {
+  component_id: string;
+  mounted_on: {
+    component_id: string;
+    interface_id: string;
+  } | null;
+}
+
 export interface SourceModelProjection {
-  schema_version: 'manyforge.source_model_projection.v2';
+  schema_version: 'manyforge.source_model_projection.v3';
   cell_id: string;
   retained_bundle_id: string;
   graph_revision: string;
@@ -1292,6 +1312,8 @@ export interface SourceModelProjection {
     contract_revision: string;
   } | null;
   model_map_product_id: string | null;
+  /** Sorted by `component_id`. */
+  components: SourceModelComponent[];
   occurrences: SourceModelOccurrence[];
   targets: SourceModelTarget[];
   source: SourceModelProjectionSource;
@@ -1356,6 +1378,8 @@ export interface LogicalSceneObject {
   placement: LogicalScenePlacement;
   provider_evidence: Record<string, JsonValue> | null;
   support_contacts: Array<Record<string, JsonValue>>;
+  /** Present only when positive (kg). */
+  mass_kg?: number;
 }
 
 export interface CarriedObjectAttachment {
@@ -1988,10 +2012,23 @@ export interface ManagerApplyPreparedActivation {
 }
 
 export interface ManagerApplyFailure {
+  /** The failed Apply step. */
   code: string;
+  /** The producer's message. */
   message: string;
   phase: ManagerApplyLifecyclePhase;
   effectDisposition: 'known' | 'unknown';
+  /** The typed inner cause: its own code (the step code when it had none). */
+  causeCode: string;
+  causeDetails: Record<string, string>;
+  /** The owner that produced the cause (`component_manager`, `kernel`, ...). */
+  producer: string;
+  /**
+   * Stated by the source. `before_effect`: the Apply made no configuration,
+   * runtime, component or Scene change; an admission claim, a Kernel fence and
+   * fail-closed readiness may still exist. Not an operator "no effect" claim.
+   */
+  effectBoundary: 'before_effect' | 'unknown';
 }
 
 export interface ManagerApplyStatus {
@@ -2012,6 +2049,15 @@ export interface ManagerApplyStatus {
   requestId: string;
   requestOwnerEpoch: string;
   state: 'pending' | 'succeeded' | 'failed' | 'unknown_effect';
+  failureAcknowledgement: 'available' | 'acknowledged' | 'unavailable';
+}
+
+/** Audit attribution for one operator-triggered failed-Apply acknowledgement. */
+export interface ManagerApplyAcknowledgementContext {
+  request_id: string;
+  source_label: string;
+  request_owner_epoch?: string;
+  correlation_id?: string;
 }
 
 export interface ManagerApplyPendingResponse {

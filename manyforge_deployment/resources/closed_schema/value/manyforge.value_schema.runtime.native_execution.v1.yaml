@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.native_execution.v1
-schema_revision: sha256:97426e22718ee3103095b35f5167fc566f1ea292d2010ec4f98c37498ab62e48
+schema_revision: sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190
 schema_purpose: value
 root_definition_id: native_execution_runtime_configuration
 definitions:
@@ -95,6 +95,19 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 1000
+                - field_id: tcp_speed_check
+                  presence: optional
+                  default:
+                    kind: materialized
+                    value: active_tcp_and_flange
+                  value_schema:
+                    kind: scalar
+                    scalar_type: string
+                    constraints:
+                      - kind: enum
+                        values:
+                          - active_tcp
+                          - active_tcp_and_flange
                 - field_id: ordinary_motion_jerk
                   presence: optional
                   default:

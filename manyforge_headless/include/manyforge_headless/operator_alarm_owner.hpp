@@ -17,6 +17,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 
 #include <manyforge_core/time/host_boot_identity.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_headless/operator_alarm_catalog.hpp>
 
 namespace manyforge::headless {
@@ -40,13 +41,10 @@ inline constexpr std::size_t kMaximumAlarmSnapshotPage = 128U;
 inline constexpr std::size_t kMaximumAlarmBulkMembers =
     kMaximumLiveAlarmCapacity;
 
-class OperatorAlarmError : public std::runtime_error {
+class OperatorAlarmError : public manyforge::core::TypedError {
 public:
   OperatorAlarmError(std::string code, std::string message);
   [[nodiscard]] const std::string &code() const noexcept;
-
-private:
-  std::string code_;
 };
 
 enum class AlarmConditionQuality {

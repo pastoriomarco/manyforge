@@ -288,7 +288,7 @@
     {
       "byte_size": 6902,
       "content_digest": "sha256:9543987d62d96a8d1ccd87778fa805f2e8d4084089a56e112a25ae660b34d69b",
-      "path": "manyforge_deployment/resources/maintained/model_assets/robotiq_2f_85.model_asset.json"
+      "path": "manyforge_deployment/resources/maintained/model_sources/robotiq_2f_85/robotiq_2f_85.model_asset.json"
     },
     {
       "byte_size": 2404,

@@ -193,7 +193,7 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
   EXPECT_EQ(provider->provider_manifest_id.value(),
             c::kPoseSourceLifecycleManifestId);
   EXPECT_EQ(provider->controllable_component_id.value(), "scene_objects");
-  EXPECT_EQ(provider->lifecycle_command_timeout_ns, 30'000'000'000LL);
+  EXPECT_EQ(provider->lifecycle_command_timeout_ns, 10'000'000'000LL);
   EXPECT_EQ(provider->signal_names,
             (std::vector<std::string>{"poses/cheese_box",
                                       "poses/robot/viewer.measured_robot",

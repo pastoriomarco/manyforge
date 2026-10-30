@@ -3,6 +3,7 @@
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 
 #include <manyforge_core/ports/iscene_authority.hpp>
+#include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_deployment/model_source.hpp>
 
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 namespace manyforge::headless {
 
@@ -137,6 +139,14 @@ struct SceneRuntimeCarriedObjectLoss final {
   std::string loss_event_id{};
   std::optional<std::string> set_key{};
 };
+
+/// C-P4 (G1): the components a carried-object-lost Stop names: the holder and
+/// every component it is mounted on (the cell kinematic index's
+/// `ancestors_of`), in id order as the Stop component selector requires.
+[[nodiscard]] std::vector<manyforge::core::ControllableComponentId>
+SceneRuntimeCarrierStopComponents(
+    const manyforge::core::CellGraphDTO &graph,
+    const manyforge::core::ControllableComponentId &holder);
 
 /// Requests the normal operational Stop of the carrier's motion with reason
 /// `carried_object_lost`; returns the refusal, if any.

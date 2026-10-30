@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,10 +28,12 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/command_schema.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
+#include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #ifdef MANYFORGE_A1_ROS_GRIPPER_CELL_TEST
 #include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
@@ -2287,6 +2290,275 @@ TEST(RetainedNativeCellRuntimeTest,
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),
             "runtime_participant_stop_port_missing");
+}
+
+// lite6_pick_and_place (merge 6 tool split): the robot's direct-control
+// binding holds every TCP of its arm target (`base`, `flange` and the mounted
+// tool's default `tcp`); the Program names only `base` and `tcp`. Its first
+// arm move failed with runtime_participant_stop_port_missing.
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramResolverAcceptsAProgramViewWithFewerFramesThanItsOwner) {
+  const auto program_value = qualification_fixture::make_binding().value();
+  auto physical_value = program_value;
+  physical_value.frame_bindings.insert(
+      std::next(physical_value.frame_bindings.begin()),
+      core::ProgramFrameRoleBindingDTO{
+          core::FrameRoleId("flange"), core::ModelInstanceId("robot.model"),
+          core::ModelRevision("model-revision"), "link_eef"});
+  const auto physical_binding =
+      core::verify_runtime_participant_binding(std::move(physical_value));
+  ASSERT_TRUE(physical_binding.ok()) << physical_binding.error().message;
+  const auto program_binding =
+      core::verify_runtime_participant_binding(core::RuntimeParticipantBindingDTO(program_value));
+  ASSERT_TRUE(program_binding.ok()) << program_binding.error().message;
+  CellTestExecutionEngine engine;
+  const auto physical = TestRegistration(physical_binding.value(), &engine);
+  const core::OperationIntentDTO intent{
+      {core::RequestId("request.fewer-frames"),
+       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      program_value.program_id,
+      program_value.program_revision,
+      program_value.program_binding_id,
+      core::ProgramRunId("run.fewer-frames"),
+      program_value.graph_revision,
+      program_value.retained_bundle_id,
+      std::nullopt,
+      {}};
+  const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
+    auto resolver = make_retained_cell_kernel_participant_resolver(
+        [selected](const core::OperationIntentDTO &, std::size_t) {
+          return core::Result<RetainedResolvedParticipant>::Ok(
+              {selected, false});
+        },
+        {physical});
+    return resolver(intent, 0U);
+  };
+  const auto resolved = resolve(program_binding.value());
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_EQ(resolved.value().engine, &engine);
+  EXPECT_EQ(resolved.value().binding.value(), program_binding.value().value());
+
+  // A frame the owner does not hold still finds no owner.
+  auto foreign = program_value;
+  foreign.frame_bindings.back().compiled_frame_name = "another_tcp";
+  const auto foreign_binding =
+      core::verify_runtime_participant_binding(std::move(foreign));
+  ASSERT_TRUE(foreign_binding.ok()) << foreign_binding.error().message;
+  const auto rejected = resolve(foreign_binding.value());
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_participant_stop_port_missing");
+}
+
+// lite6_pick_and_place (merge 6 tool split): the robot's Program `tcp` is the
+// mounted tool's frame, whose retained frame path keeps the tool's component.
+// A relative move from `tcp` (pick_retreat) failed with
+// program_reference_frame_path_missing.
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramBindingFrameOfAMountedToolKeepsTheToolComponent) {
+  const auto frame = [](const char *component, const char *model,
+                        const char *role, const char *name) {
+    return core::ResolvedComponentModelFrameDTO{
+        core::ControllableComponentId(component), core::ModelInstanceId(model),
+        core::FrameRoleId(role), name, core::ModelRevision(std::string(model) + "-rev")};
+  };
+  const std::vector<core::KinematicFramePathDTO> paths{
+      {core::ResolvedCellFrameDTO{core::CellId("cell"), "cell_frame"}, {}},
+      {frame("lite6_robot", "lite6_robot.model", "base", "link_base"), {}},
+      {frame("lite_gripper", "lite_gripper.model", "tcp", "link_tcp"), {}}};
+  const auto binding = [](const char *model, const char *role, const char *name) {
+    return core::ProgramFrameRoleBindingDTO{
+        core::FrameRoleId(role), core::ModelInstanceId(model),
+        core::ModelRevision(std::string(model) + "-rev"), name};
+  };
+  const core::ControllableComponentId robot("lite6_robot");
+  // M7: the owners come from the cell kinematic index (one row per model
+  // that ends a retained path), no longer from a per-call path scan.
+  const std::vector<RetainedSceneFrameModelOwnerInput> owners{
+      {core::ModelInstanceId("lite6_robot.model"), robot},
+      {core::ModelInstanceId("lite_gripper.model"),
+       core::ControllableComponentId("lite_gripper")}};
+  const core::ResolvedFrameDTO tool_tcp = program_binding_frame(
+      owners, robot, binding("lite_gripper.model", "tcp", "link_tcp"));
+  EXPECT_EQ(tool_tcp, core::ResolvedFrameDTO(paths[2].terminal_frame));
+  const core::ResolvedFrameDTO base = program_binding_frame(
+      owners, robot, binding("lite6_robot.model", "base", "link_base"));
+  EXPECT_EQ(base, core::ResolvedFrameDTO(paths[1].terminal_frame));
+  // A model with no retained path keeps the binding's component.
+  EXPECT_EQ(program_binding_frame(owners, robot,
+                                  binding("other.model", "tcp", "tool0"))
+                .controllable_component_id,
+            robot);
+}
+
+// M7 U2 oracle (R16): the M6b `program_binding_frame` path scan, copied
+// verbatim, equals the owner rows built from the cell kinematic index, for
+// every binding component and every model: mounted and chained tools,
+// prefix-related ids, a passive model, a model-free component, a model with
+// no retained path, and repeated paths of one model.
+namespace m6b_oracle {
+core::ResolvedComponentModelFrameDTO program_binding_frame(
+    const std::vector<core::KinematicFramePathDTO> &frame_paths,
+    const core::ControllableComponentId &binding_component,
+    const core::ProgramFrameRoleBindingDTO &frame) {
+  auto owner = binding_component;
+  for (const auto &path : frame_paths) {
+    const auto *model =
+        std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
+    if (model != nullptr && model->model_instance_id == frame.model_instance_id) {
+      owner = model->controllable_component_id;
+      break;
+    }
+  }
+  return core::ResolvedComponentModelFrameDTO{
+      std::move(owner), frame.model_instance_id, frame.frame_role_id,
+      frame.compiled_frame_name, frame.model_revision};
+}
+} // namespace m6b_oracle
+
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramBindingFrameOwnersFromTheIndexEqualTheM6bPathScan) {
+  const auto component = [](const char *id, std::vector<const char *> models) {
+    core::ControllableComponentDTO row{core::ControllableComponentId(id),
+                                       core::ComponentTypeId(std::string(id) + "_type"),
+                                       core::ComponentTypeRevision("1"),
+                                       {},
+                                       {},
+                                       std::nullopt};
+    for (const auto *model : models)
+      row.model_role_bindings.push_back(
+          {core::ModelRoleId("model"), core::ModelInstanceId(model)});
+    return row;
+  };
+  const auto mount = [](const char *id, const char *parent, const char *child) {
+    return core::ComponentAttachmentEdgeDTO{
+        core::ComponentAttachmentId(id), core::ComponentAttachmentRevision("1"),
+        {core::ControllableComponentId(parent), core::AttachmentInterfaceId("flange")},
+        {core::ControllableComponentId(child), core::AttachmentInterfaceId("mount")},
+        core::PlacementPoseDTO{}};
+  };
+  // `arm.tool` carries `arm.tool.nozzle`; `ur5` has no retained path;
+  // `io_box` owns no model; `fixture.model` is passive.
+  const core::CellGraphDTO graph{
+      "manyforge.cell_graph.v1",
+      core::GraphRevision("graph-1"),
+      core::CellId("cell"),
+      {},
+      {},
+      {component("arm", {"arm.model"}),
+       component("arm.tool", {"arm.tool.model"}),
+       component("arm.tool.nozzle", {"arm.tool.nozzle.model"}),
+       component("io_box", {}),
+       component("ur5", {"ur5.model"})},
+      {},
+      {},
+      {mount("z_mount", "arm", "arm.tool"),
+       mount("a_mount", "arm.tool", "arm.tool.nozzle")}};
+  const auto frame = [](const char *component, const char *model,
+                        const char *role, const char *name) {
+    return core::ResolvedComponentModelFrameDTO{
+        core::ControllableComponentId(component), core::ModelInstanceId(model),
+        core::FrameRoleId(role), name, core::ModelRevision(std::string(model) + "-rev")};
+  };
+  const std::vector<core::KinematicFramePathDTO> paths{
+      {core::ResolvedCellFrameDTO{core::CellId("cell"), "cell_frame"}, {}},
+      {core::ResolvedPassiveModelFrameDTO{core::ModelInstanceId("fixture.model"),
+                                          core::FrameRoleId("top"), "fixture_top",
+                                          core::ModelRevision("fixture.model-rev")},
+       {}},
+      {frame("arm", "arm.model", "base", "link_base"), {}},
+      {frame("arm", "arm.model", "flange", "link_eef"), {}},
+      {frame("arm.tool", "arm.tool.model", "tcp", "link_tcp"), {}},
+      {frame("arm.tool.nozzle", "arm.tool.nozzle.model", "tip", "nozzle_tip"), {}}};
+  const deployment::CellKinematicIndex index(graph, paths);
+  const auto owners = retained_scene_frame_model_owners(index);
+
+  const std::vector<const char *> models{
+      "arm.model", "arm.tool.model", "arm.tool.nozzle.model", "ur5.model",
+      "fixture.model", "absent.model"};
+  const std::vector<const char *> components{"arm", "arm.tool", "arm.tool.nozzle",
+                                             "io_box", "ur5"};
+  for (const auto *binding_component : components) {
+    for (const auto *model : models) {
+      const core::ProgramFrameRoleBindingDTO binding{
+          core::FrameRoleId("tcp"), core::ModelInstanceId(model),
+          core::ModelRevision(std::string(model) + "-rev"), "link_tcp"};
+      const core::ControllableComponentId bound(binding_component);
+      EXPECT_EQ(program_binding_frame(owners, bound, binding),
+                m6b_oracle::program_binding_frame(paths, bound, binding))
+          << binding_component << " / " << model;
+    }
+  }
+  // Graph owner == the path's owner stamp, for every component-model path.
+  for (const auto &path : paths) {
+    if (const auto *model = std::get_if<core::ResolvedComponentModelFrameDTO>(
+            &path.terminal_frame)) {
+      const auto *owner = index.owner_of(model->model_instance_id);
+      ASSERT_NE(owner, nullptr);
+      EXPECT_EQ(*owner, model->controllable_component_id);
+    }
+  }
+}
+
+// G6 [C-P6]: a component without its own live state source is local when
+// anything it is mounted on is local: lite6 + a pneumatic gripper (no
+// coordinate publication) resolves the gripper's own frames and the objects it
+// carries (before: program_reference_robot_not_local). A tool on a robot
+// hosted elsewhere, and that robot, stay refused.
+TEST(RetainedNativeCellRuntimeTest,
+     ComponentWithoutItsOwnStateSourceIsLocalWhenItsMountIsLocal) {
+  const auto component = [](const char *id) {
+    return core::ControllableComponentDTO{core::ControllableComponentId(id),
+                                          core::ComponentTypeId("type"),
+                                          core::ComponentTypeRevision("1"),
+                                          {},
+                                          {},
+                                          std::nullopt};
+  };
+  const auto mount = [](const char *id, const char *parent, const char *child) {
+    return core::ComponentAttachmentEdgeDTO{
+        core::ComponentAttachmentId(id), core::ComponentAttachmentRevision("1"),
+        core::ComponentAttachmentEndpointDTO{core::ControllableComponentId(parent),
+                                             core::AttachmentInterfaceId("flange")},
+        core::ComponentAttachmentEndpointDTO{core::ControllableComponentId(child),
+                                             core::AttachmentInterfaceId("mount")},
+        core::PlacementPoseDTO{}};
+  };
+  const core::CellGraphDTO graph{
+      "manyforge.cell_graph.v1",
+      core::GraphRevision("graph-1"),
+      core::CellId("cell"),
+      {},
+      {},
+      {component("lite6_robot"), component("lite_gripper"), component("gripper_io"),
+       component("ur5_robot"), component("ur5_gripper")},
+      {},
+      {},
+      {mount("lite6_flange", "lite6_robot", "lite_gripper"),
+       mount("ur5_flange", "ur5_robot", "ur5_gripper")}};
+  const deployment::CellKinematicIndex index(graph);
+  const auto mounts = retained_scene_frame_component_mounts(graph, index);
+  // Only lite6_robot has a live state source in this resolver.
+  const auto has_source = [](const core::ControllableComponentId &id) {
+    return id.value() == "lite6_robot";
+  };
+  const auto local = [&](const char *id) {
+    return retained_scene_frame_component_local(
+        mounts, core::ControllableComponentId(id), has_source);
+  };
+  EXPECT_TRUE(local("lite6_robot"));
+  EXPECT_TRUE(local("lite_gripper"));
+  EXPECT_FALSE(local("gripper_io"));
+  EXPECT_FALSE(local("ur5_robot"));
+  EXPECT_FALSE(local("ur5_gripper"));
+  // A tool with its own source is local by it, mounted or not.
+  const auto tool_has_source = [](const core::ControllableComponentId &id) {
+    return id.value() == "ur5_gripper";
+  };
+  EXPECT_TRUE(retained_scene_frame_component_local(
+      mounts, core::ControllableComponentId("ur5_gripper"), tool_has_source));
+  EXPECT_FALSE(retained_scene_frame_component_local(
+      mounts, core::ControllableComponentId("ur5_robot"), tool_has_source));
 }
 
 TEST(RetainedNativeCellRuntimeTest,

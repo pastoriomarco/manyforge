@@ -1,0 +1,35 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/robotiq_2f_140`.
+# The model is the `.structural` projection the family row reads (README.md).
+# Mounts on a robot's `flange` interface as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: tool
+id: robotiq.robotiq_2f_140
+version: 1.0.0
+title: Robotiq 2F-140
+license: BSD-3-Clause
+model:
+  urdf: robotiq_2f_140.structural.urdf
+  srdf: robotiq_2f_140.structural.srdf
+mount:
+  frame: robotiq_2f_140_mount
+tcps:                             # the first is the default TCP
+  - {id: tcp, frame: grasp_frame}
+roles:
+  groups: {gripper: gripper}
+  joints: {fingers: [finger_joint]}
+  collision_bodies:
+    gripper_collision: [left_inner_finger, left_inner_finger_pad, left_inner_knuckle, left_outer_finger, left_outer_knuckle, right_inner_finger, right_inner_finger_pad, right_inner_knuckle, right_outer_finger, right_outer_knuckle, robotiq_base_link]
+gripper:
+  actuation: position_commanded
+  states: {open: open, closed: closed}
+  attach_frame: grasp_frame
+  touch_links: [left_inner_finger, left_inner_finger_pad, left_inner_knuckle, left_outer_finger, left_outer_knuckle, right_inner_finger, right_inner_finger_pad, right_inner_knuckle, right_outer_finger, right_outer_knuckle, robotiq_base_link]
+lanes:
+  mock:
+    controllers:                  # its gripper-only Mock row (no arm controller)
+      template: ur
+      hardware_component_name: MockRobotiq2F140System
+      gripper_controller: robotiq_gripper_controller
+      hard_stop_completion_timeout_s: 0.5
+      gripper_result_timeout_s: 15.0

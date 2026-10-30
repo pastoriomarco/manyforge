@@ -518,7 +518,12 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::unique_ptr<StopSurveillanceReducerState> recovered_surveillance_state;
     std::int64_t next_surveillance_sample_ns = 0;
     std::int64_t next_surveillance_checkpoint_ns = 0;
-    if (recovered.surveillance.has_value()) {
+    // M6b: a clear ends surveillance (Recover may clear on current rest while
+    // the latest checkpoint is still monitoring); a cleared latch's
+    // surveillance is history only and is not resumed.
+    const bool latch_cleared = recovered.fault_latch.has_value() &&
+                               recovered.fault_latch->state == StopFaultLatchStateDTO::kCleared;
+    if (recovered.surveillance.has_value() && !latch_cleared) {
       if (!config_.stop_surveillance.has_value() || !recovered.fault_latch.has_value()) {
         motion_admission_closed_ = true;
       } else {
@@ -558,7 +563,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
         motion_admission_closed_ = true;
       }
     }
-    if (recovered.surveillance.has_value() &&
+    if (recovered.surveillance.has_value() && !latch_cleared &&
         recovered.surveillance->state == StopPostTerminalSurveillanceStateDTO::kMonitoring) {
       motion_admission_closed_ = true;
     }

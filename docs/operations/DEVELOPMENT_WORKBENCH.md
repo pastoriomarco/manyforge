@@ -460,6 +460,100 @@ are not recovered after a Composer restart. Use Export when a portable project
 is required: it copies the admitted source/asset closure and rewrites only the
 exported references. Do not use Save As as an asset-collection operation.
 
+### Components and Deployment
+
+The center-top sections are Program, Scene, Components and Deployment.
+
+**Components** shows each component of the cell. On the left, the list: every
+component of the Deployment Draft and of Manager Applied, with its kind, a
+tool's mount (`lite_gripper → lite6_robot.flange`), its lifecycle state and
+health, or Added in Draft (runs after Apply) / Removed in Draft; above it,
+**Activate all**; below it, **Add component**. On the right, the selected
+component's page:
+
+- what it is: profile, mount or mounted tool, Deployment status and the Program
+  roles assigned to it, with links to **Open in Robot Control** (jogging and
+  gripper commands stay in the viewer's Robot panel), **Roles in Deployment**
+  and, for an unapplied change, **Review in Deployment Changes**;
+- its lifecycle (state, readiness, open incident, stream health, Activate,
+  Prepare, Enable, Disable, Recover when offered, control routes) and its
+  vendor status as the driver reports it (error, warning, mode and state codes,
+  condition, moved externally, the blocking reason);
+- its TCPs and frames: the Applied frames of each target with what its `tcp`
+  resolves to and which frames are TCPs, a gripper's authored TCP, attach and
+  mount frames, and its custom TCPs (see [TCPs](#tcps));
+- for a tool, its payload (mass and centre of mass in its mount), read-only:
+  it is defined by the component's model (0 kg when the model defines none);
+- its I/O signals: those it declares, those of other components it uses (a
+  pneumatic gripper's valves and sensors) and those that use it (its signals in
+  another gripper's pneumatic I/O, an xArm pin on this robot, a geometric
+  contact on one of its frames); live values stay in the viewer's Tool & I/O
+  panel;
+- its settings, edited in the Deployment Draft: model and target limits, native
+  runtime inputs, Stop settings, gripper configuration, I/O device and I/O
+  signals, pose source, AI model and stream overrides, each only when the
+  component has them.
+
+Each lifecycle transition (Prepare, Enable, Disable, Recover) is one adapter
+action with one budget. Its result is **succeeded**, **failed** with a typed
+reason, or **connection lost**; the result and feedback list the substeps the
+adapter ran and their outcomes. After a dispatched failure, ManyForge decides
+what comes next from the component's current status, not from a guess about
+the failed step's partial effects. A fresh status at rest supplies the shown
+state; without it, the component is shown as Declared with a warning. A robot
+that remains fully active stays commandable. See
+[Observability](OBSERVABILITY.md#workbench-console).
+
+**Deployment** keeps the cell as a whole, in four tabs:
+
+- **Overview**: the runtime status summary, the Deployment Draft against
+  Manager Applied (components to add or remove, runtime convergence, Program
+  roles) and the Manager Apply inventory.
+- **Roles**: each Program role (satisfied, unbound or incompatible) and the
+  Program Binding.
+- **Cell settings**: motion takeover timing, global interrupt rules, the AI
+  model aliases, pose links and stream overrides that no current component
+  owns, and the read-only compiled artifact.
+- **Changes**: Preview compiles the Draft and shows Manager's convergence diff
+  against Applied (components added, replaced or removed; compiled record
+  changes; Program impact) without changing anything. Apply sends that exact
+  Draft once; when components are brought up, replaced or removed, Manager asks
+  for one confirmation in the Apply dialog.
+
+**Add component** (Components) composes components that already exist:
+the complete component rows of the example Scenarios under `examples/` (robots,
+tools, I/O devices, pose sources, AI models). A component whose gripper uses an
+I/O device is added together with it. Pick the kind and the entry, check the
+component id (the id a Program role is assigned to binds that role), and for a
+robot the frame prefix and base position, then **Add to Draft**; its page opens.
+A tool is mounted on a robot interface in the Draft: pick the robot under
+**Mount on**; the tool and its attachment row are added together. More than
+one tool may share an interface. When multiple tool-tagged components share
+it, mark exactly one attachment row `primary: true` in the Scenario's
+Deployment, then Load the Scenario. The primary tool's default TCP becomes the
+robot's End-effector TCP; without a tool on the flange, the robot's own
+default TCP applies, or its flange if it has no other default ([TCPs](#tcps)).
+The component is
+only in the Draft until Apply. Undo an unapplied addition with
+Discard. Component profiles without a ready row are listed by name; write the
+row in a Scenario first ([Adding a component](../authoring/ADDING_A_COMPONENT.md)).
+An I/O device or AI model that no example has is written by hand under
+**Custom I/O device or AI model**.
+
+Scripts and assistants use the same routes: `GET
+/api/deployment/component-catalog` lists the entries (MCP
+`manyforge_deployment` action `component_catalog`); append the entry's
+`components` rows and, for a tool, its attachment row
+(`{"parent": {"component_id": <robot>, "interface": "flange"}, "child":
+{"component_id": <tool>, "interface": "mount"}}`; the tool row has no
+`root_pose_in_cell`, its mount places it) in one edit with `POST
+/api/deployment/draft/components` (`components`, `attachments`; MCP action
+`add_components`); `POST /api/deployment/draft/preview` returns the diff; `POST
+/api/deployment/draft/apply` applies it. The Draft accepts a pure addition
+only: new rows, and new attachment rows whose child is a new component.
+Changing or removing an existing component or attachment still needs Load or
+Revert.
+
 Follow Runtime/history rather than assuming that successful preparation means a
 completed live transition. Discard changes only the Draft.
 
@@ -476,6 +570,70 @@ output is inherited by the container log. Stop keeps durable runtime state
 and captures the bounded console tail before removal. Capture any additional
 logs/status needed for investigation explicitly. Failed developer startup uses
 the same capture policy; retain the startup terminal output too.
+
+### TCPs
+
+See the [TCP guide](../authoring/TCPS.md) for selector forms, Robot Control,
+and the Active TCP. A TCP entry belongs to one component and names one target
+and one frame role, for example `lite6_robot · arm · flange` or
+`lite_gripper · gripper · tcp`.
+
+- **Model and descriptor TCPs** come from component type declarations and
+  tags; a frame's name alone does not make it a TCP. They are shown on the
+  component page under **TCPs and frames** and cannot be edited.
+- **Custom TCPs** are added, edited and deleted on the component page of a
+  robot or a tool: an id, a parent frame of that component (never another
+  custom TCP), a position in metres and a roll/pitch/yaw in degrees. Each
+  change is one Deployment Draft edit (the component row's `custom_tcps`) and
+  runs after Apply.
+- **Default TCP**: each component has at most one. For a component descriptor,
+  the first `tcps` entry declares the default. A component type with TCPs on
+  multiple targets and no single type-declared default needs `default_tcp` in
+  its Deployment row: its page then shows a **Default TCP and primary tool**
+  card with a select of its TCP entries, each shown as `frame (target)`, for
+  example `tcp (arm)`. Choosing one is a Deployment Draft edit and runs after
+  Apply.
+- **Primary tool**: when two or more tools share one mount, the robot's page
+  shows **Primary tool on <interface>** in the same card, read-only like every
+  mount: mark one tool's attachment row `primary: true` in the Scenario's
+  Deployment, then Load it. If only one tool shares the mount, it is the
+  primary tool. The primary tool's default TCP is the robot's End-effector
+  TCP.
+- **End-effector TCP**: a default mark on one of the robot's TCPs, where its
+  Active TCP starts: the primary tool's default TCP when a tool is mounted on
+  the flange; otherwise the robot's own default TCP, or its flange. If the
+  primary tool has no TCP, there is no End-effector TCP and no fallback to the
+  robot's own TCP or flange. The cell still loads and applies with a
+  non-blocking Deployment warning. Execute is refused with
+  `program_end_effector_tcp_unavailable` while any robot in the cell has no
+  End-effector TCP. Declare a TCP on each affected robot's primary tool to
+  provide one.
+  Robot Control still permits joint jog; Cartesian control needs a selected
+  TCP.
+- A TCP may have any valid name, and every frame has exactly one name: a
+  frame merely named `tcp` is not a TCP unless its component lists it. A
+  custom TCP may not reuse an existing frame name.
+
+- **Active TCP**: the TCP the robot uses now, shared by Programs and Robot
+  Control; see [TCPs](../authoring/TCPS.md).
+
+**Robot Control** has a **TCP** select beside the robot that shows and sets
+the robot's Active TCP. The picker follows the visibility rule in the [TCP
+guide](../authoring/TCPS.md#the-robots-tcp-list). Jog, Move to, the
+Cartesian moves and the viewer gizmo
+use the Active TCP. A robot without an End-effector TCP starts with no TCP
+selected and offers joint jog only ("No TCP: joint jog only"); choosing a TCP
+in the select enables the Cartesian modes.
+
+**Programs** choose each move's TCP as **Current** (the Active TCP, the
+default for a new move), **Default TCP of <role>**, or a specific TCP of the
+bound robot or of a tool (for example `gripper · cup_edge`). Custom TCPs
+still in the Draft are marked "after Apply". Add a tool to the Program's
+roles before selecting its TCP; selecting an entry adds its frame requirement
+to an existing role in the same edit. **Use current robot
+pose** captures the pose of the move's TCP, so replaying the move brings that
+same point back. The rules (which TCPs are listed, when the Active TCP changes,
+Set TCP) are in [TCPs](../authoring/TCPS.md).
 
 ### Terminal Apply recovery (simulated workbench only)
 
@@ -513,9 +671,17 @@ may need a refresh; unsaved Draft changes are lost. Startup validates the
 Saved Scenario, so invalid content leaves the runtime closed. A successful
 reload does not start a Program or authorize motion automatically.
 
-Ordinary Scenario Load remains a Manager Apply and does not restart the
+Scenario Load is a Manager Apply and does not ordinarily restart the
 workbench. These commands are a development-workbench fallback for a runtime
 that deliberately retained its restrictions.
+
+One Load refusal has its own restart requirement: Composer shows **Scenario
+refused** (`scenario_composition_refused`) when the native runtime finds an
+inconsistency while composing the candidate. The candidate was not published
+and the runtime keeps running, but authoring remains closed. Fix the cause in
+the notice details, preserve the evidence, and restart the workbench before the
+next Load. This differs from a clean pre-effect Apply refusal, which does not
+require a restart merely because the Apply failed.
 
 This procedure is only for the simulated development workbench. It is not a
 containment or recovery procedure for physical equipment.

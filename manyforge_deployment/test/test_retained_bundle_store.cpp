@@ -1569,6 +1569,11 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
       {reloaded->retained_bundle_id(), planning.product_id});
   ASSERT_TRUE(planning_model.has_value());
   EXPECT_FALSE(planning_model->resources().empty());
+  // TOOLCTX: each source URDF row carries its asset's own payload; the
+  // maintained Lite 6 asset declares none.
+  ASSERT_EQ(planning_model->model_source_urdfs().size(), 1U);
+  EXPECT_FALSE(
+      planning_model->model_source_urdfs().front().payload.has_value());
 
   ASSERT_EQ(reloaded->value().compiled_products.symbol_role_maps.size(), 1U);
   const auto& symbol =
@@ -1612,19 +1617,47 @@ TEST(FilesystemVerifiedRetainedModelMapSourceTest,
   EXPECT_FALSE(model_map->coordinates().empty());
   EXPECT_FALSE(model_map->fixed_connections().empty());
   EXPECT_FALSE(model_map->frame_paths().empty());
-  ASSERT_EQ(model_map->kinematic_frame_paths().size(),
+  const auto& kinematic_index = model_map->kinematic_index();
+  ASSERT_EQ(kinematic_index.frame_paths().size(),
             model_map->frame_paths().size());
-  const auto& cell_path = model_map->kinematic_frame_paths().front();
+  const auto& cell_path = kinematic_index.frame_paths().front();
   const auto* cell_terminal =
       std::get_if<core::ResolvedCellFrameDTO>(&cell_path.terminal_frame);
   ASSERT_NE(cell_terminal, nullptr);
   EXPECT_EQ(cell_terminal->cell_id, reloaded->value().cell_graph.cell_id);
   EXPECT_TRUE(cell_path.segments.empty());
-  EXPECT_EQ(model_map->find_kinematic_frame_path(cell_path.terminal_frame),
+  EXPECT_EQ(kinematic_index.find_frame_path(cell_path.terminal_frame),
             &cell_path);
+  // M7 U2 on a real verified map: every path is found as itself (the paths
+  // are unique), every model frame path is stamped with the graph owner
+  // (the R16 invariant), and the graph owner of every occurrence is the
+  // map's occurrence owner.
+  for (const auto& path : kinematic_index.frame_paths()) {
+    EXPECT_EQ(kinematic_index.find_frame_path(path.terminal_frame), &path);
+    const auto* model =
+        std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
+    if (model == nullptr) continue;
+    const auto* owner = kinematic_index.owner_of(model->model_instance_id);
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(*owner, model->controllable_component_id);
+  }
+  for (const auto& occurrence : model_map->model_occurrences()) {
+    const auto* owner = kinematic_index.owner_of(occurrence.model_instance_id);
+    EXPECT_EQ(owner == nullptr ? std::nullopt
+                               : std::optional<core::ControllableComponentId>(
+                                     *owner),
+              occurrence.owner_component_id);
+  }
+  // A copy of the map carries its own index.
+  const VerifiedRetainedModelMap copied_map = *model_map;
+  ASSERT_EQ(copied_map.kinematic_index().frame_paths(),
+            kinematic_index.frame_paths());
+  EXPECT_EQ(copied_map.kinematic_index().find_frame_path(
+                cell_path.terminal_frame),
+            &copied_map.kinematic_index().frame_paths().front());
   const core::KinematicResourceCoordinateDependencyDTO*
       retained_dependency = nullptr;
-  for (const auto& path : model_map->kinematic_frame_paths()) {
+  for (const auto& path : kinematic_index.frame_paths()) {
     for (const auto& segment : path.segments) {
       const auto* joint =
           std::get_if<core::KinematicModelJointPathSegmentDTO>(&segment);

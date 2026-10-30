@@ -1,18 +1,29 @@
-import type { CCLCController } from '../hooks/useCCLC';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { api } from '../api/client';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
+import {
+  componentManagerRows,
+  roleFeedback,
+  type ComponentManagerTab,
+} from '../utils/componentManager';
+import {
+  ComponentManagerChanges,
+  ComponentManagerSummary,
+  ComponentManagerTabs,
+  RoleFeedbackCard,
+} from './ComponentManager';
 import { useManagerApplyStatus } from '../hooks/useManagerApplyStatus';
 import type { ControlTransportStatus } from '../hooks/useHeadlessState';
 import type {
   BlackboardKeyDeclaration,
+  JsonValue,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerStatusProjection,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
-import { CCLCPanel } from './CCLCPanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
 import {
   selectManagerApplyInventoryIdentity,
@@ -47,8 +58,13 @@ export interface ComponentOverviewInput {
 }
 
 interface DeploymentCompositionPanelProps {
-  cclc: CCLCController;
   controller: DeploymentWorkspaceController;
+  /** The workbench's one component catalog (shared with Components). */
+  componentCatalog: ComponentCatalogState;
+  /** Opens a tab from elsewhere (a Components page link); a new sequence each time. */
+  tabRequest?: { tab: ComponentManagerTab; sequence: number } | null;
+  /** Opens the Components section. */
+  onOpenComponents?: () => void;
   enabled: boolean;
   snapshot: ComposerHeadlessState | null;
   transportStatus: ControlTransportStatus;
@@ -69,6 +85,10 @@ interface DeploymentCompositionPanelProps {
   /** The workbench's single observation of the advertised maintenance
    * operation; this panel observes only an inventory-selected operation. */
   maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
+  /** The Program Draft's component roles; null without a Program. */
+  programComponentRoles?: Record<string, JsonValue> | null;
+  /** The Scenario's Program role assignment; null when none is loaded. */
+  programRoleAssignment?: Record<string, JsonValue> | null;
 }
 
 interface DeploymentReadModel {
@@ -88,22 +108,11 @@ function shortIdentity(value: string | null | undefined): string {
   return value.length > 32 ? value.slice(0, 28) + '…' : value;
 }
 
-export function controllableComponentIds(graph: ManagerGraphProjection): string[] {
-  const value = graph.cellGraph.controllable_components;
-  if (!Array.isArray(value)) return [];
-  const identities = value.flatMap((candidate) => {
-    if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
-      return [];
-    }
-    const identity = candidate.controllable_component_id;
-    return typeof identity === 'string' && identity.trim() ? [identity] : [];
-  });
-  return [...new Set(identities)].sort();
-}
-
 export function DeploymentCompositionPanel({
-  cclc,
   controller: deploymentController,
+  componentCatalog,
+  tabRequest = null,
+  onOpenComponents,
   enabled,
   snapshot,
   transportStatus,
@@ -118,6 +127,8 @@ export function DeploymentCompositionPanel({
   systemSignalChoices = [],
   systemSignalsNeedApply = false,
   maintenanceStatus: advertisedStatus,
+  programComponentRoles = null,
+  programRoleAssignment = null,
 }: DeploymentCompositionPanelProps) {
   const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
@@ -141,10 +152,12 @@ export function DeploymentCompositionPanel({
   const maintenanceStatus = maintenance === null ? inventoryStatus : advertisedStatus;
   const [reloadToken, setReloadToken] = useState(0);
 
+  const reloadCatalog = componentCatalog.reload;
   const refresh = useCallback(() => {
     setReloadToken((current) => current + 1);
     void refreshDeploymentWorkspace();
-  }, [refreshDeploymentWorkspace]);
+    reloadCatalog();
+  }, [refreshDeploymentWorkspace, reloadCatalog]);
 
   useEffect(() => {
     if (!enabled) {
@@ -174,10 +187,26 @@ export function DeploymentCompositionPanel({
     return () => controller.abort();
   }, [enabled, reloadToken]);
 
-  const componentIds = useMemo(
-    () => readModel === null ? [] : controllableComponentIds(readModel.graph),
-    [readModel],
+  const [tab, setTab] = useState<ComponentManagerTab>(tabRequest?.tab ?? 'overview');
+  // The persistent status button opens Overview; other state stays.
+  useEffect(() => {
+    if (componentOverview.request > 0) setTab('overview');
+  }, [componentOverview.request]);
+  useEffect(() => {
+    if (tabRequest !== null) setTab(tabRequest.tab);
+  }, [tabRequest]);
+  const catalog = componentCatalog.catalog;
+  const draftDocument = deploymentController.workspace?.draft.document ?? null;
+  const appliedIds = deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? null;
+  const rows = useMemo(
+    () => componentManagerRows(draftDocument, appliedIds, catalog?.componentProfiles),
+    [appliedIds, catalog, draftDocument],
   );
+  const feedback = useMemo(() => roleFeedback(
+    programComponentRoles, programRoleAssignment, rows, catalog?.componentProfiles ?? {},
+  ), [catalog, programComponentRoles, programRoleAssignment, rows]);
+  const pendingChanges = rows.some((row) => row.change !== 'applied')
+    || deploymentController.workspace?.runAdmission.ready === false;
   const maintenanceMessage = maintenanceStatus.reason ?? (
     maintenanceStatus.status?.state === 'failed'
       || maintenanceStatus.status?.state === 'unknown_effect'
@@ -191,96 +220,9 @@ export function DeploymentCompositionPanel({
           ?? 'in progress'
       }. Controls remain disabled.`
   );
-  return (
-    <section className="panel deployment-composition-panel dpanel" aria-labelledby="deployment-composition-title">
-      <header className="panel-header">
-        <div>
-          <p className="eyebrow">Separate addressed artifact</p>
-          <h2 id="deployment-composition-title">Deployment workspace</h2>
-        </div>
-        <button
-          type="button"
-          className="quiet-button"
-          disabled={!enabled || loading}
-          onClick={refresh}
-        >
-          Refresh current state
-        </button>
-      </header>
-
-      <p className="panel-intro">
-        Edit and save a compiler-validated Deployment Draft independently from
-        Program and Manager Applied state. The header Apply command validates
-        and activates this Draft.
-      </p>
-
-      {(maintenance !== null
-        || maintenanceStatus.reason !== null
-        || maintenanceStatus.status?.state === 'pending'
-        || maintenanceStatus.status?.state === 'failed'
-        || maintenanceStatus.status?.state === 'unknown_effect') && (
-        <div className="deployment-run-gate" role="status">
-          {maintenanceMessage}
-        </div>
-      )}
-
-      {deploymentController.mutationUnavailableReason && (
-        <div className="notice severity-info notice-strip">
-          {deploymentController.mutationUnavailableReason}
-        </div>
-      )}
-      {!deploymentController.workspace?.runAdmission.ready
-        && deploymentController.workspace?.runAdmission.reason && (
-        <div className="deployment-run-gate" role="status">
-          {deploymentController.workspace.runAdmission.reason}. Run remains
-          disabled until Manager Applied matches this Draft.
-        </div>
-      )}
-      {deploymentController.feedback && (
-        <div className="program-feedback" role="status">
-          {deploymentController.feedback}
-          <button
-            type="button"
-            className="quiet-button"
-            onClick={deploymentController.clearFeedback}
-          >Dismiss</button>
-        </div>
-      )}
-
-      <ComponentOverview {...componentOverview} />
-
-      {deploymentController.workspace !== null && (
-        <DeploymentBindingProjection workspace={deploymentController.workspace} />
-      )}
-      {deploymentController.loading ? (
-        <div className="panel-state" role="status">Reading Deployment Draft…</div>
-      ) : (
-        <>
-          <DeploymentFocusedEditor
-            controller={deploymentController}
-            sourceModel={sourceModel}
-            motionDescriptors={motionDescriptors}
-            stopChains={stopChains}
-            gripperDescriptors={gripperDescriptors}
-            programKeys={programKeys}
-            executionGroupIds={executionGroupIds}
-            programSceneIds={programSceneIds}
-            systemSignalChoices={systemSignalChoices}
-            systemSignalsNeedApply={systemSignalsNeedApply}
-          />
-          <details className="dcard">
-            <summary>Advanced compiled Deployment artifact</summary>
-            <p className="field-help">
-              Generated identities and compiler-expanded policy rows are read-only here.
-            </p>
-            <DeploymentDocumentEditor controller={deploymentController} readOnly />
-          </details>
-        </>
-      )}
-
-      <details className="dcard">
-        <summary>Manager Applied state and lifecycle</summary>
-
+  const managerApplied = (
+    <details className="dcard">
+      <summary>Manager Applied state</summary>
       {!enabled && (
         <div className="panel-state">
           Deployment composition requires the configured headless product.
@@ -291,12 +233,12 @@ export function DeploymentCompositionPanel({
           Reading Manager status, graph, and diff…
         </div>
       )}
+      {/* The read failure itself is the yellow notice mirrored above; here only a neutral pointer. */}
       {enabled && error && (
-        <div className="panel-state error-state" role="alert">
-          {error}
+        <div className="panel-state" role="status">
+          Manager status could not be read; see the notice.
         </div>
       )}
-
       {enabled && readModel && !loading && !error && (
         <>
           <div className="program-runtime-grid">
@@ -325,10 +267,9 @@ export function DeploymentCompositionPanel({
               </small>
             </div>
           </div>
-
           <p className="panel-intro">
-            Deployment changes use the header Apply/Revert workflow. This
-            section observes the resulting Manager-owned operation and does not
+            Deployment changes use the one Apply workflow (the header Apply, or Apply under
+            Changes). This section observes the resulting Manager-owned operation and does not
             submit a second catalog-based transition.
           </p>
           {!readModel.status.status.apply.mutationAvailable && (
@@ -361,38 +302,128 @@ export function DeploymentCompositionPanel({
               </ol>
             )}
           </div>
-          <p className="panel-intro">
-            Program Run and manual control remain explicit owner-issued actions
-            in the persistent viewer controls.
-          </p>
-          <section className="deployment-component-section" aria-labelledby="deployment-components-title">
-            <header className="scene-authoring-heading">
-              <div>
-                <p className="eyebrow">Active Manager graph</p>
-                <h3 id="deployment-components-title">Components and lifecycle</h3>
-              </div>
-              <span>{componentIds.length} controllable</span>
-            </header>
-            {componentIds.length === 0 && (
-              <p className="panel-intro">
-                The current graph publishes no controllable component identities.
-              </p>
-            )}
-            <CCLCPanel
-              enabled={enabled}
-              componentIds={componentIds}
-              controller={cclc}
-              mutationAvailable={snapshot?.authoringAdmission.authoringAllowed === true}
-              mutationUnavailableReason={snapshot === null
-                ? 'Current backend admission is unavailable.'
-                : snapshot.programCycle.state === 'terminal_awaiting_reset'
-                  ? 'Reset the completed Program cycle before changing lifecycle or routes.'
-                  : 'Lifecycle and route changes require current Idle admission.'}
-            />
-          </section>
         </>
       )}
-      </details>
+    </details>
+  );
+
+  return (
+    <section className="panel deployment-composition-panel dpanel" aria-labelledby="deployment-composition-title">
+      <header className="panel-header">
+        <div>
+          <p className="eyebrow">Deployment</p>
+          <h2 id="deployment-composition-title">Cell composition</h2>
+        </div>
+        <button
+          type="button"
+          className="quiet-button"
+          disabled={!enabled || loading}
+          onClick={refresh}
+        >
+          Refresh current state
+        </button>
+      </header>
+
+      <p className="panel-intro">
+        Compose the cell in the Deployment Draft, independently from Program and Manager
+        Applied state. Nothing runs until the one confirmed Apply. Each component's status
+        and settings are under Components.
+      </p>
+
+      {(maintenance !== null
+        || maintenanceStatus.reason !== null
+        || maintenanceStatus.status?.state === 'pending'
+        || maintenanceStatus.status?.state === 'failed'
+        || maintenanceStatus.status?.state === 'unknown_effect') && (
+        <div className="deployment-run-gate" role="status">
+          {maintenanceMessage}
+        </div>
+      )}
+
+      {deploymentController.mutationUnavailableReason && (
+        <div className="notice severity-info notice-strip">
+          {deploymentController.mutationUnavailableReason}
+        </div>
+      )}
+      {deploymentController.feedback && (
+        <div className="program-feedback" role="status">
+          {deploymentController.feedback}
+          <button
+            type="button"
+            className="quiet-button"
+            onClick={deploymentController.clearFeedback}
+          >Dismiss</button>
+        </div>
+      )}
+
+      <ComponentManagerTabs
+        tab={tab}
+        onTab={setTab}
+        pendingChanges={pendingChanges}
+        roleIssues={feedback.filter((role) => role.status !== 'satisfied').length}
+      />
+
+      {tab === 'overview' && (
+        <div id="component-manager-overview" role="tabpanel" className="dpanel">
+          <ComponentOverview {...componentOverview} />
+          <ComponentManagerSummary
+            controller={deploymentController}
+            rows={rows}
+            feedback={feedback}
+            graph={readModel?.graph ?? null}
+            diff={readModel?.diff ?? null}
+            onNavigate={setTab}
+            onOpenComponents={onOpenComponents}
+          />
+          {managerApplied}
+        </div>
+      )}
+
+      {tab === 'roles' && (
+        <div id="component-manager-roles" role="tabpanel" className="dpanel">
+          <RoleFeedbackCard feedback={feedback} />
+          {deploymentController.workspace !== null && (
+            <DeploymentBindingProjection workspace={deploymentController.workspace} />
+          )}
+        </div>
+      )}
+
+      {tab === 'cell' && (
+        <div id="component-manager-cell" role="tabpanel" className="dpanel">
+          {deploymentController.loading ? (
+            <div className="panel-state" role="status">Reading Deployment Draft…</div>
+          ) : (
+            <>
+              <DeploymentFocusedEditor
+                controller={deploymentController}
+                scope="cell"
+                sourceModel={sourceModel}
+                motionDescriptors={motionDescriptors}
+                stopChains={stopChains}
+                gripperDescriptors={gripperDescriptors}
+                programKeys={programKeys}
+                executionGroupIds={executionGroupIds}
+                programSceneIds={programSceneIds}
+                systemSignalChoices={systemSignalChoices}
+                systemSignalsNeedApply={systemSignalsNeedApply}
+              />
+              <details className="dcard">
+                <summary>Advanced compiled Deployment artifact</summary>
+                <p className="field-help">
+                  Generated identities and compiler-expanded policy rows are read-only here.
+                </p>
+                <DeploymentDocumentEditor controller={deploymentController} readOnly />
+              </details>
+            </>
+          )}
+        </div>
+      )}
+
+      {tab === 'changes' && (
+        <div id="component-manager-changes" role="tabpanel" className="dpanel">
+          <ComponentManagerChanges controller={deploymentController} rows={rows} />
+        </div>
+      )}
     </section>
   );
 }

@@ -192,18 +192,47 @@ TEST(ComponentLifecyclePlanEvaluator, AmbiguousOrInconclusiveTransitionFailsClos
   EXPECT_EQ(decision.error().code, "component_lifecycle_transition_inconclusive");
 }
 
-TEST(ComponentLifecyclePlanEvaluator, RejectsCatalogContentBehindAStaleDeclaredDigest) {
+// C8: the catalog is verified once at composition (BuildOwnedLifecyclePlanCatalogSource);
+// a pass neither recomputes its digest nor compares provider identity beyond the
+// control domain.
+TEST(ComponentLifecyclePlanEvaluator, PassDoesNotReverifyCatalogOrMatchProviderIdentity) {
   auto catalog =
       Catalog({FixedPlan({Transition("prepare", Predicate(ComponentLifecycleStateDTO::kDeclared),
                                      ComponentLifecycleStateDTO::kPrepared)})});
+  // Content no longer matches the declared digest: composition refuses this,
+  // a pass does not recompute it.
   std::get<std::int64_t>(catalog.plans.front().timeout_policy) += 1;
+  auto observation = Observation();
+  observation.provider_manifest_revision = ProviderManifestRevision(
+      "sha256:3333333333333333333333333333333333333333333333333333333333333333");
+  observation.provider_runtime_epoch = RuntimeEpoch("runtime-epoch.2");
 
   const auto decision =
       EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
-                                  ComponentLifecycleStateDTO::kPrepared, catalog, Observation());
+                                  ComponentLifecycleStateDTO::kPrepared, catalog, observation);
+  ASSERT_TRUE(decision.ok()) << decision.error().message;
+  ASSERT_TRUE(decision.value().selected_transition.has_value());
+  EXPECT_EQ(decision.value().selected_transition->lifecycle_primitive_id,
+            LifecyclePrimitiveId("prepare"));
 
-  ASSERT_FALSE(decision.ok());
-  EXPECT_EQ(decision.error().code, "component_lifecycle_plan_evaluation_invalid");
+  auto occurrence = Occurrence(catalog);
+  occurrence.provider_manifest_id = ProviderManifestId("foreign");
+  occurrence.lifecycle_plan_catalog_digest =
+      ContentDigest(std::string("sha256:") + std::string(64, 'f'));
+  const LifecycleDomainHealthDTO health{observation.observed_state, observation.facts,
+                                        std::nullopt};
+  EXPECT_TRUE(EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                                          ComponentLifecycleStateDTO::kPrepared, catalog,
+                                          occurrence, health)
+                  .ok());
+}
+
+// One domain's per-target Recover answers on one observation.
+[[nodiscard]] std::array<LifecyclePostconditionResultDTO, 3> Targets(
+    const BrandLifecyclePlanCatalogDTO& catalog, const BrandLifecycleObservationDTO& observation) {
+  const auto answers = EvaluateLifecycleRecoverTargets(catalog, observation);
+  EXPECT_TRUE(answers.ok());
+  return answers.ok() ? answers.value() : std::array<LifecyclePostconditionResultDTO, 3>{};
 }
 
 TEST(ComponentLifecyclePlanEvaluator, SelectsExactlyOneCommonRecoverTarget) {
@@ -216,11 +245,84 @@ TEST(ComponentLifecyclePlanEvaluator, SelectsExactlyOneCommonRecoverTarget) {
                                      std::pair{std::string("mode"), std::string("automatic")}))});
   auto observation = Observation(ComponentLifecycleStateDTO::kFaulted);
 
-  const auto target = SelectCommonRecoverTarget(
-      {{Occurrence(catalog), catalog, observation}, {Occurrence(catalog), catalog, observation}});
+  const auto target =
+      SelectCommonRecoverTarget({Targets(catalog, observation), Targets(catalog, observation)});
 
   ASSERT_TRUE(target.ok()) << target.error().message;
   EXPECT_EQ(target.value(), ComponentLifecycleStateDTO::kPrepared);
+}
+
+// V-B2: each domain answers its own targets; the caller joins observations to
+// domains, so provider identity is not compared. An invalid observation is
+// refused before any target.
+TEST(ComponentLifecyclePlanEvaluator, RecoverTargetsIgnoreProviderIdentityAndRefuseInvalidInput) {
+  const auto catalog = Catalog({RecoverPlan(ComponentLifecycleStateDTO::kPrepared,
+                                            Predicate(ComponentLifecycleStateDTO::kFaulted))});
+  auto observation = Observation(ComponentLifecycleStateDTO::kFaulted);
+  observation.provider_runtime_epoch = RuntimeEpoch("runtime-epoch.2");
+  observation.provider_instance_id = ProviderInstanceId("provider.other");
+  const auto answers = EvaluateLifecycleRecoverTargets(catalog, observation);
+  ASSERT_TRUE(answers.ok()) << answers.error().message;
+  // Declared and Disabled have no plan: not satisfied.
+  EXPECT_EQ(answers.value(), (std::array{LifecyclePostconditionResultDTO::kNotSatisfied,
+                                         LifecyclePostconditionResultDTO::kSatisfied,
+                                         LifecyclePostconditionResultDTO::kNotSatisfied}));
+  const auto target = SelectCommonRecoverTarget({answers.value()});
+  ASSERT_TRUE(target.ok()) << target.error().message;
+  EXPECT_EQ(target.value(), ComponentLifecycleStateDTO::kPrepared);
+
+  observation.source_sequence = 0U;
+  const auto refused = EvaluateLifecycleRecoverTargets(catalog, observation);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_lifecycle_recover_selection_invalid");
+  EXPECT_EQ(refused.error().details.at("reason"), "observation_invalid_or_domain_mismatch");
+
+  const auto empty = SelectCommonRecoverTarget({});
+  ASSERT_FALSE(empty.ok());
+  EXPECT_EQ(empty.error().details.at("reason"), "provider_set_empty_or_over_bound");
+}
+
+// C12: a refusal names its decisive facts: the unmet clause of each transition
+// that allows the observed state, the missing fact of an inconclusive one, or
+// the state when no transition allows it.
+TEST(ComponentLifecyclePlanEvaluator, RefusalNamesTheDecisiveFacts) {
+  const auto catalog = Catalog({FixedPlan(
+      {Transition("prepare-auto",
+                  Predicate(ComponentLifecycleStateDTO::kDeclared,
+                            std::pair{std::string("mode"), std::string("automatic")}),
+                  ComponentLifecycleStateDTO::kPrepared),
+       Transition("prepare-armed",
+                  Predicate(ComponentLifecycleStateDTO::kDeclared,
+                            std::pair{std::string("arm"), std::string("armed")}),
+                  ComponentLifecycleStateDTO::kPrepared),
+       Transition("prepare-from-disabled",
+                  Predicate(ComponentLifecycleStateDTO::kDisabled,
+                            std::pair{std::string("mode"), std::string("manual")}),
+                  ComponentLifecycleStateDTO::kPrepared)})});
+
+  auto result = EvaluateLifecycleDomainPlan(
+      ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleStateDTO::kPrepared, catalog,
+      Observation(ComponentLifecycleStateDTO::kDeclared,
+                  {{LifecycleFactId("arm"), Token("idle")},
+                   {LifecycleFactId("mode"), Token("manual")}}));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "no_transition_satisfied");
+  // Token values are never copied; the transition from `disabled` is not decisive.
+  EXPECT_EQ(result.error().details.at("decisive_fact"), "mode=nonboolean, arm=nonboolean");
+
+  result = EvaluateLifecycleDomainPlan(
+      ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleStateDTO::kPrepared, catalog,
+      Observation(ComponentLifecycleStateDTO::kDeclared,
+                  {{LifecycleFactId("mode"), Token("manual")}}));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "transition_eligibility_inconclusive");
+  EXPECT_EQ(result.error().details.at("decisive_fact"), "arm=missing");
+
+  result = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+                                       ComponentLifecycleStateDTO::kPrepared, catalog,
+                                       Observation(ComponentLifecycleStateDTO::kActive));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("decisive_fact"), "state=active");
 }
 
 TEST(ComponentLifecyclePlanEvaluator, RecoverAmbiguityAndInconclusivenessFailClosed) {
@@ -229,7 +331,7 @@ TEST(ComponentLifecyclePlanEvaluator, RecoverAmbiguityAndInconclusivenessFailClo
                           RecoverPlan(ComponentLifecycleStateDTO::kPrepared,
                                       Predicate(ComponentLifecycleStateDTO::kFaulted))});
   auto target = SelectCommonRecoverTarget(
-      {{Occurrence(catalog), catalog, Observation(ComponentLifecycleStateDTO::kFaulted)}});
+      {Targets(catalog, Observation(ComponentLifecycleStateDTO::kFaulted))});
   ASSERT_FALSE(target.ok());
   EXPECT_EQ(target.error().code, "component_lifecycle_recover_target_ambiguous");
 
@@ -241,7 +343,7 @@ TEST(ComponentLifecyclePlanEvaluator, RecoverAmbiguityAndInconclusivenessFailClo
                            Predicate(ComponentLifecycleStateDTO::kFaulted,
                                      std::pair{std::string("mode"), std::string("manual")}))});
   target = SelectCommonRecoverTarget(
-      {{Occurrence(catalog), catalog, Observation(ComponentLifecycleStateDTO::kFaulted)}});
+      {Targets(catalog, Observation(ComponentLifecycleStateDTO::kFaulted))});
   ASSERT_FALSE(target.ok());
   EXPECT_EQ(target.error().code, "component_lifecycle_recover_target_inconclusive");
 }
@@ -300,10 +402,11 @@ TEST(ComponentLifecyclePlanEvaluator, FailedPrepareNamesTheSameObservationWithou
       Observation(ComponentLifecycleStateDTO::kDeclared, PrepareFacts(true, true, true)),
       Observation(ComponentLifecycleStateDTO::kDeclared, PrepareFacts(true, false, false)),
       Observation(ComponentLifecycleStateDTO::kFaulted, PrepareFacts())};
-  const std::vector<std::vector<std::string>> expected{{"declared", "false", "false", "true"},
-                                                       {"declared", "true", "true", "true"},
-                                                       {"declared", "true", "false", "false"},
-                                                       {"faulted", "true", "false", "true"}};
+  const std::vector<std::vector<std::string>> expected{
+      {"declared", "false", "false", "true", "external.controller_loaded=false"},
+      {"declared", "true", "true", "true", "external.fault_present=true"},
+      {"declared", "true", "false", "false", "external.transport_ready=false"},
+      {"faulted", "true", "false", "true", "state=faulted"}};
   for (std::size_t index = 0; index < observations.size(); ++index) {
     SCOPED_TRACE(index);
     const auto original = observations[index];
@@ -321,7 +424,8 @@ TEST(ComponentLifecyclePlanEvaluator, FailedPrepareNamesTheSameObservationWithou
         {"observed_controller_loaded", expected[index][1]},
         {"observed_fault_present", expected[index][2]},
         {"observed_transport_ready", expected[index][3]},
-        {"observed_blocking_cause", "missing"}};
+        {"observed_blocking_cause", "missing"},
+        {"decisive_fact", expected[index][4]}};
     EXPECT_EQ(result.error().details, details);
     EXPECT_LE(result.error().details.size(), kMaxLifecycleErrorDetails);
     EXPECT_EQ(observations[index], original);
@@ -357,7 +461,8 @@ TEST(ComponentLifecyclePlanEvaluator, FailureDistinguishesMissingUnknownAndNonbo
     EXPECT_EQ(result.error().details.at("observed_controller_loaded"), marker);
     EXPECT_EQ(result.error().details.at("observed_fault_present"), "false");
     EXPECT_EQ(result.error().details.at("observed_transport_ready"), "true");
-    EXPECT_EQ(result.error().details.size(), 6U);
+    EXPECT_EQ(result.error().details.at("decisive_fact"), "external.controller_loaded=" + marker);
+    EXPECT_EQ(result.error().details.size(), 7U);
     EXPECT_EQ(observation, original);
   }
 }
@@ -387,11 +492,11 @@ TEST(ComponentLifecyclePlanEvaluator, FailureNamesStandardBlockingCauseAndDiagno
   const std::map<std::string, std::string> details{
       {"reason", "no_transition_satisfied"},
       {"observed_state", "declared"},
-      {"observed_controller_loaded", "missing"},
       {"observed_fault_present", "false"},
       {"observed_transport_ready", "false"},
       {"observed_resources_ready", "true"},
       {"observed_blocking_cause", "availability"},
+      {"decisive_fact", "io.driver.transport_ready=false"},
       {"observed_diagnostic_code", "io_provider_transport_unavailable"}};
   EXPECT_EQ(result.error().details, details);
   EXPECT_LE(result.error().details.size(), kMaxLifecycleErrorDetails);
@@ -415,6 +520,7 @@ TEST(ComponentLifecyclePlanEvaluator, RobotFailureKeepsExternalKeysAndAddsCauseA
       {"observed_fault_present", "true"},
       {"observed_transport_ready", "true"},
       {"observed_blocking_cause", "fault"},
+      {"decisive_fact", "external.fault_present=true"},
       {"observed_diagnostic_code", "physical_fault"}};
   EXPECT_EQ(result.error().details, details);
 }
@@ -477,7 +583,7 @@ TEST(ComponentLifecyclePlanEvaluator, PureHealthUsesSameDecisionsAndOriginalFail
   }
 }
 
-TEST(ComponentLifecyclePlanEvaluator, PureHealthKeepsCustomFactsAndExactCatalogQualification) {
+TEST(ComponentLifecyclePlanEvaluator, PureHealthKeepsCustomFactsAndRefusesInvalidInputs) {
   const auto catalog = Catalog({FixedPlan({Transition("prepare-custom",
       Predicate(ComponentLifecycleStateDTO::kDeclared,
                 std::pair{std::string("mode"), std::string("automatic")}),
@@ -492,13 +598,13 @@ TEST(ComponentLifecyclePlanEvaluator, PureHealthKeepsCustomFactsAndExactCatalogQ
   ASSERT_TRUE(decision.value().selected_transition);
   EXPECT_EQ(decision.value().selected_transition->lifecycle_primitive_id,
             LifecyclePrimitiveId("prepare-custom"));
-  for (int mutation = 0; mutation < 4; ++mutation) {
+  // Catalog identity was verified at composition (see
+  // PassDoesNotReverifyCatalogOrMatchProviderIdentity); only malformed inputs refuse.
+  for (int mutation = 0; mutation < 2; ++mutation) {
     auto foreign = occurrence;
     auto malformed = health;
-    if (mutation == 0) foreign.provider_manifest_id = ProviderManifestId("foreign");
-    if (mutation == 1) foreign.lifecycle_plan_catalog_digest = ContentDigest(std::string("sha256:") + std::string(64, 'f'));
-    if (mutation == 2) foreign.provider_runtime_epoch = RuntimeEpoch("");
-    if (mutation == 3) malformed.facts.push_back(malformed.facts.front());
+    if (mutation == 0) foreign.provider_runtime_epoch = RuntimeEpoch("");
+    if (mutation == 1) malformed.facts.push_back(malformed.facts.front());
     const auto refused = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
         ComponentLifecycleStateDTO::kPrepared, catalog, foreign, malformed);
     ASSERT_FALSE(refused.ok());

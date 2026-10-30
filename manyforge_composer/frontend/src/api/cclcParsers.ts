@@ -44,12 +44,15 @@ const REPLAY_STATES = new Set([
   'accepted_new', 'replayed_exact', 'request_result_expired',
   'request_id_conflict', 'request_ledger_full', 'stale_request_owner_epoch',
 ]);
-const TERMINAL_STATES = new Set([
+const LIFECYCLE_TERMINAL_STATES = new Set([
+  'succeeded', 'failed', 'connection_lost',
+]);
+const ROUTE_TERMINAL_STATES = new Set([
   'succeeded', 'failed_known_no_effect', 'failed_partial_effect',
 ]);
 const LIFECYCLE_PHASES = new Set([
   'accepted', 'acquiring_domains', 'containing', 'executing', 'verifying',
-  'outcome_unknown', 'reconciling', 'succeeded', 'failed',
+  'outcome_unknown', 'succeeded', 'failed',
 ]);
 const ROUTE_PHASES = new Set([
   'accepted', 'acquiring_fence', 'observing', 'deactivating', 'activating',
@@ -61,8 +64,7 @@ const EFFECTS = new Set([
   'effect_uncertain',
 ]);
 const LIFECYCLE_ACTION_STATES = new Set([
-  'reserved', 'not_started', 'executing', 'verifying', 'reconciling',
-  'succeeded', 'failed', 'outcome_unknown',
+  'reserved', 'not_started', 'executing', 'verifying', 'succeeded', 'failed',
 ]);
 const TARGET_STATES = new Set<CCLCLifecycleTargetState>(['active', 'prepared', 'disabled']);
 const TARGET_ORIGINS = new Set<CCLCLifecycleTargetOrigin>(['startup', 'operator', 'program']);
@@ -873,6 +875,11 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
   const row = objectAt(value, 'cclcComponent');
   const hasOutputCounters = 'dropped_output_lines' in row || 'dropped_output_bytes' in row;
   const hasStreamHealth = 'stream_health' in row;
+  // M6: Recover cell's re-enable fact; present, and true, only while it waits.
+  const hasRetiredByIncident = 'active_target_retired_by_incident' in row;
+  if (hasRetiredByIncident && row.active_target_retired_by_incident !== true) {
+    fail('cclcComponent.active_target_retired_by_incident', 'true when present');
+  }
   exact(row, [
     'active_public_pointer_digest', 'component_lifecycle_generation',
     'component_lifecycle_state', 'controllable_component_id', 'domains',
@@ -881,6 +888,7 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     'retained_bundle_id', 'snapshot_digest', 'readiness',
     ...(hasOutputCounters ? ['dropped_output_lines', 'dropped_output_bytes'] : []),
     ...(hasStreamHealth ? ['stream_health'] : []),
+    ...(hasRetiredByIncident ? ['active_target_retired_by_incident'] : []),
   ], 'cclcComponent');
   const state = textAt(
     row.component_lifecycle_state,
@@ -1153,7 +1161,7 @@ function statusAt(
     arrayAt(row.domains, `${path}.domains`, 256).forEach((candidate, index) => {
       const domainPath = `${path}.domains[${index}]`;
       const domain = objectAt(candidate, domainPath);
-      exact(domain, ['action_state', 'control_domain_id', 'current_state', 'effect', 'error'], domainPath);
+      exact(domain, ['action_state', 'control_domain_id', 'current_state', 'error'], domainPath);
       if (!LIFECYCLE_ACTION_STATES.has(textAt(domain.action_state, `${domainPath}.action_state`))) {
         fail(`${domainPath}.action_state`, 'a known lifecycle action state');
       }
@@ -1161,9 +1169,6 @@ function statusAt(
       const current = nullableTextAt(domain.current_state, `${domainPath}.current_state`);
       if (current !== null && !LIFECYCLE_STATES.has(current as CCLCLifecycleState)) {
         fail(`${domainPath}.current_state`, 'a known lifecycle state or null');
-      }
-      if (!EFFECTS.has(textAt(domain.effect, `${domainPath}.effect`))) {
-        fail(`${domainPath}.effect`, 'a known lifecycle effect');
       }
       errorAt(domain.error, `${domainPath}.error`);
     });
@@ -1210,7 +1215,10 @@ function statusAt(
   let terminalResult: CCLCTransactionStatus['terminalResult'] = null;
   if (terminalRaw !== null) {
     const terminal = textAt(terminalRaw, `${path}.terminal_result`);
-    if (!TERMINAL_STATES.has(terminal)) {
+    const terminalStates = kind === 'lifecycle'
+      ? LIFECYCLE_TERMINAL_STATES
+      : ROUTE_TERMINAL_STATES;
+    if (!terminalStates.has(terminal)) {
       fail(`${path}.terminal_result`, 'a known terminal result or null');
     }
     terminalResult = terminal as Exclude<

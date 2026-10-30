@@ -20,7 +20,7 @@ _SEND_TIMEOUT_SECONDS = 0.25
 _MAXIMUM_CREDIT_BYTES = 4_096
 
 
-def _credit_identity(message: str) -> tuple[str, str, int] | None:
+def _credit_identity(message: str) -> tuple[tuple[str, str, int, int] | None, int]:
     from .execution_observation_stream import OBSERVATION_CREDIT_SCHEMA
 
     if len(message.encode("utf-8")) > _MAXIMUM_CREDIT_BYTES:
@@ -31,16 +31,19 @@ def _credit_identity(message: str) -> tuple[str, str, int] | None:
         raise ValueError("execution observation credit is not JSON") from error
     if (
         not isinstance(value, dict)
-        or set(value) != {"last_applied", "schema_version"}
+        or set(value) != {"last_applied", "pose_rate_hz", "schema_version"}
         or value.get("schema_version") != OBSERVATION_CREDIT_SCHEMA
     ):
         raise ValueError("execution observation credit has an invalid shape")
+    rate = value.get("pose_rate_hz")
+    if type(rate) is not int or not 5 <= rate <= 60:
+        raise ValueError("viewer pose rate must be an integer in 5..60 Hz")
     cursor = value.get("last_applied")
     if cursor is None:
-        return None
+        return None, rate
     if (
         not isinstance(cursor, dict)
-        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
+        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence", "delivery_sequence"}
         or not isinstance(cursor.get("owner_epoch"), str)
         or not cursor["owner_epoch"]
         or len(cursor["owner_epoch"].encode("utf-8")) > 2_048
@@ -49,12 +52,18 @@ def _credit_identity(message: str) -> tuple[str, str, int] | None:
         or len(cursor["source_epoch"].encode("utf-8")) > 2_048
         or type(cursor.get("source_sequence")) is not int
         or not 0 <= cursor["source_sequence"] <= 9_007_199_254_740_991
+        or type(cursor.get("delivery_sequence")) is not int
+        or not 0 <= cursor["delivery_sequence"] <= 9_007_199_254_740_991
     ):
         raise ValueError("execution observation credit cursor is invalid")
     return (
-        cursor["owner_epoch"],
-        cursor["source_epoch"],
-        cursor["source_sequence"],
+        (
+            cursor["owner_epoch"],
+            cursor["source_epoch"],
+            cursor["source_sequence"],
+            cursor["delivery_sequence"],
+        ),
+        rate,
     )
 
 
@@ -85,7 +94,12 @@ def create_viewer_router(
             )
             return
 
+        last_sent_at: float | None = None
+        send_complete = asyncio.Event()
+        send_complete.set()
+
         async def send_latest() -> None:
+            nonlocal last_sent_at
             from .execution_observation_stream import (
                 ExecutionObservationSourceUnavailable,
             )
@@ -101,10 +115,13 @@ def create_viewer_router(
                     return
                 if payload is None:
                     continue
+                send_complete.clear()
                 await asyncio.wait_for(
                     websocket.send_text(payload),
                     timeout=_SEND_TIMEOUT_SECONDS,
                 )
+                last_sent_at = asyncio.get_running_loop().time()
+                send_complete.set()
 
         async def receive_credit() -> None:
             from .execution_observation_stream import (
@@ -116,7 +133,13 @@ def create_viewer_router(
                     websocket.receive_text(),
                     timeout=OBSERVATION_DEMAND_LEASE_SECONDS,
                 )
-                source.grant_credit(subscription, _credit_identity(message))
+                identity, rate = _credit_identity(message)
+                await send_complete.wait()
+                if last_sent_at is not None:
+                    remaining = last_sent_at + 1.0 / rate - asyncio.get_running_loop().time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                source.grant_credit(subscription, identity)
 
         sender = asyncio.create_task(send_latest())
         receiver = asyncio.create_task(receive_credit())

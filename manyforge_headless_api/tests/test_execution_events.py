@@ -46,6 +46,8 @@ def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
         "result": None,
         "runtime_scale_status": None,
     }
+
+
     canonical = rfc8785.dumps(payload)
     return {
         "effect_pending": False,
@@ -60,6 +62,31 @@ def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
         "request_id": None,
         "sequence": sequence,
     }
+
+
+@pytest.mark.parametrize(
+    ("producer", "expected_producer"),
+    [("component_manager", "component_manager"), (None, "kernel")],
+)
+def test_execution_rpc_refusal_retains_optional_producer(
+    producer: str | None, expected_producer: str
+) -> None:
+    error = {
+        "code": "execution_command_invalid",
+        "details": {"cause_code": "stale_generation"},
+        "message": "request refused",
+    }
+    if producer is not None:
+        error["producer"] = producer
+
+    with pytest.raises(HeadlessApiError) as refused:
+        ExecutionCommandClient._raise_error_response(
+            {"error": error, "ok": False}
+        )
+
+    assert refused.value.code == "execution_command_invalid"
+    assert refused.value.details == {"cause_code": "stale_generation"}
+    assert refused.value.producer == expected_producer
 
 
 def _progress_event(
@@ -853,7 +880,7 @@ def _direct_motion_request() -> OperationIntentRequest:
                         "kind": "motion",
                         "move_id": "robot-control-preview-request-1",
                         "base_frame_role_id": "base",
-                        "tcp_endpoint": {"target_role_id": "command_target", "frame_role_id": "tcp"},
+                        "tcp_endpoint": {"kind": "current"},
                         "tolerances": {
                             "joint_position_tol_rad": 0.05,
                             "translation_tol_m": 0.005,
@@ -1014,7 +1041,7 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "bad_availability",
     ],
 )
-def test_manual_handover_query_is_one_bounded_identity_checked_read(
+def test_manual_handover_query_is_one_bounded_shape_checked_read(
     tmp_path, monkeypatch, case
 ):
     client = ExecutionCommandClient(tmp_path)
@@ -1056,7 +1083,7 @@ def test_manual_handover_query_is_one_bounded_identity_checked_read(
             ),
         }
         if case == "stale":
-            result["intent_digest"] = "sha256:" + "0" * 64
+            result["intent_digest"] = "sha256:" + "0" * 64  # Echo, not compared.
         elif case == "malformed":
             result["handover"]["producer_node_indices"] = [True]
         elif case == "extra":
@@ -1078,7 +1105,6 @@ def test_manual_handover_query_is_one_bounded_identity_checked_read(
 
     monkeypatch.setattr(client, "_exchange", exchange)
     if case in {
-        "stale",
         "malformed",
         "extra",
         "cleanup_without_parent",
@@ -1263,15 +1289,15 @@ def test_execution_client_verifies_capability_command_preview_receipt(
     )
     assert local_response["preview_receipt"]["source_kind"] == ("component_local")
 
-    def stale_schema(command: dict[str, Any]) -> dict[str, Any]:
+    def wrong_kind(command: dict[str, Any]) -> dict[str, Any]:
         response = _command_preview_response(command["operation"])
-        response["preview_receipt"]["command_schema_revision"] = "sha256:stale"
+        response["command"] = "preview_motion"
         return response
 
-    monkeypatch.setattr(client, "_exchange", stale_schema)
-    with pytest.raises(HeadlessApiError) as mismatch:
+    monkeypatch.setattr(client, "_exchange", wrong_kind)
+    with pytest.raises(HeadlessApiError) as invalid:
         client.preview_capability_command(request, trusted_principal_id=None)
-    assert mismatch.value.code == "execution_command_response_identity_mismatch"
+    assert invalid.value.code == "execution_command_response_invalid"
 
 
 class _RecordingCore:
@@ -1583,6 +1609,38 @@ def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
     assert core.ingested == []
     assert len(wakes) == baseline + 1
 
+
+
+def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
+    core = _RecordingCore()
+    execution = _StreamingExecution()
+    changed = threading.Event()
+    pump = ExecutionEventPump(core, execution, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    pump.set_change_observer(changed.set)
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    payload = {
+        "api_version": "manyforge.active_tcp_change.v1",
+        "owner_epoch": execution.owner_epoch,
+        "component_id": "robot-a",
+        "previous": None,
+        "entry": {"component_id": "robot-a", "target_id": "arm", "frame_role_id": "tcp"},
+        "source": "robot_control",
+        "offset_sent": True,
+        "registration_generation": 1,
+        "sequence": 1,
+    }
+    event = _event(execution.owner_epoch, 1)
+    event.update(record_kind="active_tcp_changed", operation_id=None, operation_revision=None,
+                 payload=payload, payload_digest=f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}")
+    try:
+        execution.append(event)
+        assert changed.wait(timeout=1.0)
+        assert core.ingested[0]["record_kind"] == "active_tcp_changed"
+        assert pump.last_error is None
+    finally:
+        pump.shutdown()
 
 def test_event_pump_logs_only_error_transitions(caplog) -> None:
     pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
@@ -3023,27 +3081,17 @@ def test_execution_client_projects_global_rule_recovery_offers_and_variant(
     # The variant keeps its explicit null reason; Stop bytes are untouched.
     assert commands[-1]["request"] == request.model_dump(mode="json")
     assert commands[-1]["request"]["reason"] is None
-    result["rule"] = {**result["rule"], "rule_id": "other"}
-    with pytest.raises(HeadlessApiError):
+    result["rule"] = {**result["rule"], "state": "unknown"}
+    with pytest.raises(HeadlessApiError) as invalid:
         client.recover_stop_fault(request)
+    assert invalid.value.code == "execution_command_response_invalid"
     result.update(accepted=False, rule=None, error="global_rule_condition_true")
     assert client.recover_stop_fault(request)["result"]["accepted"] is False
-    # SX-2216: the result proves the exact requested selector context.
     result.update(
         accepted=True,
         rule={"rule_id": "door_open", "state": "clear", "triggering_acquisition": None},
         error=None,
     )
-    for field, value in (
-        ("owner_epoch", "kernel.epoch.2"),
-        ("catalog_generation", "5"),
-        ("active_publication_generation", 3),
-        ("bundle", "bundle.2"),
-        ("graph", "graph.2"),
-    ):
-        result["context"] = {**selector["context"], field: value}
-        with pytest.raises(HeadlessApiError):
-            client.recover_stop_fault(request)
     # A replay of a historical request keeps its original context even after
     # the current Applied context (the offers) moved on.
     offers[:] = [{**offer, "selector": {
@@ -3258,3 +3306,48 @@ def test_event_pump_surfaces_a_refused_rule_row_like_any_refused_row() -> None:
     assert [row["source_sequence"] for row in core.ingested][:1] == [1]
     assert not core.completed_calls
     assert published and published[-1] is None
+
+
+def test_active_tcp_change_and_baseline_survive_events_reply(monkeypatch, tmp_path):
+    owner_epoch = "execution-host.epoch.tcp"
+    row = _event(owner_epoch, 1)
+    row.update(record_kind="active_tcp_changed", operation_id=None, operation_revision=None,
+               request_id=None, payload={"api_version": "manyforge.active_tcp_change.v1",
+                   "owner_epoch": owner_epoch, "component_id": "robot", "previous": None,
+                   "entry": None, "source": "reset", "offset_sent": False,
+                   "registration_generation": 1, "sequence": 1})
+    row["payload_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(row["payload"])).hexdigest()
+    response = _page(owner_epoch, [row])
+    baseline = [{"component_id": "robot", "entry": None, "owner_epoch": owner_epoch,
+                 "registration_generation": 1, "sequence": 1}]
+    response["active_tcp_baseline"] = baseline
+    client = ExecutionCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    page = client.events(owner_epoch, 0)
+    assert page["active_tcp_baseline"] == baseline
+    assert page["events"][0]["payload"] == row["payload"]
+    row["operation_id"] = "unexpected"
+    with pytest.raises(HeadlessApiError):
+        client.events(owner_epoch, 0)
+
+
+@pytest.mark.parametrize("payload", [
+    {"kind": "set_tcp", "tcp": {"kind": "entry", "entry": {
+        "component_id": "tool", "target_id": "gripper", "frame_role_id": "tcp"}}},
+    {"kind": "set_tcp", "tcp": {"kind": "default_of_role", "role": "tool"}},
+])
+def test_public_execution_submit_forwards_set_tcp_and_attribution(monkeypatch, tmp_path, payload):
+    from manyforge_headless_api.tests.test_models import _planning_operation
+    operation = _planning_operation("manual.set-tcp", payload)
+    request = OperationIntentRequest.model_validate(operation)
+    client = ExecutionCommandClient(tmp_path)
+    commands = []
+    rows = [{"component_id": "robot", "entry": None, "owner_epoch": "owner.1",
+             "registration_generation": 1, "sequence": 0}]
+    def exchange(command):
+        commands.append(command)
+        return {"ok": True, "command": "submit", "accepted": {}, "active_tcp": rows}
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.submit(request, trusted_principal_id="operator.1")["active_tcp"] == rows
+    assert commands[0]["operation"]["participants"][0]["payload"] == payload
+    assert commands[0]["attribution"] == {"transport": "http", "assurance": "externally_authenticated", "principal_id": "operator.1"}

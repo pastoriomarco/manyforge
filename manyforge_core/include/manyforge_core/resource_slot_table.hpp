@@ -302,6 +302,12 @@ class ResourceSlotTable final {
       std::uint64_t expected_operation_resource_generation,
       const std::vector<ResourceId>& resources);
 
+  /// Item 37 Force close only: free every slot owned by one of `operations`,
+  /// whatever its phase, and every unowned orphan-unreconciled slot. No proof
+  /// of rest is checked: the caller's confirmed Full Stop and stopped
+  /// component processes stand in for it. Returns the freed orphan resources.
+  [[nodiscard]] std::vector<ResourceId> force_release(const std::vector<OperationId>& operations);
+
   /// Replace the selected runtime inventory while preserving every unchanged
   /// occupied slot. An empty candidate is the valid no-commandable-component
   /// product. Removed resources must already be free, and any retained

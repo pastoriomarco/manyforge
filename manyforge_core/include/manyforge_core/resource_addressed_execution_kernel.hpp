@@ -39,6 +39,7 @@
 #include <manyforge_core/types/program_execution_control.hpp>
 #include <manyforge_core/types/program_io.hpp>
 #include <manyforge_core/types/runtime_domain_configuration.hpp>
+#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -55,6 +56,37 @@ struct ApplyBringUpAdmissionOfferDTO;
 struct ActiveOperationParticipant;
 
 inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
+
+/// A2a-2: an immediate component step. A short direct Kernel call: admitted
+/// like an operation of its component, then the adapter's atomic step runs
+/// synchronously, outside the Kernel locks, and nothing is stored (no
+/// operation record, journal entry or acknowledgement). No Stop ends it.
+/// Users: Set TCP (A2a); the tool payload update (`set_tcp_load`, A2b).
+struct ImmediateComponentStep final {
+  /// Hold the component's engine for the step: refused (`participant_engine_busy`)
+  /// while an operation of that engine is admitted, and no operation of that
+  /// engine is admitted while the step runs.
+  bool holds_engine{};
+  /// The adapter's atomic step; its result is the call's result.
+  std::function<Result<void>()> run;
+};
+
+/// Active TCP (M7, T-MQ15, T-A2): a robot's Set TCP, an immediate component
+/// step. The resolver supplies it with the robot's motion-target registration;
+/// the resolved entry is `tcp_entry_of(*binding.motion_endpoint,
+/// motion_endpoint_owner.value_or(binding.controllable_component_id))`.
+struct SetTcpStep final {
+  /// "Send TCP offset to controller" on: Set TCP holds the robot
+  /// (`ImmediateComponentStep::holds_engine`). Off: it holds nothing and may
+  /// run during a move (T-A2b).
+  bool holds_robot{};
+  /// The robot's confirmed TCP step, then the commit. Ok once the robot's
+  /// Active TCP is `entry` (also when it already was, and while the robot is
+  /// not enabled: A2a-1). `robot_control`: the registration's
+  /// `intrinsic_direct_control` (Robot control's Set TCP, else a Program's),
+  /// recorded with the change (A2a-2).
+  std::function<Result<void>(const TcpEntryDTO& entry, bool robot_control)> apply;
+};
 
 struct RuntimeParticipantExecutionRegistration final {
   RuntimeParticipantBinding binding;
@@ -101,6 +133,11 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Deployment target. Motion admission fails closed when it is absent.
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
 
+  /// The robot flange when this target's Deployment `tcp_speed_check` is
+  /// `active_tcp_and_flange`; absent for `active_tcp`. The ceiling above then
+  /// also holds at the flange (`speed_check_frames`, computed at admission).
+  std::optional<ResolvedFrameDTO> speed_check_flange_frame{};
+
   /// Composition-owned classification from an exact compiler-direct product,
   /// never inferred from missing Program origin or a caller's source label.
   bool intrinsic_direct_control{};
@@ -120,6 +157,14 @@ struct RuntimeParticipantExecutionRegistration final {
   std::optional<MotionInterruptScopeDTO> captured_node_interrupt_scope{};
   /// Optional earlier suffix-planning deadline from the applied Deployment.
   std::optional<double> motion_takeover_planning_budget_s{};
+  /// B7: the owner of this operation's motion-endpoint frame (the motion
+  /// component or a tool mounted on it), resolved from the cell kinematic
+  /// index. It stamps the request's TCP frame; absent means the motion
+  /// component itself.
+  std::optional<ControllableComponentId> motion_endpoint_owner{};
+  /// Active TCP (M7): present on a robot's motion-target registration that
+  /// can set its Active TCP. Absent: Set TCP is refused (`set_tcp_unavailable`).
+  std::optional<SetTcpStep> set_tcp{};
 };
 
 using RuntimeParticipantAdmissionResolver =
@@ -265,6 +310,44 @@ struct CellStopActionProjectionDTO final {
 
   friend bool operator==(const CellStopActionProjectionDTO&,
                          const CellStopActionProjectionDTO&) = default;
+};
+
+/// Item 37 Force close: one participant target of a force-closed operation.
+struct ForceClosedTargetDTO final {
+  ControllableComponentId controllable_component_id;
+  CommandTargetId command_target_id;
+  /// Its output write ended acceptance-unknown: the physical output state is unknown.
+  bool output_unknown{};
+
+  friend bool operator==(const ForceClosedTargetDTO&, const ForceClosedTargetDTO&) = default;
+};
+
+/// Item 37 Force close: one resident operation the Kernel moved into history.
+struct ForceClosedOperationDTO final {
+  OperationId operation_id;
+  OperationRevision operation_revision;
+  /// Its state when Force close moved it (history records it InterventionRequired
+  /// unless it was already Completed, Stopped, Failed or CancelledPreDispatch).
+  OperationStateKind state{OperationStateKind::kInterrupted};
+  bool containment_uncertain{};
+  std::vector<ForceClosedTargetDTO> targets;
+
+  friend bool operator==(const ForceClosedOperationDTO&, const ForceClosedOperationDTO&) = default;
+};
+
+/// Item 37 Force close: what the Kernel step left in an unknown state.
+struct ForceCloseResultDTO final {
+  /// The operator's confirmed Full Stop the step relied on.
+  StopGeneration stop_generation{0U};
+  std::vector<ForceClosedOperationDTO> operations;
+  /// Unowned orphan slots (from an earlier Kernel incarnation) it freed.
+  std::vector<ResourceId> released_orphan_resources;
+  /// FIX1: the cell-wide motion block an unresolved operation closure left
+  /// (U6), or the orphan-slot block an earlier restart left, was cleared.
+  /// Motion still needs the ordinary Prepare/Enable.
+  bool motion_block_cleared{};
+
+  friend bool operator==(const ForceCloseResultDTO&, const ForceCloseResultDTO&) = default;
 };
 
 struct ResourceAddressedExecutionKernelConfig final {
@@ -421,6 +504,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   /// Resolve, reserve, and submit one portable operation. Exact replay returns
   /// the original owner-minted identities and performs no subordinate call.
+  ///
+  /// Active TCP (M7, T-MQ15, A2a-2): a Set TCP intent
+  /// (`SetTcpParticipantIntentDTO`) runs as an immediate component step
+  /// (`execute_immediate_step`). The call returns when the step finished:
+  /// Ok = the robot's Active TCP is the resolved entry; Err = typed refusal or
+  /// step failure. Its operation id is not readable afterwards; there is
+  /// nothing to acknowledge.
   [[nodiscard]] Result<OperationAcceptedDTO> execute(const OperationIntentDTO& intent) override;
 
   [[nodiscard]] Result<std::unique_ptr<IAddressedMotionPreviewSession>>
@@ -438,6 +528,27 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
+  /// Item 37 Force close, first Kernel step: record that the operator's Full
+  /// Stop `stop_generation` is confirmed (it is the cell's newest Stop and its
+  /// certificate succeeded). From then until the product changes, the Close
+  /// lease no longer refuses resident operations. Otherwise refused with
+  /// `scenario_force_close_stop_unconfirmed`; `details.reason` is
+  /// `stop_pending` while that Stop has no certificate yet.
+  [[nodiscard]] Result<StopGeneration> arm_force_close(StopGeneration stop_generation);
+  /// Item 37 Force close, second Kernel step: only after `arm_force_close` and
+  /// the Close retirement, with the component processes already stopped by
+  /// the caller. Moves every resident operation into history marked
+  /// `cell_force_closed_by_operator`, journals that settled state (so a restart
+  /// finds it in history, not as an orphan), frees its resource slots and any
+  /// unowned orphan slot, and reports what was left in an unknown state. The
+  /// orphaned operations of a freed orphan slot are journaled settled too, and
+  /// the orphan-slot motion block ends. When one of
+  /// them had an unresolved closure, it also clears the cell-wide motion block
+  /// that closure left, by the Stop-fault-clear rule (a restart-only fault,
+  /// Manager liveness, an open latch or a pending containment keeps it). It
+  /// does not wait for a pending I/O-rule Stop response (item 39). It
+  /// commands nothing: no output, no motion.
+  [[nodiscard]] Result<ForceCloseResultDTO> force_close_operations();
   /// Install the sealed immutable Program association before any node effect.
   /// Repeated exact registration preserves current admission holds. This is
   /// process-local composition, not a public caller-supplied table interface.
@@ -891,6 +1002,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   }
 
  private:
+  friend class StopControlExecutorTestAccess;
   [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
   resolve_manual_program_handover(const OperationIntentDTO& intent);
   [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
@@ -917,9 +1029,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id, OperationRevision expected_operation_revision,
       const KernelRecoveryActionRequestDTO& request);
   [[nodiscard]] Result<void> retire_preempted_motion_operations();
+  /// `force` (item 37, Force close): the caller has refused the busy cases and
+  /// frees every slot of its operations at once (`force_release`); the drain
+  /// checks and the per-operation slot release are skipped, and I/O rules,
+  /// takeovers' included, are retired whatever their result.
   [[nodiscard]] Result<void> retire_operation_ownership_locked(
       const OperationId& operation_id, bool clear_continuation,
-      bool discard_node_continuations = false);
+      bool discard_node_continuations = false, bool force = false);
   [[nodiscard]] std::optional<std::vector<std::size_t>> fresh_motion_node_indices_locked(
       const ActiveOperation& operation) const;
   void mark_motion_retry_run_end_locked(const ProgramRunId& run_id);
@@ -1108,7 +1224,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> install_global_io_rule_catalog_locked(
       StagedGlobalIoRuleCatalog& candidate);
   void set_global_io_rule_state_locked(std::size_t index, IoGlobalRuleState state,
-      std::optional<IoRuleAcquisitionKeyDTO> acquisition = {});
+      std::optional<IoRuleAcquisitionKeyDTO> acquisition = {},
+      std::optional<ErrorDTO> unavailable_reason = {});
   void ProjectGlobalIoRuleStates() noexcept;
   void retire_all_io_rules_locked();
   [[nodiscard]] bool has_active_io_rules_locked() const;
@@ -1137,7 +1254,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ActiveOperationParticipant& participant) const;
   [[nodiscard]] Result<void> process_global_io_rule_evidence_locked(
       StopWorkHandoff& handoff, const OperationId* dispatch_boundary = nullptr,
-      std::optional<std::size_t> recovering_index = {});
+      std::optional<std::size_t> recovering_index = {}, std::optional<std::size_t> only_index = {});
   [[nodiscard]] Result<void> validate_global_io_rule_stop_locked(
       const GlobalInterruptStopSelection& selection) const;
   struct InterruptStopSelection;
@@ -1161,6 +1278,19 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void settle_deferred_pre_dispatch_cancellations() noexcept;
   [[nodiscard]] Result<OperationAcceptedDTO> execute_coordinated_motion_after_preflight(
       const OperationIntentDTO& intent);
+  /// A2a-2: run one immediate component step. Validates and resolves the
+  /// single-participant intent, asks `step_for` for the step of the resolved
+  /// registration (its refusal is returned), admits it (origin: Program node
+  /// scope as a non-motion transaction, or manual readiness unless Robot
+  /// control's own manual claim already covers the component; the
+  /// `holds_engine` busy rule; no "enabled" or "motion admission open" check,
+  /// A2a-1), then runs it outside the Kernel locks. Nothing is stored.
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_immediate_step(
+      const OperationIntentDTO& intent,
+      const std::function<Result<ImmediateComponentStep>(
+          const RuntimeParticipantExecutionRegistration&)>& step_for);
+  /// Active TCP (M7): the Set TCP user of `execute_immediate_step`.
+  [[nodiscard]] Result<OperationAcceptedDTO> execute_set_tcp(const OperationIntentDTO& intent);
   /// Dispatch none, cancel every prepared participant and release the
   /// reservation. A coordinated participant failure names its engine; a null
   /// engine is a whole-operation admission refusal (single or coordinated)
@@ -1454,6 +1584,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// D6: Scenario Close retired the current product's lifecycle targets. Set
   /// by the Close lease after retirement; cleared when the product changes.
   bool close_retired_product_{};
+  /// Item 37: the confirmed Full Stop of an operator Force close. Set by
+  /// `arm_force_close`; cleared with `close_retired_product_`, by a newer
+  /// Stop and by a newly admitted operation.
+  std::optional<StopGeneration> force_close_stop_generation_;
   bool manager_liveness_motion_inhibited_{};
   struct AttributedContainmentStop final {
     StopId stop_id;
@@ -1476,6 +1610,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // Closed refuses all new admission. A Full Stop no longer closes admission
   // by itself (its causing fault gates motion).
   bool motion_admission_closed_{};
+  /// A2a-2: engines held by a running immediate component step
+  /// (`ImmediateComponentStep::holds_engine`). Guarded by `state_mutex_`.
+  std::set<IResolvedParticipantExecutionEngine*> immediate_step_engines_;
   std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
   std::optional<KernelInternalFaultDTO> internal_fault_{};
   // Restart-only Workbench faults (internal fault, journal write fault): each

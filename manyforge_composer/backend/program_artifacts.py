@@ -7,17 +7,18 @@ import logging
 import os
 from pathlib import Path
 import stat
-from typing import NoReturn
+from typing import Any, Callable, NoReturn
 import uuid
 
 from fastapi import HTTPException
 import yaml
 
 from manyforge_behavior.canonical_artifact import (
-    MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_BYTES, StrictArtifactError, load_strict_json_yaml,
+    verify_content_identity, compute_content_identity,
 )
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import Program, ProgramValidationError, TcpEndpointAliasAmbiguous
 
 from .security import (
     SCENARIO_PROJECT_READ_ONLY_MESSAGE,
@@ -122,6 +123,7 @@ def load_program_artifact(
     *,
     allowed_roots: list[str],
     catalog: NodeCatalog,
+    legacy_attach_context: Callable[[], tuple[Any, Any]] | None = None,
 ) -> tuple[Program, str]:
     """Read and validate one Program through an attested no-follow descriptor."""
 
@@ -184,12 +186,32 @@ def load_program_artifact(
             # An authored file opened for editing: a stale self-identity is
             # an `edited_outside_manyforge` warning, not a refusal, and a
             # compatible older catalog selector loads as the active one.
-            loaded = Program(
-                f"/proc/self/fd/{descriptor}", catalog, authoring_load=True
-            )
-        except ProgramValidationError as error:
+            raw = load_strict_json_yaml(f"/proc/self/fd/{descriptor}")
+            if (legacy_attach_context is not None and isinstance(raw, dict)
+                    and isinstance(raw.get("catalog"), dict)
+                    and raw["catalog"].get("content_version") == "2.8.0"
+                    and isinstance(raw.get("api_version"), str)
+                    and catalog.content_version == "2.9.0"):
+                from .legacy_attach_migration import migrate_legacy_attach
+                deployment, assignment = legacy_attach_context()
+                clean_identity = False
+                try:
+                    verify_content_identity(raw, own_field="program_revision",
+                                            identity_domain="program-revision",
+                                            api_version=raw["api_version"], label=str(resolved))
+                    clean_identity = True
+                except StrictArtifactError:
+                    pass
+                if migrate_legacy_attach(raw, deployment, assignment) and clean_identity:
+                    raw["program_revision"] = compute_content_identity(
+                        raw, own_field="program_revision", identity_domain="program-revision",
+                        api_version=raw["api_version"],
+                    )
+            loaded = Program.from_dict(raw, catalog, path=resolved, authoring_load=True)
+        except (ProgramValidationError, StrictArtifactError) as error:
             _fail(
-                "program_artifact_validation_failed",
+                error.code if isinstance(error, TcpEndpointAliasAmbiguous)
+                else "program_artifact_validation_failed",
                 str(error),
                 status_code=400,
             )

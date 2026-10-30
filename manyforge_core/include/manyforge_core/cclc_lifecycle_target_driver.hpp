@@ -10,7 +10,6 @@
 #include <manyforge_core/ports/icclc_brand_lifecycle_port_resolver.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
-#include <manyforge_core/ports/icclc_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/ports/icclc_lifecycle_target_store.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -98,7 +97,9 @@ class ICCLCLifecycleTargetDriverPorts {
 
   [[nodiscard]] virtual Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component) = 0;
-  [[nodiscard]] virtual Result<BrandLifecyclePlanCatalogDTO> LoadLifecyclePlanCatalog(
+  /// The exact provider's pure admission query (V2-1); the returned pointer
+  /// keeps its adapter alive.
+  [[nodiscard]] virtual Result<std::shared_ptr<const ILifecycleAdmission>> Admission(
       const ResolvedLifecycleProviderOccurrenceDTO& occurrence) = 0;
   /// One read-only observation of the exact provider occurrence.
   [[nodiscard]] virtual Result<BrandLifecycleObservationDTO> Observe(
@@ -155,7 +156,6 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
   CoordinatorLifecycleTargetDriverPorts(
       ComponentLifecycleCoordinator& coordinator,
       const ICCLCCurrentComponentSnapshotSource& snapshot_source,
-      const ICCLCLifecyclePlanCatalogSource& catalog_source,
       const ICCLCBrandLifecyclePortResolver& port_resolver,
       IKernelCellAdmissionPort& kernel_cell_admission_port,
       std::function<Result<std::vector<ControllableComponentId>>()> unsettled_components =
@@ -174,7 +174,7 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
 
   [[nodiscard]] Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component) override;
-  [[nodiscard]] Result<BrandLifecyclePlanCatalogDTO> LoadLifecyclePlanCatalog(
+  [[nodiscard]] Result<std::shared_ptr<const ILifecycleAdmission>> Admission(
       const ResolvedLifecycleProviderOccurrenceDTO& occurrence) override;
   [[nodiscard]] Result<BrandLifecycleObservationDTO> Observe(
       const ResolvedLifecycleProviderOccurrenceDTO& occurrence,
@@ -202,7 +202,6 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
  private:
   ComponentLifecycleCoordinator& coordinator_;
   const ICCLCCurrentComponentSnapshotSource* snapshot_source_{};
-  const ICCLCLifecyclePlanCatalogSource* catalog_source_{};
   const ICCLCBrandLifecyclePortResolver* port_resolver_{};
   const ComponentLifecycleProductPin* product_pin_{};
   IKernelCellAdmissionPort& kernel_cell_admission_port_;
@@ -277,12 +276,12 @@ using CCLCProgramResetPositionAction =
 /// keeps it, and with it the incident rules. Only the Apply facts end the
 /// window, never a timer or an observation.
 ///
-/// From the achieved CCLC state and the brand plan catalog it computes the
-/// next intent toward each component's requested target, waits until that
-/// intent's own plan is eligible on a fresh observation and the blocking
-/// cause permits it, then submits the ordinary CCLC lifecycle transaction with
-/// system attribution. An uncertain outcome is left to CCLC reconciliation; a
-/// step is retried only after a known terminal failure and a newer
+/// From the achieved CCLC state it computes the next intent toward each
+/// component's requested target, waits until the provider's admission query
+/// answers ready on a fresh observation and the blocking cause permits it,
+/// then submits the ordinary CCLC lifecycle transaction with system
+/// attribution. A transaction ends succeeded, failed or connection lost; a
+/// failed step (connection lost included) is retried only after a newer
 /// observation. Waiting holds no claim, fence or lock, and a pass in which
 /// nothing changed submits and writes nothing.
 ///
@@ -337,6 +336,17 @@ class CCLCLifecycleTargetDriver final {
   /// recovered) incident, so the ordinary CCLC admission decides it.
   [[nodiscard]] Result<std::optional<CCLCLifecycleRequestResultDTO>> RecoverIncident(
       const ComponentLifecycleIntentDTO& intent);
+  /// M6: refuses `cclc_incident_open` (no effect) while the component has an
+  /// open incident or a stream condition that the operator's Recover would
+  /// acknowledge; never acknowledges either. Ok when nothing is pending.
+  [[nodiscard]] Result<void> RefuseWhileAcknowledgementPending(
+      const ControllableComponentId& component);
+  /// M6 (item 36): refuses `cclc_incident_changed` (no effect) when the
+  /// component's open incident is another than `expected_incident_id`; the
+  /// details name it. Ok when it is that one or none is open (item 26: an
+  /// ordinary Recover). Read only: nothing is acknowledged.
+  [[nodiscard]] Result<void> RefuseIfAnotherIncidentOpen(const ControllableComponentId& component,
+                                                         const std::string& expected_incident_id);
   /// Durable incident history events for the historian pipe.
   [[nodiscard]] Result<std::vector<ComponentIncidentEventDTO>> LoadIncidentEvents(
       std::uint64_t after_sequence, std::size_t limit);
@@ -434,14 +444,17 @@ class CCLCLifecycleTargetDriver final {
     bool retired_reached_observation{};
     /// CP9 stream verdict read at the start of this pass.
     ComponentStreamVerdictDTO streams;
-    /// Recovery generation under which this driver's last Recover of the
-    /// current target settled: a still-observed recovered cause gets one
-    /// driver Recover per operator Recover (ADR-0026 §7).
-    std::optional<std::uint64_t> recover_settled_generation;
+    /// The durable recover attempt generation read with these facts (M6,
+    /// item 35): a still-observed recovered cause gets one Recover per
+    /// recovery generation, the operator's ordinary Recover or this driver's,
+    /// across owner restarts and successor targets (ADR-0026 §7).
+    std::optional<std::uint64_t> recover_attempt_generation;
     /// m5.5: the Kernel's authoring admission read when this external-move
     /// episode was decided (no lifecycle work of the component in flight).
     /// Kept while the component's own re-arm holds the cell's lifecycle
-    /// claim; cleared once no domain reports `device.moved_externally`.
+    /// claim and, once decided ordinary, while an admitted motion re-engages
+    /// it (M6 ADAPTERM); cleared once no domain reports
+    /// `device.moved_externally`.
     std::optional<AuthoringAdmissionDTO> external_move_decision;
   };
   /// The Kernel's answer to one incident's containment request.

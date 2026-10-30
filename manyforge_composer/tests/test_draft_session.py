@@ -163,7 +163,7 @@ def _pick_macro_arguments() -> dict:
         "target_role": "arm",
         "tool_target_role": "gripper",
         "base_frame_role": "base",
-        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+        "tcp_endpoint": {"kind": "current"},
         "carrier_frame_role": "tcp",
         "touch_body_roles": ["gripper_collision"],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
@@ -445,9 +445,20 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
     ]
 
 
-def test_pick_authoring_macro_forwards_one_qualified_endpoint_to_motion_nodes() -> None:
+@pytest.mark.parametrize("selector", [
+    None,
+    {"kind": "current"},
+    {"kind": "default_of_role", "role": "gripper"},
+    # The arm declares no tcp frame since the TCP migration (REGEN-A2).
+    {"kind": "entry", "target_role": "gripper", "frame_role": "tcp"},
+])
+def test_pick_authoring_macro_forwards_selector_to_planner_and_moves(selector) -> None:
     session = ComposerDraftSession(_pick_program())
     arguments = _pick_macro_arguments()
+    if selector is None:
+        arguments.pop("tcp_endpoint")
+    else:
+        arguments["tcp_endpoint"] = selector
 
     _mutate(session, "program_draft_expand_authoring_macro", arguments)
 
@@ -458,12 +469,28 @@ def test_pick_authoring_macro_forwards_one_qualified_endpoint_to_motion_nodes() 
     )
     motion_nodes = [
         node for node in inserted["children"]
-        if node["node_id"] in {"motion.move_to_pose", "motion.follow_cartesian_path"}
+        if node["node_id"].startswith(("planning.", "motion."))
     ]
-    assert motion_nodes
-    assert all(node["parameters"]["tcp_endpoint"] == arguments["tcp_endpoint"]
+    assert len(motion_nodes) == 4
+    assert all(node["parameters"]["tcp_endpoint"] == (selector or {"kind": "current"})
                for node in motion_nodes)
     assert all("tcp_frame_role" not in node["parameters"] for node in motion_nodes)
+
+
+@pytest.mark.parametrize("selector", [
+    {"target_role": "arm", "frame_role": "tcp"},
+    {"kind": "current", "role": "arm"},
+    {"kind": "entry", "target_role": "arm"},
+])
+def test_pick_authoring_macro_rejects_malformed_selector_without_mutation(selector) -> None:
+    session = ComposerDraftSession(_pick_program())
+    before = session.retained_state()
+    arguments = _pick_macro_arguments()
+    arguments["tcp_endpoint"] = selector
+    with pytest.raises(DraftSessionError) as refused:
+        _mutate(session, "program_draft_expand_authoring_macro", arguments)
+    assert refused.value.code == "draft_arguments_invalid"
+    assert session.retained_state() == before
 
 
 def test_pick_authoring_macro_rejects_legacy_tcp_frame_selector() -> None:
@@ -587,7 +614,7 @@ def test_store_observed_move_updates_only_selected_node(
     node["parameters"] = {
         "target_role": "arm",
         "base_frame_role": "base",
-        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+        "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
         "goal": (
             [{"joint_name": "joint1", "position_rad": 0.0}]
             if observed_kind == "joint"
@@ -2036,7 +2063,7 @@ def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
         "parameters": {
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+            "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
             "translation_tol_m": 0.002,
             "max_blend_deviation_rad": 0.03,
         },
@@ -2559,3 +2586,126 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
     assert operator_result.mutation not in SUPPORTED_DRAFT_MUTATIONS
     assert session.snapshot()["saved"] is False
     assert session.snapshot()["applied"] is False
+
+
+def _lite6_program() -> Program:
+    return Program(_LITE6_PROGRAM_PATH, build_node_environment().catalog)
+
+
+def _find_node(node: dict, instance_id: str) -> dict | None:
+    if node.get("instance_id") == instance_id:
+        return node
+    for child in node.get("children", []):
+        found = _find_node(child, instance_id)
+        if found is not None:
+            return found
+    return None
+
+
+def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
+    """A new motion node starts with the portable Current selector."""
+
+    session = ComposerDraftSession(_lite6_program())
+    result = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {
+            "parent_instance_id": "@root",
+            "index": 0,
+            "node": {
+                "node_id": "motion.move_to_pose",
+                "instance_id": "new_move",
+                "parameters": {"base_frame_role": "base"},
+                "children": [],
+            },
+        },
+    )
+    program = result.snapshot["program"]
+    node = _find_node(program["tree"], "new_move")
+    assert node is not None
+    assert node["parameters"]["tcp_endpoint"] == {"kind": "current"}
+    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "tcp"]
+
+
+def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
+    session = ComposerDraftSession(_lite6_program())
+    result = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {
+            "parent_instance_id": "@root",
+            "index": 0,
+            "node": {
+                "node_id": "motion.move_to_pose",
+                "instance_id": "flange_move",
+                "parameters": {
+                    "target_role": "arm",
+                    "base_frame_role": "base",
+                    "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "flange"},
+                },
+                "children": [],
+            },
+        },
+    )
+    program = result.snapshot["program"]
+    node = _find_node(program["tree"], "flange_move")
+    assert node["parameters"]["tcp_endpoint"] == {"kind": "entry", "target_role": "arm", "frame_role": "flange"}
+    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "flange", "tcp"]
+
+
+def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:
+    """Design §3: picking a TCP adds its frame role to the target role."""
+
+    session = ComposerDraftSession(_lite6_program())
+    node = _find_node(session.snapshot()["program"]["tree"], "move_to_rest")
+    assert node is not None
+    parameters = {**node["parameters"],
+                  "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "pen"}}
+    revision = session.revision
+    result = _mutate(
+        session,
+        "tree_draft_update_node_params",
+        {
+            "instance_id": "move_to_rest",
+            "expected_node_id": node["node_id"],
+            "merge": False,
+            "parameters": parameters,
+            "value_sources": node.get("value_sources", {}),
+        },
+    )
+    assert session.revision == revision + 1
+    program = result.snapshot["program"]
+    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "pen"]
+    assert _find_node(program["tree"], "move_to_rest")["parameters"]["tcp_endpoint"] == {
+        "kind": "entry", "target_role": "arm", "frame_role": "pen",
+    }
+
+
+def test_tcp_entry_declaration_covers_set_tcp_and_keeps_other_selectors_symbolic() -> None:
+    from manyforge_composer.backend.draft_session import _declare_motion_endpoint
+
+    document = {"target_roles": {"tool": {"required_frame_roles": ["base"]}}}
+    _declare_motion_endpoint(document, {"tcp": {
+        "kind": "entry", "target_role": "tool", "frame_role": "tip",
+    }})
+    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
+    _declare_motion_endpoint(document, {"tcp_endpoint": {"kind": "current"}})
+    _declare_motion_endpoint(document, {"tcp_endpoint": {
+        "kind": "default_of_role", "role": "tool",
+    }})
+    assert document["target_roles"]["tool"]["required_frame_roles"] == ["base", "tip"]
+
+
+@pytest.mark.parametrize("selector", [
+    {"kind": "current", "role": "gripper"},
+    {"kind": "entry", "target_role": "gripper"},
+    {"kind": "default_of_role", "role": "missing"},
+])
+def test_pick_authoring_macro_rejects_invalid_tcp_selector(selector) -> None:
+    session = ComposerDraftSession(_pick_program())
+    arguments = _pick_macro_arguments()
+    arguments["tcp_endpoint"] = selector
+    before = session.retained_state()
+    with pytest.raises(DraftSessionError):
+        _mutate(session, "program_draft_expand_authoring_macro", arguments)
+    assert session.retained_state() == before

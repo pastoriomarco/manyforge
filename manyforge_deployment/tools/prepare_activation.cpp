@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/activation_preparation_request.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
@@ -642,6 +643,14 @@ int main(int argc, char **argv) {
         std::filesystem::canonical(options.activation_root);
     std::cout << deployment::canonical_json(prepare(options)) << '\n';
     return 0;
+  } catch (const core::TypedError &error) {
+    // A typed refusal: its catalog code on stdout (nothing else is written
+    // there on failure) for the preparer; the same text on stderr.
+    deployment::CanonicalValue::Object cause;
+    cause.emplace_back("cause_code", deployment::CanonicalValue(error.code()));
+    std::cout << deployment::canonical_json(deployment::CanonicalValue(std::move(cause))) << '\n';
+    std::cerr << "manyforge_prepare_activation: " << error.what() << '\n';
+    return 2;
   } catch (const std::exception &error) {
     std::cerr << "manyforge_prepare_activation: " << error.what() << '\n';
     return 2;

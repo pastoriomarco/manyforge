@@ -209,16 +209,20 @@ compile_retained_io_policies(const ProgramBindingContract *program,
       // on_trip (sealed by the codec, default gate) selects the existing
       // mechanisms: gate = scoped Stop, always latch while the condition is
       // true (upfront refusal), auto release on clear; full_stop = cell Full
-      // Stop, idle per idle_behaviour, operator release.
+      // Stop, idle per idle_behaviour, operator release; notify only projects
+      // the condition state.
       bool full_stop = false;
+      bool notify = false;
       if (const auto *value = rule.find_object_member("on_trip")) {
         if (value->as_string() == "full_stop")
           full_stop = true;
+        else if (value->as_string() == "notify")
+          notify = true;
         else if (value->as_string() != "gate")
           throw std::invalid_argument("global_interrupt_on_trip_invalid");
       }
       std::optional<core::IoRuleIdleBehaviourDTO> idle;
-      if (!full_stop)
+      if (!full_stop && !notify)
         idle = core::IoRuleIdleBehaviourDTO::kLatch;
       if (const auto *value = rule.find_object_member("idle_behaviour")) {
         if (!full_stop)
@@ -231,8 +235,11 @@ compile_retained_io_policies(const ProgramBindingContract *program,
           throw std::invalid_argument("global_interrupt_idle_invalid");
       }
       std::optional<core::StopEscalationStageId> entry;
-      if (const auto *value = rule.find_object_member("stop_entry_stage_id"))
+      if (const auto *value = rule.find_object_member("stop_entry_stage_id")) {
+        if (notify)
+          throw std::invalid_argument("global_interrupt_stop_entry_forbidden_with_notify");
         entry.emplace(value->as_string());
+      }
       const auto latch_release =
           full_stop ? core::InterruptPostLatchDisposition::kAwaitOperatorAck
                     : core::InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
@@ -243,7 +250,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
            std::move(selection), idle,
            static_cast<int>(member(rule, "priority").as_number()), entry,
            latch_release,
-           std::move(condition.value().waiting_for_program_keys), full_stop});
+           std::move(condition.value().waiting_for_program_keys), full_stop, notify});
     }
     for (const auto &[name, kind] : referenced)
       projection.referenced_deployment_blackboard_keys.push_back({name, kind});

@@ -2,7 +2,7 @@
   "api_version": "manyforge.provider_manifest.v1",
   "lifecycle_plan_catalog": {
     "catalog_api_version": "manyforge.brand_lifecycle_plan_catalog.v1",
-    "semantic_digest": "sha256:f6d46812c1a953a09c081e331c92d20473ecfc42d0ac68749e30d724c03cc3b7"
+    "semantic_digest": "sha256:54f324571f97808d6ed86de3c5d9adf88314dd602e99aab82b022c5e2f3e1ff6"
   },
   "offered_capabilities": [
     {
@@ -236,5 +236,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.ros2_control",
-  "provider_manifest_revision": "sha256:c84d1075b2741cb2e7ea6351f34d4f845fa3d8654f47db86a28134fbea14b263"
+  "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32"
 }

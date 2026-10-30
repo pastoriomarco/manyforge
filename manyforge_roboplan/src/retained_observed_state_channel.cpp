@@ -774,8 +774,78 @@ core::Result<void> RetainedObservedStateChannel::update_render_positions(
         "retained_render_coordinates_mismatch",
         "render coordinates must be finite and cover the exact retained names"));
   }
-  record_render_positions(compiled_joint_names, positions_si);
+  record_render_positions(compiled_joint_names, positions_si, true);
   return core::Result<void>::Ok();
+}
+
+void RetainedObservedStateChannel::follow_display_input() {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  follows_display_input_ = true;
+}
+
+void RetainedObservedStateChannel::set_display_input_leads(const bool leads) {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  display_input_leads_ = leads;
+}
+
+bool RetainedObservedStateChannel::live_display_leads_locked(
+    const std::int64_t now_ns) const {
+  // M6 items 23/34: poses follow the live controller stream. The display
+  // input already passed the display's rules (names, finite, not all-zero).
+  if (!follows_display_input_ || !render_display_only_ || !render_positions_valid_)
+    return false;
+  if (display_input_leads_) return true;
+  const auto addressed =
+      publication_.current_state(publication_.query_context(), now_ns);
+  if (addressed.ok()) return false;
+  const auto reason = addressed.error().details.find("reason");
+  return reason != addressed.error().details.end() &&
+         reason->second == "observation_stale";
+}
+
+std::optional<RetainedBoundRenderState>
+RetainedObservedStateChannel::live_preview_start(const std::int64_t now_ns) const {
+  std::lock_guard route_lock(route_rebind_mutex_);
+  if (!live_display_leads_locked(now_ns)) return std::nullopt;
+  return RetainedBoundRenderState{
+      current_binding_, projection_context_.joint_names, last_render_positions_,
+      render_wake_->incarnation(), render_wake_->generation(), true};
+}
+
+core::Result<RetainedBoundObservedState>
+RetainedObservedStateChannel::current_live_bound_state(const std::int64_t now_ns) const {
+  {
+    std::lock_guard route_lock(route_rebind_mutex_);
+    if (live_display_leads_locked(now_ns)) {
+      const auto context = publication_.query_context();
+      auto latest = publication_.publication(context.control_binding_id,
+                                             context.control_binding_revision);
+      if (latest.ok()) {
+        auto state = std::move(latest.value().snapshot);
+        const auto &names = projection_context_.joint_names;
+        bool aligned = state.joint_names.size() == names.size() &&
+                       state.positions.size() == names.size();
+        for (std::size_t index = 0U; aligned && index < names.size(); ++index) {
+          const auto found = std::find(names.begin(), names.end(), state.joint_names[index]);
+          aligned = found != names.end();
+          if (!aligned) break;
+          const double value =
+              last_render_positions_[static_cast<std::size_t>(found - names.begin())];
+          if (std::holds_alternative<core::AngularPositionDTO>(state.positions[index]))
+            state.positions[index] = core::AngularPositionDTO{value};
+          else
+            state.positions[index] = core::LinearPositionDTO{value};
+        }
+        if (aligned) {
+          state.velocities.reset();
+          state.complete = true;
+          return core::Result<RetainedBoundObservedState>::Ok(
+              RetainedBoundObservedState{current_binding_, std::move(state)});
+        }
+      }
+    }
+  }
+  return current_bound_state(now_ns);
 }
 
 core::Result<RetainedBoundRenderState>
@@ -788,7 +858,8 @@ RetainedObservedStateChannel::current_bound_render_state() const {
   }
   return core::Result<RetainedBoundRenderState>::Ok(RetainedBoundRenderState{
       current_binding_, projection_context_.joint_names, last_render_positions_,
-      render_wake_->incarnation(), render_wake_->generation()});
+      render_wake_->incarnation(), render_wake_->generation(),
+      render_display_only_});
 }
 
 core::Result<core::ObservedStateSnapshotDTO>
@@ -904,7 +975,9 @@ bool RetainedObservedStateChannel::wait_for_render_change(
 
 void RetainedObservedStateChannel::record_render_positions(
     const std::span<const std::string> source_joint_names,
-    const std::span<const double> positions_si) {
+    const std::span<const double> positions_si, const bool display_only) {
+  // M6: once display input arrived, it alone moves a display-led channel.
+  if (follows_display_input_ && render_display_only_ && !display_only) return;
   const auto &canonical_names = projection_context_.joint_names;
   if (source_joint_names.size() != positions_si.size() ||
       canonical_names.size() != last_render_positions_.size()) {
@@ -934,6 +1007,9 @@ void RetainedObservedStateChannel::record_render_positions(
     last_render_positions_[canonical_index] = positions_si[source_index];
   }
   render_positions_valid_ = true;
+  // Switching between display input and addressed state is a visible change.
+  changed = changed || render_display_only_ != display_only;
+  render_display_only_ = display_only;
   if (changed) {
     notify_render_change();
   }
@@ -944,6 +1020,8 @@ void RetainedObservedStateChannel::notify_render_change() noexcept {
 }
 
 void RetainedObservedStateChannel::record_render_unavailable() noexcept {
+  if (follows_display_input_ && render_display_only_) return;
+  render_display_only_ = false;
   if (render_positions_valid_) {
     render_positions_valid_ = false;
     notify_render_change();

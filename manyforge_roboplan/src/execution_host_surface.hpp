@@ -238,6 +238,20 @@ private:
 
   [[nodiscard]] CanonicalValue EventsResponse(const Command &command) const;
 
+  /// Active TCP (M7, design 4): each robot's `{component_id, entry | null,
+  /// owner_epoch, registration_generation, sequence}`, read under its
+  /// owner's lock; a reader keeps the greatest triple per robot from
+  /// results, reads and `active_tcp_changed` rows.
+  [[nodiscard]] CanonicalValue ActiveTcpBaselineValue() const;
+  [[nodiscard]] static CanonicalValue ActiveTcpBaselineValue(
+      Composition &composition, const core::RequestOwnerEpoch &owner_epoch);
+  /// `read_active_tcp` / `reset_active_tcp` (every robot, T-MQ9b: always
+  /// completes) replies.
+  [[nodiscard]] static CanonicalValue ActiveTcpResponse(Composition *composition,
+                                                        bool reset);
+  /// Robot control's `active_tcp: {entry, display} | null` (design 4).
+  [[nodiscard]] CanonicalValue ActiveTcpStatusValue(Composition &composition) const;
+
   /// Event stream reads (contract §8.1): the `events` reply facts without
   /// page and progress, and one page of the same journal read.
   [[nodiscard]] std::pair<std::string, CanonicalValue> EventStreamState() const;

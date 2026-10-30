@@ -29,6 +29,7 @@ import type {
   SceneUrdfOrigin,
   SceneUrdfPrimitive,
   SceneUrdfVisual,
+  SourceModelComponent,
   SourceModelCoordinate,
   SourceModelOccurrence,
   SourceModelProjection,
@@ -393,6 +394,24 @@ function parseSourceModelTarget(value: unknown, path: string): SourceModelTarget
   };
 }
 
+function parseSourceModelComponent(value: unknown, path: string): SourceModelComponent {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['component_id', 'mounted_on'], path);
+  let mountedOn: SourceModelComponent['mounted_on'] = null;
+  if (record.mounted_on !== null) {
+    const mount = objectAt(record.mounted_on, `${path}.mounted_on`);
+    exactKeysAt(mount, ['component_id', 'interface_id'], `${path}.mounted_on`);
+    mountedOn = {
+      component_id: nonEmptyStringAt(mount.component_id, `${path}.mounted_on.component_id`),
+      interface_id: nonEmptyStringAt(mount.interface_id, `${path}.mounted_on.interface_id`),
+    };
+  }
+  return {
+    component_id: nonEmptyStringAt(record.component_id, `${path}.component_id`),
+    mounted_on: mountedOn,
+  };
+}
+
 export function parseSourceModelProjection(value: unknown): SourceModelProjection {
   const record = objectAt(value, 'sourceModel');
   exactKeysAt(
@@ -404,6 +423,7 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
       'graph_revision',
       'model_map_contract',
       'model_map_product_id',
+      'components',
       'occurrences',
       'targets',
       'source',
@@ -411,8 +431,8 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
     'sourceModel',
   );
   const schemaVersion = stringAt(record.schema_version, 'sourceModel.schema_version');
-  if (schemaVersion !== 'manyforge.source_model_projection.v2') {
-    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v2');
+  if (schemaVersion !== 'manyforge.source_model_projection.v3') {
+    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v3');
   }
   const source = objectAt(record.source, 'sourceModel.source');
   exactKeysAt(
@@ -445,6 +465,17 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
   }
   if (source.source_owner_kind !== 'source_model_projection') {
     return fail('sourceModel.source.source_owner_kind', 'source_model_projection');
+  }
+  const components = boundedArrayAt(record.components, 'sourceModel.components', 4096)
+    .map((item, index) => parseSourceModelComponent(item, `sourceModel.components[${index}]`));
+  const componentIds = components.map((item) => item.component_id);
+  if (new Set(componentIds).size !== componentIds.length) {
+    return fail('sourceModel.components', 'unique component_id values');
+  }
+  if (components.some((item) => (
+    item.mounted_on !== null && !componentIds.includes(item.mounted_on.component_id)
+  ))) {
+    return fail('sourceModel.components', 'mounts on listed components');
   }
   const occurrences = boundedArrayAt(record.occurrences, 'sourceModel.occurrences', 4096)
     .map((item, index) => parseSourceModelOccurrence(item, `sourceModel.occurrences[${index}]`));
@@ -479,6 +510,7 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
     graph_revision: stringAt(record.graph_revision, 'sourceModel.graph_revision'),
     model_map_contract: modelMapContract,
     model_map_product_id: modelMapProductId,
+    components,
     occurrences,
     targets,
     source: {
@@ -564,9 +596,10 @@ function parseLogicalSceneShape(value: unknown, path: string): LogicalSceneShape
 
 function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObject {
   const record = objectAt(value, path);
-  exactKeysAt(
+  allowedKeysAt(
     record,
     ['collision_shapes', 'placement', 'provider_evidence', 'scene_resource_id', 'support_contacts'],
+    ['mass_kg'],
     path,
   );
   const placementRecord = objectAt(record.placement, `${path}.placement`);
@@ -612,6 +645,9 @@ function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObje
       : jsonRecordAt(record.provider_evidence, `${path}.provider_evidence`),
     support_contacts: boundedArrayAt(record.support_contacts, `${path}.support_contacts`, 4096)
       .map((item, index) => jsonRecordAt(item, `${path}.support_contacts[${index}]`)),
+    ...(record.mass_kg === undefined
+      ? {}
+      : { mass_kg: positiveNumberAt(record.mass_kg, `${path}.mass_kg`) }),
   };
 }
 
@@ -1463,7 +1499,7 @@ function parseSceneRuntimeUnknownPayload(
   };
 }
 
-function parseSceneRuntimePoseSource(
+export function parseSceneRuntimePoseSource(
   value: unknown,
   path: string,
 ): SceneRuntimePoseSource {
@@ -1547,19 +1583,11 @@ function parseSceneRuntimePoseSource(
   }
   const payload = parseSceneRuntimeGoodPayload(record.payload, `${path}.payload`);
   if (Object.keys(poseMeasurement).length > 0) {
-    if (poseMeasurement.measured_against === 'cell frame') {
-      if (base.policy_id !== 'continuous') {
-        return fail(path, 'cell-frame pose measurements only on continuous rows');
-      }
-    } else {
-      if (
-        base.policy_id !== 'continuous_relative_to_attached'
-        || payload.kind !== 'simulation_entity_pose_with_references.v1'
-      ) {
-        return fail(
-          path,
-          'gripper-relative pose measurements only on continuous_relative_to_attached referenced-pose rows',
-        );
+    // Night change 9: policy_id is the observer binding ("scene"); the apply
+    // policy that produced the measurement is not on the row.
+    if (poseMeasurement.measured_against !== 'cell frame') {
+      if (payload.kind !== 'simulation_entity_pose_with_references.v1') {
+        return fail(path, 'gripper-relative pose measurements only on referenced-pose rows');
       }
       const holder = poseMeasurement.holder!;
       const measuredAgainst = poseMeasurement.measured_against!;

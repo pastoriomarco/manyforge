@@ -293,12 +293,16 @@ TEST(ManagedProjectionRegistry,
   std::promise<void> release;
   const auto released = release.get_future().share();
   std::int64_t now_ns = 1'000;
+  std::atomic<unsigned> notifications{0U};
   ManagedProjectionRegistry registry(
       ManagedProjectionRegistryConfig{"/nonexistent-package", {},
                                       "/nonexistent-run", "native-unit",
                                       "epoch-1", std::nullopt},
       std::make_unique<GatedAssetSource>(entered, released),
-      [&now_ns] { return now_ns; });
+      [&now_ns] { return now_ns; },
+      [&notifications] {
+        ++notifications;
+      });
 
   const auto candidate = Candidate("bundle-1");
   const component_manager::detail::NativeProjectionPrepareRequest prepare{
@@ -325,12 +329,14 @@ TEST(ManagedProjectionRegistry,
 
   release.set_value();
   EXPECT_THROW(static_cast<void>(preparing.get()), std::runtime_error);
+  EXPECT_EQ(notifications.load(), 0U);
 
   // The refused candidate left no projection behind.
   EXPECT_THROW(static_cast<void>(registry.Dispatch(
                    component_manager::detail::NativeProjectionHealthQuery{
                        Binding("arm-a")})),
                std::runtime_error);
+  EXPECT_EQ(notifications.load(), 0U);
 }
 
 [[nodiscard]] core::ProjectionRevisionDTO SelectedRevision() {

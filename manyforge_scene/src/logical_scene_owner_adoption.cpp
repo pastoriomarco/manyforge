@@ -162,7 +162,7 @@ LogicalSceneSnapshotDTO BuildInitialSceneBaseline(
         operation.scene_resource_id, {operation.shape},
         core::CellFixedSceneObjectPlacementDTO{candidate.cell_id,
                                                pose.pose_in_cell},
-        std::nullopt, {}});
+        std::nullopt, {}, operation.mass_kg});
   }
   for (std::size_t index = 0U; index < candidate.objects.size(); ++index) {
     candidate.objects[index].support_contacts = NormalizeSupportContacts(
@@ -1531,7 +1531,7 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
         "maintenance completion publication is not the exact current head");
   }
   for (const auto &binding : initialization.bindings) {
-    const auto projection =
+    auto projection =
         ResolveRequiredProjection(
             binding, impl_->projection_resolver_, initialization.target);
     if (!projection.preflight_health.healthy_for_target(

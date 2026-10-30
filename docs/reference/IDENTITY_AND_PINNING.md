@@ -21,7 +21,7 @@ lists both, says why each exists, and how to regenerate the committed ones.
 | Applied composition: retained bundle, graph revision, Program Binding, Program revision, node-environment digest, applied record digest | Execute (`program_node_availability_stale`) and Runner binding | The robot runs exactly what was Applied |
 | Retained bundle against this build's closed-schema registry | Bundle verification | Bundle and build agree on every schema |
 | Stop contract roles of each provider | Activation | Every arm and gripper provider can be stopped as configured |
-| Cell admission generation, request ids, owner epochs | Run, Apply, Reset, manual operations (Stop bypasses them) | No two effects race on the robot |
+| Cell admission request ids and owner epochs, against the current admission facts (the caller's admission generation is recorded as evidence, never compared) | Run, Apply, Reset, manual operations (Stop bypasses them) | No two effects race on the robot |
 | Journal record digests and format versions | Recovery and replay | Recovery evidence is intact |
 
 ## Committed pins and generated files

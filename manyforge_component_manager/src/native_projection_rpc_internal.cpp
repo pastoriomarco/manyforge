@@ -1074,7 +1074,7 @@ enum class RequestKind : std::uint8_t {
   kRelease = 14U,
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
-  // 17 retired (provider freshness).
+  // 17 and 18 retired (provider freshness and commit marker).
 };
 
 enum class ResponseKind : std::uint8_t {
@@ -1088,7 +1088,7 @@ enum class ResponseKind : std::uint8_t {
   kReleased = 14U,
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
-  // 17 retired (provider freshness).
+  // 17 and 18 retired (provider freshness and commit marker).
 };
 
 } // namespace

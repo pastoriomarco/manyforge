@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <shared_mutex>
 #include <span>
@@ -109,6 +110,9 @@ struct RetainedBoundRenderState final {
   std::vector<double> positions_si;
   std::uint64_t render_incarnation;
   std::uint64_t render_generation;
+  /// M6: the latest coordinates came from `update_render_positions` (display
+  /// input), not from an addressed-state publication.
+  bool display_only;
 };
 
 /// One exact native state-authority channel for a sealed runtime participant.
@@ -321,14 +325,41 @@ public:
   /// two separate reads.
   [[nodiscard]] core::Result<RetainedBoundObservedState>
   current_bound_state(std::int64_t now_ns) const;
-  /// Pneumatic viewer input only. The caller selects named actual finger
-  /// feedback, or the instantaneous expected position after admission. Every
-  /// coordinate must match this exact binding's compiled resource names.
-  /// This never publishes authoritative state or projects the planning scene.
+  /// Viewer input only: a pneumatic gripper's named actual finger feedback
+  /// or expected position after admission, or (M6) a measured Real arm's
+  /// vendor joint states. Every coordinate must match this exact binding's
+  /// compiled resource names. This never publishes authoritative state or
+  /// projects the planning scene; the next addressed-state publication
+  /// replaces these coordinates, unless `follow_display_input`.
   [[nodiscard]] core::Result<void> update_render_positions(
       const core::RuntimeParticipantBinding &expected_binding,
       std::span<const std::string> compiled_joint_names,
       std::span<const double> positions_si);
+  /// M6: a display-led channel (a Real arm's display follows its vendor
+  /// joint topic). Once display input arrived, only `update_render_positions`
+  /// moves the render coordinates: addressed-state publications still update
+  /// the authoritative state, but neither replace nor hide the last display
+  /// input. Before it, they render as usual.
+  void follow_display_input();
+  /// M6 (approval list 2, item 34): the owner marks whether its latest
+  /// display input leads planning previews (the robot reports a move from
+  /// its own interface, or ManyForge's own re-arm is in progress).
+  void set_display_input_leads(bool leads);
+  /// M6 (item 34): a jog/Move-to preview's start state on a display-led
+  /// channel: the latest display input, while it leads or while the
+  /// addressed state is stale (`observation_stale`). Empty otherwise: the
+  /// preview starts from `current_state`, as before. Never read for
+  /// planning an admitted motion, readiness or arrival.
+  [[nodiscard]] std::optional<RetainedBoundRenderState>
+  live_preview_start(std::int64_t now_ns) const;
+  /// M6 (items 23/34): the host's presentation reads (control state,
+  /// observation). Under the same rule as `live_preview_start`, the latest
+  /// addressed snapshot's identity with the live display positions, complete
+  /// and without velocities, even while the addressed state is stale.
+  /// Otherwise exactly `current_bound_state`. Never read for planning an
+  /// admitted motion, readiness or arrival.
+  [[nodiscard]] core::Result<RetainedBoundObservedState>
+  current_live_bound_state(std::int64_t now_ns) const;
   [[nodiscard]] core::Result<RetainedBoundRenderState>
   current_bound_render_state() const;
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
@@ -413,9 +444,15 @@ private:
   std::shared_ptr<RetainedObservationWake> render_wake_;
   std::vector<double> last_render_positions_;
   bool render_positions_valid_{};
+  bool render_display_only_{};
+  bool follows_display_input_{};
+  bool display_input_leads_{};
+  /// Caller holds route_rebind_mutex_.
+  [[nodiscard]] bool live_display_leads_locked(std::int64_t now_ns) const;
 
   void record_render_positions(std::span<const std::string> source_joint_names,
-                               std::span<const double> positions_si);
+                               std::span<const double> positions_si,
+                               bool display_only = false);
   void record_render_unavailable() noexcept;
   void notify_render_change() noexcept;
 };

@@ -5,6 +5,7 @@
 #include <manyforge_core/types/json_value.hpp>
 #include <manyforge_core/types/placement_pose.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_core/types/tcp_entry.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -133,11 +134,27 @@ struct RuntimeUnitDTO {
 };
 
 /// One of exactly six mutable graph-record kinds.
+/// One user-authored custom TCP of a component's model occurrence (the
+/// Deployment row's `custom_tcps`, parent resolved to a link). It composes
+/// like a descriptor offset frame: a generated massless link named
+/// `frame_role_id` fixed to `parent_link_name` at `pose_in_parent_link`.
+/// The parent is a source link or a descriptor offset frame, never another
+/// custom TCP.
+struct ModelCustomTcpDTO {
+  FrameRoleId frame_role_id;
+  std::string parent_link_name;
+  PlacementPoseDTO pose_in_parent_link;
+
+  friend bool operator==(const ModelCustomTcpDTO&, const ModelCustomTcpDTO&) = default;
+};
+
 struct ModelInstanceDTO {
   ModelInstanceId model_instance_id;
   ModelAssetId model_asset_id;
   ModelRevision model_revision;
   std::optional<PlacementPoseDTO> root_pose_in_cell;
+  /// Sorted by `frame_role_id`; only on a component-owned occurrence.
+  std::vector<ModelCustomTcpDTO> custom_tcps{};
 
   friend bool operator==(const ModelInstanceDTO&, const ModelInstanceDTO&) = default;
 };
@@ -150,6 +167,9 @@ struct ControllableComponentDTO {
   std::vector<ModelRoleBindingDTO> model_role_bindings;
   std::vector<RuntimeUnitId> runtime_unit_ids;
   std::optional<PlacementPoseDTO> root_pose_in_cell;
+  /// B5: the component's default TCP (authored `default_tcp`, else the one
+  /// target that declares a default); absent when it has no TCP.
+  std::optional<ComponentDefaultTcpDTO> default_tcp{};
 
   friend bool operator==(const ControllableComponentDTO&,
                          const ControllableComponentDTO&) = default;
@@ -266,6 +286,8 @@ struct ComponentAttachmentEdgeDTO {
   ComponentAttachmentEndpointDTO parent;
   ComponentAttachmentEndpointDTO child;
   PlacementPoseDTO child_interface_pose_in_parent_interface;
+  /// B5: the authored primary tool among several on one parent interface.
+  bool primary{};
 
   friend bool operator==(const ComponentAttachmentEdgeDTO&,
                          const ComponentAttachmentEdgeDTO&) = default;

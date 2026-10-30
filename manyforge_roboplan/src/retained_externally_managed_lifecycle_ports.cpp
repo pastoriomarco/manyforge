@@ -1,9 +1,11 @@
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 
+#include <manyforge_core/component_lifecycle_transition_runner.hpp>
 #include <manyforge_core/types/component_incident.hpp>
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <tuple>
@@ -207,26 +209,27 @@ participant_resources(const core::RuntimeParticipantBindingDTO &binding) {
            *candidate.diagnostic_snapshot == *previous.diagnostic_snapshot));
 }
 
+// A transition refused before its runner started: failed, no substep ran.
 [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
 brand_result(const core::BrandLifecyclePrimitiveIntentDTO &intent,
              std::string reason, std::string message) {
-  return {intent.lifecycle_transaction_id,
-          intent.lifecycle_transaction_generation,
-          intent.controllable_component_id,
-          intent.control_domain_id,
-          intent.control_domain_revision,
-          intent.provider_instance_id,
-          intent.provider_manifest_id,
-          intent.provider_manifest_revision,
-          intent.provider_runtime_unit_id,
-          intent.provider_runtime_epoch,
-          intent.lifecycle_primitive_id,
-          intent.lifecycle_primitive_attempt_id,
-          intent.expected_observation_generation,
-          core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-          core::LifecyclePrimitiveEffectDTO::kNone,
-          std::nullopt,
-          transition_error(std::move(reason), std::move(message))};
+  core::BrandLifecyclePrimitiveResultDTO result{
+      intent.lifecycle_transaction_id,
+      intent.lifecycle_transaction_generation,
+      intent.controllable_component_id,
+      intent.control_domain_id,
+      intent.control_domain_revision,
+      intent.provider_instance_id,
+      intent.provider_manifest_id,
+      intent.provider_manifest_revision,
+      intent.provider_runtime_unit_id,
+      intent.provider_runtime_epoch,
+      intent.lifecycle_primitive_id,
+      intent.lifecycle_primitive_attempt_id,
+      intent.expected_observation_generation,
+      core::LifecycleTransitionOutcomeDTO::kFailed,
+      transition_error(std::move(reason), std::move(message))};
+  return result;
 }
 
 } // namespace
@@ -252,20 +255,25 @@ bool RetainedExternallyManagedDomainSnapshot::locally_valid() const noexcept {
 
 struct RetainedExternallyManagedBrandLifecyclePort::State final {
   State(core::ResolvedLifecycleProviderOccurrenceDTO occurrence_in,
+        core::BrandLifecyclePlanCatalogDTO catalog_in,
         RetainedExternallyManagedDomainSnapshotSource source_in,
         core::IClock &clock_in, const core::Duration freshness_ns_in,
+        const core::Duration poll_period_ns_in,
         RetainedExternallyManagedPrimitiveDispatcher dispatcher_in)
-      : occurrence(std::move(occurrence_in)), source(std::move(source_in)),
+      : occurrence(std::move(occurrence_in)),
+        admission(std::move(catalog_in)), source(std::move(source_in)),
         dispatcher(std::move(dispatcher_in)), clock(&clock_in),
-        freshness_ns(freshness_ns_in) {}
+        freshness_ns(freshness_ns_in), poll_period_ns(poll_period_ns_in) {}
 
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
+  core::CatalogLifecycleAdmission admission;
   RetainedExternallyManagedDomainSnapshotSource source;
   RetainedExternallyManagedPrimitiveDispatcher dispatcher;
   std::optional<core::ControllableComponentId> component;
   RetainedProviderDomainPrimitiveDispatcher provider_dispatcher;
   core::IClock *clock;
   core::Duration freshness_ns;
+  core::Duration poll_period_ns;
   std::uint64_t next_source_sequence{1U};
   std::uint64_t last_external_generation{};
   std::optional<RetainedExternallyManagedDomainSnapshot> last_external_snapshot;
@@ -279,12 +287,16 @@ RetainedExternallyManagedBrandLifecyclePort::
 core::Result<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
 RetainedExternallyManagedBrandLifecyclePort::Create(
     core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
+    core::BrandLifecyclePlanCatalogDTO catalog,
     RetainedExternallyManagedDomainSnapshotSource snapshot_source,
     core::IClock &clock, const core::Duration observation_freshness_ns,
+    const core::Duration poll_period_ns,
     RetainedExternallyManagedPrimitiveDispatcher dispatcher) {
   if (!provider_occurrence.locally_valid() || !snapshot_source ||
       observation_freshness_ns <= 0 ||
-      observation_freshness_ns > core::kMaxLifecycleTransactionTimeoutNs) {
+      observation_freshness_ns > core::kMaxLifecycleTransactionTimeoutNs ||
+      poll_period_ns <= 0 ||
+      poll_period_ns > core::kMaxLifecycleTransactionTimeoutNs) {
     return reject<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>(
         "external_brand_lifecycle_input_invalid",
         "external brand lifecycle observation inputs are invalid");
@@ -293,18 +305,21 @@ RetainedExternallyManagedBrandLifecyclePort::Create(
       Result<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>::Ok(
           std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>(
               new RetainedExternallyManagedBrandLifecyclePort(
-                  std::make_shared<State>(std::move(provider_occurrence),
-                                          std::move(snapshot_source), clock,
-                                          observation_freshness_ns,
-                                          std::move(dispatcher)))));
+                  std::make_shared<State>(
+                      std::move(provider_occurrence), std::move(catalog),
+                      std::move(snapshot_source), clock,
+                      observation_freshness_ns, poll_period_ns,
+                      std::move(dispatcher)))));
 }
 
 core::Result<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>
 RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
     core::ControllableComponentId component,
     core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
+    core::BrandLifecyclePlanCatalogDTO catalog,
     RetainedExternallyManagedDomainSnapshotSource snapshot_source,
     core::IClock &clock, const core::Duration observation_freshness_ns,
+    const core::Duration poll_period_ns,
     RetainedProviderDomainPrimitiveDispatcher dispatcher) {
   if (component.empty() || !dispatcher)
     return reject<std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort>>(
@@ -312,8 +327,9 @@ RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
         "provider lifecycle requires its actual component and driver "
         "dispatcher");
   auto result =
-      Create(std::move(provider_occurrence), std::move(snapshot_source), clock,
-             observation_freshness_ns);
+      Create(std::move(provider_occurrence), std::move(catalog),
+             std::move(snapshot_source), clock, observation_freshness_ns,
+             poll_period_ns);
   if (result.ok()) {
     result.value()->state_->component = std::move(component);
     result.value()->state_->provider_dispatcher = std::move(dispatcher);
@@ -403,9 +419,15 @@ RetainedExternallyManagedBrandLifecyclePort::Observe(
       std::move(result));
 }
 
+const core::ILifecycleAdmission &
+RetainedExternallyManagedBrandLifecyclePort::Admission() const {
+  return state_->admission;
+}
+
 core::BrandLifecyclePrimitiveResultDTO
 RetainedExternallyManagedBrandLifecyclePort::Dispatch(
     const core::BrandLifecyclePrimitiveIntentDTO &intent,
+    const core::LifecycleSubstepFeedbackSink &feedback,
     const std::stop_token cancellation) {
   if (!intent.locally_valid() ||
       !exact_occurrence(state_->occurrence, intent) ||
@@ -414,36 +436,78 @@ RetainedExternallyManagedBrandLifecyclePort::Dispatch(
     return brand_result(intent, "external_brand_lifecycle_intent_invalid",
                         "external lifecycle intent is invalid or stale");
   }
-  if (cancellation.stop_requested()) {
-    return brand_result(intent, "external_brand_lifecycle_cancelled",
-                        "external lifecycle observation was cancelled");
-  }
   if (!state_->dispatcher && !state_->provider_dispatcher) {
     return brand_result(
         intent, "external_brand_lifecycle_observer_only",
         "ManyForge observes but does not mutate the external product lifecycle");
   }
-  RetainedExternallyManagedPrimitiveOutcome outcome;
-  try {
-    if (state_->provider_dispatcher)
-      outcome = state_->provider_dispatcher(intent, cancellation);
-    else
-      outcome = state_->dispatcher(state_->occurrence.control_domain_id,
-                                   intent.lifecycle_primitive_id, cancellation,
-                                   intent.remaining_duration_ns);
-  } catch (...) {
-    // An exception after a possible send cannot prove no effect.
-    outcome = {core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain,
-               core::LifecyclePrimitiveEffectDTO::kPossible, std::nullopt,
-               transition_error("external_brand_lifecycle_dispatch_exception",
-                                "external lifecycle primitive raised an exception")};
-  }
-  auto result = brand_result(intent, "unused", "unused");
-  result.dispatch_state = outcome.dispatch;
-  result.effect = outcome.effect;
-  result.known_result = outcome.known;
-  result.error = std::move(outcome.error);
-  return result;
+  // V-B2: the whole transition, one substep at a time from fresh
+  // observations of this same exact occurrence. The runner refuses a
+  // cancelled transition before it observes.
+  const core::BrandLifecycleObservationQueryDTO query{
+      intent.lifecycle_transaction_id,  intent.lifecycle_transaction_generation,
+      intent.controllable_component_id, intent.control_domain_id,
+      intent.control_domain_revision,   intent.provider_instance_id,
+      intent.provider_manifest_id,      intent.provider_manifest_revision,
+      intent.provider_runtime_unit_id,  intent.provider_runtime_epoch};
+  const core::LifecycleTransitionRunnerIo io{
+      [&] { return Observe(query); },
+      [&](const core::LifecyclePrimitiveId &substep,
+          const std::uint64_t generation, const std::int64_t remaining_ns,
+          const core::LifecycleSubstepFeedbackSink &nested,
+          const std::stop_token stop) {
+        // A nested substep (V-B2 §2.4): its events carry this transition's
+        // attempt, and each finished one is listed after its substep.
+        std::map<core::LifecyclePrimitiveId, std::int64_t> started_at;
+        std::vector<core::LifecycleSubstepEventDTO> finished;
+        const core::LifecycleSubstepFeedbackSink stamped =
+            [&](const core::LifecycleSubstepEventDTO &event) {
+              auto copy = event;
+              copy.attempt_id = intent.lifecycle_primitive_attempt_id;
+              if (copy.phase == core::LifecycleSubstepEventDTO::Phase::kStarted)
+                started_at.insert_or_assign(copy.substep_id, copy.at_ns);
+              else
+                finished.push_back(copy);
+              if (nested) nested(copy);
+            };
+        RetainedExternallyManagedPrimitiveOutcome outcome;
+        try {
+          if (state_->provider_dispatcher) {
+            auto step = intent;
+            step.lifecycle_primitive_id = substep;
+            step.expected_observation_generation = generation;
+            step.remaining_duration_ns = remaining_ns;
+            outcome = state_->provider_dispatcher(step, stop);
+          } else {
+            outcome = state_->dispatcher(state_->occurrence.control_domain_id,
+                                         substep, stop, remaining_ns, stamped);
+          }
+        } catch (...) {
+          // An exception after a possible send: a failed substep.
+          outcome = {RetainedRos2ControlSwitchOutcome::kUncertain,
+                     transition_error(
+                         "external_brand_lifecycle_dispatch_exception",
+                         "external lifecycle primitive raised an exception")};
+        }
+        core::LifecycleSubstepDispatchOutcome result{TransitionOutcome(outcome),
+                                                     std::move(outcome.error)};
+        // A failed nested substep ended this one: its error is this one's.
+        for (const auto &event : finished) {
+          const auto started = started_at.find(event.substep_id);
+          const bool succeeded =
+              event.outcome == core::LifecycleTransitionOutcomeDTO::kSucceeded;
+          result.nested.push_back(
+              {event.substep_id, event.within, *event.outcome,
+               started != started_at.end() ? started->second : event.at_ns,
+               event.at_ns, succeeded ? std::nullopt : result.error});
+        }
+        return result;
+      },
+      core::WaitLifecycleInterruptibly,
+      state_->clock,
+      state_->poll_period_ns};
+  return core::RunLifecycleTransition(intent, state_->admission, io, feedback,
+                                      cancellation);
 }
 
 RetainedExternallyManagedControllerLifecyclePort::

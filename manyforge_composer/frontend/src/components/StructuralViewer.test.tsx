@@ -505,6 +505,7 @@ describe('viewer failure isolation', () => {
     });
     const presentation: RuntimeScenePresentation = {
       measuredRobot: robotPresentation,
+      measuredRobotSources: [],
       measuredTcp: measuredPose('tcp-1', 'viewer.measured_tcp', 'scene-runtime:tcp'),
       measuredObjects: [measuredPose('part', 'continuous_unattached', 'scene-runtime:part')],
       attachedObjects: [],
@@ -580,6 +581,7 @@ describe('viewer failure isolation', () => {
     }>;
     const empty: RuntimeScenePresentation = {
       measuredRobot: null,
+      measuredRobotSources: [],
       measuredTcp: null,
       measuredObjects: [],
       attachedObjects: [],

@@ -732,8 +732,10 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         // D6: a new product ends any Close of the previous one; a latch of the
         // previous product is now carried (stop_fault_admission_scope_locked).
         if (stop_retained_bundle_id_ != candidate_stop_facts->retained_bundle_id ||
-            stop_graph_revision_ != candidate_stop_facts->graph_revision)
+            stop_graph_revision_ != candidate_stop_facts->graph_revision) {
           close_retired_product_ = false;
+          force_close_stop_generation_.reset();
+        }
         stop_retained_bundle_id_ = std::move(candidate_stop_facts->retained_bundle_id);
         stop_graph_revision_ = std::move(candidate_stop_facts->graph_revision);
         config_.graph_revision = stop_graph_revision_;
@@ -1951,22 +1953,23 @@ ResourceAddressedExecutionKernel::publish_component_command_readiness(
         domain->current_scope->provider() != nullptr ||
         domain->current_scope->controller().active_control_configuration != configurations[i] ||
         domain->current_state != ComponentLifecycleStateDTO::kActive ||
-        !domain->reconciliation_evidence ||
-        domain->reconciliation_evidence->observation_generation != observed.observation_generation ||
-        domain->reconciliation_evidence->observed_state != ComponentLifecycleStateDTO::kActive ||
-        domain->reconciliation_evidence->postcondition_result != LifecyclePostconditionResultDTO::kSatisfied) {
+        !domain->observed_after || !domain->resolved_provider_occurrence ||
+        domain->observed_after->observation_generation != observed.observation_generation ||
+        domain->observed_after->observed_state != ComponentLifecycleStateDTO::kActive) {
       return reject<ComponentCommandReadinessDTO>("selected successor lacks exact current holding observations",
                                                   "selected_successor_holding_not_current");
     }
     for (const auto& row : installed) {
       const auto& path = *row.binding.value().control_path;
       if (path.control_domain_id != domains[i]) continue;
-      const auto& observation = *domain->reconciliation_evidence;
-      if (observation.provider_instance_id != path.provider_instance_id ||
-          observation.provider_manifest_id != path.provider_manifest_id ||
-          observation.provider_manifest_revision != path.provider_manifest_revision ||
-          observation.provider_runtime_unit_id != path.provider_runtime_unit_id ||
-          observation.provider_runtime_epoch != path.provider_runtime_epoch) {
+      // V-B2: the holding observation is the one recorded after the domain's
+      // transition; it was taken from the domain's resolved provider.
+      const auto& occurrence = *domain->resolved_provider_occurrence;
+      if (occurrence.provider_instance_id != path.provider_instance_id ||
+          occurrence.provider_manifest_id != path.provider_manifest_id ||
+          occurrence.provider_manifest_revision != path.provider_manifest_revision ||
+          occurrence.provider_runtime_unit_id != path.provider_runtime_unit_id ||
+          occurrence.provider_runtime_epoch != path.provider_runtime_epoch) {
         return reject<ComponentCommandReadinessDTO>("selected successor observation belongs to another occurrence",
                                                     "selected_successor_holding_not_current");
       }

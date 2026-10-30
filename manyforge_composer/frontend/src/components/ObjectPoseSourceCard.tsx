@@ -49,8 +49,7 @@ export function ObjectPoseSourceCard({ controller, sceneResourceId }: {
   const components = poseSourceComponents(document);
   const stored = poseLinks(document).find((row) => row.scene_resource_id === sceneResourceId) ?? null;
   const [pending, setPending] = useState<PoseLink | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => { setPending(null); setError(null); }, [sceneResourceId]);
+  useEffect(() => { setPending(null); }, [sceneResourceId]);
   const link = pending ?? stored;
   const component = components.find((item) => item.componentId === link?.source_id);
   const kinds = offeredKeyKinds(component);
@@ -64,9 +63,8 @@ export function ObjectPoseSourceCard({ controller, sceneResourceId }: {
       setPending(next);
       return;
     }
-    const result = await savePoseLink(controller, sceneResourceId, next);
-    if (result === null) setError('The Deployment owner rejected this pose-source link.');
-    else { setError(null); setPending(null); }
+    // A refusal shows once, in the yellow Deployment notice row.
+    if (await savePoseLink(controller, sceneResourceId, next) !== null) setPending(null);
   };
   const withKind = (base: PoseLink, next: PoseKeyKind | undefined): PoseLink => ({
     ...base, source_key: next === undefined ? {} : defaultSourceKey(next),
@@ -208,7 +206,6 @@ export function ObjectPoseSourceCard({ controller, sceneResourceId }: {
               </p>
             </>
           )}
-          {error && <p className="inline-message severity-error" role="alert">{error}</p>}
         </>
       )}
     </section>

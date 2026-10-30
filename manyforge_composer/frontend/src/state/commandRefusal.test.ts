@@ -1,20 +1,25 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseApiErrorDto } from '../api/parsers/programRuntime';
-import { commandRefusalText, receiptRefusal } from './commandRefusal';
+import { ERROR_CATALOG } from '../api/errorCatalog.generated';
+import {
+  commandRefusalText, errorCatalogRow, errorPresentation, receiptRefusal,
+} from './commandRefusal';
 
 describe('command refusal text', () => {
-  it('names the Kernel admission reason of a Trial-E-like refusal', () => {
-    // Captured live: POST /api/control/commands, HTTP 409.
+  it('names the Kernel admission reason of a refusal', () => {
+    // POST /api/control/commands, HTTP 409.
     const error = parseApiErrorDto({
       detail: {
-        code: 'stale_generation',
-        details: { reason: 'expected_generation_stale' },
+        code: 'request_ledger_full',
+        details: { reason: 'claim_capacity_exhausted' },
         message: 'cell-admission request rejected',
       },
     })!;
     expect(commandRefusalText(error)).toBe(
-      'cell-admission request rejected (Reason: expected_generation_stale)',
+      'Too many retained requests: The request was refused because the record of recent requests is full.'
+        + ' Wait for running work to finish and try again; report it if this persists.'
+        + ' cell-admission request rejected (Reason: claim_capacity_exhausted)',
     );
   });
 
@@ -27,10 +32,25 @@ describe('command refusal text', () => {
         details: { reason: 'claim_capacity_exhausted' },
       },
     }), { withCode: true })).toBe(
-      'invalid_request: cell-admission request rejected (Reason: claim_capacity_exhausted)',
+      'invalid_request: Request is invalid: The request was refused before any effect because a'
+        + ' field is missing or invalid. The details name each refused field.'
+        + ' cell-admission request rejected (Reason: claim_capacity_exhausted)',
     );
     expect(commandRefusalText(receiptRefusal('command_not_allowed', null), { withCode: true }))
-      .toBe('command_not_allowed: command_not_allowed');
+      .toBe('command_not_allowed: Command not allowed: This command is not allowed in the current'
+        + ' state. command_not_allowed');
+  });
+
+  it('retains the actual producer of a rejected receipt when supplied', () => {
+    const nested = receiptRefusal('invalid_request', {
+      producer: 'headless_api',
+      error: { message: 'refused', details: { reason: 'busy' }, producer: 'kernel' },
+    });
+    expect(nested.producer).toBe('kernel');
+    expect(nested.details).toEqual({ reason: 'busy' });
+    expect(receiptRefusal('invalid_request', { producer: 'kernel' }).producer).toBe('kernel');
+    expect(receiptRefusal('invalid_request', { error: { message: 'refused' } }).producer)
+      .toBeUndefined();
   });
 
   it('keeps the existing alarm and motion-wait guidance first', () => {
@@ -42,5 +62,46 @@ describe('command refusal text', () => {
     expect(commandRefusalText({
       code: 'unacknowledged_operator_alarms', message: 'refused', details: null, origin: null,
     })).toBe('Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.');
+  });
+
+  it('presents the catalog text and falls back to the producer message', () => {
+    // A code without a row keeps the producer's message, unchanged.
+    expect(errorCatalogRow('not_a_catalog_code')).toBeNull();
+    expect(errorPresentation({
+      code: 'not_a_catalog_code', message: 'owner said no', details: { reason: 'busy' }, origin: null,
+    })).toEqual({ text: 'owner said no (Reason: busy)', detail: null });
+    // A row without full text shows its compact text and the producer message.
+    // Every shipped row has full text, so the test adds a temporary one.
+    const catalog = ERROR_CATALOG as Record<string, readonly [string, string]>;
+    catalog.test_placeholder_code = ['Placeholder', ''];
+    try {
+      expect(errorPresentation({
+        code: 'test_placeholder_code', message: 'producer text', details: null, origin: null,
+      })).toEqual({ text: 'Placeholder', detail: 'producer text' });
+    } finally {
+      delete catalog.test_placeholder_code;
+    }
+    // Inherited object members are not catalog rows.
+    expect(errorCatalogRow('toString')).toBeNull();
+    // The Manager's forwarded producer is carried, not shown as text.
+    const forwarded = parseApiErrorDto({
+      detail: { code: 'apply_admission_failed', message: 'Kernel refused', producer: 'kernel' },
+    })!;
+    expect(forwarded.producer).toBe('kernel');
+    expect(errorPresentation(forwarded).text).toBe('Apply not admitted');
+  });
+
+  it('presents lost position feedback as its own motion stop, not a collision', () => {
+    // Live incident 2026-10-29: stale measured joint states stopped motion.
+    const { text, detail } = errorPresentation({
+      code: 'runtime_monitor_observation_lost',
+      message: 'Runtime monitor stopped the operation: measured robot state was lost',
+      details: { reason: 'runtime_monitor_observation_lost' },
+      origin: null,
+    });
+    expect(text).toBe('Robot position feedback lost');
+    expect(detail).toMatch(
+      /^Motion stopped: the robot's position feedback was lost during motion; this is not a detected collision\./,
+    );
   });
 });

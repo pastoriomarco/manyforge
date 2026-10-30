@@ -7,55 +7,19 @@
   },
   "description": "Isaac UR10e measured grasp-loss example using the cheese-box pose source and a node-level Fallback recovery.",
   "members": {
-    "assignment.yaml": "sha256:1d248020eb6772cc45e60b008e25548ed6aa146b8735be2c4035ec3a818257af",
-    "deployment.yaml": "sha256:19de8b4874f0c72434b9df0a865e8bdc7fcef8413ab86ccffbecec408e2c6d79",
-    "program.yaml": "sha256:0d67e3826331ce4d7557ede9afd68eec8429ba3b796b98809905f82fc575bedd"
+    "assignment.yaml": "sha256:69c7b89118188759f118a3c642b33183fbb9ca2942544dc12c7d717b8b1c7b01",
+    "deployment.yaml": "sha256:2dae6ba10ef0e0174763ea7da9981cd45291cedf6d7c6a2f88e3c428e8cd428a",
+    "program.yaml": "sha256:9b9f6d9aa196bbef31a361935513163e071e5d2cb2b1c333a9be51006bb8bb51"
   },
   "name": "isaac-ur10e-grasp-lost",
   "saved_status": {
-    "checked_content_digest": "sha256:d3c19f7974b8675e21e4c661440f664f65e78a5579f679eea3148e7bc23b81de",
+    "checked_content_digest": "sha256:389df7bbe7c79c13dba5cae5676a741f6395bbbf1f6d0fc7f41213d518e38c0c",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
   "scenario_id": "isaac-ur10e-grasp-lost",
   "source_snapshot": {
     "entries": [
-      {
-        "content_digest": "sha256:111e37f13a664989dd54226f80f521b32ea0b71c975282a16696b14be7cc9249",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl"
-      },
-      {
-        "content_digest": "sha256:043901d9c22b38d09b30d11326108ab3ef1445b4bd655ef313f94199f25f57ed",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl"
-      },
-      {
-        "content_digest": "sha256:d341d986aa8aca7262565c039c04fb6b4c0f2f5c93443519eb7ca9bfc67ba17c",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl"
-      },
-      {
-        "content_digest": "sha256:bd7da1b31b73f1aa1d61b26a582cea10f16f17396d54b8937890fa51547d26b0",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl"
-      },
-      {
-        "content_digest": "sha256:37c1779f71fb5504a5898048a36f9f4bfce0f5e7039ff1dce53808b95c229777",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl"
-      },
-      {
-        "content_digest": "sha256:be21c5e18c901d4747cbc8fa1a2af15dad7173ff701482a8517e33278432bb21",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl"
-      },
-      {
-        "content_digest": "sha256:d61e9c5304d8015333856e4a26d99e32b695b6ada993253986b1afe8e396ab11",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl"
-      },
-      {
-        "content_digest": "sha256:666a92ee075f6f320ffb13b39995a5b374657cee90ded4c52c23ede20a812f34",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl"
-      },
-      {
-        "content_digest": "sha256:f042edc44ede9773e7cad00f7d7354d0b7c1c6a6353fe897b2ca2e6ac71107fc",
-        "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl"
-      },
       {
         "content_digest": "sha256:8a214f3f650e703fa081bd4bd8b1caeb0667598bec22d8b0e572efb97d06e957",
         "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/base.stl"
@@ -113,12 +77,56 @@
         "source_id": "component:isaac_ur10e_light_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist3.dae"
       },
       {
-        "content_digest": "sha256:6443713ddfa8a8e64803e9d27e4adeb06823c2c9ec5542bd94dad6e48b8cfbbc",
+        "content_digest": "sha256:6ca086113247713fa5c1a92dfcbb56f30a15420a21d00733b865757f0d0367b2",
         "source_id": "component:isaac_ur10e_light_robot:srdf"
       },
       {
-        "content_digest": "sha256:6a7fcb71888fc49de4faba4e3bad7ba4b2796f91bc71ab8aab9fe7fd8a83f666",
+        "content_digest": "sha256:9528e0b3d7ef949d5212ea74802374ed939c1a16e6d710f7ea10a06de59187f8",
         "source_id": "component:isaac_ur10e_light_robot:urdf"
+      },
+      {
+        "content_digest": "sha256:111e37f13a664989dd54226f80f521b32ea0b71c975282a16696b14be7cc9249",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl"
+      },
+      {
+        "content_digest": "sha256:043901d9c22b38d09b30d11326108ab3ef1445b4bd655ef313f94199f25f57ed",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl"
+      },
+      {
+        "content_digest": "sha256:d341d986aa8aca7262565c039c04fb6b4c0f2f5c93443519eb7ca9bfc67ba17c",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:bd7da1b31b73f1aa1d61b26a582cea10f16f17396d54b8937890fa51547d26b0",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl"
+      },
+      {
+        "content_digest": "sha256:37c1779f71fb5504a5898048a36f9f4bfce0f5e7039ff1dce53808b95c229777",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:be21c5e18c901d4747cbc8fa1a2af15dad7173ff701482a8517e33278432bb21",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl"
+      },
+      {
+        "content_digest": "sha256:d61e9c5304d8015333856e4a26d99e32b695b6ada993253986b1afe8e396ab11",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:666a92ee075f6f320ffb13b39995a5b374657cee90ded4c52c23ede20a812f34",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl"
+      },
+      {
+        "content_digest": "sha256:f042edc44ede9773e7cad00f7d7354d0b7c1c6a6353fe897b2ca2e6ac71107fc",
+        "source_id": "component:robotiq_2f_140:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:c4eaf848e2354ce9f3ce26f6dc97d5ab7f91f2945d34fbeda813cc9772fd6f90",
+        "source_id": "component:robotiq_2f_140:srdf"
+      },
+      {
+        "content_digest": "sha256:cd275c8c8b4a8521eea39c793abc79710598cd22724be04f07c80b58eaba8808",
+        "source_id": "component:robotiq_2f_140:urdf"
       }
     ],
     "schema_version": "manyforge.scenario.source_snapshot.v1"

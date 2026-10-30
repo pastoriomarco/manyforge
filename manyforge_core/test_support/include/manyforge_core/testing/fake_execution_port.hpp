@@ -61,11 +61,11 @@ class FakeExecutionPort final : public IExecutionPort {
     return result;
   }
 
-  ExecutionPortCommandResultDTO Replace(const ExecutionGoalKey& active_key,
-                                        const ExecutionGoalKey& next_key,
-                                        const TrajectoryDTO& trajectory) override {
+  ExecutionPortCommandResultDTO Replace(
+      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const TrajectoryDTO& trajectory) override {
     std::lock_guard lock(mutex_);
-    commands_.emplace_back(ReplaceCall{active_key, next_key, trajectory});
+    commands_.emplace_back(ReplaceCall{active_key, next_key, trajectory, std::nullopt});
     if (RingFullLocked()) return NotReady();
     const auto result = NextResultLocked();
     if (result.dispatch != ExecutionPortDispatch::kNotDispatched) {

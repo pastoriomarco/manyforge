@@ -92,6 +92,35 @@ export function acceptManagerApplyStatus(
     : current;
 }
 
+/** Accept only the acknowledgement state from its exact command/readback. */
+export function acceptManagerApplyAcknowledgementStatus(
+  current: ManagerApplyStatus | null,
+  candidate: ManagerApplyStatus,
+): ManagerApplyStatus | null {
+  const accepted = acceptManagerApplyStatus(current, candidate);
+  if (
+    current !== null
+    && sameManagerApply(current, candidate)
+    && current.state === 'failed'
+    && candidate.state === 'failed'
+    && current.failureAcknowledgement !== 'acknowledged'
+    && candidate.failureAcknowledgement === 'acknowledged'
+  ) {
+    return { ...current, failureAcknowledgement: 'acknowledged' };
+  }
+  if (
+    current !== null
+    && sameManagerApply(current, candidate)
+    && current.state === 'failed'
+    && candidate.state === 'failed'
+    && current.failureAcknowledgement === 'available'
+    && candidate.failureAcknowledgement === 'unavailable'
+  ) {
+    return { ...current, failureAcknowledgement: 'unavailable' };
+  }
+  return accepted;
+}
+
 /**
  * The identity of one settled Manager Apply (succeeded, failed or with an
  * unknown effect), or null while none is settled. A settlement is the

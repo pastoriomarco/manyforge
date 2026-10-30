@@ -7,7 +7,8 @@ import {
   useRef,
   useState,
 } from 'react';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, apiErrorCode } from '../api/client';
+import { CommandRefusalError, commandRefusalCause } from '../state/commandRefusal';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import {
   buildPreviewIntent,
@@ -26,8 +27,8 @@ import {
   motionTargetsForStatus,
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
-import type { StructuredError } from '../types/api';
-import type { HeadlessStateSource } from './useHeadlessState';
+import type { ProgramCycleStatus, StructuredError } from '../types/api';
+import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
 import {
   cellRecoverMessage,
   useComponentIncidents,
@@ -40,10 +41,13 @@ import type {
 } from '../state/robotControl';
 import type { PoseDragDiscard, RobotControlMode } from '../state/robotControl';
 import { acknowledgedUncertainOutputs, type UncertainOutput } from '../utils/uncertainOutputs';
+import { tcpEntryIdentityKey } from '../types/robotControl';
 import { writeManualPneumaticValves } from '../state/pneumaticManual';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
+  CellRecoverResult,
   DirectControlOperationIntent,
+  DirectControlSetTcpIntent,
   DirectControlGripperStatus,
   DirectControlMotionStatus,
   ExecutionOwnerStatus,
@@ -51,7 +55,87 @@ import type {
   Pose3Value,
   RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
+  TcpEntryIdentity,
 } from '../types/robotControl';
+
+// Recover cell keeps its press alive across HTTP timeouts by replaying its
+// request ID; a replay answering `cell_recover_in_progress` is asked again
+// after this pause.
+export const CELL_RECOVER_REPLAY_PAUSE_MS = 1000;
+
+/** Pair a robot with the component selected at its flange, including TCP-less tools. */
+export function mountedToolsFromStatus(
+  status: ExecutionOwnerStatus | null,
+): Record<string, string> {
+  const mounts: Record<string, string> = {};
+  if (status === null) return mounts;
+  for (const robot of status.directControlTargets) {
+    const endEffectorComponentId = robot.targetDescriptor.endEffectorComponentId;
+    if (endEffectorComponentId !== null
+      && endEffectorComponentId !== robot.controllableComponentId) {
+      mounts[robot.controllableComponentId] = endEffectorComponentId;
+    }
+  }
+  return mounts;
+}
+
+type TcpFence = {
+  componentId: string;
+  targetId: string;
+  graphRevision: string;
+  retainedBundleId: string;
+  value: NonNullable<DirectControlMotionStatus['activeTcp']>;
+  strict: boolean;
+  adopt: boolean;
+};
+
+function tcpAtLeast(current: DirectControlMotionStatus['activeTcp'], fence: TcpFence): boolean {
+  if (current === null || current.ownerEpoch !== fence.value.ownerEpoch) return false;
+  if (current.registrationGeneration !== fence.value.registrationGeneration)
+    return current.registrationGeneration > fence.value.registrationGeneration;
+  if (current.sequence !== fence.value.sequence) return current.sequence > fence.value.sequence;
+  if (fence.strict) return false;
+  return current.entry === null ? fence.value.entry === null
+    : fence.value.entry !== null && tcpEntryIdentityKey(current.entry) === tcpEntryIdentityKey(fence.value.entry);
+}
+
+function setTcpReceiptFence(result: unknown, status: ExecutionOwnerStatus,
+  motion: DirectControlMotionStatus, requestId: string, admittedFailure = false): TcpFence {
+  if (result === null || typeof result !== 'object' || Array.isArray(result))
+    throw new Error('Set TCP returned no confirmed Active TCP.');
+  const envelope = result as Record<string, unknown>;
+  const accepted = envelope.accepted;
+  if ((!admittedFailure && (envelope.ok !== true || envelope.command !== 'submit'
+    || accepted === null || typeof accepted !== 'object' || Array.isArray(accepted)
+    || (accepted as Record<string, unknown>).request_id !== requestId
+    || typeof (accepted as Record<string, unknown>).operation_id !== 'string'
+    || !(accepted as Record<string, unknown>).operation_id)) || !Array.isArray(envelope.active_tcp))
+    throw new Error('Set TCP returned an invalid acceptance.');
+  const rows = envelope.active_tcp.filter((item: unknown) => item !== null && typeof item === 'object'
+    && !Array.isArray(item) && (item as Record<string, unknown>).component_id === motion.controllableComponentId);
+  if (rows.length !== 1) throw new Error('Set TCP returned no unique robot Active TCP.');
+  const row = rows[0] as Record<string, unknown>;
+  const entry = row.entry;
+  if (row.owner_epoch !== status.ownerEpoch || !Number.isSafeInteger(row.registration_generation)
+    || (row.registration_generation as number) < 1 || !Number.isSafeInteger(row.sequence)
+    || (row.sequence as number) < 0 || (entry !== null && (typeof entry !== 'object' || Array.isArray(entry))))
+    throw new Error('Set TCP returned an invalid Active TCP identity.');
+  let selected: TcpEntryIdentity | null = null;
+  let display: string | null = null;
+  if (entry !== null) {
+    const wire = entry as Record<string, unknown>;
+    if (typeof wire.component_id !== 'string' || typeof wire.target_id !== 'string'
+      || typeof wire.frame_role_id !== 'string') throw new Error('Set TCP returned an invalid TCP entry.');
+    selected = { componentId: wire.component_id, targetId: wire.target_id, frameRoleId: wire.frame_role_id };
+    const descriptor = motion.targetDescriptor.tcps.find((tcp) => tcpEntryIdentityKey(tcp.entry) === tcpEntryIdentityKey(selected!));
+    if (descriptor === undefined) throw new Error("Set TCP returned a TCP outside this robot's list.");
+    display = descriptor.qualifiedName;
+  }
+  return { componentId: motion.controllableComponentId, targetId: motion.commandTargetId,
+    graphRevision: status.graphRevision, retainedBundleId: status.retainedBundleId,
+    strict: false, adopt: true, value: { entry: selected, display, ownerEpoch: status.ownerEpoch,
+      registrationGeneration: row.registration_generation as number, sequence: row.sequence as number } };
+}
 
 function requestId(): string {
   return globalThis.crypto?.randomUUID?.()
@@ -226,7 +310,8 @@ export function buildManualAvailabilityIntent(
 export function manualAvailabilityScopeFence(
   snapshot: ComposerHeadlessState | null,
   mode: RobotControlMode,
-  selection?: Pick<RobotControlState, 'selectedControllableComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
+  selection?: Pick<RobotControlState, 'selectedControllableComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>
+    & Partial<Pick<RobotControlState, 'mountedToolByRobot'>>,
 ): string | null {
   const status = snapshot?.executionControlStatus;
   if (status == null || snapshot == null) return null;
@@ -254,6 +339,12 @@ export interface RobotControlController {
   state: RobotControlState;
   /** Current owner projection, unlike state.status retained for presentation. */
   currentStatus: ExecutionOwnerStatus | null;
+  /** Fresh owner rows for the Resume comparison, including a confirmed Set TCP receipt. */
+  tcpResumeStatus?: ExecutionOwnerStatus | null;
+  tcpResumeFresh?: boolean;
+  tcpResumeConnectionLost?: boolean;
+  /** Program cycle from that same current Headless snapshot. */
+  tcpResumeCycle?: ProgramCycleStatus | null;
   /** Selected addressed robot/tool projection used by all direct-control UI. */
   selectedStatus: ExecutionOwnerStatus | null;
   motionTargets: DirectControlMotionStatus[];
@@ -269,12 +360,23 @@ export interface RobotControlController {
   runtimeScalePending: boolean;
   runtimeScaleError: string | null;
   stopFaultRecoveryPending: boolean;
+  /** The press outlived one HTTP call; Headless is still running it. */
+  stopFaultRecoveryInProgress: boolean;
+  /** SX-679: the operator's abort of the running press was sent, not yet answered. */
+  stopFaultRecoveryAbortPending: boolean;
+  /** SX-679/684: why Recover cell is unavailable now (Scenario Close runs), or null. */
+  cellRecoverBlockedReason: string | null;
+  setCellRecoverBlockedReason: (reason: string | null) => void;
   stopFaultRecoveryError: string | null;
   /** Open component incidents (CCLC snapshots) while the cell is latched. */
   componentIncidents: OpenComponentIncident[];
   componentIncidentsUnavailableReason: string | null;
   selectRobot: (controllableComponentId: string, motionTargetId: string) => void;
   selectTool: (gripperTargetId: string) => void;
+  /** TCP-C: move and show the selected robot at another of its TCPs. */
+  selectTcp: (entryKey: string) => void;
+  tcpApplying: boolean;
+  tcpError: string | null;
   selectMode: (mode: RobotControlMode) => void;
   selectMoveToSource: (source: MoveToDraftSource) => void;
   editMoveToOptions: (update: Partial<CartesianMoveDraftOptions>) => void;
@@ -291,6 +393,8 @@ export interface RobotControlController {
   revert: () => void;
   stop: () => Promise<void>;
   recoverStopFault: () => Promise<void>;
+  /** SX-679: abort the running Recover cell; its result then lists what was done. */
+  abortRecoverStopFault: () => Promise<void>;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
   /** Reset the current terminal operation; approved uncertain outputs of it are acknowledged (contract 66). */
@@ -322,16 +426,30 @@ export function useRobotControl(
   const [controlPending, setControlPending] = useState<
     'stop' | 'reset' | null
   >(null);
+  const [tcpApplying, setTcpApplying] = useState(false);
+  const [tcpError, setTcpError] = useState<string | null>(null);
+  const [tcpFence, setTcpFence] = useState<TcpFence | null>(null);
+  const tcpInFlight = useRef<{ id: string; ownerEpoch: string } | null>(null);
+  const [tcpWaitOwner, setTcpWaitOwner] = useState<{ ownerEpoch: string; graphRevision: string; retainedBundleId: string;
+    componentId: string; targetId: string } | null>(null);
   const [runtimeScaleStatus, setRuntimeScaleStatus] = useState<RuntimeScaleControlStatus | null>(null);
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
   const [runtimeScalePending, setRuntimeScalePending] = useState(false);
   const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
   const [stopFaultRecoveryPending, setStopFaultRecoveryPending] = useState(false);
+  const [stopFaultRecoveryInProgress, setStopFaultRecoveryInProgress] = useState(false);
+  const [stopFaultRecoveryAbortPending, setStopFaultRecoveryAbortPending] = useState(false);
+  const [cellRecoverBlockedReason, setCellRecoverBlockedReason] = useState<string | null>(null);
   const [stopFaultRecoveryError, setStopFaultRecoveryError] = useState<string | null>(null);
-  const stopFaultRecoveryRequest = useRef<{ ownerEpoch: string } | null>(null);
+  const stopFaultRecoveryRequest = useRef<{ abort: AbortController } | null>(null);
   const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
   const pneumaticWriteAbort = useRef<AbortController | null>(null);
   useEffect(() => () => pneumaticWriteAbort.current?.abort(), []);
+  // Leaving ends the wait for a Recover cell press (Headless keeps running it).
+  useEffect(() => () => {
+    stopFaultRecoveryRequest.current?.abort.abort();
+    stopFaultRecoveryRequest.current = null;
+  }, []);
   const dragGeneration = useRef<number | null>(null);
   useLayoutEffect(() => {
     if (!state.poseDragging) dragGeneration.current = null;
@@ -369,16 +487,99 @@ export function useRobotControl(
   const selectedControllableComponentId = state.selectedControllableComponentId;
   const selectedMotionTargetId = state.selectedMotionTargetId;
   const selectedGripperTargetId = state.selectedGripperTargetId;
-  const selectedStatus = useMemo(
+  const mountedToolByRobot = state.mountedToolByRobot;
+  const ownerSelectedStatus = useMemo(
     () => selectedStatusForState({
       status: ownerStatus,
       selectedControllableComponentId,
       selectedMotionTargetId,
       selectedGripperTargetId,
+      mountedToolByRobot,
     }),
     [ownerStatus, selectedControllableComponentId, selectedMotionTargetId,
-      selectedGripperTargetId],
+      selectedGripperTargetId, mountedToolByRobot],
   );
+  const selectedStatus = useMemo(() => {
+    const motion = ownerSelectedStatus?.directControl;
+    if (ownerSelectedStatus === null || motion == null || tcpFence === null
+      || !tcpFence.adopt || ownerSelectedStatus.ownerEpoch !== tcpFence.value.ownerEpoch
+      || ownerSelectedStatus.graphRevision !== tcpFence.graphRevision
+      || ownerSelectedStatus.retainedBundleId !== tcpFence.retainedBundleId
+      || motion.controllableComponentId !== tcpFence.componentId || motion.commandTargetId !== tcpFence.targetId
+      || tcpAtLeast(motion.activeTcp, tcpFence)) return ownerSelectedStatus;
+    const entry = tcpFence.value.entry;
+    const row = entry === null ? null : motion.targetDescriptor.tcps.find((tcp) => (
+      tcpEntryIdentityKey(tcp.entry) === tcpEntryIdentityKey(entry)
+    ));
+    if (row === undefined) return ownerSelectedStatus;
+    const observed = ownerSelectedStatus.observedMotion;
+    return { ...ownerSelectedStatus,
+      directControl: { ...motion, activeTcp: tcpFence.value, tcpFrameRoleId: row?.frameRoleId ?? null,
+        tcpTargetRoleId: row?.targetRoleId ?? null, selectedTcpEntryKey: row === null ? undefined : tcpEntryIdentityKey(row.entry) },
+      observedMotion: observed === null ? null : { ...observed,
+        currentTcpPose: row === null ? null : observed.tcpPoses[tcpEntryIdentityKey(row.entry)] ?? null },
+    };
+  }, [ownerSelectedStatus, tcpFence]);
+
+  // Presentation retains the last status on disconnect. Resume comparison uses
+  // only the current shell projection and the already-confirmed TCP receipt.
+  const shell = controlSource?.getShellSnapshot?.();
+  const tcpResumeConnectionLost = shell == null || shell.transportStatus === 'connecting'
+    || shell.transportStatus === 'disconnected';
+  const tcpResumeFresh = shell?.transportStatus === 'connected' && shell.semanticStatus === 'current'
+    && shell.transportError === null && shell.snapshot === headlessSnapshot;
+  const freshStatus = tcpResumeFresh ? headlessSnapshot?.executionControlStatus ?? null : null;
+  const tcpResumeCycle = tcpResumeFresh ? headlessSnapshot?.programCycle ?? null : null;
+  const tcpResumeStatus = freshStatus === null || !tcpApplying || tcpWaitOwner === null
+    || freshStatus.ownerEpoch !== tcpWaitOwner.ownerEpoch
+    || freshStatus.graphRevision !== tcpWaitOwner.graphRevision
+    || freshStatus.retainedBundleId !== tcpWaitOwner.retainedBundleId
+    ? freshStatus : {
+      ...freshStatus,
+      directControlTargets: freshStatus.directControlTargets.map((row) => {
+        if (row.controllableComponentId !== tcpWaitOwner.componentId || row.commandTargetId !== tcpWaitOwner.targetId) return row;
+        if (tcpFence === null || !tcpFence.adopt
+          || tcpFence.componentId !== tcpWaitOwner.componentId || tcpFence.targetId !== tcpWaitOwner.targetId
+          || tcpFence.value.ownerEpoch !== freshStatus.ownerEpoch
+          || tcpFence.graphRevision !== freshStatus.graphRevision || tcpFence.retainedBundleId !== freshStatus.retainedBundleId)
+          return { ...row, activeTcp: null };
+        return tcpAtLeast(row.activeTcp, tcpFence) ? row : { ...row, activeTcp: tcpFence.value };
+      }),
+    };
+
+  useEffect(() => {
+    if (tcpFence === null) return;
+    // Wait for the reducer's own projection, not merely a newer transport
+    // snapshot that has not yet replaced the drafts and pose it presents.
+    const live = state.status;
+    if (live == null) return;
+    if (live.ownerEpoch !== tcpFence.value.ownerEpoch || live.graphRevision !== tcpFence.graphRevision
+      || live.retainedBundleId !== tcpFence.retainedBundleId) {
+      setTcpFence(null);
+      setTcpApplying(false);
+      setTcpWaitOwner(null);
+      return;
+    }
+    const current = live.directControlTargets.find((row) => row.controllableComponentId === tcpFence.componentId
+      && row.commandTargetId === tcpFence.targetId);
+    if (current !== undefined && tcpAtLeast(current.activeTcp, tcpFence)) {
+      setTcpFence(null);
+      setTcpApplying(false);
+      setTcpWaitOwner(null);
+    }
+  }, [tcpFence, state.status]);
+
+  useEffect(() => {
+    const live = headlessSnapshot?.executionControlStatus;
+    if (tcpWaitOwner !== null && live != null && (live.ownerEpoch !== tcpWaitOwner.ownerEpoch
+      || live.graphRevision !== tcpWaitOwner.graphRevision || live.retainedBundleId !== tcpWaitOwner.retainedBundleId)) {
+      tcpInFlight.current = null;
+      setTcpFence(null);
+      setTcpApplying(false);
+      setTcpWaitOwner(null);
+      setTcpError(null);
+    }
+  }, [tcpWaitOwner, headlessSnapshot?.executionControlStatus]);
   const motionTargets = useMemo(
     () => ownerStatus === null ? [] : motionTargetsForStatus(ownerStatus),
     [ownerStatus],
@@ -405,6 +606,9 @@ export function useRobotControl(
     ?? 'Checking backend manual-control availability.';
   const manualControlBlocked = useRef(!manualControlAllowed);
   manualControlBlocked.current = !manualControlAllowed;
+  const cartesianMode = state.mode === 'pose_goal' || state.mode === 'cartesian_path'
+    || (state.mode === 'move_to' && state.moveToKind === 'pose');
+  const tcpBlocksCartesian = tcpApplying && cartesianMode;
   const projectedOwnerRef = useRef<string | null>(null);
   const previewStatusRef = useRef(selectedStatus);
   previewStatusRef.current = selectedStatus;
@@ -414,6 +618,7 @@ export function useRobotControl(
     : selectedStatusForState({
       status: headlessSnapshot.executionControlStatus,
       selectedControllableComponentId, selectedMotionTargetId, selectedGripperTargetId,
+      mountedToolByRobot,
     });
   // A pneumatic transition must query the same snapshot as its scope fence.
   // Missing/invalid current descriptors must never fall back to the old one.
@@ -422,6 +627,13 @@ export function useRobotControl(
       || (currentAvailabilityStatus !== null && hasPneumaticGripperDescriptor(currentAvailabilityStatus)));
   availabilityStatusRef.current = pneumaticAvailabilityTransition
     ? currentAvailabilityStatus : selectedStatus;
+
+  useEffect(() => {
+    const current = headlessSnapshot?.executionControlStatus;
+    const mounts = enabled ? mountedToolsFromStatus(current ?? null) : {};
+    dispatch({ type: 'mounted_tools_changed', mounts,
+      graphRevision: current?.graphRevision, retainedBundleId: current?.retainedBundleId });
+  }, [enabled, headlessSnapshot?.executionControlStatus, state.status, state.phase, state.operation]);
 
   useEffect(() => {
     // An old owner's response cannot block or reject a successor's draft.
@@ -495,6 +707,7 @@ export function useRobotControl(
     const previewStatus = previewStatusRef.current;
     if (
       !enabled
+      || tcpBlocksCartesian
       || !manualControlAllowed
       || state.phase !== 'planning'
       || state.poseDragging
@@ -538,7 +751,6 @@ export function useRobotControl(
             if (cleanupInFlight.current === null) {
               const cycle = latestSnapshot.current?.programCycle;
               if (controlSource === null || cycle?.programRunId !== context.program_run_id
-                || cycle.programRunnerOwnerEpoch !== context.program_runner_owner_epoch
                 || cycle.runRevision == null) {
                 throw new Error('The held Program changed before manual cleanup.');
               }
@@ -583,6 +795,7 @@ export function useRobotControl(
               type: 'preview_rejected',
               generation,
               error: errorMessage(error, 'Motion preview failed.'),
+              errorRefusal: commandRefusalCause(error),
               targetRejection: previewTargetRejection(error),
             });
           }
@@ -595,6 +808,7 @@ export function useRobotControl(
     };
   }, [
     enabled,
+    tcpBlocksCartesian,
     observeProgramRun,
     manualControlAllowed,
     currentAvailability,
@@ -624,6 +838,138 @@ export function useRobotControl(
     dispatch({ type: 'select_tool', gripperTargetId });
   }, []);
 
+  const selectTcp = useCallback((entryKey: string) => {
+    const status = selectedStatus;
+    const motion = status?.directControl;
+    const tcp = motion?.targetDescriptor.tcps.find((row) => tcpEntryIdentityKey(row.entry) === entryKey);
+    if (operationActive || tcpInFlight.current !== null || tcpApplying || cleanupInFlight.current !== null || cleanupFailure !== null
+      || !enabled || controlSource === null || status === null || motion == null || motion.activeTcp === null
+      || tcp === undefined || (motion.activeTcp?.entry != null
+        && tcpEntryIdentityKey(motion.activeTcp.entry) === entryKey)) return;
+    const id = requestId();
+    const intent: DirectControlSetTcpIntent = {
+      request_context: { request_id: id, request_owner_epoch: status.ownerEpoch,
+        source_label: 'composer_ui', correlation_id: null },
+      program_id: motion.programId, program_revision: motion.programRevision,
+      program_binding_id: motion.programBindingId, program_run_id: motion.programRunId,
+      expected_graph_revision: status.graphRevision, expected_retained_bundle_id: status.retainedBundleId,
+      expected_scene_revision: null, coordination_policy: 'independent',
+      participants: [{ component_role_id: motion.componentRoleId, target_role_id: motion.targetRoleId,
+        required_capability_id: motion.operationCapabilityId, action_span: null,
+        payload: { kind: 'set_tcp', tcp: { kind: 'entry', entry: {
+          component_id: tcp.entry.componentId, target_id: tcp.entry.targetId,
+          frame_role_id: tcp.entry.frameRoleId,
+        } } } }],
+    };
+    const flight = { id, ownerEpoch: status.ownerEpoch };
+    tcpInFlight.current = flight;
+    dispatch({ type: 'active_tcp_change_started' });
+    setTcpApplying(true);
+    setTcpWaitOwner({ ownerEpoch: status.ownerEpoch, graphRevision: status.graphRevision,
+      retainedBundleId: status.retainedBundleId, componentId: motion.controllableComponentId,
+      targetId: motion.commandTargetId });
+    setTcpError(null);
+    let waitingForStatus = false;
+    let setTcpSubmitted = false;
+    const fallbackFence: TcpFence = {
+      componentId: motion.controllableComponentId, targetId: motion.commandTargetId,
+      graphRevision: status.graphRevision, retainedBundleId: status.retainedBundleId,
+      strict: true, adopt: false, value: motion.activeTcp,
+    };
+    void (async () => {
+      if (observeProgramRun) {
+        let availability = await api.execution.manualAvailability(intent);
+        if (!availability.available || availability.manualHandover === null)
+          throw new Error(availability.unavailableReason ?? 'The held target is not available for manual control.');
+        if (availability.cleanupRequired) {
+          if (cleanupInFlight.current !== null)
+            throw new Error('Manual handover is already in progress.');
+          const context = availability.manualHandover;
+          const cycle = latestSnapshot.current?.programCycle;
+          if (cycle?.programRunId !== context.program_run_id || cycle.runRevision == null)
+            throw new Error('The held Program changed before manual cleanup.');
+          const cleanupId = requestId();
+          const cleanup = controlSource.sendExecutionCommand('program_manual_handover', {
+            request_id: cleanupId, program_run_id: context.program_run_id,
+            expected_owner_epoch: context.program_runner_owner_epoch,
+            expected_run_revision: cycle.runRevision, operation: { ...intent, manual_handover: context },
+          }, cleanupId).then(() => undefined);
+          cleanupInFlight.current = cleanup;
+          try {
+            await cleanup;
+          } catch (error: unknown) {
+            setCleanupFailure(errorMessage(error, 'Manual handover failed. Check Program recovery.'));
+            throw error;
+          } finally {
+            if (cleanupInFlight.current === cleanup) cleanupInFlight.current = null;
+            setAvailability(null);
+            refreshAvailability();
+          }
+          availability = await api.execution.manualAvailability(intent);
+          if (!availability.available || availability.cleanupRequired || availability.manualHandover === null)
+            throw new Error(availability.unavailableReason ?? 'The held target changed after manual cleanup.');
+        }
+        intent.manual_handover = availability.manualHandover;
+      }
+      const live = latestSnapshot.current?.executionControlStatus;
+      if (live == null || live.ownerEpoch !== status.ownerEpoch
+        || live.graphRevision !== status.graphRevision || live.retainedBundleId !== status.retainedBundleId)
+        throw new Error('The robot control target changed before Set TCP.');
+      const target = previewStatusRef.current?.directControl;
+      if (target == null || target.activeTcp === null || target.programBindingId !== motion.programBindingId
+        || target.controllableComponentId !== motion.controllableComponentId
+        || target.commandTargetId !== motion.commandTargetId)
+        throw new Error('The robot control target changed before Set TCP.');
+      const payload: Record<string, unknown> = { ...intent };
+      delete payload.request_context;
+      setTcpSubmitted = true;
+      const receipt = await controlSource.sendExecutionCommand('operation_start', payload, id);
+      const afterReply = latestSnapshot.current?.executionControlStatus;
+      if (tcpInFlight.current !== flight || afterReply == null || afterReply.ownerEpoch !== status.ownerEpoch
+        || afterReply.graphRevision !== status.graphRevision || afterReply.retainedBundleId !== status.retainedBundleId) return;
+      // Once a result is received, do not re-enable Cartesian work until the
+      // corresponding owner status has caught up. If the reply is invalid,
+      // require a version strictly newer than the pre-command status.
+      waitingForStatus = true;
+      setTcpFence(fallbackFence);
+      const fence = setTcpReceiptFence(receipt.result, status, motion, id);
+      setTcpFence(fence);
+    })().catch((error: unknown) => {
+      if (tcpInFlight.current === flight && setTcpSubmitted && error instanceof CommandDeliveryUnconfirmedError) {
+        waitingForStatus = true;
+        setTcpFence(fallbackFence);
+      }
+      const current = latestSnapshot.current?.executionControlStatus;
+      if (tcpInFlight.current === flight && current?.ownerEpoch === status.ownerEpoch && current.graphRevision === status.graphRevision
+        && current.retainedBundleId === status.retainedBundleId) {
+        const raw = error instanceof CommandRefusalError ? error.executionResult : null;
+        const result = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+          ? raw as Record<string, unknown> : null;
+        const ownerError = result?.error !== null && typeof result?.error === 'object' && !Array.isArray(result.error)
+          ? result.error as Record<string, unknown> : null;
+        const details = ownerError?.details !== null && typeof ownerError?.details === 'object' && !Array.isArray(ownerError.details)
+          ? ownerError.details as Record<string, unknown> : null;
+        if (result?.ok === false && details?.immediate_step === 'admitted') {
+          waitingForStatus = true;
+          try {
+            setTcpFence(setTcpReceiptFence(raw, status, motion, id, true));
+          } catch {
+            setTcpFence(fallbackFence);
+          }
+        }
+        setTcpError(errorMessage(error, 'Set TCP failed.'));
+      }
+    }).finally(() => {
+      if (tcpInFlight.current === flight) {
+        tcpInFlight.current = null;
+        if (!waitingForStatus) {
+          setTcpApplying(false);
+          setTcpWaitOwner(null);
+        }
+      }
+    });
+  }, [selectedStatus, enabled, controlSource, observeProgramRun, cleanupFailure, tcpApplying, operationActive]);
+
   useEffect(() => {
     dispatch({ type: 'program_activity_changed' });
   }, [observeProgramRun]);
@@ -636,14 +982,6 @@ export function useRobotControl(
       setControlPending(null);
     }
   }, [state.status?.ownerEpoch, state.operation?.operationId]);
-
-  useEffect(() => {
-    if (stopFaultRecoveryRequest.current?.ownerEpoch !== state.status?.ownerEpoch) {
-      stopFaultRecoveryRequest.current = null;
-      setStopFaultRecoveryPending(false);
-      setStopFaultRecoveryError(null);
-    }
-  }, [state.status?.ownerEpoch]);
 
   useEffect(() => {
     const pending = approveInFlight.current;
@@ -671,6 +1009,7 @@ export function useRobotControl(
       if (pendingOperationControl.current === pending) dispatch({
         type: 'operation_control_failed', ownerEpoch: pending.ownerEpoch, operationId: pending.operationId,
         error: errorMessage(error, `Operation ${control} was rejected.`),
+        errorRefusal: commandRefusalCause(error),
       });
     } finally {
       if (pendingOperationControl.current === pending) {
@@ -900,7 +1239,7 @@ export function useRobotControl(
     if (!manualControlBlocked.current) dispatch({ type: 'edit_move_options', update });
   }, []);
   const beginPoseDrag = useCallback(() => {
-    if (manualControlBlocked.current || !enabled || headlessSnapshot?.executionControlStatus == null || state.operation?.resident
+    if (manualControlBlocked.current || tcpBlocksCartesian || (tcpInFlight.current !== null && cartesianMode) || !enabled || headlessSnapshot?.executionControlStatus == null || state.operation?.resident
       || robotControlHasActiveOperation(state) || approveInFlight.current !== null
       || !['pose_goal', 'cartesian_path', 'move_to'].includes(state.mode)
       || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')
@@ -908,7 +1247,7 @@ export function useRobotControl(
     dragGeneration.current = state.generation + 1;
     dispatch({ type: 'begin_pose_drag' });
     return true;
-  }, [state, enabled, headlessSnapshot?.executionControlStatus]);
+  }, [state, enabled, headlessSnapshot?.executionControlStatus, tcpBlocksCartesian, cartesianMode]);
   const finishPoseDrag = useCallback((pose: Pose3Value | null, discard?: PoseDragDiscard) => {
     const generation = dragGeneration.current;
     if (generation !== null) dispatch({ type: 'finish_pose_drag', generation, pose, discard });
@@ -932,6 +1271,8 @@ export function useRobotControl(
   const approve = useCallback(async () => {
     if (
       approveInFlight.current !== null
+      || tcpBlocksCartesian
+      || (tcpInFlight.current !== null && cartesianMode)
       || dragGeneration.current !== null
       || state.poseDragging
       || pendingAuthoringInputs.current.size > 0
@@ -958,7 +1299,6 @@ export function useRobotControl(
           throw new Error('Mapped pneumatic manual control is available when the Program is idle after Reset.');
         }
         const cycleGeneration = start.programCycle.cycleGeneration;
-        const runnerEpoch = start.programCycle.programRunnerOwnerEpoch;
         pneumaticAbort = new AbortController();
         pneumaticWriteAbort.current = pneumaticAbort;
         const abort = pneumaticAbort;
@@ -968,8 +1308,7 @@ export function useRobotControl(
           if (abort.signal.aborted || runtimeScaleStopActive.current || snapshot == null
             || snapshot.programCycle.state !== 'idle_after_reset'
             || snapshot.programCycle.cycleGeneration !== cycleGeneration
-            || snapshot.programCycle.programRunnerOwnerEpoch !== runnerEpoch
-            || live == null || live.ownerEpoch !== currentTarget.ownerEpoch
+            || live == null
             || live.graphRevision !== currentTarget.graphRevision
             || live.retainedBundleId !== currentTarget.retainedBundleId) {
             throw new Error('Manual pneumatic sequence stopped because the current Program or Deployment changed.');
@@ -1002,12 +1341,13 @@ export function useRobotControl(
         type: 'approve_rejected',
         generation: state.generation,
         error: errorMessage(error, 'Motion approval was rejected.'),
+        errorRefusal: commandRefusalCause(error),
       });
     } finally {
       if (pneumaticWriteAbort.current === pneumaticAbort) pneumaticWriteAbort.current = null;
       if (approveInFlight.current === pending) approveInFlight.current = null;
     }
-  }, [controlSource, state]);
+  }, [controlSource, state, tcpBlocksCartesian, cartesianMode]);
 
   const revert = useCallback(() => {
     if (manualControlBlocked.current) return;
@@ -1040,11 +1380,19 @@ export function useRobotControl(
   );
   const componentIncidents = useComponentIncidents(enabled && cellFaultOpen, incidentComponentIds);
   const refreshComponentIncidents = componentIncidents.refresh;
+  const shownIncidents = componentIncidents.incidents;
+  const shownIncidentsUnavailable = componentIncidents.unavailableReason;
 
   // "Recover cell" is one operator action (addendum 2, contract item 6). One
   // Headless call acknowledges every open component incident, waits briefly
   // for the cell latch, and clears it only when its owner reports it ready;
-  // otherwise it returns the typed reason, shown here.
+  // otherwise it returns the typed reason, shown here. A press may outlast
+  // one HTTP call (each component re-enables within its own lifecycle
+  // allowance): after an HTTP timeout the SAME request ID is sent again,
+  // replay-only, and Headless answers `cell_recover_in_progress` or the
+  // stored final result. A resend never starts a press: after a Headless
+  // restart or eviction it answers an unknown outcome, shown as such.
+  // The wait ends only on a final result or when the operator leaves.
   const recoverStopFault = useCallback(async () => {
     const status = state.status;
     const fault = status?.cellStopAction.fault;
@@ -1053,13 +1401,42 @@ export function useRobotControl(
       || status === null
       || fault === null
       || stopFaultRecoveryRequest.current !== null
+      || cellRecoverBlockedReason !== null
     ) return;
-    const pending = { ownerEpoch: status.ownerEpoch };
+    // M6 (item 36): the press acknowledges only the incidents on screen; an
+    // unread list sends none (today's press).
+    const shownIncidentIds = cellFaultOpen && shownIncidentsUnavailable === null
+      ? shownIncidents.map(({ incident }) => incident.incidentId) : null;
+    const pending = { abort: new AbortController() };
+    const pressId = requestId();
     stopFaultRecoveryRequest.current = pending;
     setStopFaultRecoveryPending(true);
+    setStopFaultRecoveryInProgress(false);
     setStopFaultRecoveryError(null);
     try {
-      const message = cellRecoverMessage(await api.execution.cellRecover(requestId()));
+      let result: CellRecoverResult;
+      for (let resend = false; ; resend = true) {
+        let reply: CellRecoverResult | null = null;
+        try {
+          reply = await api.execution.cellRecover(
+            pressId, shownIncidentIds, pending.abort.signal, resend,
+          );
+        } catch (error: unknown) {
+          if (apiErrorCode(error) !== 'headless_http_timeout') throw error;
+        }
+        if (stopFaultRecoveryRequest.current !== pending) return;
+        if (reply !== null && reply.reason?.code !== 'cell_recover_in_progress') {
+          result = reply;
+          break;
+        }
+        setStopFaultRecoveryInProgress(true);
+        if (reply !== null) {
+          // Headless answered at once that the press still runs: ask again shortly.
+          await new Promise((resolve) => window.setTimeout(resolve, CELL_RECOVER_REPLAY_PAUSE_MS));
+          if (stopFaultRecoveryRequest.current !== pending) return;
+        }
+      }
+      const message = cellRecoverMessage(result);
       if (message !== null && stopFaultRecoveryRequest.current === pending) {
         setStopFaultRecoveryError(message);
       }
@@ -1073,10 +1450,30 @@ export function useRobotControl(
       if (stopFaultRecoveryRequest.current === pending) {
         stopFaultRecoveryRequest.current = null;
         setStopFaultRecoveryPending(false);
+        setStopFaultRecoveryInProgress(false);
       }
       refreshComponentIncidents();
     }
-  }, [enabled, refreshComponentIncidents, state.status]);
+  }, [
+    cellFaultOpen, cellRecoverBlockedReason, enabled, refreshComponentIncidents, shownIncidents,
+    shownIncidentsUnavailable, state.status,
+  ]);
+
+  // SX-679: the operator's voluntary abort. Headless starts no later step of
+  // the running press; the step in flight settles within its own limit and
+  // the press then answers `cell_recover_aborted` with what was done, which
+  // the pending press above receives and shows.
+  const abortRecoverStopFault = useCallback(async () => {
+    if (stopFaultRecoveryRequest.current === null) return;
+    setStopFaultRecoveryAbortPending(true);
+    try {
+      await api.execution.cellRecoverAbort(requestId());
+    } catch (error: unknown) {
+      setStopFaultRecoveryError(errorMessage(error, 'Abort of Recover cell was rejected.'));
+    } finally {
+      setStopFaultRecoveryAbortPending(false);
+    }
+  }, []);
 
   const reset = useCallback(async (approvedUncertainOutputs: readonly UncertainOutput[] = []) => {
     const operation = state.operation;
@@ -1135,6 +1532,10 @@ export function useRobotControl(
     // Keep the complete owner projection for cross-target recovery and cell
     // controls. Target-specific authoring uses selectedStatus below.
     currentStatus: state.status,
+    tcpResumeStatus,
+    tcpResumeFresh,
+    tcpResumeConnectionLost,
+    tcpResumeCycle,
     selectedStatus,
     motionTargets,
     gripperTargets,
@@ -1149,11 +1550,18 @@ export function useRobotControl(
     runtimeScalePending,
     runtimeScaleError,
     stopFaultRecoveryPending,
+    stopFaultRecoveryInProgress,
+    stopFaultRecoveryAbortPending,
+    cellRecoverBlockedReason,
+    setCellRecoverBlockedReason,
     stopFaultRecoveryError,
     componentIncidents: componentIncidents.incidents,
     componentIncidentsUnavailableReason: componentIncidents.unavailableReason,
     selectRobot,
     selectTool,
+    selectTcp,
+    tcpApplying,
+    tcpError,
     selectMode,
     selectMoveToSource,
     editMoveToOptions,
@@ -1170,6 +1578,7 @@ export function useRobotControl(
     revert,
     stop,
     recoverStopFault,
+    abortRecoverStopFault,
     dismissRuntimeScaleError,
     dismissError,
     reset,
@@ -1192,6 +1601,9 @@ export function useRobotControl(
     runtimeScaleDraft,
     runtimeScaleError,
     stopFaultRecoveryPending,
+    stopFaultRecoveryInProgress,
+    stopFaultRecoveryAbortPending,
+    cellRecoverBlockedReason,
     stopFaultRecoveryError,
     componentIncidents.incidents,
     componentIncidents.unavailableReason,
@@ -1216,8 +1628,16 @@ export function useRobotControl(
     controlSource,
     stop,
     recoverStopFault,
+    abortRecoverStopFault,
     selectRobot,
     selectTool,
+    selectTcp,
+    tcpResumeStatus,
+    tcpResumeFresh,
+    tcpResumeConnectionLost,
+    tcpResumeCycle,
+    tcpApplying,
+    tcpError,
     dismissRuntimeScaleError,
     dismissError,
   ]);

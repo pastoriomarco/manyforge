@@ -77,6 +77,25 @@ def test_expansion_preserves_roles_typed_values_and_host(catalog):
         skills.expand(**{**request, "target_roles": {"arm": "gripper"}})
 
 
+def test_place_expands_without_unused_tcp_frame_roles(catalog):
+    skills = load_skill_catalog(default_skills_dir(), catalog=catalog)
+    artifact = load_skill(default_skills_dir() / "place_object.skill.yaml")
+    host = _context(catalog)
+    host.update(deepcopy(artifact["example"]["program_declarations"]))
+    host["target_roles"]["gripper"].pop("required_frame_roles")
+    assert host["target_roles"]["arm"]["required_frame_roles"] == ["base"]
+    result = skills.expand(
+        skill_id="place_object",
+        # The host Program caps velocity at 0.4.
+        arguments={**artifact["example"]["arguments"], "velocity_scale": 0.4},
+        component_roles={"robot": "robot", "tool": "tool"},
+        target_roles={"arm": "arm", "gripper": "gripper"},
+        instance_prefix="selected.place",
+        program_context=host,
+    )
+    assert result["tree"]["instance_id"] == "selected.place.place"
+
+
 @pytest.mark.parametrize(
     "mutate,reason",
     [

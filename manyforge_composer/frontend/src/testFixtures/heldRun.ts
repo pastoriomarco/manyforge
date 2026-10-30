@@ -81,7 +81,7 @@ export const heldCatalog: CatalogEntry[] = [{
 
 export function heldOffer(patch: Partial<CycleRecoveryOffer> = {}): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v4',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v5',
     offerId: digest('e'),
     offerRevision: 1,
     programRunId: 'run.1',

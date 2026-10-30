@@ -11,7 +11,11 @@ import {
 } from '../api/parsers/ioSignals';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { JsonValue } from '../types/api';
-import { globalRuleStateText, type GlobalRuleStatus } from '../utils/globalRuleStatus';
+import {
+  globalRuleStateText,
+  globalRuleUnavailableText,
+  type GlobalRuleStatus,
+} from '../utils/globalRuleStatus';
 import {
   IO_DRIVER_FRESHNESS_NOTE,
   IO_LIVENESS_LABELS,
@@ -166,17 +170,29 @@ export function GlobalRuleStatusSection({ rules, current = true }: {
       <div className="runtime-control-heading"><strong>Global rules</strong></div>
       {rules !== null && !current
         && <p className="hint">Control state is not current; showing the last known rule states.</p>}
-      {rules === null ? <p className="hint">Global rule states are not known yet.</p> : rules.map((rule) => (
-        <div className="runtime-control-heading" key={rule.ruleId} data-global-rule={rule.ruleId}
-          data-global-rule-state={rule.state} data-global-rule-current={String(current)}>
-          <span>{rule.ruleId}</span>
-          <span className={`status-pill${!current ? ''
-            : rule.state === 'clear' ? ' status-pill-connected'
-              : rule.state === 'tripped' || rule.state === 'latched' ? ' status-pill-danger' : ''}`}>
-            {current ? globalRuleStateText(rule) : `last known: ${globalRuleStateText(rule)} (not current)`}
-          </span>
-        </div>
-      ))}
+      {rules === null ? <p className="hint">Global rule states are not known yet.</p> : rules.map((rule) => {
+        const unavailableText = current ? globalRuleUnavailableText(rule) : null;
+        return (
+          <div className="runtime-control-heading" key={rule.ruleId} data-global-rule={rule.ruleId}
+            data-global-rule-state={rule.state} data-global-rule-current={String(current)}>
+            <span>{rule.ruleId}</span>
+            <div>
+              <span className={`status-pill${!current ? ''
+                : rule.state === 'clear' ? ' status-pill-connected'
+                  : rule.state === 'tripped' || rule.state === 'latched' || rule.state === 'unknown' ? ' status-pill-danger' : ''}`}>
+                {current ? globalRuleStateText(rule) : `last known: ${globalRuleStateText(rule)} (not current)`}
+              </span>
+              {unavailableText !== null && <>
+                <p className="hint">{unavailableText}</p>
+                <details>
+                  <summary>Details</summary>
+                  <pre>{JSON.stringify(rule.unavailableReason?.details, null, 2)}</pre>
+                </details>
+              </>}
+            </div>
+          </div>
+        );
+      })}
     </section>
   );
 }

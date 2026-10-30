@@ -16,6 +16,9 @@ namespace manyforge::core {
 /// Source label of every lifecycle request CCLC submits while following a
 /// requested target (ADR-0026 §7 lifecycle-target amendment, 2026-10-08).
 inline constexpr std::string_view kLifecycleTargetSourceLabel = "manyforge_lifecycle_target";
+/// M6: Headless's Recover cell re-enable names its own Recover, Prepare and
+/// Enable with this label; only its targets keep the incident re-enable mark.
+inline constexpr std::string_view kCellRecoverReenableSourceLabel = "cell_recover_reenable";
 
 /// Requested lifecycle target of one component. It is distinct from the
 /// achieved CCLC state, which only a verified transaction establishes.
@@ -24,6 +27,16 @@ enum class LifecycleTargetStateDTO : std::uint8_t {
   kPrepared,
   kDisabled,
 };
+
+/// M6: whether a new target keeps the incident re-enable mark (an incident
+/// retired the Active target and Active was not restored). Only Recover
+/// cell's own re-enable targets keep it; any other target (an operator's
+/// Prepare, Enable or Disable, startup, an Apply) ends it.
+[[nodiscard]] inline bool KeepsIncidentReenable(LifecycleTargetStateDTO requested,
+                                                std::string_view source_label) {
+  return requested != LifecycleTargetStateDTO::kDisabled &&
+         source_label == kCellRecoverReenableSourceLabel;
+}
 
 enum class LifecycleTargetOriginDTO : std::uint8_t {
   kStartup = 0,
@@ -219,6 +232,10 @@ struct ComponentLifecycleTargetViewDTO final {
   std::optional<std::uint64_t> dropped_output_bytes{};
   /// CP9 health of the component's declared streams; empty when none.
   std::vector<StreamHealthDTO> stream_health{};
+  /// M6: an incident retired the component's Active target and Active was
+  /// not restored since (reaching Active, an operator Disable, Close or an
+  /// Apply replacing the component end it). Recover cell enables it again.
+  bool active_target_retired_by_incident{};
 
   friend bool operator==(const ComponentLifecycleTargetViewDTO&,
                          const ComponentLifecycleTargetViewDTO&) = default;

@@ -261,7 +261,6 @@ resource_evidence_digest(const core::StopSurveillanceObservationQueryDTO &query,
 
 [[nodiscard]] core::ContentDigest external_reconciliation_evidence_digest(
     const core::StopFaultLatchDTO &latch, const core::ResourceId &resource,
-    const core::ContentDigest &settlement_digest,
     const core::ContentDigest &no_active_goal_digest,
     const core::ContentDigest &configuration_digest) {
   const CanonicalValue value(CanonicalValue::Object{
@@ -273,7 +272,6 @@ resource_evidence_digest(const core::StopSurveillanceObservationQueryDTO &query,
       {"no_active_goal_evidence_digest",
        CanonicalValue(no_active_goal_digest.value())},
       {"resource_id", CanonicalValue(resource.value())},
-      {"settlement_evidence_digest", CanonicalValue(settlement_digest.value())},
       {"stop_generation",
        CanonicalValue(std::to_string(latch.stop_generation.value()))},
       {"stop_id", CanonicalValue(latch.stop_id.value())},
@@ -1394,49 +1392,51 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
           expectation, evidence.has_value(), std::move(evidence)});
     }
 
+    // M6b (maintainer rule): a robot with no active move and no Stop being
+    // executed is stopped; no further checks. One no-active-goal fact per
+    // captured resource of a source whose goal-activity observer reports no
+    // active goal, for every latch (not only failed_uncontained). No joint
+    // state is read: no fresh sample and no rest velocity is required. The
+    // Kernel adds the Stop-executing/reserved/dispatched slots as fenced.
     std::vector<core::StopFaultRecoveryResourceFactDTO> external_facts;
-    if (core::stop_fault_trigger_observed(
-            latch, core::StopFaultTriggerDTO::kFailedUncontained)) {
-      for (const auto &source : sources) {
-        std::vector<core::ResourceId> selected_resources;
-        for (const auto &resource : binding_resources(source.binding)) {
-          if (std::binary_search(latch.captured_resources.begin(),
-                                 latch.captured_resources.end(), resource)) {
-            selected_resources.push_back(resource);
-          }
-        }
-        if (selected_resources.empty())
-          continue;
-        auto quiescence = observe_current_quiescence_after_refresh(
-            source, selected_resources, assessed_at_ns, clock_);
-        if (!quiescence.ok())
-          continue;
-        for (const auto &resource : selected_resources) {
-          const auto settlement = resource_facts.find(resource);
-          if (settlement == resource_facts.end() ||
-              settlement->second.state !=
-                  core::StopFaultRecoveryResourceStateDTO::kSettled ||
-              !settlement->second.evidence_digest.has_value()) {
-            continue;
-          }
-          const auto &observed = quiescence.value().observation;
-          external_facts.push_back(core::StopFaultRecoveryResourceFactDTO{
-              resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
-              observed.snapshot.source_epoch, observed.snapshot.sequence,
-              observed.source_age_ns,
-              kRetainedNativeReconciliationFreshnessBudgetNs,
-              external_reconciliation_evidence_digest(
-                  latch, resource, *settlement->second.evidence_digest,
-                  observed.no_active_goal_evidence_digest,
-                  observed.configuration_evidence_digest),
-              std::nullopt});
+    for (const auto &source : sources) {
+      std::vector<core::ResourceId> selected_resources;
+      for (const auto &resource : binding_resources(source.binding)) {
+        if (std::binary_search(latch.captured_resources.begin(),
+                               latch.captured_resources.end(), resource)) {
+          selected_resources.push_back(resource);
         }
       }
-      std::sort(external_facts.begin(), external_facts.end(),
-                [](const auto &left, const auto &right) {
-                  return left.resource_id < right.resource_id;
-                });
+      if (selected_resources.empty() || !source.no_active_goal_evidence_source ||
+          !source.binding.value().control_path.has_value())
+        continue;
+      auto no_active_goal = source.no_active_goal_evidence_source(assessed_at_ns);
+      if (!no_active_goal.ok() ||
+          !content_identity::is_sha256_digest(no_active_goal.value().value()))
+        continue;
+      const auto &value = source.binding.value();
+      const auto &path = *value.control_path;
+      const auto configuration = configuration_evidence_digest(
+          core::StopFaultRecoveryConfigurationExpectationDTO{
+              path.control_domain_id, path.active_control_configuration_id,
+              path.active_control_configuration_generation},
+          value.retained_bundle_id, value.graph_revision);
+      for (const auto &resource : selected_resources) {
+        // The goal-activity read is current at the assessment: age 0, one
+        // observation of the provider runtime's goal state.
+        external_facts.push_back(core::StopFaultRecoveryResourceFactDTO{
+            resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
+            path.provider_runtime_epoch, 1U, 0,
+            kRetainedNativeReconciliationFreshnessBudgetNs,
+            external_reconciliation_evidence_digest(
+                latch, resource, no_active_goal.value(), configuration),
+            std::nullopt});
+      }
     }
+    std::sort(external_facts.begin(), external_facts.end(),
+              [](const auto &left, const auto &right) {
+                return left.resource_id < right.resource_id;
+              });
 
     std::vector<core::StopFaultRecoveryResourceFactDTO> resources;
     resources.reserve(resource_facts.size());

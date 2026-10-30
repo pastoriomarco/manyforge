@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -93,7 +94,7 @@ def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
         b'{"schema_version":"manyforge.source_model_context.v1",'
         b'"node_environment":{"schema_version":"manyforge.'
         b'node_environment_projection.v2"},'
-        b'"source_model":{"schema_version":"manyforge.source_model_projection.v2",'
+        b'"source_model":{"schema_version":"manyforge.source_model_projection.v3",'
         b'"padding":"'
     )
     suffix = b'"}}' + (b"}" if native else b"")
@@ -309,7 +310,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.source_model_projection.v2"},
+            json={"schema_version": "manyforge.source_model_projection.v3"},
             request=request,
         )
 
@@ -319,7 +320,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.source_model()["schema_version"].endswith("projection.v2")
+        assert client.source_model()["schema_version"].endswith("projection.v3")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/source-model"]
@@ -741,6 +742,46 @@ def test_client_distinguishes_transport_timeout_from_other_unavailability() -> N
         raw.close()
 
 
+def test_client_posts_one_apply_acknowledgement_with_identity_in_query() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        response = client.manager_apply_acknowledge(
+            "apply/1",
+            1,
+            {
+                "request_id": "composer-ack.request.1",
+                "source_label": "manyforge_composer",
+            },
+        )
+        assert response == {"ok": True}
+    finally:
+        raw.close()
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/api/manager/apply/acknowledge"
+    assert parse_qsl(requests[0].url.query.decode("ascii")) == [
+        ("apply_id", "apply/1"),
+        ("apply_generation", "1"),
+    ]
+    assert json.loads(requests[0].content) == {
+        "request_context": {
+            "request_id": "composer-ack.request.1",
+            "source_label": "manyforge_composer",
+        }
+    }
+
+
 def test_client_rejects_noncanonical_alarm_condition_path_before_http() -> None:
     transport = httpx.MockTransport(
         lambda request: pytest.fail(f"unexpected request: {request.url}")
@@ -752,3 +793,24 @@ def test_client_rejects_noncanonical_alarm_condition_path_before_http() -> None:
             client.acknowledge_alarm("condition/../../health", {})
     finally:
         raw.close()
+
+
+def test_http_refusal_keeps_the_reported_producer() -> None:
+    forwarded = HeadlessHttpClient._error_from_response(
+        {"detail": {"code": "stale_generation", "message": "moved",
+                    "details": {"reason": "expected_generation_stale"},
+                    "producer": "kernel"}},
+        409,
+    )
+    assert forwarded.code == "stale_generation"
+    assert forwarded.producer == "kernel"
+    raw_manager = HeadlessHttpClient._error_from_response(
+        {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+         "error": {"code": "apply_busy", "message": "busy", "details": {},
+                   "producer": "component_manager"}},
+        409,
+    )
+    assert raw_manager.producer == "component_manager"
+    unnamed = HeadlessHttpClient._error_from_response({"detail": "text"}, 500)
+    assert unnamed.code == "headless_http_error"
+    assert unnamed.producer == "headless_api"

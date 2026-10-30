@@ -46,6 +46,7 @@ function controller(): DeploymentWorkspaceController {
     busy: false,
     applying: false,
     error: null,
+    errorCauseCode: null,
     feedback: null,
     acceptedApply: null,
     acceptedApplyCorrelationId: null,
@@ -68,6 +69,8 @@ function controller(): DeploymentWorkspaceController {
     saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
+    addComponents: vi.fn(),
+    previewDraft: vi.fn(),
     confirmApply: vi.fn(),
     cancelApplyConfirmation: vi.fn(),
   };

@@ -35,6 +35,8 @@ struct XArmRobotStatesTransport::Cache final {
     report.motion_enable_mask = message.mt_able;
     // Only for the Enable gate's agreement check (R7 §3.6), never a state.
     report.joint_angles_rad.assign(message.angle.begin(), message.angle.end());
+    // Item 44: compared with the TCP offset before each motion.
+    report.tcp_offset.assign(message.offset.begin(), message.offset.end());
     std::lock_guard lock(mutex);
     latest = report;
   }

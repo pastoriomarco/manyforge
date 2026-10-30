@@ -1,0 +1,36 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/robotiq_2f_85`.
+# Mounts on a robot's `flange` interface as its own component (merge 6).
+api_version: manyforge.component_package.v1
+kind: tool
+id: robotiq.robotiq_2f_85
+version: 1.0.0
+title: Robotiq 2F-85
+license: BSD-3-Clause
+model:
+  urdf: robotiq_2f_85.urdf
+  srdf: robotiq_2f_85.srdf
+mount:
+  frame: robotiq_2f_85_mount
+tcps:                             # the first is the default TCP; D3: the mount,
+                                  # today's UR5e `tool0` poses
+  - {id: tcp, frame: robotiq_2f_85_mount}
+  - {id: base, frame: robotiq_85_base_link}
+roles:
+  groups: {gripper: robotiq_2f_85_gripper}
+  joints: {fingers: [robotiq_85_left_knuckle_joint]}
+  collision_bodies:
+    gripper_collision: [robotiq_85_base_link, robotiq_85_left_finger_link, robotiq_85_left_finger_tip_link, robotiq_85_left_inner_knuckle_link, robotiq_85_left_knuckle_link, robotiq_85_right_finger_link, robotiq_85_right_finger_tip_link, robotiq_85_right_inner_knuckle_link, robotiq_85_right_knuckle_link]
+gripper:
+  actuation: position_commanded
+  states: {open: open, closed: closed}
+  attach_frame: robotiq_85_base_link
+  touch_links: [robotiq_85_base_link, robotiq_85_left_finger_link, robotiq_85_left_finger_tip_link, robotiq_85_left_inner_knuckle_link, robotiq_85_left_knuckle_link, robotiq_85_right_finger_link, robotiq_85_right_finger_tip_link, robotiq_85_right_inner_knuckle_link, robotiq_85_right_knuckle_link]
+lanes:
+  mock:
+    controllers:                  # its gripper-only Mock row (no arm controller)
+      template: ur
+      hardware_component_name: MockRobotiq2F85System
+      gripper_controller: robotiq_gripper_controller
+      hard_stop_completion_timeout_s: 0.5
+      gripper_result_timeout_s: 15.0

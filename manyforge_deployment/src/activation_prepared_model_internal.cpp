@@ -157,7 +157,7 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
       "asset://" + std::string(model_asset_id) + "/model.urdf";
   const std::string srdf_uri =
       "asset://" + std::string(model_asset_id) + "/model.srdf";
-  CanonicalValue candidate(CanonicalValue::Object{
+  CanonicalValue::Object candidate{
       {"api_version", CanonicalValue(std::string(core::kModelAssetApiVersion))},
       {"model_asset_id", CanonicalValue(std::string(model_asset_id))},
       {"model_revision", CanonicalValue(std::string(kZeroDigest))},
@@ -180,7 +180,12 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
        member(semantics, "resource_role_bindings", "semantics")},
       {"collision_body_role_bindings",
        member(semantics, "collision_body_role_bindings", "semantics")},
-  });
+  };
+  // A family's own payload (a tool's mass and centre of mass) is optional.
+  if (const auto *payload = semantics.find_object_member("payload");
+      payload != nullptr) {
+    candidate.emplace_back("payload", *payload);
+  }
 
   const auto *schema =
       build_qualified_closed_schema_registry().find_catalog_schema_family(
@@ -192,7 +197,8 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
   }
   return validate_and_normalize_unqualified_artifact_candidate(
              *schema->compiled_schema(),
-             parse_strict_json_model_yaml(canonical_json(candidate)))
+             parse_strict_json_model_yaml(
+                 canonical_json(CanonicalValue(std::move(candidate)))))
       .normalized_root();
 }
 

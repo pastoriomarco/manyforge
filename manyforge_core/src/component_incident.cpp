@@ -196,9 +196,11 @@ std::vector<LifecycleIncidentRecoveryPolicyDTO> DefaultLifecycleIncidentRecovery
   using Cause = LifecycleBlockingCauseClassDTO;
   // Addendum 2 item 6: every class requires the operator's acknowledgement;
   // the steps are performed by the lifecycle plans CCLC runs afterwards.
+  // V-B3: vendor-neutral step names; the vendor's own codes stay in the
+  // incident's `vendor_codes`.
   return {
       {Cause::kEmergencyStop, true, true, false,
-       "release_emergency_stop,clear_error,enable_motors,servo_mode,ready"},
+       "release_emergency_stop,clear_error,enable_drives,motion_mode,ready"},
       {Cause::kProtectiveStop, true, false, false, "clear_error,ready_from_fresh_state"},
       {Cause::kSafeguardStop, true, true, false, "reset_safeguard,clear_error,ready"},
       {Cause::kFault, true, true, false, "physical_action_if_required,clear_error,ready"},

@@ -668,9 +668,18 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       status: 'accepted', workspace: workspace(1),
       activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
     });
-    await act(async () => { await latest?.newScenarioDocument(true); });
+    const confirmedAuthoring = {
+      workspaceEpoch: 'confirmed.workspace', workspaceRevision: 5,
+      programDraftId: 'confirmed.program', programDraftRevision: 8,
+      deploymentDraftId: 'confirmed.deployment', deploymentDraftRevision: 13,
+    };
+    await act(async () => { await latest?.newScenarioDocument(true, confirmedAuthoring); });
     expect(apiMock.scenarioDocuments.new).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ draftId: 'draft-1', deploymentDraftId: 'deployment-draft-1' }), true,
+      expect.objectContaining({
+        expectedWorkspaceEpoch: 'confirmed.workspace', expectedWorkspaceRevision: 5,
+        draftId: 'confirmed.program', expectedDraftRevision: 8,
+        deploymentDraftId: 'confirmed.deployment', expectedDeploymentDraftRevision: 13,
+      }), true,
     );
     expect(latest?.acceptedApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
     expect(latest?.state.message).toContain('New Scenario accepted (apply.new)');
@@ -767,18 +776,25 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     );
     expect(latest?.scenarioDocumentPath).toBe('/workspace/cell');
 
+    const confirmedAuthoring = {
+      workspaceEpoch: 'load.confirmed', workspaceRevision: 6,
+      programDraftId: 'program.confirmed', programDraftRevision: 7,
+      deploymentDraftId: 'deployment.confirmed', deploymentDraftRevision: 10,
+    };
     await act(async () => {
       latest?.loadScenarioDocument(
         '/workspace/cell',
         true,
+        confirmedAuthoring,
       );
       await Promise.resolve();
       await Promise.resolve();
     });
     expect(apiMock.scenarioDocuments.load).toHaveBeenCalledWith(
       expect.objectContaining({
-        deploymentDraftId: 'deployment-draft-1',
-        expectedDeploymentDraftRevision: 4,
+        expectedWorkspaceEpoch: 'load.confirmed', expectedWorkspaceRevision: 6,
+        draftId: 'program.confirmed', expectedDraftRevision: 7,
+        deploymentDraftId: 'deployment.confirmed', expectedDeploymentDraftRevision: 10,
       }),
       '/workspace/cell',
       true,

@@ -36,10 +36,5 @@ namespace manyforge::core {
     const RuntimeParticipantStopReadiness& readiness,
     std::span<const HardStopResourceLimitDTO> retained_default_limits,
     MotionInterruptNodeCategory node_category);
-[[nodiscard]] Result<PreparedOperationParticipantDTO> DecodePreparedOperationParticipant(
-    std::string_view canonical_bytes, const RuntimeParticipantBinding& binding,
-    const RuntimeParticipantStopReadiness& readiness,
-    std::span<const HardStopResourceLimitDTO> retained_default_limits,
-    MotionInterruptNodeCategory node_category);
 
 }  // namespace manyforge::core

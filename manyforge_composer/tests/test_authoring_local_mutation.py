@@ -379,34 +379,6 @@ def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_pat
     assert commit.snapshot.project["document_id"] == "saved-scenario"
 
 
-@pytest.mark.parametrize("session", ["project", "whole-workspace"])
-def test_stale_generation_refuses_before_under_claim_project_effect(tmp_path, session) -> None:
-    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
-    headless.generation = 8
-    effects: list[str] = []
-    initial_revision = workspace.revision
-
-    with pytest.raises(HTTPException) as raised:
-        coordinator.execute_local_mutation(
-            _envelope(),
-            operation_kind="save_scenario_document",
-            draft_id=program.draft_id,
-            draft_revision=program.revision,
-            payload={"path": "scenario.test"},
-            workspace=workspace,
-            session=session,
-            install=program.install_no_op if session == "whole-workspace" else None,
-            prepare_project_under_claim=lambda: effects.append("write")
-            or scenario_project_facts(None),
-        )
-
-    assert raised.value.detail["code"] == "stale_generation"
-    assert effects == []
-    assert headless.claims == []
-    assert workspace.revision == initial_revision
-    assert coordinator.local_claim_pending is False
-
-
 def test_refusal_settles_proven_no_effect_and_keeps_the_typed_error(
     tmp_path,
 ) -> None:
@@ -674,22 +646,21 @@ def test_admission_refusal_takes_no_claim(tmp_path) -> None:
     assert headless.events == []
 
 
-def test_stale_admission_generation_takes_no_claim(tmp_path) -> None:
+def test_older_admission_generation_is_claim_evidence_only(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
 
-    with pytest.raises(HTTPException) as raised:
-        _run_local(
-            coordinator,
-            workspace,
-            program,
-            headless,
-            envelope=_envelope(generation=6),
-        )
+    # The browser read generation 6; the current generation is 7.
+    _run_local(
+        coordinator,
+        workspace,
+        program,
+        headless,
+        envelope=_envelope(generation=6),
+    )
 
-    assert raised.value.status_code == 409
-    assert raised.value.detail["code"] == "stale_generation"
-    assert headless.claims == []
-    assert headless.events == []
+    assert [claim["expected_admission_generation"] for claim in headless.claims] == [6]
+    assert headless.events[0] == "acquire"
+    assert coordinator.local_claim_pending is False
 
 
 def test_whole_workspace_session_uses_the_replacement_commit(tmp_path) -> None:
@@ -931,7 +902,7 @@ def test_accepted_apply_keeps_overlapping_authoring_at_the_owner_boundary(
 def test_authoritative_acquire_rejection_does_not_contain(tmp_path) -> None:
     _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     headless.acquire_error = HeadlessClientError(
-        "stale_generation", "claim was rejected", status_code=409
+        "authoring_not_ready", "claim was rejected", status_code=409
     )
 
     with pytest.raises(HTTPException):

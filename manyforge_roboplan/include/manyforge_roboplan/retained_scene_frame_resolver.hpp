@@ -11,9 +11,45 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+
+/// The component that owns one model instance in the cell graph.
+struct RetainedSceneFrameModelOwnerInput final {
+  core::ModelInstanceId model_instance_id;
+  core::ControllableComponentId controllable_component_id;
+};
+
+/// The retained frame a Program frame-role binding names. A frame of a tool
+/// mounted on the bound robot keeps its own component (its model's owner);
+/// the binding's component owns every other frame.
+[[nodiscard]] core::ResolvedComponentModelFrameDTO program_binding_frame(
+    const std::vector<RetainedSceneFrameModelOwnerInput> &model_owners,
+    const core::ControllableComponentId &binding_component,
+    const core::ProgramFrameRoleBindingDTO &frame);
+
+/// LOADFIX6: one owner row per model that ends a component-model frame path
+/// of the cell kinematic index, in path order; the owner is the index's
+/// `owner_of` (the cell graph). Passive models have no row.
+template <typename KinematicIndex>
+[[nodiscard]] std::vector<RetainedSceneFrameModelOwnerInput>
+retained_scene_frame_model_owners(const KinematicIndex &index) {
+  std::vector<RetainedSceneFrameModelOwnerInput> owners;
+  for (const auto &path : index.frame_paths()) {
+    const auto *terminal =
+        std::get_if<core::ResolvedComponentModelFrameDTO>(&path.terminal_frame);
+    if (terminal == nullptr ||
+        std::any_of(owners.begin(), owners.end(), [&](const auto &row) {
+          return row.model_instance_id == terminal->model_instance_id;
+        }))
+      continue;
+    if (const auto *owner = index.owner_of(terminal->model_instance_id))
+      owners.push_back({terminal->model_instance_id, *owner});
+  }
+  return owners;
+}
 
 struct RetainedTargetSceneFrameInput final {
   core::ControllableComponentId controllable_component_id;
@@ -21,6 +57,47 @@ struct RetainedTargetSceneFrameInput final {
   core::FrameRoleId target_frame_role_id;
   core::ResolvedComponentModelFrameDTO frame;
 };
+
+/// G6 [C-P6]: one mounted component and every component it is mounted on,
+/// nearest first (the cell kinematic index's `ancestors_of`).
+struct RetainedSceneFrameComponentMountInput final {
+  core::ControllableComponentId controllable_component_id;
+  std::vector<core::ControllableComponentId> mounted_on;
+};
+
+/// G6: one mount row per graph component that is mounted on another.
+template <typename CellGraph, typename KinematicIndex>
+[[nodiscard]] std::vector<RetainedSceneFrameComponentMountInput>
+retained_scene_frame_component_mounts(const CellGraph &graph,
+                                      const KinematicIndex &index) {
+  std::vector<RetainedSceneFrameComponentMountInput> mounts;
+  for (const auto &component : graph.controllable_components) {
+    auto mounted_on = index.ancestors_of(component.controllable_component_id);
+    if (!mounted_on.empty())
+      mounts.push_back(
+          {component.controllable_component_id, std::move(mounted_on)});
+  }
+  return mounts;
+}
+
+/// G6 [C-P6]: a component is local to a resolver when it has a live state
+/// source there (`has_source`), or when it has none and anything it is
+/// mounted on has one (a pneumatic tool on a local arm).
+template <typename HasSource>
+[[nodiscard]] bool retained_scene_frame_component_local(
+    const std::vector<RetainedSceneFrameComponentMountInput> &mounts,
+    const core::ControllableComponentId &component,
+    const HasSource &has_source) {
+  if (has_source(component))
+    return true;
+  const auto row =
+      std::find_if(mounts.begin(), mounts.end(), [&](const auto &candidate) {
+        return candidate.controllable_component_id == component;
+      });
+  return row != mounts.end() &&
+         std::any_of(row->mounted_on.begin(), row->mounted_on.end(),
+                     has_source);
+}
 
 enum class RetainedSceneFrameCoordinateAuthority {
   kRequiredPublication,
@@ -48,8 +125,12 @@ struct RetainedSceneFrameResolverInput final {
   core::CellId cell_id;
   std::string compiled_cell_frame_name;
   std::vector<core::KinematicFramePathDTO> frame_paths;
+  /// The owner of each model that ends a component-model frame path.
+  std::vector<RetainedSceneFrameModelOwnerInput> model_owners;
   std::vector<RetainedTargetSceneFrameInput> target_frames;
   std::vector<RetainedSceneFrameComponentAttachmentInput> component_attachments;
+  /// G6: what each mounted component is mounted on.
+  std::vector<RetainedSceneFrameComponentMountInput> component_mounts;
   std::vector<RetainedSceneFrameStateSourceInput> state_sources;
   std::int64_t maximum_receiver_time_skew_ns{10'000'000};
 };
@@ -119,9 +200,12 @@ public:
         retained_bundle.value().cell_graph.graph_revision,
         model_map.cell_frame().cell_id,
         model_map.cell_frame().compiled_frame_name,
-        model_map.kinematic_frame_paths(),
+        model_map.kinematic_index().frame_paths(),
+        retained_scene_frame_model_owners(model_map.kinematic_index()),
         {},
         {},
+        retained_scene_frame_component_mounts(
+            retained_bundle.value().cell_graph, model_map.kinematic_index()),
         {},
         10'000'000};
 

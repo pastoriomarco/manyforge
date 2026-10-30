@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  acceptManagerApplyAcknowledgementStatus,
   acceptManagerApplyStatus,
   selectManagerApplyInventoryIdentity,
   selectManagerApplyObservationIdentity,
@@ -35,6 +36,10 @@ function status(
       message: 'replacement initialization failed',
       phase,
       effectDisposition: state === 'failed' ? 'known' : 'unknown',
+      causeCode: 'typed_cause_code',
+      causeDetails: {},
+      producer: 'component_manager',
+      effectBoundary: 'unknown',
     } : null,
     lastProgress: {
       phase,
@@ -53,6 +58,7 @@ function status(
     requestId: 'request-1',
     requestOwnerEpoch: 'owner-1',
     state,
+    failureAcknowledgement: 'unavailable',
   };
 }
 
@@ -97,6 +103,54 @@ describe('Manager Apply presentation state', () => {
     const terminal = status('runtime_converged', 'unknown_effect');
     expect(acceptManagerApplyStatus(terminal, status('accepted'))).toBe(terminal);
     expect(terminal.failure?.effectDisposition).toBe('unknown');
+  });
+
+  it('accepts explicit acknowledgement completion without letting stale status undo it', () => {
+    const offered = {
+      ...status('runtime_converged', 'failed'),
+      failure: {
+        ...status('runtime_converged', 'failed').failure!,
+        effectBoundary: 'before_effect' as const,
+      },
+      failureAcknowledgement: 'available' as const,
+    };
+    const completed = {
+      ...status('accepted', 'failed'),
+      failure: {
+        ...status('accepted', 'failed').failure!,
+        effectBoundary: 'before_effect' as const,
+      },
+      failureAcknowledgement: 'acknowledged' as const,
+    };
+    const acknowledged = acceptManagerApplyAcknowledgementStatus(offered, completed);
+
+    expect(acknowledged?.state).toBe('failed');
+    expect(acknowledged?.phase).toBe('runtime_converged');
+    expect(acknowledged?.failure).toEqual(offered.failure);
+    expect(acknowledged?.failureAcknowledgement).toBe('acknowledged');
+    expect(acceptManagerApplyStatus(acknowledged, offered)).toBe(acknowledged);
+    expect(acceptManagerApplyAcknowledgementStatus(acknowledged, offered))
+      .toBe(acknowledged);
+    expect(acceptManagerApplyStatus(offered, completed)).toBe(offered);
+  });
+
+  it('keeps unavailable failed acknowledgement active and does not restore stale availability', () => {
+    const available = {
+      ...status('runtime_converged', 'failed'),
+      failure: {
+        ...status('runtime_converged', 'failed').failure!,
+        effectBoundary: 'before_effect' as const,
+      },
+      failureAcknowledgement: 'available' as const,
+    };
+    const unavailable = {
+      ...available,
+      failureAcknowledgement: 'unavailable' as const,
+    };
+    expect(acceptManagerApplyAcknowledgementStatus(available, unavailable)?.failureAcknowledgement)
+      .toBe('unavailable');
+    expect(acceptManagerApplyAcknowledgementStatus(unavailable, available))
+      .toBe(unavailable);
   });
 
   it('does not replace one operation with a response for another identity', () => {

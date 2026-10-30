@@ -27,6 +27,10 @@ struct CartesianTrajectoryContractInput final {
   std::string compiled_tcp_frame;
   core::SpeedProfileDTO speed_profile;
   core::PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
+  /// Every point the linear-speed retime holds under the TCP limit (the
+  /// robot flange under `active_tcp_and_flange`); `compiled_tcp_frame` is
+  /// always one. Angular and acceleration caps stay TCP path constraints.
+  std::vector<std::string> compiled_speed_frames{};
 };
 
 struct CartesianJointDynamicsEnvelope {

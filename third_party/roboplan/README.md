@@ -56,8 +56,8 @@ silently dropping patches.
 
 ## Carried 0.7 patches
 
-`patches.sha256` is authoritative for order and content. Five small
-dependency-internal fixes are carried:
+`patches.sha256` is authoritative for order and content. Six small
+dependency-internal changes are carried:
 
 1. `0010-construct-roboplan-070-scene-scratch-without-assignment.patch`
    (`57b699cb2dec5604f091ad5170c6e187caa7132cc14dd2b0b58b726c04d4930b`)
@@ -97,6 +97,15 @@ dependency-internal fixes are carried:
    truthful without installing a second TOPPRA generation or placeholder
    distribution metadata. The build requirements remain unchanged and the
    dependency-stack verifier continues to prove the selected native linkage.
+6. `0015-roboplan-070-scene-collision-pair-margins.patch`
+   (`fdcb0fb10d84f2df9f3f33bb7c37c8c9a5e4ddd9cd9767595894e06a63f93fb1`)
+   adds `Scene::setCollisionPairMargins`, which sets coal's per-pair
+   `security_margin` and rebuilds the broadphase, and makes `SceneContext`
+   copy those margins, so RRT and path checks keep the ManyForge collision
+   clearance. Remove after an upstream release provides an equivalent per-pair
+   margin that reaches `SceneContext`-based planners and the focused Scene,
+   RRT, worker-protocol and kernel clearance rows pass without it. Dossier:
+   `upstream/roboplan-070-scene-collision-pair-margins.md`.
 
 Patches 0010 through 0013 are the rebased 0.7 successors of the retired 0.6
 series 0005, 0006, 0008 and 0009. Those 0.6 bodies are no longer kept in this

@@ -13,7 +13,6 @@
 #include <utility>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
-#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
@@ -209,10 +208,6 @@ adopt_durable_route_configurations(
     }
 
     std::vector<RuntimeEpochRouteReconciliation> reconciliations;
-    core::FilesystemResolvedStopBasePlanRepository repository(
-        config.run_root, config.maximum_resolved_stop_plan_count,
-        config.maximum_resolved_stop_plan_bytes,
-        config.maximum_single_resolved_stop_plan_bytes);
     for (const auto &domain : facts.value().domains) {
       const auto graph_domain = std::find_if(
           bundle.cell_graph.control_domains.begin(),
@@ -366,9 +361,9 @@ adopt_durable_route_configurations(
       }
 
       auto participants =
-          deployment::resolve_store_and_verify_route_readiness_batch(
+          deployment::resolve_and_verify_route_readiness_batch(
               retained_bundle, artifact_source, expected, active,
-              component_expectations, physical.value(), repository);
+              component_expectations, physical.value());
       if (!participants.ok()) {
         return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
             participants.error());
@@ -1137,7 +1132,6 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
     const core::NativeApplyPlanDTO &plan,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     const std::span<const core::RuntimeParticipantBinding> physical_bindings,
-    const std::filesystem::path &execution_run_root,
     const core::ConfigurationFenceStatusQueryDTO &actual_parent_fence) {
   try {
     if (!deployment::verify_retained_bundle_identity(bundle) ||
@@ -1151,8 +1145,6 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
       return reject<void>("native_candidate_input_invalid",
                           "native CCLC candidate route inputs do not match the recorded plan");
     }
-    core::FilesystemResolvedStopBasePlanRepository plan_repository(
-        execution_run_root);
     for (const auto &desired : bundle.value().desired_control_configurations) {
       std::vector<core::RuntimeParticipantBinding> representatives;
       representatives.reserve(desired.binding_routes.size());
@@ -1302,9 +1294,9 @@ core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
           {domain_component, planned_component->generation,
            planned_component->state}};
       auto participants =
-          deployment::resolve_store_and_verify_route_readiness_batch(
+          deployment::resolve_and_verify_route_readiness_batch(
               bundle, artifact_source, expected, configuration, components,
-              representatives, plan_repository);
+              representatives);
       if (!participants.ok()) {
         return core::Result<void>::Err(participants.error());
       }

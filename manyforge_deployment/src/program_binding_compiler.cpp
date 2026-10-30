@@ -21,6 +21,7 @@
 #include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/capability_definition_codec.hpp"
+#include "manyforge_deployment/cell_kinematic_index.hpp"
 #include "manyforge_deployment/command_schema_codec.hpp"
 #include "manyforge_deployment/component_type_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -591,18 +592,6 @@ struct ResolvedResourceRole final {
     fail("target resource role has no retained coordinate mapping");
   }
   return std::move(*result);
-}
-
-[[nodiscard]] const CompositionTargetFrameResolution& require_frame(
-    const CompositionTargetResolution& target,
-    const core::FrameRoleId& role) {
-  const auto* frame = find_exactly_one<CompositionTargetFrameResolution>(
-      target.frames,
-      [&](const auto& value) { return value.frame_role_id == role; });
-  if (frame == nullptr) {
-    fail("target role requires a missing or ambiguous frame role");
-  }
-  return *frame;
 }
 
 [[nodiscard]] const CompositionTargetCollisionResolution& require_collision(
@@ -1299,6 +1288,14 @@ struct UnresolvedRoleCollector final {
   ProgramResolvedRolesDTO resolved;
 };
 
+[[nodiscard]] std::vector<RobotTcp> compile_robot_tcps(
+    const core::RetainedBundleDTO& bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot,
+    const core::CommandTargetId& robot_target,
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_program_binding_contract(
     const core::ProgramBindingContractDTO &program_contract,
@@ -1441,26 +1438,38 @@ compile_program_binding_contract(
 
         std::vector<core::ProgramFrameRoleBindingDTO> frames;
         for (const auto& role : requirement.required_frame_roles) {
-          const auto declared_frame = std::find_if(
-              target_type.frame_roles.begin(), target_type.frame_roles.end(),
-              [&](const auto& value) { return value.frame_role_id == role; });
-          if (declared_frame == target_type.frame_roles.end()) {
+          const auto* declared_frame =
+              detail::declared_target_frame_role(target_type, role);
+          // The target's own row (one name per frame, C-RQ8). TCP-C: a custom
+          // TCP (TCP-A) is a composed frame of the target that its type does
+          // not declare; it binds like a declared frame.
+          const auto* frame = find_target_frame_role(*target, role);
+          if (declared_frame == nullptr && frame == nullptr) {
             unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
                         "target role requires a frame absent from its component "
                         "type");
           }
-          const auto& frame = require_frame(*target, role);
-          const auto* resolved =
-              std::get_if<CompositionComponentModelFrame>(&frame.frame);
-          if (resolved == nullptr ||
-              resolved->controllable_component_id !=
-                  component.controllable_component_id) {
-            fail("target frame does not resolve to the selected component");
+          if (frame == nullptr) {
+            fail("target role requires a missing or ambiguous frame role");
           }
+          const auto* resolved =
+              std::get_if<CompositionComponentModelFrame>(&frame->frame);
+          if (resolved == nullptr ||
+              !retained_model_map.kinematic_index().carries(
+                  component.controllable_component_id,
+                  resolved->controllable_component_id)) {
+            fail("motion_endpoint_not_mounted: target frame does not resolve to "
+                 "the selected component or a tool mounted on it");
+          }
+          // Contact bodies stay with the component's own declared frame.
+          const bool own_frame = declared_frame != nullptr &&
+                                 resolved->controllable_component_id ==
+                                     component.controllable_component_id;
           frames.push_back(core::ProgramFrameRoleBindingDTO{
               role, resolved->model_instance_id, resolved->model_revision,
               resolved->compiled_frame_name,
-              declared_frame->contact_body_role_ids});
+              own_frame ? declared_frame->contact_body_role_ids
+                        : std::vector<core::CollisionBodyRoleId>{}});
         }
 
         // Scene frame resolution is independent of command capability
@@ -1648,12 +1657,35 @@ compile_program_binding_contract(
             capabilities.push_back(std::move(*resolved));
           }
         }
+        std::optional<std::vector<RobotTcp>> target_tcps;
+        if (std::any_of(target_type.capabilities.begin(),
+                        target_type.capabilities.end(),
+                        [](const auto& capability) {
+                          return capability.capability_id.value() ==
+                                 "execution.trajectory.execute";
+                        })) {
+          target_tcps = compile_robot_tcps(
+              bundle, retained_model_map,
+              component.controllable_component_id,
+              target_assignment.command_target_id, catalog.capabilities,
+              catalog_artifact_store);
+        }
+        std::optional<core::TcpEntryDTO> default_tcp;
+        if (const auto* value = retained_model_map.kinematic_index()
+                                    .default_tcp_of(
+                                        component.controllable_component_id)) {
+          default_tcp = core::TcpEntryDTO{
+              component.controllable_component_id,
+              value->command_target_id, value->frame_role_id};
+        }
         target_bindings.push_back(core::ProgramTargetRoleBindingDTO{
             requirement.target_role_id, requirement.component_role_id,
             component.controllable_component_id,
             target_assignment.command_target_id, std::move(frames),
             std::move(resources), std::move(collision_bodies),
-            std::move(capabilities), std::move(signals)});
+            std::move(capabilities), std::move(signals), std::nullopt,
+            std::move(target_tcps),
+            std::move(default_tcp)});
       } catch (const TargetUnavailable& error) {
         record(error, requirement.component_role_id, requirement.target_role_id,
                component_assignment.controllable_component_id,
@@ -1862,10 +1894,185 @@ find_target_capability(const core::ComponentTypeCommandTargetDTO& target,
       });
 }
 
+// TCP-C: the TCP frame roles of one command target: the roles its type tags
+// as TCPs, plus the composed frames its type does not declare (the
+// component's custom TCPs, TCP-A).
+[[nodiscard]] std::set<std::string> target_tcp_roles(
+    const core::ComponentTypeCommandTargetDTO& type,
+    const CompositionTargetResolution* composed) {
+  std::set<std::string> roles;
+  for (const auto& frame : type.frame_roles) {
+    if (frame.tcp) roles.insert(frame.frame_role_id.value());
+  }
+  if (composed != nullptr) {
+    for (const auto& frame : composed->frames) {
+      if (std::none_of(type.frame_roles.begin(), type.frame_roles.end(),
+                       [&](const auto& declared) {
+                         return declared.frame_role_id == frame.frame_role_id;
+                       })) {
+        roles.insert(frame.frame_role_id.value());
+      }
+    }
+  }
+  return roles;
+}
+
+[[nodiscard]] bool same_tcp_entry(const core::TcpEntryDTO& left,
+                                  const core::TcpEntryDTO& right) {
+  return left.component_id == right.component_id &&
+         left.target_id == right.target_id &&
+         left.frame_role_id == right.frame_role_id;
+}
+
+[[nodiscard]] std::vector<RobotTcp> compile_robot_tcps(
+    const core::RetainedBundleDTO& bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot,
+    const core::CommandTargetId& robot_target,
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    const ICatalogArtifactSource& catalog_artifact_store) {
+  const auto& graph = bundle.cell_graph;
+  const auto& index = retained_model_map.kinematic_index();
+  const auto end_effector = index.end_effector_entry(robot, robot_target);
+  std::vector<RobotTcp> rows;
+
+  const auto append_target = [&](const core::ControllableComponentDTO& owner,
+                                 const core::ComponentTypeCommandTargetDTO& target_type,
+                                 const bool robot_target_row) {
+    const auto* composed = retained_model_map.find_target(
+        owner.controllable_component_id, target_type.command_target_id);
+    if (composed == nullptr) {
+      fail("robot TCP target has no exact retained model-map target");
+    }
+    auto roles = target_tcp_roles(target_type, composed);
+    // The robot's flange, when present, is also in the TCP list.
+    if (robot_target_row &&
+        find_target_frame_role(*composed, core::FrameRoleId("flange")) != nullptr)
+      roles.insert("flange");
+    const auto* component_default =
+        index.default_tcp_of(owner.controllable_component_id);
+    for (const auto& role_name : roles) {
+      const core::FrameRoleId role(role_name);
+      const auto* frame = find_target_frame_role(*composed, role);
+      if (frame == nullptr) {
+        fail("robot TCP role has no exact retained frame");
+      }
+      const auto* resolved =
+          std::get_if<CompositionComponentModelFrame>(&frame->frame);
+      if (resolved == nullptr ||
+          resolved->controllable_component_id !=
+              owner.controllable_component_id) {
+        fail("robot TCP frame does not belong to its declared owner");
+      }
+      const auto* declared =
+          detail::declared_target_frame_role(target_type, role);
+      std::vector<core::CollisionBodyRoleId> contact_bodies;
+      if (declared != nullptr)
+        contact_bodies = declared->contact_body_role_ids;
+      const core::TcpEntryDTO entry{owner.controllable_component_id,
+                                    target_type.command_target_id, role};
+      rows.push_back(RobotTcp{
+          entry,
+          core::ProgramFrameRoleBindingDTO{
+              role, resolved->model_instance_id, resolved->model_revision,
+              resolved->compiled_frame_name, std::move(contact_bodies)},
+          end_effector.has_value() && same_tcp_entry(*end_effector, entry),
+          component_default != nullptr &&
+              component_default->command_target_id == entry.target_id &&
+              component_default->frame_role_id == entry.frame_role_id});
+    }
+  };
+
+  const auto& robot_component = require_component(graph, robot);
+  const auto robot_type = load_component_type(
+      bundle, robot_component, capabilities, catalog_artifact_store);
+  const auto& robot_command_target = require_target_type(robot_type, robot_target);
+  append_target(robot_component, robot_command_target, true);
+
+  std::vector<const core::ControllableComponentDTO*> components;
+  components.reserve(graph.controllable_components.size());
+  for (const auto& component : graph.controllable_components)
+    components.push_back(&component);
+  std::sort(components.begin(), components.end(), [](const auto* left,
+                                                      const auto* right) {
+    return left->controllable_component_id < right->controllable_component_id;
+  });
+  for (const auto* component : components) {
+    if (component->controllable_component_id == robot) continue;
+    const auto type = load_component_type(bundle, *component, capabilities,
+                                          catalog_artifact_store);
+    if (!contains(type.value().tags, "tool")) continue;
+    std::vector<const core::ComponentTypeCommandTargetDTO*> targets;
+    targets.reserve(type.value().command_targets.size());
+    for (const auto& target : type.value().command_targets)
+      targets.push_back(&target);
+    std::sort(targets.begin(), targets.end(), [](const auto* left,
+                                                 const auto* right) {
+      return left->command_target_id < right->command_target_id;
+    });
+    for (const auto* target : targets)
+      append_target(*component, *target, false);
+  }
+
+  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+    return std::tie(left.entry.component_id, left.entry.target_id,
+                    left.entry.frame_role_id) <
+           std::tie(right.entry.component_id, right.entry.target_id,
+                    right.entry.frame_role_id);
+  });
+  if (rows.size() > core::kMaxProgramNestedRoleBindings ||
+      std::adjacent_find(rows.begin(), rows.end(), [](const auto& left,
+                                                       const auto& right) {
+        return same_tcp_entry(left.entry, right.entry);
+      }) != rows.end()) {
+    fail("robot TCP list is duplicate or exceeds its fixed bound");
+  }
+  return rows;
+}
+
+// TCP-C: the tool on a robot's `flange` interface, its TCP target (the
+// target of its default TCP, B5) and that target's TCP roles.
+struct DirectControlMountedTool final {
+  core::ControllableComponentId controllable_component_id;
+  core::CommandTargetId command_target_id;
+  std::set<std::string> model_roles;
+  std::set<std::string> tcp_roles;
+};
+
+[[nodiscard]] std::optional<DirectControlMountedTool> direct_control_mounted_tool(
+    const core::RetainedBundleDTO& bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot,
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    const ICatalogArtifactSource& catalog_artifact_store) {
+  // The single or primary tool on the `flange` interface (B5).
+  const auto& index = retained_model_map.kinematic_index();
+  const auto* tool_id = index.tool_on(robot, "flange");
+  if (tool_id == nullptr) return std::nullopt;
+  // A tool without a default TCP has no TCP (C-P2).
+  const auto* default_tcp = index.default_tcp_of(*tool_id);
+  if (default_tcp == nullptr) return std::nullopt;
+  const auto& tool = require_component(bundle.cell_graph, *tool_id);
+  const auto type =
+      load_component_type(bundle, tool, capabilities, catalog_artifact_store);
+  const auto& target = require_target_type(type, default_tcp->command_target_id);
+  DirectControlMountedTool result{tool.controllable_component_id,
+                                  target.command_target_id, {}, {}};
+  for (const auto& frame : target.frame_roles) {
+    result.model_roles.insert(frame.model_role_id.value());
+  }
+  result.tcp_roles = target_tcp_roles(
+      target, retained_model_map.find_target(tool.controllable_component_id,
+                                             target.command_target_id));
+  return result;
+}
+
 [[nodiscard]] core::ProgramBindingContractDTO
 make_direct_control_motion_contract(
     const core::RetainedNodeEnvironmentDTO& node_environment,
-    const core::ComponentTypeCommandTargetDTO& target) {
+    const core::ComponentTypeCommandTargetDTO& target,
+    const std::set<std::string>& tcp_roles,
+    const std::optional<DirectControlMountedTool>& tool) {
   std::set<std::string> model_role_names;
   for (const auto& group : target.model_group_roles) {
     model_role_names.insert(group.model_role_id.value());
@@ -1887,23 +2094,25 @@ make_direct_control_motion_contract(
     fail("direct-control motion target has no complete model/frame/resource/"
          "collision contract");
   }
-  for (const auto required_role : {kDirectControlBaseFrameRoleId,
-                                   kDirectControlTcpFrameRoleId}) {
-    if (std::none_of(target.frame_roles.begin(), target.frame_roles.end(),
-                     [&](const auto& role) {
-                       return role.frame_role_id.value() == required_role;
-                     })) {
-      fail("direct-control motion target omits its logical " +
-           std::string(required_role) + " frame role");
-    }
+  const auto declares = [&](std::string_view id) {
+    return std::any_of(target.frame_roles.begin(), target.frame_roles.end(),
+                       [&](const auto& role) {
+                         return role.frame_role_id.value() == id;
+                       });
+  };
+  if (!declares(kDirectControlBaseFrameRoleId)) {
+    fail("direct-control motion target omits its logical " +
+         std::string(kDirectControlBaseFrameRoleId) + " frame role");
   }
 
   const auto model_roles =
       sorted_ids<core::ModelRoleId>(model_role_names);
-  std::set<std::string> frame_role_names;
-  for (const auto& frame : target.frame_roles) {
-    frame_role_names.insert(frame.frame_role_id.value());
-  }
+  // TCP-C interim legacy endpoint binding: keep `base` and the current robot
+  // plus mounted-tool TCP roles. The full Deployment inventory is compiled
+  // separately into `robot_tcps`; other frame roles, a merely named `tcp`
+  // included (C-P3), are not endpoint bindings.
+  std::set<std::string> frame_role_names{tcp_roles};
+  frame_role_names.insert(std::string(kDirectControlBaseFrameRoleId));
   std::set<std::string> resource_role_names;
   for (const auto& resource : target.resource_roles) {
     resource_role_names.insert(core::resource_role_id(resource).value());
@@ -1983,12 +2192,34 @@ make_direct_control_motion_contract(
             CanonicalValue(std::string(kDirectControlTargetRoleId))},
        })},
   });
+  // TCP-C: a mounted tool's TCPs are a frame-only second target role, so
+  // Robot Control can move the robot at them ({mounted_tool_target, <tcp>}).
+  // Without a tool the projection, and so the revision, is unchanged.
+  std::vector<core::FrameRoleId> tool_frame_roles;
+  std::vector<core::ModelRoleId> tool_model_roles;
+  auto revision_projection = projection;
+  if (tool.has_value()) {
+    tool_frame_roles = sorted_ids<core::FrameRoleId>(tool->tcp_roles);
+    tool_model_roles = sorted_ids<core::ModelRoleId>(tool->model_roles);
+    auto fields = projection.as_object();
+    fields.emplace_back(
+        "mounted_tool",
+        CanonicalValue(CanonicalValue::Object{
+            {"component_role_id",
+             CanonicalValue(std::string(kDirectControlToolComponentRoleId))},
+            {"frame_roles", strong_id_array(tool_frame_roles)},
+            {"model_roles", strong_id_array(tool_model_roles)},
+            {"target_role_id",
+             CanonicalValue(std::string(kDirectControlToolTargetRoleId))},
+        }));
+    revision_projection = CanonicalValue(std::move(fields));
+  }
   std::string revision_preimage{
       "manyforge.direct-control-motion-program-revision.v2"};
   revision_preimage.push_back('\0');
-  revision_preimage.append(canonical_json(projection));
+  revision_preimage.append(canonical_json(revision_projection));
 
-  return core::ProgramBindingContractDTO{
+  core::ProgramBindingContractDTO contract{
       core::ProgramId(std::string(kDirectControlMotionProgramId)),
       core::ProgramRevision(sha256_digest(revision_preimage)),
       node_environment,
@@ -2003,6 +2234,41 @@ make_direct_control_motion_contract(
           std::move(capabilities), frame_roles, resource_roles,
           collision_roles, model_roles}},
       {}};
+  if (tool.has_value()) {
+    // Role ids sort after the robot's, so the robot stays the first row.
+    contract.component_roles.push_back(core::ProgramComponentRoleRequirementDTO{
+        core::ComponentRoleId(std::string(kDirectControlToolComponentRoleId)),
+        {}, tool_model_roles, {}});
+    contract.target_roles.push_back(core::ProgramTargetRoleRequirementDTO{
+        core::TargetRoleId(std::string(kDirectControlToolTargetRoleId)),
+        core::ComponentRoleId(std::string(kDirectControlToolComponentRoleId)),
+        {}, tool_frame_roles, {}, {}, tool_model_roles});
+  }
+  return contract;
+}
+
+// TCP-C: the direct-control role assignment: the robot target, plus the
+// mounted tool's TCP target when the contract has one.
+[[nodiscard]] core::ProgramRoleAssignmentDTO direct_control_motion_assignment(
+    const core::ControllableComponentId& controllable_component_id,
+    const core::CommandTargetId& command_target_id,
+    const std::optional<DirectControlMountedTool>& tool) {
+  core::ProgramRoleAssignmentDTO assignment{
+      {core::ProgramComponentRoleAssignmentDTO{
+          core::ComponentRoleId(std::string(kDirectControlComponentRoleId)),
+          controllable_component_id}},
+      {core::ProgramTargetRoleAssignmentDTO{
+          core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
+          command_target_id}}};
+  if (tool.has_value()) {
+    assignment.component_roles.push_back(core::ProgramComponentRoleAssignmentDTO{
+        core::ComponentRoleId(std::string(kDirectControlToolComponentRoleId)),
+        tool->controllable_component_id});
+    assignment.target_roles.push_back(core::ProgramTargetRoleAssignmentDTO{
+        core::TargetRoleId(std::string(kDirectControlToolTargetRoleId)),
+        tool->command_target_id});
+  }
+  return assignment;
 }
 
 [[nodiscard]] core::ProgramBindingContractDTO make_direct_control_io_contract(
@@ -2204,6 +2470,23 @@ make_direct_control_gripper_contract(
 }
 
 }  // namespace
+
+std::vector<RobotTcp> robot_tcps(
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot,
+    const core::CommandTargetId& robot_target,
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    const ICatalogArtifactSource& catalog_artifact_store) {
+  if (!verify_retained_bundle_identity(retained_bundle) ||
+      retained_model_map.query().retained_bundle_id !=
+          retained_bundle.retained_bundle_id()) {
+    fail("robot TCP list inputs do not share one verified retained bundle");
+  }
+  return compile_robot_tcps(retained_bundle.value(), retained_model_map, robot,
+                            robot_target, capabilities,
+                            catalog_artifact_store);
+}
 
 std::shared_ptr<const ProgramBinding> compile_program_binding(
     const ProgramBindingContract& program_contract,
@@ -2410,19 +2693,20 @@ compile_direct_control_motion_program_binding(
     const auto component_type = load_component_type(
         bundle, component, catalog.capabilities, catalog_artifact_store);
     const auto& target = require_target_type(component_type, command_target_id);
+    const auto tool = direct_control_mounted_tool(
+        bundle, retained_model_map, controllable_component_id,
+        catalog.capabilities, catalog_artifact_store);
     auto contract = make_direct_control_motion_contract(
-        bundle.catalogs.node_environment, target);
-    core::ProgramRoleAssignmentDTO assignment{
-        {core::ProgramComponentRoleAssignmentDTO{
-            core::ComponentRoleId(
-                std::string(kDirectControlComponentRoleId)),
-            controllable_component_id}},
-        {core::ProgramTargetRoleAssignmentDTO{
-            core::TargetRoleId(std::string(kDirectControlTargetRoleId)),
-            command_target_id}}};
+        bundle.catalogs.node_environment, target,
+        target_tcp_roles(target, retained_model_map.find_target(
+                                     controllable_component_id,
+                                     command_target_id)),
+        tool);
     return compile_program_binding_contract(
-        contract, std::move(assignment), retained_bundle,
-        retained_model_map, catalog_artifact_store);
+        contract,
+        direct_control_motion_assignment(controllable_component_id,
+                                         command_target_id, tool),
+        retained_bundle, retained_model_map, catalog_artifact_store);
   } catch (const ProgramBindingCompilerError&) {
     throw;
   } catch (const std::exception& error) {
@@ -2579,19 +2863,19 @@ compile_direct_control_program_binding_inventory(
                "joint-planning capability family");
         }
         if (has_execution) {
+          const auto tool = direct_control_mounted_tool(
+              bundle, retained_model_map, component.controllable_component_id,
+              catalog.capabilities, catalog_artifact_store);
           auto contract = make_direct_control_motion_contract(
-              bundle.catalogs.node_environment, target);
+              bundle.catalogs.node_environment, target,
+              target_tcp_roles(target, retained_model_map.find_target(
+                                           component.controllable_component_id,
+                                           target.command_target_id)),
+              tool);
           result.motion.push_back(compile_program_binding_contract(
               contract,
-              core::ProgramRoleAssignmentDTO{
-                  {core::ProgramComponentRoleAssignmentDTO{
-                      core::ComponentRoleId(
-                          std::string(kDirectControlComponentRoleId)),
-                      component.controllable_component_id}},
-                  {core::ProgramTargetRoleAssignmentDTO{
-                      core::TargetRoleId(
-                          std::string(kDirectControlTargetRoleId)),
-                      target.command_target_id}}},
+              direct_control_motion_assignment(component.controllable_component_id,
+                                               target.command_target_id, tool),
               retained_bundle, retained_model_map,
               catalog_artifact_store));
         }
@@ -2628,6 +2912,108 @@ compile_direct_control_program_binding_inventory(
                      "failed: ") +
          error.what());
   }
+}
+
+std::vector<DirectControlTcp> direct_control_motion_tcps(
+    const ProgramBinding& direct_control_binding,
+    const DirectControlProgramBindingInventory& inventory,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map) {
+  if (retained_model_map.query().retained_bundle_id !=
+          retained_bundle.retained_bundle_id() ||
+      direct_control_binding.value().retained_bundle_id !=
+          retained_bundle.retained_bundle_id()) {
+    fail("direct-control TCP projection inputs do not share one retained bundle");
+  }
+  const auto& binding = direct_control_binding.value();
+  const auto robot = std::find_if(
+      binding.target_role_bindings.begin(), binding.target_role_bindings.end(),
+      [](const auto& row) {
+        return row.target_role_id.value() == kDirectControlTargetRoleId;
+      });
+  if (robot == binding.target_role_bindings.end()) {
+    fail("direct-control motion binding has no robot target role");
+  }
+  const auto& index = retained_model_map.kinematic_index();
+  std::vector<DirectControlTcp> rows;
+  if (!robot->robot_tcps) return rows;
+  rows.reserve(robot->robot_tcps->size());
+  for (const auto& tcp : *robot->robot_tcps) {
+    const bool mounted_here =
+        index.carries(robot->controllable_component_id, tcp.entry.component_id);
+    std::optional<core::TargetRoleId> legacy_target_role;
+    bool ambiguous_legacy_target_role = false;
+    for (const auto& target : binding.target_role_bindings) {
+      if (target.controllable_component_id != tcp.entry.component_id ||
+          target.command_target_id != tcp.entry.target_id) {
+        continue;
+      }
+      const auto frame = std::find_if(
+          target.frame_role_bindings.begin(), target.frame_role_bindings.end(),
+          [&](const auto& candidate) {
+            return candidate.frame_role_id == tcp.entry.frame_role_id &&
+                   candidate.model_instance_id == tcp.frame.model_instance_id &&
+                   candidate.model_revision == tcp.frame.model_revision &&
+                   candidate.compiled_frame_name ==
+                       tcp.frame.compiled_frame_name;
+          });
+      if (frame == target.frame_role_bindings.end()) continue;
+      if (legacy_target_role.has_value()) {
+        ambiguous_legacy_target_role = true;
+        break;
+      }
+      legacy_target_role = target.target_role_id;
+    }
+    if (ambiguous_legacy_target_role) legacy_target_role.reset();
+    const bool mounted_elsewhere =
+        !mounted_here &&
+        std::any_of(inventory.motion.begin(), inventory.motion.end(),
+                    [&](const auto& candidate) {
+                      if (candidate == nullptr) return false;
+                      const auto& other_targets =
+                          candidate->value().target_role_bindings;
+                      const auto other_robot = std::find_if(
+                          other_targets.begin(), other_targets.end(),
+                          [](const auto& target) {
+                            return target.target_role_id.value() ==
+                                   kDirectControlTargetRoleId;
+                          });
+                      if (other_robot == other_targets.end() ||
+                          other_robot->controllable_component_id ==
+                              robot->controllable_component_id)
+                        return false;
+                      return index.carries(
+                          other_robot->controllable_component_id,
+                          tcp.entry.component_id);
+                    });
+    rows.push_back(DirectControlTcp{
+        tcp,
+        tcp.entry.component_id.value() + "." +
+            tcp.entry.frame_role_id.value(),
+        std::move(legacy_target_role), mounted_here, mounted_elsewhere});
+  }
+  std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
+    if (left.binding.end_effector != right.binding.end_effector)
+      return left.binding.end_effector;
+    return std::tie(left.binding.entry.component_id,
+                    left.binding.entry.target_id,
+                    left.binding.entry.frame_role_id) <
+           std::tie(right.binding.entry.component_id,
+                    right.binding.entry.target_id,
+                    right.binding.entry.frame_role_id);
+  });
+  std::map<std::pair<std::string, std::string>, std::size_t> role_counts;
+  for (const auto& row : rows) {
+    ++role_counts[{row.binding.entry.component_id.value(),
+                   row.binding.entry.frame_role_id.value()}];
+  }
+  for (auto& row : rows) {
+    if (role_counts.at({row.binding.entry.component_id.value(),
+                        row.binding.entry.frame_role_id.value()}) > 1U) {
+      row.display += " (" + row.binding.entry.target_id.value() + ")";
+    }
+  }
+  return rows;
 }
 
 }  // namespace manyforge::deployment

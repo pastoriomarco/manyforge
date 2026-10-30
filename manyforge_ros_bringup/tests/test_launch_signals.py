@@ -24,6 +24,7 @@ from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks  # noq
 LAUNCH_FILES = {
     "mock_control.launch.py": "launch_setup",
     "isaac_topic_based_control.launch.py": "_launch_setup",
+    "isaac_gripper.launch.py": "_launch_setup",
     "sim_plc.launch.py": "launch_setup",
 }
 

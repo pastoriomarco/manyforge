@@ -162,9 +162,11 @@ class ManagedProjectionRegistry::Impl final {
 public:
   Impl(ManagedProjectionRegistryConfig config,
        std::unique_ptr<const IManagedProjectionAssetSource> assets,
-       RetainedPlannerSceneProjection::Clock monotonic_now_ns)
+       RetainedPlannerSceneProjection::Clock monotonic_now_ns,
+       std::function<void()> snapshot_changed)
       : config_(std::move(config)), assets_(std::move(assets)),
-        clock_(std::move(monotonic_now_ns)) {
+        clock_(std::move(monotonic_now_ns)),
+        snapshot_changed_(std::move(snapshot_changed)) {
     Require(assets_ != nullptr && clock_ != nullptr,
             "native projection registry requires assets and a clock");
   }
@@ -968,6 +970,17 @@ private:
          {"provider_binding_id", binding.provider_binding_id.value()}}};
   }
 
+  static void
+  NotifySnapshotChanged(const std::function<void()> &notify) noexcept {
+    if (notify) {
+      try {
+        notify();
+      } catch (...) {
+        // Notification cannot change a completed projection result.
+      }
+    }
+  }
+
   [[nodiscard]] core::ProjectionCommitResultDTO ApplyTransaction(
       const component_manager::detail::NativeProjectionTransactionRequest
           &request) {
@@ -982,7 +995,13 @@ private:
                                        projection);
     }
     if (!pending.has_value()) {
-      return projection->ApplyTransaction(request.transaction);
+      const auto before = projection->logical_snapshot();
+      auto result = projection->ApplyTransaction(request.transaction);
+      if (result.result == core::ProjectionCommitResultStateDTO::kCommitted &&
+          before != projection->logical_snapshot()) {
+        NotifySnapshotChanged(snapshot_changed_);
+      }
+      return result;
     }
     const auto failure =
         PendingOperationError("transaction", request.native_runtime_binding);
@@ -1014,7 +1033,14 @@ private:
                                        projection);
     }
     if (!pending.has_value()) {
-      return projection->RebuildBootstrapProjection(request);
+      const auto before = projection->logical_snapshot();
+      auto result = projection->RebuildBootstrapProjection(request);
+      if (result.state ==
+              core::NativeProjectionBootstrapRebuildState::kRebuilt &&
+          before != projection->logical_snapshot()) {
+        NotifySnapshotChanged(snapshot_changed_);
+      }
+      return result;
     }
     const auto failure = PendingOperationError(
         "bootstrap_rebuild", request.native_runtime_binding);
@@ -1107,7 +1133,13 @@ private:
     if (accepted_health.state == core::ProjectionHealthState::kHealthy) {
       // An exact healthy target is an idempotent terminal replay; a different
       // healthy target is a proven recovery conflict. Neither needs a worker.
-      return projection->RebuildProjection(request);
+      const auto before = projection->logical_snapshot();
+      auto result = projection->RebuildProjection(request);
+      if (result.result == core::ProjectionCommitResultStateDTO::kCommitted &&
+          before != projection->logical_snapshot()) {
+        NotifySnapshotChanged(snapshot_changed_);
+      }
+      return result;
     }
     accepted_health.state = core::ProjectionHealthState::kRebuilding;
     accepted_health.active_projection_revision = std::nullopt;
@@ -1150,10 +1182,16 @@ private:
     try {
       inserted->second.worker = JoinedWorker{std::thread(
           [job, projection, request, binding,
-           progress = std::move(progress)]() {
+           snapshot_changed = snapshot_changed_, progress = std::move(progress)]() {
             try {
               progress->Advance("collision_world_construction");
+              const auto before = projection->logical_snapshot();
               auto outcome = projection->RebuildProjection(request);
+              if (outcome.result ==
+                      core::ProjectionCommitResultStateDTO::kCommitted &&
+                  before != projection->logical_snapshot()) {
+                NotifySnapshotChanged(snapshot_changed);
+              }
               progress->Advance(
                   outcome.result ==
                           core::ProjectionCommitResultStateDTO::kCommitted
@@ -1457,6 +1495,7 @@ private:
   const ManagedProjectionRegistryConfig config_;
   const std::unique_ptr<const IManagedProjectionAssetSource> assets_;
   const RetainedPlannerSceneProjection::Clock clock_;
+  const std::function<void()> snapshot_changed_;
   std::map<ManagedProjectionKey, RegisteredProjection> projections_;
   std::map<ManagedProjectionKey, RegisteredProjection> retired_projections_;
   std::uint64_t projection_incarnation_{};
@@ -1484,9 +1523,11 @@ private:
 ManagedProjectionRegistry::ManagedProjectionRegistry(
     ManagedProjectionRegistryConfig config,
     std::unique_ptr<const IManagedProjectionAssetSource> assets,
-    RetainedPlannerSceneProjection::Clock monotonic_now_ns)
+    RetainedPlannerSceneProjection::Clock monotonic_now_ns,
+    std::function<void()> snapshot_changed)
     : impl_(std::make_unique<Impl>(std::move(config), std::move(assets),
-                                   std::move(monotonic_now_ns))) {}
+                                   std::move(monotonic_now_ns),
+                                   std::move(snapshot_changed))) {}
 
 ManagedProjectionRegistry::~ManagedProjectionRegistry() = default;
 

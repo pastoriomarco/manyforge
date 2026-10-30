@@ -128,20 +128,6 @@ def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
     return value
 
 
-def _failure_assessment_has_deadline(intervention) -> bool:
-    """A failure pause whose owner assessment carries an observation deadline."""
-
-    if (
-        intervention is None
-        or intervention.policy_parameter == "operator_stop_policy"
-        or intervention.owner_task_id is None
-        or not isinstance(intervention.owner_assessment, Mapping)
-    ):
-        return False
-    deadline = intervention.owner_assessment.get("observed_state_valid_until_ns")
-    return type(deadline) is int and deadline > 0
-
-
 def _digest(value: object, *, field: str) -> str:
     text = _text(value, field=field, maximum_bytes=71)
     if (
@@ -820,7 +806,7 @@ class ProgramRunOwner:
                     context_port.bind(port_context)
                     context_bound = True
                 run = ExecutableProgramRun(
-                    program=admission.program,
+                    program=admission.program.with_active_tcp_binding(admission.program_binding),
                     environment=admission.environment,
                     capture=capture,
                     project_path=admission.project_path,
@@ -1013,7 +999,7 @@ class ProgramRunOwner:
         *,
         node_instance_id: str,
         proposed: Sequence[tuple[str, Any]],
-    ) -> tuple[str, Mapping[str, Any]]:
+    ) -> tuple[str, Mapping[str, Any], Mapping[str, Any]]:
         """Resolve one captured node's inputs with proposals; no owner effect."""
 
         with self._lock:
@@ -1037,49 +1023,36 @@ class ProgramRunOwner:
             run = entry.run
         return run.pending_selected_observation()
 
-    def failure_assessment_refresh_required(self, program_run_id: str) -> bool:
-        """Whether a failure pause holds an owner observation deadline.
+    def refresh_failure_assessment(self, program_run_id: str, *, node_attempt_id: str):
+        """Re-read a held failure's owner assessment when the operator presses.
 
-        Owner Retry readiness bounded by a measured observation stays current
-        only while the retained owner assessment is re-read; status
-        projections themselves perform no owner I/O. Without an owner
-        deadline the dormant pause needs no observation tick.
+        Recovery offers do not expire, so a manual result checks freshness
+        here, like the Resume and replan presses. The Program's own
+        acknowledgement of the non-moving state is not an owner fact: it is
+        kept. Raises ProgramRunOwnerError when the owner cannot be read.
         """
 
-        with self._lock:
-            entry = self._entry(program_run_id)
-            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
-                return False
-        port = self._ports.program_interventions
-        return port is not None and any(
-            _failure_assessment_has_deadline(hold)
-            for hold in port.read_holds(program_run_id)
-        )
-
-    def _refresh_failure_assessment(self, intervention) -> None:
-        """Re-read the failed task's current owner assessment.
-
-        A failed read keeps the retained assessment, whose deadline then
-        elapses and keeps Retry disabled (fail closed).
-        """
-
+        intervention = self.intervention(program_run_id, node_attempt_id=node_attempt_id)
+        if intervention is None or intervention.owner_task_id is None:
+            raise ProgramRunOwnerError("held attempt has no owner task")
         owner_port = getattr(self._ports, intervention.owner_port_name or "", None)
-        observe = getattr(owner_port, "observe", None)
+        # A fresh owner read (SX-655), never the task's cached terminal.
+        read = getattr(owner_port, "current_recovery_assessment", None)
         port = self._ports.program_interventions
-        if not callable(observe) or port is None:
-            return
-        try:
-            task = observe(intervention.owner_task_id)
-        except Exception:
-            return
-        assessment = task.metadata.get("recovery_assessment")
-        if (
-            task.task_id != intervention.owner_task_id
-            or task.state not in {OwnerTaskState.FAILED, OwnerTaskState.INTERRUPTED}
-            or not isinstance(assessment, Mapping)
-        ):
-            return
-        port.refresh_owner_assessment(intervention.identity, assessment)
+        if not callable(read) or port is None:
+            raise ProgramRunOwnerError("held task owner cannot read its recovery assessment")
+        assessment = read(intervention.owner_task_id, intervention.identity)
+        if not isinstance(assessment, Mapping):
+            raise ProgramRunOwnerError("held task has no current recovery assessment")
+        previous = intervention.owner_assessment
+        acknowledged = (
+            isinstance(previous, Mapping)
+            and previous.get("acknowledged_non_moving") is True
+        )
+        return port.refresh_owner_assessment(
+            intervention.identity,
+            {**assessment, "acknowledged_non_moving": acknowledged},
+        )
 
     def _refresh_stop_assessment(self, intervention):
         if intervention.owner_port_name is None or intervention.owner_task_id is None:
@@ -1622,6 +1595,15 @@ class ProgramRunOwner:
                     blocked[node_id] = "selected_owner_assessment_unavailable"
                     continue
             if (
+                states.get(node_id) == "held"
+                and item.policy_parameter == "operator_stop_policy"
+                and isinstance(item.owner_assessment, Mapping)
+                and item.owner_assessment.get("reason_code") == "terminal_cleanup_pending"
+            ):
+                # Its Stop is still settling: not yet Resume-ready (GUI "Stopping").
+                blocked[node_id] = "selected_motion_stop_settling"
+                continue
+            if (
                 states.get(node_id) != "held"
                 or item.policy_parameter != "operator_stop_policy"
                 or item.owner_task_id is None
@@ -1640,9 +1622,17 @@ class ProgramRunOwner:
             else:
                 batch.append(item)
         candidates = {item.identity.node_instance_id for item in batch}
+        recorded = {item.identity.node_instance_id for item in current}
         for node_id, state in states.items():
             if state == "held" and node_id not in candidates:
-                blocked[node_id] = "selected_owner_recovery_unavailable"
+                # A stopped node whose operator-Stop hold the tree has not
+                # recorded yet (its Stop's cleanup still settles) is stopping.
+                blocked[node_id] = (
+                    "selected_motion_stop_settling"
+                    if node_id not in recorded
+                    or blocked.get(node_id) == "selected_motion_stop_settling"
+                    else "selected_owner_recovery_unavailable"
+                )
         return tuple(batch), blocked
 
     def execution_selection_controls(self, program_run_id: str) -> dict[str, Any]:
@@ -1782,6 +1772,10 @@ class ProgramRunOwner:
                         "group_id": group_id,
                         "node_count": len(nodes),
                         "held_node_count": len(selected_held),
+                        "ordinary_held_node_count": (
+                            None if state in {"unavailable", "stopping", "faulted"}
+                            else len(selected_ordinary_held)
+                        ),
                         "state": state,
                         "stop_allowed": eligible and state not in {"ready", "held"},
                         "start_allowed": release_allowed,
@@ -2141,7 +2135,13 @@ class ProgramRunOwner:
                     self._recover_stopped_item(run, item, request_id, reason)
                     cleanup_accepted = True
                 port = getattr(self._ports, failure.owner_port_name or "", None)
-                if close_held and failure.owner_task_id is not None:
+                if (
+                    close_held
+                    and failure.owner_task_id is not None
+                    # An unconfirmed Stop is not closable here: its node closes
+                    # it if its next read allows, else it stays for Reset.
+                    and failure.reason_code != "program_stop_settlement_unconfirmed"
+                ):
                     close = getattr(port, "close", None)
                     if not callable(close):
                         raise ProgramRunOwnerError(
@@ -2965,7 +2965,6 @@ class ProgramRunOwner:
                 # terminal snapshot and revisions remain unchanged.
                 return self._observe_reset_containment(program_run_id)
             observe_only = False
-            failure_refresh = None
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.STOPPING:
@@ -2993,18 +2992,7 @@ class ProgramRunOwner:
                     self._schedule_program_time(entry, tree_ticks=not dormant)
                     if dormant:
                         if not self.operator_stop_observation_required(program_run_id):
-                            dormant_snapshot = self._snapshot(entry)
-                            failure_refresh = tuple(
-                                hold
-                                for hold in (
-                                    ()
-                                    if intervention_port is None
-                                    else intervention_port.read_holds(program_run_id)
-                                )
-                                if _failure_assessment_has_deadline(hold)
-                            )
-                            if not failure_refresh:
-                                return dormant_snapshot
+                            return self._snapshot(entry)
                         # A separate intervention keeps ordinary tree work
                         # dormant, but cannot hide already-accepted Stop work.
                         observe_only = True
@@ -3019,11 +3007,6 @@ class ProgramRunOwner:
                     reconcile_full_stop = False
                     reconcile_finalize = False
                     run = entry.run
-            if failure_refresh:
-                # Owner I/O outside the run lock; the tree stays dormant.
-                for hold in failure_refresh:
-                    self._refresh_failure_assessment(hold)
-                return dormant_snapshot
             if reconcile_stop:
                 return self.reconcile_stop(program_run_id)
             if reconcile_full_stop:

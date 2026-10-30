@@ -139,6 +139,8 @@ const char* recovery_class_name(RecoveryClass recovery_class) {
       return "ordinary_operator_stop";
     case RecoveryClass::kUnknownFault:
       return "unknown_fault";
+    case RecoveryClass::kOrdinaryProgramStop:
+      return "ordinary_program_stop";
   }
   return "unknown";
 }
@@ -260,20 +262,16 @@ std::uint64_t RecoveryCertificateStore::publish(KernelStopCertificateDTO certifi
   const auto index = owner_index(certificate.stop_owner);
   auto& current = authoritative_[index];
   // Strictly monotonic authority: a completion from an older (or equal but
-  // different) owner session is retained as evidence but never displaces the
-  // newer authoritative record. A same-session republication takes the later
-  // value so ordering remains deterministic.
+  // different) owner session never displaces the newer authoritative record.
+  // A same-session republication takes the later value so ordering remains
+  // deterministic.
   const bool same_owner_session =
       current.has_value() && certificate.stop_owner_generation == current->stop_owner_generation &&
       certificate.execution_id == current->execution_id &&
       certificate.latch_id == current->latch_id;
   if (!current.has_value() || certificate.stop_owner_generation > current->stop_owner_generation ||
       same_owner_session) {
-    current = certificate;
-  }
-  evidence_ring_.push_back(std::move(certificate));
-  while (evidence_ring_.size() > kEvidenceRingCapacity) {
-    evidence_ring_.pop_front();
+    current = std::move(certificate);
   }
   return next_revision_;
 }
@@ -758,6 +756,14 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
         assessment.stop_certificate_revision = certificate->certificate_revision;
         assessment.backend_stop_confirmed = certificate->backend_stop_confirmed;
       }
+      if (!capture.terminal_cleanup_complete) {
+        // Certified, but the execute worker's terminal cleanup still runs:
+        // not yet decided. Its completion republishes (retry_ready, close).
+        assessment.status = RecoveryAssessmentStatus::kWaiting;
+        assessment.reason_code = reason_codes::kRecoveryTerminalCleanupPending;
+        assessment.evidence_refs.push_back(assessment.stop_certificate_id);
+        break;
+      }
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
       assessment.retry_admissible = true;
       assessment.allowed_actions.insert(assessment.allowed_actions.begin(),
@@ -792,6 +798,13 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
   }
   finish_assessment(assessment, previous_revision);
   return assessment;
+}
+
+bool stopped_awaiting_terminal_cleanup(const KernelRecoveryAssessmentDTO& assessment) noexcept {
+  return assessment.execution_state == ExecutionState::kStopped &&
+         assessment.status == RecoveryAssessmentStatus::kWaiting &&
+         assessment.reason_code == reason_codes::kRecoveryTerminalCleanupPending &&
+         assessment.backend_stop_confirmed && !assessment.stop_certificate_id.empty();
 }
 
 bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO& previous,

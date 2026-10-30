@@ -68,7 +68,7 @@ def _seal(payload: dict) -> dict:
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v2",
+                b"manyforge.source_model_projection.v3",
                 canonical_json_bytes(semantic),
             )
         )
@@ -78,7 +78,7 @@ def _seal(payload: dict) -> dict:
 
 def _projection() -> dict:
     return _seal({
-        "schema_version": "manyforge.source_model_projection.v2",
+        "schema_version": "manyforge.source_model_projection.v3",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -87,6 +87,13 @@ def _projection() -> dict:
             "contract_revision": "1",
         },
         "model_map_product_id": "product.model-map.1",
+        "components": [
+            {"component_id": "arm.left", "mounted_on": None},
+            {
+                "component_id": "gripper.left",
+                "mounted_on": {"component_id": "arm.left", "interface_id": "flange"},
+            },
+        ],
         "occurrences": [
             {
                 "component_id": "arm.left",
@@ -221,6 +228,10 @@ def test_source_projection_preserves_source_semantics_and_exact_viewer_binding()
     assert verified.payload["targets"][0]["model_groups"][0][
         "source_group_name"
     ] == "lite6"
+    assert verified.payload["components"][1]["mounted_on"] == {
+        "component_id": "arm.left",
+        "interface_id": "flange",
+    }
 
 
 def test_empty_projection_carries_no_model_map_identity() -> None:
@@ -345,6 +356,32 @@ def _duplicate_end_effector_identity(payload: dict) -> None:
                 {"source_content_digest": "sha256:" + "0" * 64}
             ),
             "source digest does not match",
+        ),
+        (
+            lambda payload: payload.pop("components"),
+            "unsupported shape",
+        ),
+        (
+            lambda payload: payload["components"].reverse(),
+            "not canonical unique rows",
+        ),
+        (
+            lambda payload: payload["components"].append(
+                deepcopy(payload["components"][1])
+            ),
+            "not canonical unique rows",
+        ),
+        (
+            lambda payload: payload["components"][1]["mounted_on"].update(
+                {"component_id": "arm.right"}
+            ),
+            "names an unknown component",
+        ),
+        (
+            lambda payload: payload["components"][1]["mounted_on"].update(
+                {"primary": True}
+            ),
+            "unsupported shape",
         ),
         (
             _duplicate_group_state_identity,

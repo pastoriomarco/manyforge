@@ -38,6 +38,7 @@ using core::ComponentAttachmentEdgeDTO;
 using core::ComponentAttachmentEndpointDTO;
 using core::ComponentAttachmentId;
 using core::ComponentAttachmentRevision;
+using core::ComponentDefaultTcpDTO;
 using core::ComponentTypeId;
 using core::ComponentTypeRevision;
 using core::ContainmentGranularity;
@@ -54,10 +55,12 @@ using core::ControllableComponentId;
 using core::ControllerTopologyId;
 using core::ControlRouteId;
 using core::EndpointRoleId;
+using core::FrameRoleId;
 using core::GraphRevision;
 using core::JsonObjectDTO;
 using core::JsonValueDTO;
 using core::ModelAssetId;
+using core::ModelCustomTcpDTO;
 using core::ModelInstanceDTO;
 using core::ModelInstanceId;
 using core::ModelRevision;
@@ -364,11 +367,40 @@ template <typename StrongType>
                      child_path(path, "configuration"))};
 }
 
+// Deployment custom TCPs of one occurrence: sorted, unique ids, a non-empty
+// parent link and a valid pose. Their composition checks the rest.
+[[nodiscard]] std::vector<ModelCustomTcpDTO> parse_custom_tcps(const CanonicalValue* value,
+                                                               std::string_view path) {
+  std::vector<ModelCustomTcpDTO> result;
+  if (value == nullptr) return result;
+  const auto& array = require_array(*value, path);
+  if (array.empty()) fail(path, "an empty custom_tcps list is omitted");
+  for (std::size_t index = 0; index < array.size(); ++index) {
+    const std::string item_path = index_path(path, index);
+    const auto& object = require_object(array[index], item_path);
+    require_exact_fields(object, {"frame_role_id", "parent_link_name", "pose_in_parent_link"},
+                         item_path);
+    ModelCustomTcpDTO row{
+        parse_identity<FrameRoleId>(require_member(object, "frame_role_id", item_path),
+                                    child_path(item_path, "frame_role_id")),
+        require_string(require_member(object, "parent_link_name", item_path),
+                       child_path(item_path, "parent_link_name")),
+        parse_placement_pose(require_member(object, "pose_in_parent_link", item_path),
+                             child_path(item_path, "pose_in_parent_link"))};
+    if (row.parent_link_name.empty()) fail(item_path, "parent_link_name must be non-empty");
+    if (!result.empty() && !(result.back().frame_role_id < row.frame_role_id)) {
+      fail(path, "custom TCPs must be uniquely sorted by frame_role_id");
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
 [[nodiscard]] ModelInstanceDTO parse_model_instance(const CanonicalValue& value,
                                                     std::string_view path) {
   const auto& object = require_object(value, path);
   require_fields(object, {"model_instance_id", "model_asset_id", "model_revision"},
-                 {"root_pose_in_cell"}, path);
+                 {"root_pose_in_cell", "custom_tcps"}, path);
   const CanonicalValue* root_pose = find_member(object, "root_pose_in_cell");
   return ModelInstanceDTO{
       parse_identity<ModelInstanceId>(require_member(object, "model_instance_id", path),
@@ -380,7 +412,8 @@ template <typename StrongType>
       root_pose == nullptr
           ? std::nullopt
           : std::optional<PlacementPoseDTO>{
-                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))}};
+                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))},
+      parse_custom_tcps(find_member(object, "custom_tcps"), child_path(path, "custom_tcps"))};
 }
 
 [[nodiscard]] std::vector<ModelRoleBindingDTO> parse_model_role_bindings(
@@ -413,13 +446,26 @@ template <typename StrongType>
   return result;
 }
 
+// B5: a component's default TCP, `{command_target_id, frame_role_id}`.
+[[nodiscard]] std::optional<ComponentDefaultTcpDTO> parse_default_tcp(const CanonicalValue* value,
+                                                                     std::string_view path) {
+  if (value == nullptr) return std::nullopt;
+  const auto& object = require_object(*value, path);
+  require_exact_fields(object, {"command_target_id", "frame_role_id"}, path);
+  return ComponentDefaultTcpDTO{
+      parse_identity<CommandTargetId>(require_member(object, "command_target_id", path),
+                                      child_path(path, "command_target_id")),
+      parse_identity<FrameRoleId>(require_member(object, "frame_role_id", path),
+                                  child_path(path, "frame_role_id"))};
+}
+
 [[nodiscard]] ControllableComponentDTO parse_controllable_component(const CanonicalValue& value,
                                                                     std::string_view path) {
   const auto& object = require_object(value, path);
   require_fields(object,
                  {"controllable_component_id", "component_type_id", "component_type_revision",
                   "model_role_bindings", "runtime_unit_ids"},
-                 {"root_pose_in_cell"}, path);
+                 {"root_pose_in_cell", "default_tcp"}, path);
   const CanonicalValue* root_pose = find_member(object, "root_pose_in_cell");
   return ControllableComponentDTO{
       parse_identity<ControllableComponentId>(
@@ -436,7 +482,8 @@ template <typename StrongType>
       root_pose == nullptr
           ? std::nullopt
           : std::optional<PlacementPoseDTO>{
-                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))}};
+                parse_placement_pose(*root_pose, child_path(path, "root_pose_in_cell"))},
+      parse_default_tcp(find_member(object, "default_tcp"), child_path(path, "default_tcp"))};
 }
 
 [[nodiscard]] std::int64_t parse_positive_int64(const CanonicalValue &value,
@@ -841,10 +888,15 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
 [[nodiscard]] ComponentAttachmentEdgeDTO parse_component_attachment(const CanonicalValue& value,
                                                                     std::string_view path) {
   const auto& object = require_object(value, path);
-  require_exact_fields(object,
-                       {"component_attachment_id", "component_attachment_revision", "parent",
-                        "child", "child_interface_pose_in_parent_interface"},
-                       path);
+  require_fields(object,
+                 {"component_attachment_id", "component_attachment_revision", "parent",
+                  "child", "child_interface_pose_in_parent_interface"},
+                 {"primary"}, path);
+  // B5: `primary` is written only when true.
+  const CanonicalValue* primary = find_member(object, "primary");
+  if (primary != nullptr && !(primary->is_bool() && primary->as_bool())) {
+    fail(child_path(path, "primary"), "primary is true or omitted");
+  }
   return ComponentAttachmentEdgeDTO{
       parse_identity<ComponentAttachmentId>(require_member(object, "component_attachment_id", path),
                                             child_path(path, "component_attachment_id")),
@@ -854,7 +906,8 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
       parse_attachment_endpoint(require_member(object, "parent", path), child_path(path, "parent")),
       parse_attachment_endpoint(require_member(object, "child", path), child_path(path, "child")),
       parse_placement_pose(require_member(object, "child_interface_pose_in_parent_interface", path),
-                           child_path(path, "child_interface_pose_in_parent_interface"))};
+                           child_path(path, "child_interface_pose_in_parent_interface")),
+      primary != nullptr};
 }
 
 template <typename Record, typename Parser, typename Key>
@@ -964,6 +1017,17 @@ template <typename StrongType>
     object.emplace_back("root_pose_in_cell",
                         placement_pose_value(*record.root_pose_in_cell));
   }
+  if (!record.custom_tcps.empty()) {
+    CanonicalValue::Array rows;
+    rows.reserve(record.custom_tcps.size());
+    for (const auto& custom : record.custom_tcps) {
+      rows.emplace_back(CanonicalValue::Object{
+          {"frame_role_id", identity_value(custom.frame_role_id)},
+          {"parent_link_name", CanonicalValue(custom.parent_link_name)},
+          {"pose_in_parent_link", placement_pose_value(custom.pose_in_parent_link)}});
+    }
+    object.emplace_back("custom_tcps", CanonicalValue(std::move(rows)));
+  }
   return CanonicalValue(std::move(object));
 }
 
@@ -984,6 +1048,13 @@ template <typename StrongType>
   if (record.root_pose_in_cell.has_value()) {
     object.emplace_back("root_pose_in_cell",
                         placement_pose_value(*record.root_pose_in_cell));
+  }
+  if (record.default_tcp.has_value()) {
+    object.emplace_back(
+        "default_tcp",
+        CanonicalValue(CanonicalValue::Object{
+            {"command_target_id", identity_value(record.default_tcp->command_target_id)},
+            {"frame_role_id", identity_value(record.default_tcp->frame_role_id)}}));
   }
   return CanonicalValue(std::move(object));
 }
@@ -1126,13 +1197,15 @@ template <typename StrongType>
 }
 
 [[nodiscard]] CanonicalValue component_attachment_value(const ComponentAttachmentEdgeDTO& record) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object object{
       {"component_attachment_id", identity_value(record.component_attachment_id)},
       {"component_attachment_revision", identity_value(record.component_attachment_revision)},
       {"parent", attachment_endpoint_value(record.parent)},
       {"child", attachment_endpoint_value(record.child)},
       {"child_interface_pose_in_parent_interface",
-       placement_pose_value(record.child_interface_pose_in_parent_interface)}});
+       placement_pose_value(record.child_interface_pose_in_parent_interface)}};
+  if (record.primary) object.emplace_back("primary", CanonicalValue(true));
+  return CanonicalValue(std::move(object));
 }
 
 template <typename Record, typename Converter>
@@ -1374,6 +1447,11 @@ void validate_intrinsic(const CellGraphDTO& graph) {
       fail("model_instances.root_pose_in_cell",
            "passive model instance '" + model.model_instance_id.value() +
                "' requires a root pose");
+    }
+    if (!owned && !model.custom_tcps.empty()) {
+      fail("model_instances.custom_tcps",
+           "passive model instance '" + model.model_instance_id.value() +
+               "' cannot carry custom TCPs");
     }
   }
 

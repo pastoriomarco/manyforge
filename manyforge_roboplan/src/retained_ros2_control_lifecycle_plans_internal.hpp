@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 
 namespace manyforge::roboplan_backend::detail::ros2_control_lifecycle_plans_internal {
@@ -29,8 +30,9 @@ predicate(std::vector<core::ComponentLifecycleStateDTO> states,
   return {std::move(states), std::move(values)};
 }
 
-/// Timeout of every shared ros2_control lifecycle plan (30 s).
-inline constexpr std::int64_t kRos2ControlLifecyclePlanTimeoutNs = 30'000'000'000LL;
+/// Timeout of every shared ros2_control lifecycle plan: the default
+/// component lifecycle budget (10 s).
+inline constexpr std::int64_t kRos2ControlLifecyclePlanTimeoutNs = core::kDefaultLifecycleBudgetNs;
 
 [[nodiscard]] inline std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_lifecycle_plans() {
@@ -83,10 +85,11 @@ retained_ros2_control_lifecycle_plans() {
   };
 }
 
-/// The gripper domain of a Real xArm-family component: the shared plans, but
-/// Recover targets `disabled`, the Real arm's Recover target, so the component
-/// has one common target (spec 210 section 3.17). A healthy gripper has
-/// nothing to clear: the target is already satisfied and nothing dispatches.
+/// The Real gripper plans, for a Real component's gripper domain: the shared
+/// plans, but Recover targets `disabled`, the Real arm's Recover target, so
+/// the component has one common target (spec 210 section 3.17). A healthy
+/// gripper has nothing to clear: the target is already satisfied and nothing
+/// dispatches.
 [[nodiscard]] inline std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_gripper_lifecycle_plans() {
   using State = core::ComponentLifecycleStateDTO;

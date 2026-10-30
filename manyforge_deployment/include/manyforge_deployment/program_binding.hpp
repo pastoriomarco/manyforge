@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -86,6 +87,12 @@ reload_verified_program_binding(
 /// binding. This does not replace contextual bundle/model-map verification.
 [[nodiscard]] bool verify_program_binding_identity(
     const ProgramBinding& binding) noexcept;
+
+/// The target's own frame row for one frame role; null when absent or
+/// ambiguous. Every frame has one name: there is no `tcp` alias (C-RQ8), so
+/// `{arm, tcp}` is the arm target's own `tcp` frame, if it has one.
+[[nodiscard]] const CompositionTargetFrameResolution* find_target_frame_role(
+    const CompositionTargetResolution& target, const core::FrameRoleId& role);
 
 /// Immutable Program-Binding read port.
 ///

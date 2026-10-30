@@ -133,8 +133,8 @@
         "media_type": "application/xml"
       },
       {
-        "byte_size": 8245,
-        "content_digest": "sha256:a10fb0c78b1ad39a78afcb2cb3e180f803d0d758b80a880cd95d59696175e2b0",
+        "byte_size": 8468,
+        "content_digest": "sha256:79b50b7b33cf0a763f8d00e2984fad87f10bfa32230da2b6249ad98b8311f765",
         "logical_uri": "asset://robotiq_2f_85/model.urdf",
         "media_type": "application/xml"
       }
@@ -144,12 +144,16 @@
   },
   "frame_role_bindings": [
     {
-      "frame_role_id": "gripper_tcp",
+      "frame_role_id": "base",
       "source_link_name": "robotiq_85_base_link"
     },
     {
-      "frame_role_id": "root",
-      "source_link_name": "robotiq_85_base_link"
+      "frame_role_id": "mount",
+      "source_link_name": "robotiq_2f_85_mount"
+    },
+    {
+      "frame_role_id": "tcp",
+      "source_link_name": "robotiq_2f_85_mount"
     }
   ],
   "instance_cardinality": "multiple_per_cell",
@@ -160,7 +164,7 @@
       "source_group_name": "robotiq_2f_85_gripper"
     }
   ],
-  "model_revision": "sha256:0063436a41d3454d7addf62ae7efe4499a3f772c14fcb853205ea98e01da5988",
+  "model_revision": "sha256:765066e0ee9be4905aaafc892f75f06093b7aa29eb804e3af41fcdcf302f32af",
   "resource_role_bindings": [
     {
       "resource_role_id": "fingers",
@@ -169,5 +173,5 @@
       ]
     }
   ],
-  "root_frame_role_id": "root"
+  "root_frame_role_id": "mount"
 }

@@ -108,6 +108,7 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     record = owner.take_diagnostic(run_id)
     # The motion node's system-owned outcome key is captured like any key.
     assert record["blackboard"] == {
+        "active_tcp.arm": {"component_id": "robot.1", "target_id": "arm.command", "frame_role_id": "tcp"},
         "node_outcome.move_to_pick": "completed",
         "recorded_value": True,
     }
@@ -579,6 +580,20 @@ def _readiness(binding_id: str) -> NodeExecutionReadiness:
     )
 
 
+class _FixtureProgramRunOwner(ProgramRunOwner):
+    def start(self, admission, *, program_run_id=None):
+        snapshot = super().start(admission, program_run_id=program_run_id)
+        # The Runner normally registers the store and seeds it from the
+        # Kernel's ordered Active TCP baseline before ticking the run.
+        for row in admission.program_binding.get("target_role_bindings", ()):
+            if row.get("robot_tcps"):
+                self.value_store(snapshot.capture.program_run_id).write_active_tcp(
+                    row["target_role_id"],
+                    row["robot_tcps"][0]["entry"],
+                )
+        return snapshot
+
+
 def _fixture(
     *,
     initial_task_state: OwnerTaskState,
@@ -637,6 +652,16 @@ def _fixture(
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
             "node_policies": [],
+            "target_role_bindings": [{
+                "target_role_id": "arm",
+                "component_role_id": "robot",
+                "controllable_component_id": "robot.1",
+                "command_target_id": "arm.command",
+                "robot_tcps": [{"entry": {"component_id": "robot.1",
+                                          "target_id": "arm.command",
+                                          "frame_role_id": "tcp"},
+                                "end_effector": True}],
+            }],
         },
         readiness=_readiness(_DIGEST_A),
         owner_identities=(
@@ -647,7 +672,7 @@ def _fixture(
             ),
         ),
     )
-    owner = ProgramRunOwner(
+    owner = _FixtureProgramRunOwner(
         owner_id="program-runner.cell-a",
         owner_epoch="program-runner.epoch.1",
         ports=ports,
@@ -1196,6 +1221,8 @@ def test_terminal_reset_partial_stop_accepts_only_current_zero_sample():
 
 
 def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_operation():
+    from .test_production_ports import _motion_test_port
+
     class ResetTransport:
         def __init__(self) -> None:
             self.owner_epoch = "kernel.epoch.7"
@@ -1318,7 +1345,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
             return {"ok": True}
 
     transport = ResetTransport()
-    native = NativeKernelProgramPort(KernelClient(transport))
+    native = _motion_test_port(transport)
     fixture_owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.FAILED
     )
@@ -1366,7 +1393,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
             {
                 "target_role": "arm",
                 "base_frame_role": "base",
-                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+                "tcp_endpoint": {"kind": "entry", "target_role": "arm", "frame_role": "tcp"},
                 "goal": {
                     "position_m": [0.0, 0.0, 0.1],
                     "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
@@ -1669,6 +1696,7 @@ class _ObservationBoundFailureTaskPort(_PolicyTaskPort):
         super().__init__(events, OwnerTaskState.FAILED)
         self.deadline_ns = deadline_ns
         self.observations = 0
+        self.fresh_reads = 0
 
     def _assessment(self) -> dict[str, Any]:
         return {
@@ -1696,12 +1724,16 @@ class _ObservationBoundFailureTaskPort(_PolicyTaskPort):
             reason_code="no_feasible_candidate",
         )
 
+    def current_recovery_assessment(self, task_id: str, identity) -> dict[str, Any]:
+        self.fresh_reads += 1
+        return self._assessment()
+
 
 @pytest.mark.parametrize("deadline_ns", [0, 1_000])
-def test_failure_pause_keeps_owner_observation_deadline_current(deadline_ns) -> None:
-    """A dormant failure pause re-reads its owner assessment only while that
-    assessment is bounded by an observation deadline, so a Retry offer follows
-    the owner's freshness instead of a deadline captured at failure time."""
+def test_failure_pause_stays_dormant_whatever_the_owner_deadline(deadline_ns) -> None:
+    """Recovery offers do not expire, so a dormant failure pause never re-reads
+    its owner assessment to keep a deadline current: freshness is checked when
+    an action is pressed."""
     interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
     owner, admission, task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.FAILED,
@@ -1714,23 +1746,42 @@ def test_failure_pause_keeps_owner_observation_deadline_current(deadline_ns) -> 
     assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
     failure = interventions.read(run_id)
     assert failure.owner_assessment["observed_state_valid_until_ns"] == deadline_ns
-    if deadline_ns == 0:
-        # No owner deadline: the pause stays dormant without owner reads.
-        assert not owner.failure_assessment_refresh_required(run_id)
-        owner.advance_once(run_id)
-        assert task.observations == 0
-        owner.stop(run_id)
-        return
-
-    assert owner.failure_assessment_refresh_required(run_id)
-    task.deadline_ns = 2_000
     held = owner.advance_once(run_id)
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
-    assert task.observations == 1
+    assert task.observations == 0
     assert task.starts == 1  # the tree stayed dormant
-    refreshed = interventions.read(run_id)
+    assert interventions.read(run_id).identity == failure.identity
+    owner.stop(run_id)
+
+
+def test_press_time_failure_refresh_reads_the_owner_and_keeps_the_acknowledgement() -> None:
+    """SX-648/655: a manual-result press freshly re-reads the held task's
+    owner assessment (offers do not expire), not its cached observation; the
+    Program's non-moving acknowledgement stays."""
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=lambda events: _ObservationBoundFailureTaskPort(
+            events, deadline_ns=1_000
+        ),
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
+    failure = interventions.read(run_id)
+    interventions.refresh_owner_assessment(
+        failure.identity,
+        {**failure.owner_assessment, "acknowledged_non_moving": True},
+    )
+    task.deadline_ns = 2_000
+    refreshed = owner.refresh_failure_assessment(
+        run_id, node_attempt_id=failure.identity.node_attempt_id
+    )
+    assert task.fresh_reads == 1 and task.observations == 0
     assert refreshed.identity == failure.identity
     assert refreshed.owner_assessment["observed_state_valid_until_ns"] == 2_000
+    assert refreshed.owner_assessment["acknowledged_non_moving"] is True
+    assert interventions.read(run_id).owner_assessment == refreshed.owner_assessment
     owner.stop(run_id)
 
 
@@ -2884,6 +2935,7 @@ def test_motion_held_counts_only_effectful_nodes_and_settled_holds():
     assert scope.node_count == 3
     assert (group["group_id"], group["state"]) == ("all", "ready")
     assert (group["node_count"], group["held_node_count"]) == (3, 2)
+    assert group["ordinary_held_node_count"] == 0
     assert controls["motion_held"] is True
 
     def published(current: dict[str, list[int]]) -> dict[str, Any]:
@@ -2896,11 +2948,16 @@ def test_motion_held_counts_only_effectful_nodes_and_settled_holds():
     # Held while control flow keeps running, so `all` is only `mixed`.
     stopped = published({"held": [0, 1]})
     assert stopped["groups"][0]["state"] == "mixed"
+    assert stopped["groups"][0]["ordinary_held_node_count"] == 2
     assert stopped["motion_held"] is True
     # Never-started and stopped work alike stay held.
-    assert published({"ready": [0], "held": [1]})["motion_held"] is True
+    mixed = published({"ready": [0], "held": [1]})
+    assert mixed["motion_held"] is True
+    assert mixed["groups"][0]["ordinary_held_node_count"] == 1
     # Still stopping, faulted, or one effectful node released: not held.
-    assert published({"held": [0], "stopping": [1]})["motion_held"] is False
+    stopping = published({"held": [0], "stopping": [1]})
+    assert stopping["motion_held"] is False
+    assert stopping["groups"][0]["ordinary_held_node_count"] is None
     assert published({"held": [0], "faulted": [1]})["motion_held"] is False
     assert published({"held": [0]})["motion_held"] is False
 
@@ -4848,7 +4905,7 @@ def test_input_failure_reaches_status_diagnostic_and_offer_exactly() -> None:
     assert diagnostic["message"] == status["message"]
     assert (diagnostic["details"], diagnostic["origin"]) == (details, origin)
     offer = _recovery_offer(paused, interventions, run_id, "wait")
-    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v4"
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v5"
     assert offer["reason_code"] == "node_input_unavailable"
     assert offer["message"] == status["message"]
     assert offer["message"].startswith(
@@ -5124,6 +5181,205 @@ class _MotionRetryTaskPort(_TaskPort):
     def recover(self, _task_id, _identity, *, action, request_id, reason):
         self.recoveries.append(action)
         return {"request_id": request_id, "action": action, "accepted": True, "error": None}
+
+
+class _ProgramStopTaskPort(_TaskPort):
+    """F-6a (D+W): a carry motion stopped while moving, as the production
+    port projects it. `recovery_class` is the Kernel's requester class: the
+    Program's own Stop (gate trip, carried object lost) or an operator Stop
+    (which keeps the pause_for_operator policy). The engine reports waiting
+    (`terminal_cleanup_pending`) for the first `cleanup_reads` observations,
+    then retry_ready with close permission."""
+
+    def __init__(self, events: list[str], recovery_class: str, cleanup_reads: int) -> None:
+        super().__init__(events, OwnerTaskState.ACTIVE)
+        self.recovery_class = recovery_class
+        self.cleanup_reads = cleanup_reads
+        self.observes = 0
+        self.closes: list[str] = []
+        self.recoveries: list[tuple[str, str]] = []
+
+    def start(self, _node_id, _identity, _inputs) -> OwnerTaskSnapshot:
+        self.starts += 1
+        self._events.append("leaf_start")
+        return OwnerTaskSnapshot(task_id=f"task-{self.starts}", state=OwnerTaskState.ACTIVE)
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        if task_id != "task-1":
+            # The failure branch's own motion (the safe pose) completes.
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.SUCCEEDED)
+        self.observes += 1
+        pending = self.observes <= self.cleanup_reads
+        metadata: dict[str, Any] = {
+            "operation_id": task_id,
+            "operation_state": "stopped",
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 1,
+            "recovery_assessment": {
+                "allowed_actions": (
+                    ["reset_cycle"] if pending else ["replan_from_stopped_state", "reset_cycle"]
+                ),
+                "recovery_class": self.recovery_class,
+                "status": "waiting" if pending else "retry_ready",
+                "reason_code": "terminal_cleanup_pending" if pending else "stop_certified",
+                "execution_state": "Stopped",
+                "eligible_close": not pending,
+                "retry_eligibility": {
+                    "eligible": False,
+                    "cause": "not_eligible",
+                    "effect": "effect_observed",
+                    "reason": "not_retryable_state",
+                },
+            },
+        }
+        if self.recovery_class == "ordinary_operator_stop":
+            metadata["authored_failure_policy"] = "pause_for_operator"
+            metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.INTERRUPTED,
+            metadata=metadata,
+            reason_code="interrupt_fault",
+            message="Global interrupt rule matched",
+        )
+
+    def close(self, task_id, _identity, *, request_id) -> bool:
+        self.closes.append(task_id)
+        return True
+
+    def recover(self, task_id, _identity, *, action, request_id, reason):
+        self.recoveries.append((task_id, request_id))
+        return {"request_id": request_id, "action": action, "accepted": True, "error": None}
+
+
+def _advance_until_settled(owner: ProgramRunOwner, run_id: str, limit: int = 20):
+    snapshot = owner.advance_once(run_id)
+    for _ in range(limit):
+        if snapshot.state is not ProgramRunState.RUNNING:
+            break
+        snapshot = owner.advance_once(run_id)
+    return snapshot
+
+
+@pytest.mark.parametrize("cleanup_reads", [0, 1, 3])
+def test_f6a_program_requested_stop_fails_into_the_tree_and_closes_after_cleanup(
+    cleanup_reads: int,
+) -> None:
+    """D: the Program's own Stop is an ordinary node failure, not an operator
+    hold: the operation closes (the robot's engine is free for the failure
+    branch's motion) and no intervention is recorded. W: while the engine's
+    terminal cleanup is pending the node rereads instead of retaining it."""
+
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _ProgramStopTaskPort(
+            events, "ordinary_program_stop", cleanup_reads
+        ),
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    settled = _advance_until_settled(owner, run_id)
+    assert task.closes == ["task-1"]
+    assert task.observes >= cleanup_reads + 1
+    assert interventions.read_all(run_id) == ()
+    # This minimal Program has no failure branch: the node's failure is the
+    # Run's, with the Stop's typed cause (in a Fallback the next child runs).
+    assert settled.state is ProgramRunState.FAILED
+    assert settled.reason_code == "interrupt_fault"
+
+
+def test_f6a_program_requested_stop_runs_the_fallback_recovery_motion() -> None:
+    """The lite6_grasp_lost shape: Fallback(carry, safe pose). The carry is
+    stopped by the Program's own Stop (gate on `part_lost`, or
+    on_grasp_lost {stop_motion: true}); after its terminal cleanup the
+    operation closes, so the recovery branch's motion on the same robot is
+    started (not refused `participant_engine_busy`) and the Run succeeds with
+    no operator hold."""
+
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _ProgramStopTaskPort(events, "ordinary_program_stop", 2),
+        interventions=interventions,
+    )
+    document = admission.program.to_dict()
+    carry = deepcopy(document["tree"]["children"][0])
+    carry["instance_id"] = "pick_retreat"
+    safe_pose = deepcopy(carry)
+    safe_pose["instance_id"] = "safe_pose_after_loss"
+    document["tree"] = {
+        "node_id": "fallback",
+        "instance_id": "carry_or_recover",
+        "parameters": {},
+        "children": [carry, safe_pose],
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    admission = _admission_for_program(
+        admission, Program.from_dict(document, admission.environment.catalog), []
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    settled = _advance_until_settled(owner, run_id)
+    assert task.closes == ["task-1"]
+    assert task.starts == 2  # The recovery motion was submitted after the close.
+    assert interventions.read_all(run_id) == ()
+    assert settled.state is ProgramRunState.SUCCEEDED
+
+
+def test_f6a_program_requested_stop_with_intervention_policy_holds_for_the_operator() -> None:
+    """(d) An intervention recovery_policy on the node: the Program's own Stop
+    holds the Run (INTERVENTION_REQUIRED) as a failure hold, not an operator
+    Stop. The operation stays live for Retry / Continue / Reset, recorded on
+    the decided assessment after the terminal cleanup."""
+
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _ProgramStopTaskPort(events, "ordinary_program_stop", 2),
+        interventions=interventions,
+    )
+    program = _program_with_policies(admission, second_row=True)
+    rows = [policy.to_dict() for policy in program_node_policies(program)]
+    run_id = owner.start(_admission_for_program(admission, program, rows)).capture.program_run_id
+    held = _advance_until_settled(owner, run_id)
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert task.closes == []
+    rows = interventions.read_all(run_id)
+    assert len(rows) == 1
+    assert rows[0].policy_parameter != "operator_stop_policy"
+    assert rows[0].reason_code == "interrupt_fault"
+    assert rows[0].owner_assessment["status"] == "retry_ready"
+    assert rows[0].owner_assessment["eligible_close"] is True
+    assert rows[0].owner_assessment["recovery_class"] == "ordinary_program_stop"
+    owner.stop(run_id)
+
+
+def test_f6a_operator_stop_still_holds_on_its_decided_assessment() -> None:
+    """An operator Stop is still an operator hold (Resume / Reset), and with W
+    the hold is recorded on the decided assessment, never on the brief
+    terminal-cleanup wait. Nothing is closed."""
+
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=lambda events: _ProgramStopTaskPort(events, "ordinary_operator_stop", 2),
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    held = _advance_until_settled(owner, run_id)
+    assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert task.closes == []
+    rows = interventions.read_all(run_id)
+    assert len(rows) == 1
+    assert rows[0].policy_parameter == "operator_stop_policy"
+    assert rows[0].owner_assessment["status"] == "retry_ready"
+    assert rows[0].owner_assessment["recovery_class"] == "ordinary_operator_stop"
+    owner.stop(run_id)
 
 
 def test_run_stopped_during_an_automatic_retry_wait_leaves_nothing_resident() -> None:
@@ -5441,6 +5697,33 @@ def test_continue_refused_when_the_held_operation_cannot_close() -> None:
             reason=None,
         )
     assert scope.release_requests == releases
+    owner.stop(run_id)
+
+
+def test_item11_acknowledge_of_an_unconfirmed_stop_releases_without_closing() -> None:
+    """Item 11: Continue on a `program_stop_settlement_unconfirmed` hold is the
+    operator's Acknowledge. Its operation is not closable here (the node
+    closes it if its next read allows, else it stays for Reset), so nothing
+    is closed and the hold's groups are released, where an ordinary Continue
+    would be refused."""
+
+    owner, task, scope, interventions, run_id, _paused = _two_group_holds(None)
+    arm = _hold(interventions, run_id, "arm_move")
+    entry = interventions._runs[run_id].entries["arm_move"]
+    entry.record = replace(entry.record, reason_code="program_stop_settlement_unconfirmed")
+    closes: list[Any] = []
+    task.close = lambda *args, **kwargs: closes.append(args) or False
+    releases = scope.release_requests
+
+    owner.continue_failure_pause(
+        run_id,
+        node_attempt_id=arm.identity.node_attempt_id,
+        request_id="acknowledge.arm",
+        reason=None,
+    )
+    assert closes == []
+    assert scope.release_requests == releases + 1
+    assert scope.last_selection_release["group_ids"] == ["arm"]
     owner.stop(run_id)
 
 

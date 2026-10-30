@@ -2158,9 +2158,15 @@ read_verified_planning_resources(
         detail::fail_retained_bundle(
             "retained model source closure has no URDF entrypoint");
       }
+      std::vector<core::ModelFrameRoleBindingDTO> offset_frame_roles;
+      for (const auto &binding : verified.value().frame_role_bindings) {
+        if (binding.pose_in_source_link.has_value())
+          offset_frame_roles.push_back(binding);
+      }
       model_source_urdfs->push_back(VerifiedRetainedModelSourceUrdf{
           core::ModelAssetId(identity.first),
-          core::ModelRevision(identity.second), std::move(*source_urdf)});
+          core::ModelRevision(identity.second), std::move(*source_urdf),
+          std::move(offset_frame_roles), verified.value().payload});
     }
     if (verified.qualified_asset().reference() != *reference ||
         verified.value() != qualified.value() ||
@@ -2283,15 +2289,16 @@ detail::RetainedModelMapVerificationAuthority::verify(
   detail::require_symbol_role_map_matches_retained_bundle(parsed,
                                                           bundle.value());
   DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
-  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
-      build_runtime_kinematic_paths(decoded, bundle.value().cell_graph);
+  CellKinematicIndex kinematic_index(
+      bundle.value().cell_graph,
+      build_runtime_kinematic_paths(decoded, bundle.value().cell_graph));
   return VerifiedRetainedModelMap(
       query, product->product_contract_id, product->product_contract_revision,
       std::move(decoded.cell_frame), std::move(decoded.model_occurrences),
       std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
       std::move(decoded.references), std::move(decoded.coordinates),
       std::move(decoded.control_bindings), std::move(decoded.fixed_connections),
-      std::move(decoded.frame_paths), std::move(kinematic_frame_paths),
+      std::move(decoded.frame_paths), std::move(kinematic_index),
       std::move(decoded.targets));
 }
 
@@ -2366,22 +2373,6 @@ VerifiedRetainedModelMap::find_binding(
     if (candidate.controllable_component_id != component_id ||
         candidate.command_target_id != command_target_id ||
         candidate.control_binding_id != control_binding_id) {
-      continue;
-    }
-    if (match != nullptr) {
-      return nullptr;
-    }
-    match = &candidate;
-  }
-  return match;
-}
-
-const core::KinematicFramePathDTO *
-VerifiedRetainedModelMap::find_kinematic_frame_path(
-    const core::ResolvedFrameDTO &terminal_frame) const noexcept {
-  const core::KinematicFramePathDTO *match = nullptr;
-  for (const auto &candidate : kinematic_frame_paths_) {
-    if (candidate.terminal_frame != terminal_frame) {
       continue;
     }
     if (match != nullptr) {
@@ -2964,8 +2955,9 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
         detail::require_symbol_role_map_matches_retained_bundle(
             parsed, bundle->value());
         DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
-        std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
-            build_runtime_kinematic_paths(decoded, bundle->value().cell_graph);
+        CellKinematicIndex kinematic_index(
+            bundle->value().cell_graph,
+            build_runtime_kinematic_paths(decoded, bundle->value().cell_graph));
 
         return VerifiedRetainedModelMap(
             query, product->product_contract_id, product->product_contract_revision,
@@ -2973,7 +2965,7 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
             std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
             std::move(decoded.references), std::move(decoded.coordinates),
             std::move(decoded.control_bindings), std::move(decoded.fixed_connections),
-            std::move(decoded.frame_paths), std::move(kinematic_frame_paths),
+            std::move(decoded.frame_paths), std::move(kinematic_index),
             std::move(decoded.targets));
       });
 }

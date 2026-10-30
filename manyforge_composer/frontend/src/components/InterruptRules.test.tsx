@@ -143,7 +143,7 @@ const station = {
   configuration: {
     runtime_kind: 'io_provider',
     runtime_configuration: {
-      io_provider_devices: [{ controllable_component_id: 'station', lifecycle_command_timeout_s: 30 }],
+      io_provider_devices: [{ controllable_component_id: 'station' }],
       io_signals: [
         { controllable_component_id: 'station', command_target_id: 'io', resource_role_id: 'part_present',
           signal_name: 'part_present', source_id: 'm', value_type: 'bool', direction: 'input',
@@ -332,6 +332,53 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     } finally { await full.unmount(); }
   });
 
+  it('offers publish-only notify without idle or Stop-stage controls', async () => {
+    const mounted = await mountDeployment({ interrupt_rules: [{
+      rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      on_trip: 'full_stop', idle_behaviour: 'latch', stop_entry_stage_id: 'motion_controlled_stop',
+    }] });
+    try {
+      expect(options(mounted.control('part_lost on trip'))).toEqual(['', 'full_stop', 'notify']);
+      await mounted.type('part_lost on trip', 'notify');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(['policies', 'interrupt_rules'], 'set', [{
+        rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+        on_trip: 'notify',
+      }]);
+    } finally { await mounted.unmount(); }
+
+    // The mocked mutation does not update the Deployment draft. Render the
+    // applied notify value separately to verify its publish-only controls.
+    const notify = await mountDeployment({ interrupt_rules: [{
+      rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      on_trip: 'notify',
+    }] });
+    try {
+      expect(notify.control('part_lost on trip').value).toBe('notify');
+      expect(notify.all((props) => props['aria-label'] === 'part_lost idle behaviour')).toHaveLength(0);
+      expect(notify.all((props) => props['aria-label'] === 'part_lost stop entry stage stages')).toHaveLength(0);
+    } finally { await notify.unmount(); }
+
+    const malformed = await mountDeployment({ interrupt_rules: [{
+      rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      on_trip: 'notify', stop_entry_stage_id: 'motion_controlled_stop',
+    }] });
+    try {
+      const problem = malformed.all((props) => props['aria-label'] === 'part_lost notify settings');
+      expect(problem).toHaveLength(1);
+      expect(problem[0].children).toContain('does not apply to on_trip notify');
+    } finally { await malformed.unmount(); }
+
+    const malformedIdle = await mountDeployment({ interrupt_rules: [{
+      rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      on_trip: 'notify', idle_behaviour: 'latch',
+    }] });
+    try {
+      const problem = malformedIdle.all((props) => props['aria-label'] === 'part_lost notify settings');
+      expect(problem).toHaveLength(1);
+      expect(problem[0].children).toContain('full_stop only');
+    } finally { await malformedIdle.unmount(); }
+  });
+
   it('loads the trial rule (all_motion, full_stop, latch, priority 0) without flags', async () => {
     const trial = { rule_id: 'light_curtain', condition: { compare: { operand, op: '==', value: true } },
       scope: 'all_motion', priority: 0, on_trip: 'full_stop', idle_behaviour: 'latch' };
@@ -406,7 +453,7 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
       await act(() => (mounted.control('station output acknowledgement timeout').onBlur as () => void)());
       expect(mounted.controller.mutate).toHaveBeenLastCalledWith(
         ['components', 0, 'configuration', 'runtime_configuration', 'io_provider_devices'], 'set',
-        [{ controllable_component_id: 'station', lifecycle_command_timeout_s: 30, output_source_ack_timeout_s: 0.8 }],
+        [{ controllable_component_id: 'station', lifecycle_command_timeout_s: 10, output_source_ack_timeout_s: 0.8 }],
       );
     } finally { await mounted.unmount(); }
     const mockOnly = structuredClone(station);
@@ -476,15 +523,17 @@ describe('Deployment motion takeover timing', () => {
 });
 
 describe('Deployment motion takeover refusal feedback', () => {
-  it('reports an owner refusal of a well-formed value without calling it malformed', async () => {
+  it('leaves an owner refusal of a well-formed value to the yellow notice row, without calling it malformed', async () => {
     const mounted = await mountDeployment({ motion_takeover_preparation_budget_s: 0.5 });
     try {
       vi.mocked(mounted.controller.mutate).mockResolvedValueOnce(null);
       await mounted.type('Takeover planning budget', '0.4');
       await act(() => (mounted.control('Takeover planning budget').onBlur as (() => void) | undefined)?.());
       const texts = mounted.all((props) => typeof props.children === 'string').map((props) => props.children);
-      expect(texts).toContain('Value was rejected.');
-      expect(texts).toContain('The Deployment owner rejected this timing change.');
+      expect(mounted.controller.mutate).toHaveBeenCalledOnce();
+      // No red inline repeat of the refusal.
+      expect(texts).not.toContain('The Deployment owner rejected this timing change.');
+      expect(texts).not.toContain('Value was rejected.');
       expect(texts.some((text) => String(text).startsWith('Enter a positive value'))).toBe(false);
     } finally { await mounted.unmount(); }
   });

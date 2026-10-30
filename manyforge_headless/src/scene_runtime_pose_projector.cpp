@@ -4,6 +4,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/types/carried_object_lost.hpp>
+#include <manyforge_deployment/cell_kinematic_index.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -507,6 +508,15 @@ RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
 
 } // namespace
 
+std::vector<core::ControllableComponentId>
+SceneRuntimeCarrierStopComponents(const core::CellGraphDTO &graph,
+                                  const core::ControllableComponentId &holder) {
+  auto components = deployment::CellKinematicIndex(graph).ancestors_of(holder);
+  components.push_back(holder);
+  std::sort(components.begin(), components.end());
+  return components;
+}
+
 SceneRuntimePoseDistance
 SceneRuntimePoseDistanceBetween(const core::Pose3DTO &from,
                                 const core::Pose3DTO &to) noexcept {
@@ -975,32 +985,7 @@ SceneRuntimePoseProjector::Commit(core::RequestId request_id,
       std::move(operation),
       std::nullopt,
   };
-  auto committed = scene_authority_.Commit(request);
-  // Only this exact, pre-acceptance housekeeping refusal permits one new
-  // request. An old-epoch rejection without this proof is not replayable.
-  if (committed.presence_valid() && !committed.success && committed.error &&
-      committed.replay_status == core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch &&
-      committed.request_id == request.request_context.request_id &&
-      committed.projection_status == core::SceneProjectionCommitStatusDTO::kNotAttempted &&
-      !committed.transaction_sequence &&
-      committed.error->code == "stale_request_owner_epoch") {
-    const auto &details = committed.error->details;
-    const auto reason = details.find("reason");
-    const auto previous = details.find("previous_request_owner_epoch");
-    const auto next = details.find("expected_request_owner_epoch");
-    if (reason != details.end() && reason->second == "scene_history_compaction_no_effect" &&
-        previous != details.end() && next != details.end() &&
-        previous->second == request.request_context.request_owner_epoch.value() &&
-        next->second != previous->second && !next->second.empty() &&
-        scene_authority_.CurrentProjectionRevision() == projection &&
-        scene_authority_.CurrentRequestOwnerEpoch().value() == next->second) {
-      request.request_context.request_owner_epoch = core::RequestOwnerEpoch(next->second);
-      request_id = core::RequestId(request_id.value() + ".after-compaction");
-      request.request_context.request_id = request_id;
-      committed = scene_authority_.Commit(request);
-    }
-  }
-  return committed;
+  return scene_authority_.Commit(request);
 }
 
 std::optional<SceneRuntimePoseProjector::GraspMeasurement>

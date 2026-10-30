@@ -356,7 +356,8 @@ def write_manifest(
 ) -> None:
     files = []
     for path in sorted(target.rglob("*")):
-        if path.is_file() and path.name != "STATIC_MANIFEST.json":
+        # The component descriptor describes the bundle; it is not model content.
+        if path.is_file() and path.name not in ("STATIC_MANIFEST.json", "component.yaml"):
             files.append(
                 {
                     "path": path.relative_to(target).as_posix(),

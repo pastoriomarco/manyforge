@@ -22,6 +22,7 @@ constexpr std::size_t kMaximumComponents = 128U;
 constexpr std::size_t kMaximumAttachments = 256U;
 constexpr std::size_t kMaximumPackageRoots = 128U;
 constexpr std::size_t kMaximumTargets = 128U;
+constexpr std::size_t kMaximumCustomTcps = 256U;
 
 [[noreturn]] void fail(std::string message) {
   throw std::invalid_argument("Deployment intent " + std::move(message));
@@ -184,6 +185,83 @@ void require_pose(const CanonicalValue &value, std::string_view label) {
   }
 }
 
+// `custom_tcps`: `{tcp_id, parent_frame, pose}` rows, uniquely sorted by
+// tcp_id, each pose with a unit quaternion. The compiler resolves parents.
+[[nodiscard]] std::vector<ActivationCustomTcp>
+custom_tcps(const CanonicalValue *value, std::string_view label) {
+  std::vector<ActivationCustomTcp> result;
+  if (value == nullptr) return result;
+  const auto &rows = array(*value, label);
+  if (rows.size() > kMaximumCustomTcps) {
+    fail("custom_tcp_invalid: " + std::string(label) + " exceeds its bound");
+  }
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const std::string row_label =
+        std::string(label) + "[" + std::to_string(index) + "]";
+    require_fields(rows[index], {"parent_frame", "pose", "tcp_id"}, {},
+                   row_label);
+    const auto &tcp_id = portable_identifier(
+        member(rows[index], "tcp_id", row_label), row_label + ".tcp_id");
+    const auto &parent = text(member(rows[index], "parent_frame", row_label),
+                              row_label + ".parent_frame");
+    // The spec 210 authoring pose: `position_m` plus `orientation` as either
+    // `rpy_deg` (fixed-axis roll, pitch, yaw in degrees) or a unit `xyzw`.
+    const auto &pose = member(rows[index], "pose", row_label);
+    const std::string pose_label = row_label + ".pose";
+    require_fields(pose, {"orientation", "position_m"}, {}, pose_label);
+    const auto &orientation = member(pose, "orientation", pose_label);
+    const bool rpy = orientation.find_object_member("rpy_deg") != nullptr;
+    require_fields(orientation, {rpy ? "rpy_deg" : "xyzw"}, {},
+                   pose_label + ".orientation");
+    const auto numbers = [&](const CanonicalValue &value, std::size_t count,
+                             const std::string &label) {
+      const auto &values = array(value, label);
+      double norm_squared = 0.0;
+      if (values.size() != count) fail("custom_tcp_invalid: " + label +
+                                       " has the wrong coordinate count");
+      for (const auto &coordinate : values) {
+        const auto *number = std::get_if<double>(&coordinate.storage());
+        if (number == nullptr || !std::isfinite(*number))
+          fail("custom_tcp_invalid: " + label + " must contain finite numbers");
+        norm_squared += *number * *number;
+      }
+      return norm_squared;
+    };
+    static_cast<void>(numbers(member(pose, "position_m", pose_label), 3U,
+                              pose_label + ".position_m"));
+    if (rpy) {
+      static_cast<void>(numbers(member(orientation, "rpy_deg", pose_label), 3U,
+                                pose_label + ".orientation.rpy_deg"));
+    } else if (std::abs(numbers(member(orientation, "xyzw", pose_label), 4U,
+                                pose_label + ".orientation.xyzw") -
+                        1.0) > 1e-6) {
+      fail("custom_tcp_invalid: " + pose_label +
+           ".orientation.xyzw must be a unit quaternion");
+    }
+    if (!result.empty() && !(result.back().tcp_id < tcp_id)) {
+      fail("custom_tcp_duplicate: " + std::string(label) +
+           " must be uniquely sorted by tcp_id");
+    }
+    result.push_back({tcp_id, parent, pose});
+  }
+  return result;
+}
+
+// B5: `default_tcp: {command_target_id, frame_role_id}`. The compiler checks
+// the pair against the component's TCPs.
+[[nodiscard]] std::optional<core::ComponentDefaultTcpDTO>
+default_tcp(const CanonicalValue *value, std::string_view label) {
+  if (value == nullptr) return std::nullopt;
+  require_fields(*value, {"command_target_id", "frame_role_id"}, {}, label);
+  const std::string target_label = std::string(label) + ".command_target_id";
+  const std::string role_label = std::string(label) + ".frame_role_id";
+  return core::ComponentDefaultTcpDTO{
+      core::CommandTargetId(portable_identifier(
+          member(*value, "command_target_id", label), target_label)),
+      core::FrameRoleId(portable_identifier(
+          member(*value, "frame_role_id", label), role_label))};
+}
+
 void require_target_settings(const CanonicalValue &value,
                              std::string_view label) {
   const auto &settings = object(value, label);
@@ -265,8 +343,29 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   if (attachments.size() > kMaximumAttachments) {
     fail("attachments exceed their bound");
   }
-  for (const auto &attachment : attachments) {
-    static_cast<void>(object(attachment, "attachment"));
+  // A mounted child takes its placement from the attachment: it omits
+  // root_pose_in_cell, and the optional pose defaults to identity. The cell
+  // graph and structural validation own references, interfaces and capacity.
+  std::set<std::string, std::less<>> mounted_components;
+  for (std::size_t index = 0U; index < attachments.size(); ++index) {
+    const auto &attachment = attachments[index];
+    const std::string label = "attachments[" + std::to_string(index) + "]";
+    require_fields(attachment, {"child", "parent"}, {"pose", "primary"}, label);
+    if (const auto *primary = attachment.find_object_member("primary");
+        primary != nullptr && !primary->is_bool())
+      fail(label + ".primary must be a boolean");
+    for (const std::string_view end : {"parent", "child"}) {
+      const std::string end_label = label + "." + std::string(end);
+      const auto &endpoint = member(attachment, end, label);
+      require_fields(endpoint, {"component_id", "interface"}, {}, end_label);
+      const auto &component_id = portable_identifier(
+          member(endpoint, "component_id", end_label), end_label + ".component_id");
+      static_cast<void>(portable_identifier(
+          member(endpoint, "interface", end_label), end_label + ".interface"));
+      if (end == "child") mounted_components.insert(component_id);
+    }
+    if (const auto *pose = attachment.find_object_member("pose"); pose != nullptr)
+      require_pose(*pose, label + ".pose");
   }
   static_cast<void>(object(member(value, "policies", "root"), "policies"));
   if (const auto *compatibility = value.find_object_member("compatibility");
@@ -283,16 +382,24 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     const auto &component = components[index];
     const std::string label = "components[" + std::to_string(index) + "]";
     const auto required_model_free_profile = model_free_profile(component);
+    const auto *authored_id = component.find_object_member("component_id");
+    const bool mounted = authored_id != nullptr && authored_id->is_string() &&
+                         mounted_components.contains(authored_id->as_string());
     if (required_model_free_profile)
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "target_settings"},
                      {}, label);
+    else if (mounted)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "model_source", "target_settings"},
+                     {"custom_tcps", "default_tcp", "frame_prefix"}, label);
     else
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "model_source", "root_pose_in_cell", "target_settings"},
-                     {"frame_prefix"}, label);
+                     {"custom_tcps", "default_tcp", "frame_prefix"}, label);
     const auto &component_id = portable_identifier(
         member(component, "component_id", label), label + ".component_id");
     const auto &profile_id = portable_identifier(
@@ -309,9 +416,23 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     static_cast<void>(object(configuration, label + ".configuration"));
     std::optional<CapturedComponentModelSource> captured;
     std::optional<CanonicalValue> pose;
+    // The component's lifecycle time budget (seconds, (0, 3600]); an I/O
+    // device keeps its own in runtime_configuration.io_provider_devices.
+    if (const auto *budget =
+            configuration.find_object_member("lifecycle_command_timeout_s");
+        budget != nullptr) {
+      const auto *seconds = std::get_if<double>(&budget->storage());
+      if (required_model_free_profile == std::string_view("io_device_v0"))
+        fail(label + ".configuration.lifecycle_command_timeout_s: an I/O "
+                     "device sets it in runtime_configuration.io_provider_devices");
+      if (seconds == nullptr || !std::isfinite(*seconds) || !(*seconds > 0.0) ||
+          *seconds > 3600.0)
+        fail(label + ".configuration.lifecycle_command_timeout_s must be a "
+                     "number of seconds above 0 and at most 3600");
+    }
     if (required_model_free_profile) {
       require_fields(configuration, {"runtime_kind", "runtime_configuration"},
-                     {}, label + ".configuration");
+                     {"lifecycle_command_timeout_s"}, label + ".configuration");
       if (profile_id != *required_model_free_profile ||
           !target_settings.as_object().empty())
         fail(label + " requires " + std::string(*required_model_free_profile) +
@@ -323,8 +444,10 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       captured = std::move(captured_sources[captured_index++]);
       require_model_source(member(component, "model_source", label),
                            captured->srdf.has_value(), label + ".model_source");
-      pose = member(component, "root_pose_in_cell", label);
-      require_pose(*pose, label + ".root_pose_in_cell");
+      if (!mounted) {
+        pose = member(component, "root_pose_in_cell", label);
+        require_pose(*pose, label + ".root_pose_in_cell");
+      }
     }
     std::string frame_prefix;
     if (const auto *prefix = component.find_object_member("frame_prefix"); prefix != nullptr) {
@@ -337,7 +460,11 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     }
     parsed_components.push_back(
         {component_id, profile_id, pose, target_settings, configuration,
-         std::move(captured), std::move(frame_prefix)});
+         std::move(captured), std::move(frame_prefix),
+         custom_tcps(component.find_object_member("custom_tcps"),
+                     label + ".custom_tcps"),
+         default_tcp(component.find_object_member("default_tcp"),
+                     label + ".default_tcp")});
   }
 
   if (captured_index != captured_sources.size())

@@ -336,7 +336,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         policy=_policy(),
     )
     assert offer is not None
-    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v4"
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v5"
     assert offer["policy"] == _policy()
     assert offer["retries_used"] == 0
     # The held node's own failure is carried unchanged.
@@ -348,7 +348,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
         "node_instance_id": "move.1",
         "owner_api": "kernel.operation",
     }
-    assert offer["valid_until_ns"] is None
+    assert "valid_until_ns" not in offer
     assert _first_enabled(offer) == "acknowledge_and_continue"
     assert all(offer[field] == value for field, value in _fences().items())
     assert (
@@ -505,23 +505,24 @@ def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:
             "retry_admissible": True,
             "status": "retry_ready",
             "stop_owner_generation": 3,
+            # The Stop-time sample is already past the Kernel's freshness
+            # budget when the offer is built (the live "born expired" case).
             "observed_state_valid_until_ns": time.monotonic_ns() - 1,
         }
     )
-    expired = controls.recovery_offer(
+    settled = controls.recovery_offer(
         cycle_generation=6,
         owner_epoch="runner.epoch.1",
         intervention=intervention,
         policy={**_policy(), "allow_intervention": False, "max_retries": 0},
     )
-    assert expired is not None
-    expired_reset = next(
-        row for row in expired["actions"] if row["action_id"] == "reset_cycle"
-    )
-    assert expired_reset["enabled"] is False
-    assert expired_reset["disabled_reason_code"] == (
-        "recovery_owner_observation_expired"
-    )
+    assert settled is not None
+    assert "valid_until_ns" not in settled
+    settled_actions = {row["action_id"]: row for row in settled["actions"]}
+    # Offers do not expire: freshness is checked when the action is pressed.
+    assert settled_actions["reset_cycle"]["enabled"] is True
+    assert settled_actions["reset_cycle"]["disabled_reason_code"] is None
+    assert settled_actions["replan_from_stopped_state"]["enabled"] is True
 
 
 def test_released_operator_stop_projects_no_stale_offer() -> None:
@@ -642,7 +643,7 @@ def test_owner_backed_retry_requires_confirmed_non_moving_state() -> None:
     )
 
 
-def test_manual_result_requires_policy_and_fresh_non_moving_owner_evidence() -> None:
+def test_manual_result_requires_policy_and_non_moving_owner_evidence() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     intervention = _intervention()
 
@@ -671,25 +672,35 @@ def test_manual_result_requires_policy_and_fresh_non_moving_owner_evidence() -> 
         "disabled_reason_code": None,
     }
 
+    # A past owner observation deadline no longer disables it.
     intervention.owner_assessment["observed_state_valid_until_ns"] = (
         time.monotonic_ns() - 1
     )
-    expired = controls.recovery_offer(
+    held = controls.recovery_offer(
         cycle_generation=6,
         owner_epoch="runner.epoch.1",
         intervention=intervention,
         policy=_policy(),
     )
-    assert expired is not None
-    assert expired["manual_result"] == {
-        "enabled": False,
-        "disabled_reason_code": "manual_result_owner_observation_expired",
+    assert held is not None
+    assert held["manual_result"] == {
+        "enabled": True,
+        "disabled_reason_code": None,
     }
 
 
-def test_expired_owner_observation_disables_every_recovery_effect() -> None:
+def test_past_owner_observation_deadline_keeps_every_recovery_action() -> None:
+    """Offers do not expire while the run is held: a past Kernel observation
+    deadline neither disables an action nor withdraws Retry."""
+
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     intervention = _intervention(acknowledged=True)
+    fresh = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=intervention,
+        policy=_policy(),
+    )
     intervention.owner_assessment["observed_state_valid_until_ns"] = (
         time.monotonic_ns() - 1
     )
@@ -702,13 +713,17 @@ def test_expired_owner_observation_disables_every_recovery_effect() -> None:
     )
 
     assert offer is not None
-    assert _first_enabled(offer) is None
-    assert all(not action["enabled"] for action in offer["actions"])
-    assert {
-        action["disabled_reason_code"]
+    assert "valid_until_ns" not in offer
+    # The deadline is not offer semantics: same offer, same command fence.
+    assert offer["offer_id"] == fresh["offer_id"]
+    assert offer["offer_revision"] == fresh["offer_revision"]
+    assert offer["actions"] == fresh["actions"]
+    assert _first_enabled(offer) == "acknowledge_and_continue"
+    assert any(
+        action["action_id"] == "retry_runtime_step" and action["enabled"]
         for action in offer["actions"]
-        if action["action_id"] != "reset_cycle"
-    } == {"recovery_owner_observation_expired"}
+    )
+    assert offer["manual_result"]["enabled"] is True
 
 
 def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> None:
@@ -772,59 +787,6 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
     } == {"recovery_action_forbidden_by_captured_policy"}
 
 
-def test_owner_deadline_extension_keeps_retry_offer_and_expiry_disables_it() -> None:
-    """A fresh owner observation extends the deadline without replacing the
-    offer the operator is answering; a stale one disables Retry."""
-
-    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    intervention = _intervention()
-    now = time.monotonic_ns()
-    intervention.owner_assessment = {
-        "allowed_actions": ["retry_after_scene_repair", "reset_cycle"],
-        "assessment_revision": 4,
-        "control_command_epoch": 0,
-        "observed_state_valid_until_ns": now + 60_000_000_000,
-        "recovery_class": "failed_validation",
-        "retry_admissible": True,
-        "status": "retry_ready",
-    }
-    policy = {"allow_intervention": True, "max_retries": 0}
-
-    def offer():
-        return controls.recovery_offer(
-            cycle_generation=5,
-            owner_epoch="runner.epoch.1",
-            intervention=intervention,
-            policy=policy,
-        )
-
-    first = offer()
-    assert _first_enabled(first) == "retry_after_scene_repair"
-    intervention.owner_assessment = {
-        **intervention.owner_assessment,
-        "observed_state_valid_until_ns": now + 120_000_000_000,
-    }
-    extended = offer()
-    assert extended["offer_id"] == first["offer_id"]
-    assert extended["offer_revision"] == first["offer_revision"]
-    assert extended["valid_until_ns"] == now + 120_000_000_000
-    assert _first_enabled(extended) == "retry_after_scene_repair"
-
-    intervention.owner_assessment = {
-        **intervention.owner_assessment,
-        "observed_state_valid_until_ns": time.monotonic_ns() - 1,
-    }
-    stale = offer()
-    assert stale["offer_id"] != first["offer_id"]
-    assert _first_enabled(stale) is None
-    retry = next(
-        action
-        for action in stale["actions"]
-        if action["action_id"] == "retry_after_scene_repair"
-    )
-    assert retry["disabled_reason_code"] == "recovery_owner_observation_expired"
-
-
 def _continue_action(offer):
     return next(
         action for action in offer["actions"] if action["action_id"] == "continue_with_failure"
@@ -877,6 +839,87 @@ def test_continue_is_offered_for_failure_holds_with_confirmation_and_close_fact(
         policy=_policy(),
     )
     assert all(row["action_id"] != "continue_with_failure" for row in stop["actions"])
+
+
+def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None:
+    """(d) A Program-requested Stop held by an intervention recovery_policy:
+    Retry from the stopped state (bounded by max_retries), Continue (the node
+    fails, the tree goes on into its Fallback) and Reset are offered."""
+
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    held = _intervention()
+    held.reason_code = "interrupt_fault"
+    held.owner_assessment = {
+        **held.owner_assessment,
+        "allowed_actions": ["replan_from_stopped_state", "reset_cycle"],
+        "eligible_close": True,
+        "latch_id": "",
+        "recovery_class": "ordinary_program_stop",
+        "status": "retry_ready",
+    }
+    policy = {"allow_intervention": True, "max_retries": 1}
+    offer = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=policy
+    )
+    actions = {row["action_id"]: row for row in offer["actions"]}
+    assert actions["replan_from_stopped_state"]["enabled"] is True
+    assert _continue_action(offer)["enabled"] is True
+    assert "reset_cycle" in actions
+    assert offer["recovery_class"] == "ordinary_program_stop"
+    controls.note_retry("move.1")  # The one allowed Retry is used.
+    exhausted = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=policy
+    )
+    retry = next(
+        row for row in exhausted["actions"] if row["action_id"] == "replan_from_stopped_state"
+    )
+    assert retry["enabled"] is False
+    assert retry["disabled_reason_code"] == "recovery_retry_limit_reached"
+    assert _continue_action(exhausted)["enabled"] is True
+
+
+def test_item11_unconfirmed_stop_hold_offers_continue_as_its_acknowledge() -> None:
+    """Item 11: an unconfirmed Program Stop holds whatever the node's policy,
+    on an undecided assessment. Its Continue (the operator's Acknowledge) is
+    enabled anyway, still with confirmation, and still waits for confirmed
+    containment like any Continue."""
+
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    held = _intervention()
+    held.reason_code = "program_stop_settlement_unconfirmed"
+    held.owner_assessment = {
+        **held.owner_assessment,
+        "eligible_close": False,
+        "observed_state_valid_until_ns": time.monotonic_ns() - 1,
+        "recovery_class": "ordinary_program_stop",
+        "status": "waiting",
+    }
+    default_policy = {"allow_intervention": False, "max_retries": 0}
+    offer = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=default_policy
+    )
+    action = _continue_action(offer)
+    assert action["enabled"] is True
+    assert action["disabled_reason_code"] is None
+    assert action["requires_confirmation"] is True
+    assert offer["reason_code"] == "program_stop_settlement_unconfirmed"
+    pending = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=held,
+        policy=default_policy,
+        containment_pending=True,
+    )
+    assert _continue_action(pending)["enabled"] is False
+    assert _continue_action(pending)["disabled_reason_code"] == (
+        "failure_pause_containment_unconfirmed"
+    )
+    # Any other hold keeps its policy and close gates.
+    held.reason_code = "interrupt_fault"
+    other = controls.recovery_offer(
+        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=default_policy
+    )
+    assert _continue_action(other)["enabled"] is False
 
 
 def test_each_held_node_keeps_its_own_stable_offer() -> None:
