@@ -13,8 +13,10 @@
 #include <manyforge_roboplan/roboplan_planner_options.hpp>
 #include <memory>
 #include <optional>
+#include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
 #include <roboplan_example_models/resources.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -302,16 +304,170 @@ TEST(RoboPlanCandidateComputerTest,
   ASSERT_TRUE(fixture.scene
                   ->setCollisionPairMargins(std::vector<double>(pairs, 10.0))
                   .has_value());
+  const auto collision_results = [&] {
+    const auto& model = fixture.scene->getCollisionModel();
+    const auto& data = fixture.scene->getCollisionData();
+    std::ostringstream out;
+    for (std::size_t index = 0; index < model.collisionPairs.size() &&
+                                index < data.collisionResults.size(); ++index) {
+      if (!data.collisionResults[index].isCollision()) continue;
+      const auto& pair = model.collisionPairs[index];
+      out << " [pair=" << index << ", bodies="
+          << model.geometryObjects[pair.first].name << "/"
+          << model.geometryObjects[pair.second].name;
+      if (index < data.distanceResults.size())
+        out << ", distance=" << data.distanceResults[index].min_distance;
+      if (index < data.collisionRequests.size())
+        out << ", margin=" << data.collisionRequests[index].security_margin;
+      out << "]";
+    }
+    return out.str();
+  };
+  const auto prior_collision_results = collision_results();
   RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
                                      {0x1234U, 65'536U, 0.01});
   const auto result = computer.compute(request(fixture, joint_goal(fixture)));
   ASSERT_FALSE(result.ok());
+  for (const auto* key : {"reason", "classification", "collision_signed_distance_m",
+                          "collision_clearance_m"}) {
+    ASSERT_NE(result.error().details.find(key), result.error().details.end())
+        << "missing " << key << "; " << result.error().message << "; details: "
+        << ::testing::PrintToString(result.error().details)
+        << "; collision results before compute:" << prior_collision_results
+        << "; collision results after compute:" << collision_results();
+  }
   EXPECT_EQ(result.error().details.at("reason"), "native_start_state_collision");
   EXPECT_EQ(result.error().details.at("classification"), "clearance");
   EXPECT_GT(std::stod(result.error().details.at("collision_signed_distance_m")), 0.0);
   EXPECT_DOUBLE_EQ(std::stod(result.error().details.at("collision_clearance_m")), 10.0);
   EXPECT_NE(result.error().message.find("closer than the collision clearance"),
             std::string::npos);
+}
+
+TEST(RoboPlanCandidateComputerTest, MeasuresSceneDistanceAndInactivePairBehavior) {
+  auto fixture = make_fixture();
+  auto& scene = *fixture.scene;
+  const auto full_start = scene.toFullJointPositions("arm", fixture.start);
+  const Eigen::Vector4d color(0.2, 0.4, 0.8, 1.0);
+  auto added = scene.addSphereGeometry("measure_link_sphere", "forearm_link",
+                                       roboplan::Sphere(0.1),
+                                       Eigen::Matrix4d::Identity(), color);
+  ASSERT_TRUE(added.has_value()) << added.error();
+  Eigen::Matrix4d world_pose = Eigen::Matrix4d::Identity();
+  world_pose(0, 3) = 100.0;
+  added = scene.addSphereGeometry("measure_world_sphere", "universe",
+                                  roboplan::Sphere(0.1), world_pose, color);
+  ASSERT_TRUE(added.has_value()) << added.error();
+  const auto link_ids = scene.getCollisionGeometryIds("measure_link_sphere");
+  const auto world_ids = scene.getCollisionGeometryIds("measure_world_sphere");
+  ASSERT_TRUE(link_ids.has_value());
+  ASSERT_TRUE(world_ids.has_value());
+  ASSERT_EQ(link_ids->size(), 1U);
+  ASSERT_EQ(world_ids->size(), 1U);
+  const auto& model = scene.getCollisionModel();
+  const auto pair_it = std::find_if(model.collisionPairs.begin(), model.collisionPairs.end(),
+      [&](const auto& pair) {
+        return (pair.first == link_ids->front() && pair.second == world_ids->front()) ||
+               (pair.second == link_ids->front() && pair.first == world_ids->front());
+      });
+  ASSERT_NE(pair_it, model.collisionPairs.end());
+  const auto pair_index = static_cast<std::size_t>(pair_it - model.collisionPairs.begin());
+  scene.computeCollisionDistances(full_start);
+  const auto center = scene.getCollisionData().oMg[link_ids->front()].translation().eval();
+  auto place = [&](double offset) {
+    world_pose.block<3, 1>(0, 3) = center + Eigen::Vector3d(offset, 0, 0);
+    return scene.updateGeometryPlacement("measure_world_sphere", "universe", world_pose);
+  };
+  ASSERT_TRUE(place(0.25).has_value());
+  std::vector<double> margins(model.collisionPairs.size(), 0.0);
+  margins[pair_index] = 0.1;
+  ASSERT_TRUE(scene.setCollisionPairMargins(margins).has_value());
+  scene.computeCollisionDistances(full_start);
+  const double separated = scene.getCollisionData().distanceResults[pair_index].min_distance;
+  EXPECT_NEAR(separated, 0.05, 1e-6);
+  EXPECT_GT(separated, 0.0);
+  EXPECT_LT(separated, margins[pair_index]);
+
+  ASSERT_TRUE(place(0.2).has_value());
+  scene.computeCollisionDistances(full_start);
+  const double touching = scene.getCollisionData().distanceResults[pair_index].min_distance;
+  EXPECT_NEAR(touching, 0.0, 1e-6);
+  ASSERT_TRUE(place(0.15).has_value());
+  scene.computeCollisionDistances(full_start);
+  const double penetrating = scene.getCollisionData().distanceResults[pair_index].min_distance;
+  EXPECT_LE(penetrating, 0.0);
+  RecordProperty("separated_distance_m", std::to_string(separated));
+  RecordProperty("touching_distance_m", std::to_string(touching));
+  RecordProperty("penetrating_distance_m", std::to_string(penetrating));
+
+  // Use the Scene's own scratch: the production diagnostic reads this same
+  // distanceResults array. Toggle only this pair, then restore it afterwards.
+  auto& data = const_cast<pinocchio::GeometryData&>(scene.getCollisionData());
+  ASSERT_TRUE(place(0.25).has_value());
+  scene.computeCollisionDistances(full_start);
+  const double prior = data.distanceResults[pair_index].min_distance;
+  ASSERT_NEAR(prior, 0.05, 1e-6);
+  ASSERT_TRUE(data.activeCollisionPairs[pair_index]);
+  data.activeCollisionPairs[pair_index] = false;
+  ASSERT_TRUE(place(0.15).has_value());
+  scene.computeCollisionDistances(full_start);
+  EXPECT_FALSE(data.activeCollisionPairs[pair_index]);
+  EXPECT_DOUBLE_EQ(data.distanceResults[pair_index].min_distance, prior);
+  // These are the clearance-loop distance and margin conditions used by the
+  // production diagnostic; no active-pair check precedes that loop.
+  const auto stale = data.distanceResults[pair_index].min_distance;
+  const auto margin = data.collisionRequests[pair_index].security_margin;
+  EXPECT_GT(stale, 0.0);
+  EXPECT_LT(stale, margin);
+  data.activeCollisionPairs[pair_index] = true;
+  scene.computeCollisionDistances(full_start);
+  ASSERT_LT(data.distanceResults[pair_index].min_distance, 0.0);
+  // Keep a measured positive pair as a competing clearance and suppress all
+  // other pairs, so the diagnostic must choose between these two.
+  std::size_t competitor = model.collisionPairs.size();
+  for (std::size_t i = 0; i < model.collisionPairs.size(); ++i) {
+    const auto d = data.distanceResults[i].min_distance;
+    if (i != pair_index && data.activeCollisionPairs[i] && d > 0.0 && d < 10.0) {
+      competitor = i;
+      break;
+    }
+  }
+  ASSERT_LT(competitor, model.collisionPairs.size());
+  margins.assign(model.collisionPairs.size(), 0.0);
+  margins[competitor] = 10.0;
+  ASSERT_TRUE(scene.setCollisionPairMargins(margins).has_value());
+  for (std::size_t i = 0; i < model.collisionPairs.size(); ++i) {
+    data.activeCollisionPairs[i] = (i == pair_index || i == competitor);
+    if (!data.activeCollisionPairs[i]) data.distanceResults[i].min_distance = 1000.0;
+  }
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto first = computer.compute(request(fixture, joint_goal(fixture)));
+  ASSERT_FALSE(first.ok());
+  const auto& details = first.error().details;
+  EXPECT_EQ(details.at("reason"), "native_start_state_collision");
+  EXPECT_EQ(details.at("failure_stage"), "start_state");
+  EXPECT_EQ(details.count("classification"), 0U);
+  const auto& pair = model.collisionPairs[pair_index];
+  EXPECT_EQ(details.at("collision_body_a"), model.geometryObjects[pair.first].name);
+  EXPECT_EQ(details.at("collision_body_b"), model.geometryObjects[pair.second].name);
+  EXPECT_LT(std::stod(details.at("collision_signed_distance_m")), 0.0);
+  ASSERT_TRUE(data.activeCollisionPairs[competitor]);
+  ASSERT_GT(data.distanceResults[competitor].min_distance, 0.0);
+  ASSERT_LT(data.distanceResults[competitor].min_distance, margins[competitor]);
+  const auto stale_contact = data.distanceResults[pair_index].min_distance;
+  ASSERT_LT(stale_contact, 0.0);
+  data.activeCollisionPairs[pair_index] = false;
+  const auto second = computer.compute(request(fixture, joint_goal(fixture)));
+  ASSERT_FALSE(second.ok());
+  ASSERT_FALSE(data.activeCollisionPairs[pair_index]);
+  ASSERT_DOUBLE_EQ(data.distanceResults[pair_index].min_distance, stale_contact);
+  for (std::size_t i = 0; i < pair_index; ++i)
+    ASSERT_GT(data.distanceResults[i].min_distance, 0.0);
+  EXPECT_EQ(second.error().details.at("reason"), "native_start_state_collision");
+  EXPECT_EQ(second.error().details.at("failure_stage"), "start_state");
+  EXPECT_EQ(second.error().details.at("classification"), "clearance");
+  EXPECT_GT(std::stod(second.error().details.at("collision_signed_distance_m")), 0.0);
 }
 
 TEST(RoboPlanCandidateComputerTest, CollisionCheckStepMustBePositive) {

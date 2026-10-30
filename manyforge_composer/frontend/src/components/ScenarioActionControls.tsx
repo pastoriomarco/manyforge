@@ -296,7 +296,9 @@ export function ScenarioActionControls({
                 : deploymentPending.discard ? ' (Deployment)' : ' (Program)'}.
               {' '}Saved and the running cell do not change.
             </p>
-            <button type="button" className="primary-action" disabled={routes.discard.target === null} onClick={confirm}>Discard changes</button>
+            <div className="dialog-actions">
+              <button type="button" className="primary-action" disabled={routes.discard.target === null} onClick={confirm}>Discard changes</button>
+            </div>
           </div>
         )}
         {action === 'revert' && (
@@ -306,7 +308,9 @@ export function ScenarioActionControls({
               {routes.revert.target === 'deployment'
                 && ' Changed components must be inactive first; Manager refuses to change an active one.'}
             </p>
-            <button type="button" className="primary-action" disabled={routes.revert.target === null} onClick={confirm}>Revert to saved</button>
+            <div className="dialog-actions">
+              <button type="button" className="primary-action" disabled={routes.revert.target === null} onClick={confirm}>Revert to saved</button>
+            </div>
           </div>
         )}
         {action === 'apply' && (
@@ -339,9 +343,11 @@ export function ScenarioActionControls({
             )}
             {resetsRun && <ResetsRunWarning />}
             {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
-            <button type="button" className="primary-action" disabled={routes.apply.target === null} onClick={confirm}>
-              {resetsRun ? 'Reset run and Apply' : 'Apply'}
-            </button>
+            <div className="dialog-actions">
+              <button type="button" className="primary-action" disabled={routes.apply.target === null} onClick={confirm}>
+                {resetsRun ? 'Reset run and Apply' : 'Apply'}
+              </button>
+            </div>
           </div>
         )}
       </OverlayPanel>

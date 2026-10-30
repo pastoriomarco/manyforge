@@ -90,12 +90,11 @@ def test_committed_scene_initialization_is_joined_to_exact_current_history():
         validate_committed_scenario_activation(value)
 
 
-def test_sealed_empty_cannot_request_scene_initialization():
+def test_sealed_empty_can_request_scene_initialization():
     value = _publication()
     value["scene_initialization"] = "initialize"
     value["committed_applies"][-1]["scene_initialization"] = "initialize"
-    with pytest.raises(ProgramBindingTransportError):
-        validate_committed_scenario_activation(value)
+    validate_committed_scenario_activation(value)
 
 
 def test_scenario_origin_names_its_normalized_absolute_project_folder():

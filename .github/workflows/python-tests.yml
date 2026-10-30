@@ -104,4 +104,4 @@ jobs:
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${IMAGE_ID}" \
-            bash -lc 'set -euo pipefail; ./scripts/test-all.sh bindings; ./scripts/test-all.sh python; ./scripts/test-all.sh bridge; cd manyforge_composer/frontend; npm ci --ignore-scripts; cd /workspace; ./scripts/test-all.sh composer'
+            bash -lc 'set -euo pipefail; git config --global --add safe.directory /workspace; ./scripts/test-all.sh bindings; ./scripts/test-all.sh python; ./scripts/test-all.sh bridge; cd manyforge_composer/frontend; npm ci --ignore-scripts; cd /workspace; ./scripts/test-all.sh composer'

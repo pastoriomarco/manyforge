@@ -32,6 +32,7 @@ run_package() {
     -B "${build_dir}" \
     "-${testing_option}=ON" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O1 -g1 -DNDEBUG" \
     -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST \
     -DCMAKE_CXX_FLAGS="${sanitizer_flags}" \
     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \

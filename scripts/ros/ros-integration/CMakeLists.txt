@@ -33,6 +33,14 @@ add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_exe
 # runtime links it; unrelated targets stay out of the default build.
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_xarm_control"
   xarm_control EXCLUDE_FROM_ALL)
+if(BUILD_TESTING AND TARGET test_xarm_robot_states_transport AND
+   TARGET test_xarm_driver_services)
+  # The xArm package is excluded from the default graph to keep unrelated
+  # vendor targets out; these maintained transport/service tests are part of
+  # the normal ROS integration lane.
+  add_custom_target(manyforge_xarm_transport_service_tests ALL
+    DEPENDS test_xarm_robot_states_transport test_xarm_driver_services)
+endif()
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" roboplan)
 # Preserve the runtime helper's established host/worker artifact locations.
 set_target_properties(manyforge_ros2_control_execution_host

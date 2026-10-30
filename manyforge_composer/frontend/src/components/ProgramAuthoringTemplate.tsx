@@ -305,8 +305,8 @@ export function ProgramAuthoringTemplate({
             <label><span>Result key</span><input value={blackboardKey} onChange={(event) => setBlackboardKey(event.target.value)} /></label>
           </div>
           <label><span>Instance prefix</span><input value={instancePrefix} onChange={(event) => setInstancePrefix(event.target.value)} /></label>
-          <div className="overlay-actions">
-            <button type="submit" disabled={busy || !available}>Insert visible template</button>
+          <div className="dialog-actions">
+            <button type="submit" className="primary-action" disabled={busy || !available}>Insert visible template</button>
           </div>
         </form>
       </OverlayPanel>

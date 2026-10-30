@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -206,9 +207,13 @@ class CellAdmissionClient:
                 "execution_command_oversized",
                 "cell-admission command exceeds its byte bound",
             )
+        operation = "resolve_socket"
+        peer_pid: int | None = None
         try:
             with self._run_root.socket_address(socket_file) as socket_address:
+                operation = "socket"
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    operation = "setsockopt"
                     client.setsockopt(
                         socket.SOL_SOCKET,
                         socket.SO_RCVBUF,
@@ -216,28 +221,41 @@ class CellAdmissionClient:
                     )
                     # With a deadline every blocking step (connect, send,
                     # receive) gets only the time that remains of it.
+                    operation = "settimeout"
                     client.settimeout(self._socket_timeout(deadline))
+                    operation = "connect"
                     client.connect(socket_address)
                     if hasattr(socket, "SO_PEERCRED"):
+                        operation = "getsockopt(SO_PEERCRED)"
                         credentials = client.getsockopt(
                             socket.SOL_SOCKET, socket.SO_PEERCRED, 12
                         )
                         _pid, peer_uid, _gid = struct.unpack("3i", credentials)
+                        peer_pid = _pid
                         if peer_uid != os.geteuid():
                             raise OSError("peer is not owned by the current user")
+                    operation = "settimeout"
                     client.settimeout(self._socket_timeout(deadline))
+                    operation = "send"
                     if client.send(encoded) != len(encoded):
                         raise OSError("command packet was truncated")
+                    operation = "settimeout"
                     client.settimeout(self._socket_timeout(deadline))
+                    operation = "recvmsg"
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAXIMUM_RESPONSE_BYTES
                     )
+                    operation = "validate_socket"
         except (
             PrivateTransportCapabilityError,
             FileNotFoundError,
             OSError,
             TimeoutError,
         ) as error:
+            logging.getLogger(__name__).warning(
+                "Native cell-admission transport failed: syscall=%s errno=%s peer_socket=%s peer_pid=%s exception_type=%s",
+                operation, getattr(error, "errno", None), socket_file, peer_pid, type(error).__name__,
+            )
             raise CellAdmissionError(
                 "execution_owner_unavailable",
                 f"native execution transport failed: {error}",

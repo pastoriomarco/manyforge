@@ -41,7 +41,6 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
         scenario_id="lite6_pick_and_place",
         cell_id="cell.fixture",
         admission_filename="admission.json",
-        model_config=tmp_path / "models.json",
         api_port=9010,
         runner_port=9011,
         composer_port=9000,

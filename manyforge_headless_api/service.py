@@ -371,7 +371,13 @@ class HeadlessService:
         # preview is in flight (see program_node_correction_preview).
         self._apply_scene_stop = Event()
         self._apply_scene_completion_lock = Lock()
+        self._empty_scene_execution_lock = Lock()
         self._apply_scene_attempted: tuple[str, int, str] | None = None
+        self._empty_scene_applies: set[tuple[str, int]] = set()
+        self._direct_scene_clears: set[tuple[str, str]] = set()
+        self._scene_clear: dict[str, Any] | None = None
+        self._initial_scene_failure: dict[str, Any] | None = None
+        self.initial_scene_observer: Callable[[], None] | None = None
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
         # Item 38: set when this service ran the Kernel's Force close step
@@ -803,7 +809,8 @@ class HeadlessService:
                 "headless_runtime_projection_invalid",
                 "runtime snapshot version is unsupported",
             )
-        return snapshot
+        # Headless-owned condition: available without querying Program Runner.
+        return {**snapshot, **self.initial_scene_status()}
 
     def component_overview_facts(
         self,
@@ -1458,20 +1465,33 @@ class HeadlessService:
         attempt the current initializing Apply again on its next notification.
         """
 
-        if self.program_runner is None:
-            return
         try:
-            self.program_runner.reconcile_persistent_values()
-        except ProgramRunnerClientError as error:
+            self._program_runner().reconcile_persistent_values()
+        except (HeadlessApiError, ProgramRunnerClientError) as error:
             logging.getLogger(__name__).warning(
                 "Program runner did not reconcile persistent values after a "
                 "committed Apply: %s: %s",
                 error.code,
                 error,
             )
+        identity = None
+        dispatched = False
+        def mark_dispatched() -> None:
+            nonlocal dispatched
+            dispatched = True
         try:
             committed = self.committed_scenario_activation()
+            if committed["scene_initialization"] != "initialize":
+                return
+            identity = (committed["apply_id"], committed["apply_generation"],
+                        committed["record_digest"])
             applied = self.program_applied_status()
+            if (committed["scene_initialization"] == "initialize"
+                and applied["origin"]["kind"] in {"scenario", "sealed_canonical_empty"}
+                and applied["program_id"] is None
+                and applied["record_digest"] == identity[2]):
+                self._clear_empty_applied(identity)
+                return
             if (
                 committed["scene_initialization"] != "initialize"
                 or applied["origin"]["kind"] != "scenario"
@@ -1479,15 +1499,13 @@ class HeadlessService:
                 or applied["record_digest"] != committed["record_digest"]
             ):
                 return
-            identity = (
-                committed["apply_id"], committed["apply_generation"],
-                committed["record_digest"],
-            )
             with self._apply_scene_completion_lock:
                 current = self.committed_scenario_activation()
                 if (current["apply_id"], current["apply_generation"],
                     current["record_digest"]) != identity:
                     return
+                if self._initial_scene_failure is not None and self._initial_scene_failure["identity"] != identity:
+                    self._initial_scene_failure = None
                 if self._apply_scene_attempted == identity:
                     return
                 self._apply_scene_attempted = identity
@@ -1498,7 +1516,7 @@ class HeadlessService:
                 cycle = self.program_cycle_status()
                 current_owner = cycle["program_runner_owner_epoch"]
                 if owner_epoch is not None and current_owner != owner_epoch:
-                    return
+                    raise HeadlessApiError("program_runner_unavailable", "Program runner changed during initial scene preparation")
                 owner_epoch = current_owner
                 admission = self.authoring_admission()
                 current = self.committed_scenario_activation()
@@ -1527,13 +1545,14 @@ class HeadlessService:
                     )
                 try:
                     # Runner rechecks selection and admission before effects.
-                    self.program_scene_prepare(request)
+                    self.program_scene_prepare(request, on_dispatch=mark_dispatched)
                     return
                 except HeadlessApiError as error:
                     # Only the typed Runner refusal is known to precede effects.
                     if (error.code != "authoring_not_ready"
                         or not isinstance(error.__cause__, ProgramRunnerClientError)):
                         raise
+                    dispatched = False  # Runner explicitly refused before effects.
                     last_refusal = error
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -1541,11 +1560,212 @@ class HeadlessService:
                     if self._apply_scene_stop.wait(min(0.25, remaining)):
                         return
         except (HeadlessApiError, ProgramRunnerClientError) as error:
+            if identity is not None:
+                self._record_initial_scene_failure(identity, error, dispatched=dispatched)
             logging.getLogger(__name__).warning(
                 "Program scene preparation after committed Apply failed: %s: %s",
                 error.code,
                 error,
             )
+
+    def _notify_initial_scene(self) -> None:
+        if self.initial_scene_observer is not None:
+            try:
+                self.initial_scene_observer()
+            except Exception:
+                logging.getLogger(__name__).exception("Initial scene status wake failed")
+
+    def _current_apply_identity(self) -> tuple[str, int, str]:
+        committed = self.committed_scenario_activation()
+        return (committed["apply_id"], committed["apply_generation"], committed["record_digest"])
+
+    def _record_initial_scene_failure(self, identity: tuple[str, int, str], error: Exception, *, dispatched: bool) -> None:
+        # Unconfirmed or superseded identity must not modify the condition.
+        try:
+            with self._apply_scene_completion_lock:
+                if self._current_apply_identity() != identity:
+                    return
+                # After submission, even a typed failure may follow partial Scene effects.
+                unknown = dispatched
+                # DX-3300: last confirmed arrival wins. Rare reordered RPC
+                # replies can temporarily report an older outcome for this Apply.
+                self._initial_scene_failure = {
+                    "identity": identity, "state": "unknown" if unknown else "failed",
+                    "reason": {"code": getattr(error, "code", "program_scene_preparation_failed"),
+                               "message": str(error) or type(error).__name__},
+                }
+            self._notify_initial_scene()
+        except (HeadlessApiError, ProgramRunnerClientError):
+            return
+
+    def _clear_initial_scene_failure(self, identity: tuple[str, int, str]) -> None:
+        try:
+            with self._apply_scene_completion_lock:
+                if self._current_apply_identity() == identity and self._initial_scene_failure is not None and self._initial_scene_failure["identity"] == identity:
+                    self._initial_scene_failure = None
+            self._notify_initial_scene()
+        except (HeadlessApiError, ProgramRunnerClientError):
+            pass
+
+    def initial_scene_status(self) -> dict[str, Any]:
+        # Independent of Runner availability. A new confirmed Apply supersedes the old condition.
+        with self._apply_scene_completion_lock:
+            try:
+                identity = self._current_apply_identity()
+            except (HeadlessApiError, ProgramRunnerClientError):
+                identity = None
+            if identity is not None and self._initial_scene_failure is not None and self._initial_scene_failure["identity"] != identity:
+                self._initial_scene_failure = None
+            condition = deepcopy(self._initial_scene_failure)
+        if condition is not None:
+            apply_id, generation, digest = condition.pop("identity")
+            condition.update(apply_id=apply_id, apply_generation=generation, record_digest=digest)
+        return {"initial_scene_failure": condition}
+
+    def _clear_empty_applied(self, identity: tuple[str, int, str]) -> None:
+        with self._empty_scene_execution_lock:
+            self._clear_empty_applied_once(identity)
+
+    def _clear_empty_applied_once(self, identity: tuple[str, int, str]) -> None:
+        with self._apply_scene_completion_lock:
+            if identity[:2] not in self._empty_scene_applies or self._apply_scene_attempted == identity:
+                return
+
+            def publish_unstarted(result: dict[str, Any]) -> None:
+                # A stale follower cannot replace another clear's evidence.
+                if (self._scene_clear is None
+                    or (self._scene_clear.get("apply_id"),
+                        self._scene_clear.get("apply_generation")) == identity[:2]):
+                    self._scene_clear = {"apply_id": identity[0], "apply_generation": identity[1],
+                                         **result}
+
+            try:
+                current = self.committed_scenario_activation()
+                current_identity = (current["apply_id"], current["apply_generation"],
+                                    current["record_digest"])
+            except Exception as error:
+                logging.getLogger(__name__).warning(
+                    "Cannot confirm committed Apply for Scene clear: %s", error
+                )
+                return
+            self._empty_scene_applies.discard(identity[:2])
+            if current_identity != identity:
+                publish_unstarted({"state": "superseded", "remaining": None, "reason": None})
+                return
+            self._apply_scene_attempted = identity
+            self._scene_clear = {"apply_id": identity[0], "apply_generation": identity[1],
+                                 "state": "pending", "remaining": None, "reason": None}
+
+        sent = False
+        try:
+            cycle = self._program_runner().cycle_status()
+            admission = self.authoring_admission()
+            current = self.committed_scenario_activation()
+            if (current["apply_id"], current["apply_generation"], current["record_digest"]) != identity:
+                result = {"state": "superseded", "remaining": None, "reason": None}
+            else:
+                request = ProgramScenePreparationRequest(
+                    request_id="apply-scene." + identity[2][7:],
+                    request_owner_epoch=cycle["program_runner_owner_epoch"],
+                    source_label="headless_apply_completion",
+                    expected_applied_record_digest=identity[2],
+                    expected_admission_generation=admission["admission_generation"],
+                    clear_empty_scene=True,
+                )
+                sent = True
+                response = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
+                result = self._scene_clear_result(response, identity[2])
+        except Exception as error:
+            refused_before_effect = isinstance(error, ProgramRunnerClientError) and error.code in {
+                "authoring_not_ready", "program_run_applied_selection_stale",
+            }
+            unknown = sent and not refused_before_effect
+            result = {"state": "unknown" if unknown else "failed", "remaining": None,
+                      "reason": {"code": "scene_clear_unknown" if unknown else "scene_clear_failed",
+                                 "message": str(error) or type(error).__name__,
+                                 "details": {"reason": getattr(error, "code", "scene_owner_unavailable")}}}
+        with self._apply_scene_completion_lock:
+            if (self._scene_clear is not None
+                and (self._scene_clear["apply_id"], self._scene_clear["apply_generation"]) == identity[:2]
+                and self._scene_clear["state"] == "pending"):
+                self._scene_clear.update(result)
+
+    @staticmethod
+    def _scene_clear_result(response: dict[str, Any], expected_digest: str | None) -> dict[str, Any]:
+        proof = response.get("prepared_scene")
+        if (not isinstance(proof, dict)
+            or response.get("schema_version") != "manyforge.program_scene_preparation.v1"
+            or response.get("status") != "prepared"
+            or response.get("applied_record_digest") != expected_digest
+            or response.get("program_revision") is not None
+            or proof.get("schema_version") != "manyforge.empty_scene_clear.v1"
+            or proof.get("state") not in {"succeeded", "partial", "failed", "unknown", "superseded"}
+            or (proof.get("last_observed_remaining") is not None
+                and (not isinstance(proof["last_observed_remaining"], list)
+                     or not all(isinstance(item, str) and item for item in proof["last_observed_remaining"])))
+            or (proof.get("state") == "succeeded" and
+                (proof.get("last_observed_remaining") != [] or proof.get("refused") != []))
+            or (proof.get("state") == "partial" and
+                (not proof.get("last_observed_remaining") or not proof.get("refused")))
+            or not isinstance(proof.get("refused", []), list)
+            or not all(isinstance(item, dict)
+                       and all(isinstance(item.get(key), str) and item[key]
+                       for key in ("resource_id", "code", "message"))
+                       for item in proof.get("refused", []))
+            or (proof.get("state") in {"failed", "unknown"} and
+                (not isinstance(proof.get("reason"), str)
+                 or not isinstance(proof.get("message"), str)))):
+            raise ValueError("Program runner returned invalid Scene clear evidence")
+        reason = None
+        if proof["state"] in {"partial", "failed", "unknown"}:
+            reason = {"code": "scene_clear_" + proof["state"],
+                      "message": proof.get("message", "Some Scene objects remain"),
+                      "details": {"reason": proof.get("reason"),
+                          "resource_id": proof.get("resource_id"),
+                          "refused": proof.get("refused", [])}}
+        return {"state": proof["state"], "remaining": proof["last_observed_remaining"],
+                "reason": reason}
+
+    def _clear_current_empty_scene(self, request: ProgramScenePreparationRequest) -> dict[str, Any]:
+        key = (request.request_owner_epoch, request.request_id)
+        with self._empty_scene_execution_lock:
+            with self._apply_scene_completion_lock:
+                if key in self._direct_scene_clears:
+                    raise HeadlessApiError("scene_clear_failed", "This Scene clear request was already attempted")
+                self._direct_scene_clears.add(key)
+                self._scene_clear = {"request_id": request.request_id, "state": "pending",
+                                     "remaining": None, "reason": None}
+            sent = False
+            try:
+                manager = self.manager_status()
+                source, status = manager["source"], manager["status"]
+                active = status.get("active", {})
+                publication = active.get("publication", {})
+                if (source.get("available") is not True or source.get("freshness") != "fresh"
+                    or status.get("manager_ready") is not True
+                    or not isinstance(status.get("runtime"), dict)
+                    or status["runtime"].get("converged") is not True
+                    or active.get("canonical_empty") is not True
+                    or publication.get("publication_generation") != request.expected_publication_generation):
+                    raise HeadlessApiError("program_run_applied_selection_stale", "Canonical empty Scene changed before clearing")
+                cycle = self._program_runner().cycle_status()
+                if cycle.get("program_runner_owner_epoch") != request.request_owner_epoch:
+                    raise HeadlessApiError("program_runner_unavailable", "Program runner changed before clearing")
+                sent = True
+                response = self._program_runner().prepare_applied_scene(request.model_dump(mode="json"))
+                result = self._scene_clear_result(response, None)
+            except Exception as error:
+                refused_before_effect = isinstance(error, ProgramRunnerClientError) and error.code in {
+                    "authoring_not_ready", "program_run_applied_selection_stale",
+                }
+                unknown = sent and not refused_before_effect
+                result = {"state": "unknown" if unknown else "failed", "remaining": None,
+                          "reason": {"code": "scene_clear_unknown" if unknown else "scene_clear_failed",
+                                     "message": str(error) or type(error).__name__,
+                                     "details": {"reason": getattr(error, "code", "scene_owner_unavailable")}}}
+            with self._apply_scene_completion_lock:
+                self._scene_clear.update(result)
+                return {"scene_clear": deepcopy(self._scene_clear)}
 
     def follow_committed_apply(self, apply_id: str, apply_generation: int) -> None:
         """Wake the Program runner for an Apply observed committed through a
@@ -1894,8 +2114,10 @@ class HeadlessService:
         return snapshot
 
     def program_scene_prepare(
-        self, request: ProgramScenePreparationRequest
+        self, request: ProgramScenePreparationRequest, *, on_dispatch: Callable[[], None] | None = None
     ) -> dict[str, Any]:
+        if request.clear_empty_scene and request.expected_applied_record_digest is None:
+            return self._clear_current_empty_scene(request)
         applied = self.program_applied()
         source = applied.get("source")
         if (
@@ -1907,9 +2129,15 @@ class HeadlessService:
                 "Applied Program changed before scene preparation",
             )
         try:
-            result = self._program_runner().prepare_applied_scene(
-                request.model_dump(mode="json")
-            )
+            preparation_identity = self._current_apply_identity()
+        except (HeadlessApiError, ProgramRunnerClientError):
+            preparation_identity = None
+        try:
+            runner = self._program_runner()
+            body = request.model_dump(mode="json")
+            if on_dispatch is not None:
+                on_dispatch()
+            result = runner.prepare_applied_scene(body)
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
         proof = result.get("prepared_scene")
@@ -1938,6 +2166,9 @@ class HeadlessService:
                 "program_runner_response_invalid",
                 "Program runner returned an invalid scene-preparation result",
             )
+        if (preparation_identity is not None
+            and preparation_identity[2] == request.expected_applied_record_digest):
+            self._clear_initial_scene_failure(preparation_identity)
         return result
 
     def program_run_read(self, program_run_id: str) -> dict[str, Any]:
@@ -2126,17 +2357,41 @@ class HeadlessService:
         )
         return self.program_cycle_reset(reset)
 
-    def program_cycle_status(self) -> dict[str, Any]:
+    def program_cycle_status(self, *, include_scene_clear: bool = False) -> dict[str, Any]:
         try:
-            return self._program_runner().cycle_status()
+            result = self._program_runner().cycle_status()
+            if include_scene_clear:
+                with self._apply_scene_completion_lock:
+                    result["scene_clear"] = deepcopy(self._scene_clear)
+            return result
         except ProgramRunnerClientError as error:
+            if include_scene_clear:
+                with self._apply_scene_completion_lock:
+                    clear = deepcopy(self._scene_clear)
+                if clear is not None:
+                    raise HeadlessApiError(error.code, str(error),
+                                           details={**error.details, "scene_clear": clear},
+                                           producer=error.producer) from error
             raise self._runner_error(error) from error
 
     def program_cycle_reset(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         """Forward one Reset; Program Runner owns every lifecycle phase."""
 
         try:
-            return self._program_runner().reset_cycle(request.model_dump(mode="json"))
+            identity = None
+            if request.reload_initial_scene:
+                try:
+                    identity = self._current_apply_identity()
+                except (HeadlessApiError, ProgramRunnerClientError):
+                    pass
+            result = self._program_runner().reset_cycle(request.model_dump(mode="json"))
+            if (identity is not None
+                and result.get("schema_version") == "manyforge.program_cycle_reset_result.v1"
+                and result.get("program_run_id") == request.program_run_id
+                and result.get("reset_cycle_generation") == request.expected_cycle_generation
+                and result.get("idle_cycle_generation") == request.expected_cycle_generation + 1):
+                self._clear_initial_scene_failure(identity)
+            return result
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
@@ -2925,6 +3180,11 @@ class HeadlessService:
             and isinstance(apply_id, str)
             and type(apply_generation) is int
         ):
+            if (response.get("replay_status") == "accepted_new"
+                and request.scene_initialization == "initialize"
+                and request.prepared_activation.program_outcome["kind"] == "no_program"):
+                with self._apply_scene_completion_lock:
+                    self._empty_scene_applies.add((apply_id, apply_generation))
             self.apply_follower.follow(apply_id, apply_generation)
         return response
 

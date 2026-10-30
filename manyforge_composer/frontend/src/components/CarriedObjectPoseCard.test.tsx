@@ -98,6 +98,9 @@ function mountedHost() {
     if (value === undefined) throw new Error('Mounted carried-object control not found');
     return value;
   };
+  const findAll = (match: (props: Props) => boolean) => walk(host)
+    .map(props)
+    .filter((props): props is Props => props !== undefined && match(props));
   const keydownListeners = new Set<(event: KeyboardEvent) => void>();
   document.addEventListener = (type: string, listener: EventListenerOrEventListenerObject) => {
     if (type === 'keydown' && typeof listener === 'function') {
@@ -116,6 +119,7 @@ function mountedHost() {
   return {
     host,
     find,
+    findAll,
     focusedProps: () => focused === null ? undefined : props(focused),
     dispatchKeyDown,
   };
@@ -191,16 +195,16 @@ describe('Carried object pose card', () => {
     expect(html).not.toContain('Source header frame');
   });
 
-  it('offers Detach here and explains when Program motion makes it unavailable', () => {
+  it('offers Detach and explains when Program motion makes it unavailable', () => {
     const available = renderToStaticMarkup(<CarriedObjectPoseCard measurement={measurement}
       attachment={attachment} detachUnavailableReason={null} onDetach={async () => {}} />);
-    expect(available).toContain('Detach here');
+    expect(available).toContain('>Detach</button>');
     expect(available).not.toContain('disabled=""');
 
     const moving = renderToStaticMarkup(<CarriedObjectPoseCard measurement={measurement}
       attachment={attachment} detachUnavailableReason="Not available while the Program is moving."
       onDetach={async () => {}} />);
-    expect(moving).toContain('Detach here');
+    expect(moving).toContain('>Detach</button>');
     expect(moving).toContain('disabled=""');
     expect(moving).toContain('Not available while the Program is moving.');
   });
@@ -213,21 +217,26 @@ describe('Carried object pose card', () => {
     await act(() => root.render(<CarriedObjectPoseCard measurement={measurement}
       attachment={attachment} detachUnavailableReason={null} onDetach={onDetach} />));
     try {
-      const click = async (label: string) => act(async () => {
-        await dom.find((props) => props.children === label && typeof props.onClick === 'function').onClick?.();
+      const click = async (label: string, last = false) => act(async () => {
+        const buttons = dom.findAll((props) => (
+          props.children === label && typeof props.onClick === 'function'
+        ));
+        const button = last ? buttons.at(-1) : buttons[0];
+        if (button === undefined) throw new Error(`Mounted ${label} button not found`);
+        await button.onClick?.();
       });
-      await click('Detach here');
+      await click('Detach');
       expect(dom.find((props) => props.role === 'dialog')['aria-modal']).toBe(true);
       expect(dom.find((props) => props.children
         === 'Detach part.1 from lite6_robot / gripper at its current pose?')).toBeDefined();
       await click('Cancel');
       expect(onDetach).not.toHaveBeenCalled();
-      expect(dom.focusedProps()?.children).toBe('Detach here');
+      expect(dom.focusedProps()?.children).toBe('Detach');
 
-      await click('Detach here');
       await click('Detach');
+      await click('Detach', true);
       expect(onDetach).toHaveBeenCalledExactlyOnceWith(attachment);
-      expect(dom.focusedProps()?.children).toBe('Detach here');
+      expect(dom.focusedProps()?.children).toBe('Detach');
     } finally {
       await act(() => root.unmount());
     }
@@ -248,9 +257,9 @@ describe('Carried object pose card', () => {
       const click = async (label: string) => act(async () => {
         await dom.find((props) => props.children === label && typeof props.onClick === 'function').onClick?.();
       });
-      await click('Detach here');
+      await click('Detach');
       await act(() => root.render(renderCard(null)));
-      expect(dom.find((props) => props.children === 'Detach here').disabled).toBe(true);
+      expect(dom.find((props) => props.children === 'Detach').disabled).toBe(true);
       await act(() => dom.dispatchKeyDown('Escape'));
       expect(dom.focusedProps()?.['aria-label']).toBe('Carried object pose');
       expect(onDetach).not.toHaveBeenCalled();
@@ -273,9 +282,14 @@ describe('Carried object pose card', () => {
       attachment={attachment} detachUnavailableReason={null} onDetach={onDetach} />));
     try {
       const click = async (label: string) => act(async () => {
-        await dom.find((props) => props.children === label && typeof props.onClick === 'function').onClick?.();
+        const buttons = dom.findAll((props) => (
+          props.children === label && typeof props.onClick === 'function'
+        ));
+        const button = buttons.at(-1);
+        if (button === undefined) throw new Error(`Mounted ${label} button not found`);
+        await button.onClick?.();
       });
-      await click('Detach here');
+      await click('Detach');
       await click('Detach');
       expect(dom.find((props) => props.role === 'alert').children).toContain('Object state conflict');
     } finally {

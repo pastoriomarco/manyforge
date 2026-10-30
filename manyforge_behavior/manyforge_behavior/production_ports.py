@@ -990,8 +990,14 @@ class _SceneTargetBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _SceneApplyCapture:
+    retained_bundle_id: str
+    graph_revision: str
+
+
+@dataclass(frozen=True, slots=True)
 class _SceneBoundContext:
-    capture: ProgramRunPortContext
+    capture: ProgramRunPortContext | _SceneApplyCapture
     component_models: Mapping[tuple[str, str], tuple[str, str]]
     component_frames: Mapping[tuple[str, str, str], dict[str, str]]
     targets: Mapping[str, _SceneTargetBinding]
@@ -6271,6 +6277,7 @@ class HeadlessSceneProgramPort:
         operation: Mapping[str, Any],
         program_reset_scene_authorization: Mapping[str, Any] | None = None,
         program_node_evidence: Mapping[str, Any] | None = None,
+        verify_receipt: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         body: dict[str, Any] = {
             "request_context": {
@@ -6360,6 +6367,13 @@ class HeadlessSceneProgramPort:
                 )
         try:
             response = self._scene.commit(body)
+        except SceneTransactionRejectedError as error:
+            if verify_receipt and (
+                error.response.get("request_id") != body["request_context"]["request_id"]
+                or error.response.get("request_owner_epoch") != body["request_context"]["request_owner_epoch"]
+            ):
+                raise SceneOutcomeUnknownError("Scene refusal names another request") from error
+            raise
         except SceneOutcomeUnknownError as error:
             if program_node_evidence is None:
                 raise
@@ -6394,6 +6408,11 @@ class HeadlessSceneProgramPort:
             raise OwnerInvocationPendingError(
                 "Scene transaction outcome is unconfirmed", observe
             ) from error
+        if verify_receipt and (
+            response.get("request_id") != body["request_context"]["request_id"]
+            or response.get("request_owner_epoch") != body["request_context"]["request_owner_epoch"]
+        ):
+            raise SceneOutcomeUnknownError("Scene receipt names another request")
         return self._committed_revision(context, expected_projection_revision, response), response
 
     @staticmethod
@@ -6769,6 +6788,119 @@ class HeadlessSceneProgramPort:
             )
         operations.sort(key=lambda item: (item[0], item[1]["scene_resource_id"]))
         return [operation for _pick_object, operation in operations]
+
+    def clear_applied_scene(
+        self, *, retained_bundle_id: str, graph_revision: str,
+        request_id: str, is_current: Callable[[], bool],
+    ) -> dict[str, Any]:
+        """Clear one empty Applied Scene using ordinary owner transactions.
+
+        The current Apply is checked before every write. A newer Apply can
+        still arrive between that check and the owner's transaction boundary.
+        """
+        context = _SceneBoundContext(
+            capture=_SceneApplyCapture(retained_bundle_id, graph_revision),
+            component_models={}, component_frames={}, targets={},
+        )
+        view = self._read_view(context)
+        refused: list[dict[str, str]] = []
+        kept: set[str] = set()
+        ordinal = 0
+
+        def commit(operation: Mapping[str, Any], resource_id: str) -> dict[str, Any] | None:
+            nonlocal view, ordinal
+            try:
+                current = is_current()
+            except Exception as error:
+                return {"state": "failed", "reason": "apply_status_unavailable",
+                        "message": str(error), "last_observed_remaining": sorted(view.objects)}
+            if not current:
+                return {"state": "superseded", "last_observed_remaining": sorted(view.objects)}
+            ordinal += 1
+            try:
+                committed_revision, _response = self._commit(
+                    context=context,
+                    request_id=_request_identity("scene-clear", request_id, str(ordinal)),
+                    correlation_id=request_id,
+                    request_owner_epoch=view.request_owner_epoch,
+                    expected_projection_revision=view.projection_revision,
+                    operation=operation,
+                    verify_receipt=True,
+                )
+                refreshed = self._read_view(context)
+                if (refreshed.cell_id != view.cell_id
+                    or not _projection_same_or_forward(refreshed.projection_revision,
+                                                       committed_revision)):
+                    raise ProductionPortError("Scene changed identity while clearing")
+                view = refreshed
+            except SceneTransactionRejectedError as error:
+                return {"state": "failed", "resource_id": resource_id,
+                        "reason": error.code, "message": str(error), "owner_refused": True,
+                        "last_observed_remaining": sorted(view.objects)}
+            except Exception as error:
+                return {"state": "unknown", "resource_id": resource_id,
+                        "reason": "scene_outcome_unknown", "message": str(error),
+                        "last_observed_remaining": sorted(view.objects)}
+            return None
+
+        for attachment in view.attachments:
+            resource_id = _text(attachment.get("scene_resource_id"), field="scene_resource_id")
+            result = commit({
+                "kind": "detach_carried_object_at_current_pose",
+                "carried_object_attachment_id": attachment["carried_object_attachment_id"],
+                "expected_carried_object_attachment_revision": attachment["carried_object_attachment_revision"],
+                "expected_scene_resource_id": resource_id,
+                "expected_controllable_component_id": attachment["controllable_component_id"],
+                "expected_command_target_id": attachment["command_target_id"],
+            }, resource_id)
+            if result is not None:
+                if result.get("owner_refused") is not True:
+                    result["refused"] = refused
+                    return result
+                kept.add(resource_id)
+                refused.append({"resource_id": resource_id, "code": result["reason"],
+                                "message": result["message"]})
+
+        # A retained carried object may depend on another Scene object.
+        try:
+            removal_order = self._removal_order(view.objects)
+            pending = list(kept)
+            while pending:
+                resource_id = pending.pop()
+                for contact in view.objects.get(resource_id, {}).get("support_contacts", ()):
+                    support_id = contact["support_object_id"]
+                    if support_id not in kept:
+                        kept.add(support_id)
+                        pending.append(support_id)
+        except Exception as error:
+            return {"state": "failed", "reason": "scene_removal_order_invalid",
+                    "message": str(error), "last_observed_remaining": sorted(view.objects),
+                    "refused": refused}
+        for resource_id in removal_order:
+            if resource_id in kept:
+                continue
+            result = commit({"kind": "remove_object", "scene_resource_id": resource_id}, resource_id)
+            if result is not None:
+                result["refused"] = refused
+                return result
+        try:
+            current = is_current()
+        except Exception as error:
+            return {"state": "failed", "reason": "apply_status_unavailable",
+                    "message": str(error), "last_observed_remaining": sorted(view.objects),
+                    "refused": refused}
+        if not current:
+            return {"state": "superseded", "last_observed_remaining": sorted(view.objects)}
+        remaining = sorted(set(view.objects) | {
+            _text(attachment.get("scene_resource_id"), field="scene_resource_id")
+            for attachment in view.attachments
+        })
+        if remaining and not refused:
+            return {"state": "failed", "reason": "scene_changed",
+                    "message": "Scene still contains objects after clearing",
+                    "last_observed_remaining": remaining}
+        return {"state": "partial" if remaining else "succeeded",
+                "last_observed_remaining": remaining, "refused": refused}
 
     def prepare_initial_scene(
         self,

@@ -11,9 +11,10 @@ import { api, authoringRefusalMessage, isStaleWorkspaceError, savedNotAdoptedMes
 import { errorMessage } from '../state/structuralResource';
 import { parseManagerApplyAvailability } from '../api/parsers';
 import { managerPublicationMatches } from '../state/scenarioClose';
+import { waitForObservation } from './useCCLC';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
-  programLocalFence,
+  programLocalFenceFromAdmission,
   publicationSupersedesProgram,
   programActionUnavailableReason,
   scenarioLocalFence,
@@ -178,10 +179,16 @@ export function useProgramWorkspace(
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
+  const [newSceneClearApply, setNewSceneClearApply] = useState<ManagerApplyIdentity | null>(null);
+  const clearNewSceneClearApply = useCallback((apply: ManagerApplyIdentity) => {
+    setNewSceneClearApply((current) => current?.applyId === apply.applyId
+      && current.applyGeneration === apply.applyGeneration ? null : current);
+  }, []);
   const scenarioOpened = useRef(onScenarioOpened);
   useEffect(() => { scenarioOpened.current = onScenarioOpened; }, [onScenarioOpened]);
   const generation = useRef(0);
   const mounted = useRef(true);
+  const sceneClearAbort = useRef<AbortController | null>(null);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
   const workspaceReadGeneration = useRef<number | null>(null);
   const projectionIdentityRead = useRef<string | null>(null);
@@ -302,9 +309,11 @@ export function useProgramWorkspace(
     return request;
   }, []);
 
+  const { beginMutation, finishMutation, refresh: refreshAuthoring } = authoring;
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
+    onAuthoringRefusal?: (message: string) => void,
   ): Promise<ProgramWorkspaceRunResult | null> => {
     // A Scenario Discard is a Draft edit; whether any Scenario document has
     // unapplied changes is decided by its route and by the backend, never by
@@ -314,13 +323,13 @@ export function useProgramWorkspace(
       && programActionUnavailableReason(
         state.workspace, action, edit ? mutationUnavailableReason : documentUnavailableReason,
       ) !== null) return null;
-    if (action !== 'refresh' && !authoring.beginMutation(edit ? 'edit' : 'document')) return null;
+    if (action !== 'refresh' && !beginMutation(edit ? 'edit' : 'document')) return null;
     const current = generation.current + 1;
     generation.current = current;
     dispatch({ type: 'request_started', generation: current, action });
     try {
       const result = await request();
-      if (action !== 'refresh') authoring.finishMutation(result.acceptedApply ?? null);
+      if (action !== 'refresh') finishMutation(result.acceptedApply ?? null);
       if (mounted.current && result.acceptedApply) {
         setAcceptedApply(result.acceptedApply);
       }
@@ -335,13 +344,14 @@ export function useProgramWorkspace(
       }
       return result;
     } catch (error: unknown) {
-      if (action !== 'refresh') authoring.finishMutation(null, error);
+      if (action !== 'refresh') finishMutation(null, error);
       // A stale fence is also refused before any effect, but it needs the
       // refresh below, so it is never handled as a plain refusal.
       const refusal = action === 'refresh' || isStaleWorkspaceError(error)
         ? null : authoringRefusalMessage(error);
       if (refusal !== null) {
         if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
+        onAuthoringRefusal?.(refusal);
         return null;
       }
       if (mounted.current) {
@@ -371,11 +381,11 @@ export function useProgramWorkspace(
           },
           () => undefined,
         );
-        void authoring.refresh();
+        void refreshAuthoring();
       }
       return null;
     }
-  }, [authoring, state.workspace, documentUnavailableReason, mutationUnavailableReason, readWorkspace]);
+  }, [beginMutation, finishMutation, refreshAuthoring, state.workspace, documentUnavailableReason, mutationUnavailableReason, readWorkspace]);
 
   const refresh = useCallback(() => {
     const result = run(
@@ -394,6 +404,7 @@ export function useProgramWorkspace(
     mounted.current = true;
     return () => {
       mounted.current = false;
+      sceneClearAbort.current?.abort();
     };
   }, []);
 
@@ -466,6 +477,7 @@ export function useProgramWorkspace(
    * `expected`, the fence's Draft identity must be exactly that content;
    * otherwise nothing may be sent (`ProgramDraftChangedError`).
    */
+  const admissionGeneration = snapshot?.authoringAdmission.admissionGeneration ?? null;
   const localFence = useCallback((
     kind: 'edit' | 'document',
     expected?: ExpectedProgramDraft,
@@ -473,17 +485,17 @@ export function useProgramWorkspace(
     if (
       (kind === 'edit' ? mutationUnavailableReason : documentUnavailableReason) !== null
       || published === null
-      || snapshot === null
+      || admissionGeneration === null
     ) return null;
     const mismatch = expected === undefined ? null : programDraftMismatch(published, expected);
     if (mismatch !== null) throw new ProgramDraftChangedError(mismatch);
-    return programLocalFence(
+    return programLocalFenceFromAdmission(
       published,
-      snapshot,
+      admissionGeneration,
       requestOwnerEpoch.current,
       identity('composer-authoring'),
     );
-  }, [documentUnavailableReason, mutationUnavailableReason, published, snapshot]);
+  }, [documentUnavailableReason, mutationUnavailableReason, published, admissionGeneration]);
 
   /**
    * The one Scenario document fence.
@@ -676,6 +688,7 @@ export function useProgramWorkspace(
     path: string | null,
     confirmDiscard: boolean,
     confirmedAuthoring?: AuthoringWorkspaceIdentity,
+    onAuthoringRefusal?: (message: string) => void,
   ) => {
     const label = path === null ? 'New Scenario' : 'Scenario Load';
     return run(path === null ? 'new_scenario_document' : 'load_scenario_document', async () => {
@@ -685,6 +698,8 @@ export function useProgramWorkspace(
         ? await api.scenarioDocuments.new(requestFence, confirmDiscard)
         : await api.scenarioDocuments.load(requestFence, path, confirmDiscard);
       scenarioOpened.current?.();
+      if (path === null && mounted.current) setNewSceneClearApply(response.status === 'accepted'
+        ? acceptedApplyIdentity(response.activation.apply_id, response.activation.apply_generation) : null);
       if (response.status === 'applied') {
         return {
           workspace: response.workspace,
@@ -693,6 +708,47 @@ export function useProgramWorkspace(
         };
       }
       const applyId = response.activation.apply_id;
+      const applyIdentity = acceptedApplyIdentity(applyId, response.activation.apply_generation);
+      if (path === null && applyIdentity !== null) {
+        const abort = new AbortController();
+        sceneClearAbort.current = abort;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<void>((resolve) => {
+          timer = setTimeout(() => { resolve(); abort.abort(); }, 10_000);
+        });
+        const poll = async () => {
+          let sawPublication = false;
+          for (;;) {
+            const clear = await api.programs.sceneClearStatus(abort.signal);
+            if (clear !== null && clear.applyId === applyIdentity.applyId
+              && clear.applyGeneration === applyIdentity.applyGeneration && clear.state !== 'pending') break;
+            const activation = await api.manager.applyStatus(applyIdentity.applyId, applyIdentity.applyGeneration, abort.signal);
+            if (activation.state === 'failed' || activation.state === 'unknown_effect') break;
+            if (activation.state === 'succeeded') {
+              const current = await api.manager.status(abort.signal);
+              const transaction = current.status.active.publication.transaction;
+              const same = transaction !== null && typeof transaction === 'object' && !Array.isArray(transaction)
+                && transaction.kind === 'named_apply' && transaction.apply_id === applyIdentity.applyId
+                && transaction.apply_generation === applyIdentity.applyGeneration;
+              if (current.source.available && current.source.freshness === 'fresh') {
+                if (same) sawPublication = true;
+                else if (sawPublication) break;
+              }
+            }
+            await waitForObservation(abort.signal);
+          }
+        };
+        try {
+          await Promise.race([poll(), deadline]);
+        } catch (error) {
+          if (!mounted.current) throw error;
+          // The workspace is still opened; Activity reports the unknown clear outcome.
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+          abort.abort();
+          if (sceneClearAbort.current === abort) sceneClearAbort.current = null;
+        }
+      }
       return {
         workspace: response.workspace,
         message: `${label} accepted (${applyId}); configuration progress is shown under Activity. Motion does not start automatically.`,
@@ -702,11 +758,12 @@ export function useProgramWorkspace(
           response.activation.apply_generation,
         ),
       };
-    });
+    }, onAuthoringRefusal);
   }, [run, scenarioFence]);
   const loadScenarioDocument = useCallback(
-    (path: string, confirmDiscard: boolean, confirmedAuthoring?: AuthoringWorkspaceIdentity) => (
-      activateScenarioDocument(path, confirmDiscard, confirmedAuthoring)
+    (path: string, confirmDiscard: boolean, confirmedAuthoring?: AuthoringWorkspaceIdentity,
+      onAuthoringRefusal?: (message: string) => void) => (
+      activateScenarioDocument(path, confirmDiscard, confirmedAuthoring, onAuthoringRefusal)
     ),
     [activateScenarioDocument],
   );
@@ -751,6 +808,8 @@ export function useProgramWorkspace(
   return useMemo(() => ({
     state,
     acceptedApply,
+    newSceneClearApply,
+    clearNewSceneClearApply,
     mutationAvailable,
     mutationUnavailableReason,
     documentUnavailableReason,
@@ -788,6 +847,8 @@ export function useProgramWorkspace(
     reportCloseCancellation,
   }), [
     acceptedApply,
+    newSceneClearApply,
+    clearNewSceneClearApply,
     admissionObserved,
     apply,
     clearFeedback,

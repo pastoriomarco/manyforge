@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import inspect
+import errno
 import os
 import socket
+import struct
 import threading
 import time
 from typing import Any
@@ -336,6 +338,78 @@ def test_publication_deadline_bounds_the_whole_exchange_not_each_step(
         for connection in accepted:
             connection.close()
         listener.close()
+
+
+def test_transport_failure_logs_syscall_errno_and_peer_without_changing_error(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    from contextlib import contextmanager
+
+    class RunRoot:
+        @contextmanager
+        def socket_address(self, _filename):
+            yield "/private/execution-command.sock"
+
+    class BrokenSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _address):
+            pass
+
+        def getsockopt(self, *_args):
+            return struct.pack("3i", 1234, os.geteuid(), os.getegid())
+
+        def send(self, _packet):
+            raise BrokenPipeError(errno.EPIPE, "private-path-or-user-text")
+
+        def close(self):
+            pass
+
+    client = CellAdmissionClient(tmp_path)
+    client._run_root = RunRoot()
+    from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionObservationSession
+    from manyforge_headless_api.native import HeadlessApiError
+
+    execution = ExecutionCommandClient(tmp_path)
+    execution._run_root = RunRoot()
+    monkeypatch.setattr(cell_admission.socket, "socket", lambda *_args: BrokenSocket())
+    with pytest.raises(CellAdmissionError) as failure:
+        client.get()
+    assert failure.value.code == "execution_owner_unavailable"
+    assert failure.value.outcome_unknown
+    assert str(failure.value) == "native execution transport failed: [Errno 32] private-path-or-user-text"
+    assert "syscall=send errno=32 peer_socket=execution-command.sock peer_pid=1234" in caplog.text
+    assert "exception_type=BrokenPipeError" in caplog.text
+    assert "private-path-or-user-text" not in caplog.text
+    caplog.clear()
+    with pytest.raises(HeadlessApiError) as execution_failure:
+        execution.identity()
+    assert execution_failure.value.code == "execution_owner_unavailable"
+    assert str(execution_failure.value) == "native execution transport failed: [Errno 32] private-path-or-user-text"
+    assert "syscall=send errno=32 peer_socket=execution-command.sock" in caplog.text
+    assert "private-path-or-user-text" not in caplog.text
+    caplog.clear()
+    with pytest.raises(HeadlessApiError) as control_failure:
+        execution._exchange_on({"command": "test"}, execution._control_socket_path)
+    assert control_failure.value.code == "execution_owner_unavailable"
+    assert "syscall=send errno=32 peer_socket=execution-control.sock" in caplog.text
+    caplog.clear()
+    with ExecutionObservationSession(RunRoot(), tmp_path / "execution-observation.sock") as session:
+        with pytest.raises(HeadlessApiError) as observation_failure:
+            session.next(None, threading.Event())
+    assert observation_failure.value.code == "execution_owner_unavailable"
+    assert "syscall=send errno=32 peer_socket=execution-observation.sock" in caplog.text
+    assert "private-path-or-user-text" not in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -5617,14 +5617,14 @@ class CloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
 };
 
 // Reproduce the exact final scoped-settlement lock ordering with a real
-// exclusion and barriers. The test-only timed acquisition bounds a regressed
+// exclusion and barriers. The test-only bounded acquisition bounds a regressed
 // blocking implementation; no production timeout or guard changes.
 class ContendedCloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
  public:
   class Lease final : public ICellCloseAdmissionLease {
    public:
     Lease(ContendedCloseLeaseAdmissionPort& owner,
-          std::unique_lock<std::timed_mutex> lock, bool first)
+          std::unique_lock<std::mutex> lock, bool first)
         : owner_(owner), lock_(std::move(lock)), first_(first) {}
     Result<void> ValidatePrerequisites() const override {
       if (first_ && ++checks_ == 2) {
@@ -5639,7 +5639,7 @@ class ContendedCloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
     }
    private:
     ContendedCloseLeaseAdmissionPort& owner_;
-    std::unique_lock<std::timed_mutex> lock_;
+    std::unique_lock<std::mutex> lock_;
     bool first_;
     mutable int checks_{};
   };
@@ -5652,9 +5652,13 @@ class ContendedCloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
       changed_.notify_all();
     }
     std::unique_lock lock(admission_, std::defer_lock);
-    if (!lock.try_lock_for(std::chrono::seconds(2)))
-      return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Err(
-          {"test_kernel_lease_timeout", "scoped settlement retained a reversed blocking lock", {}});
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!lock.try_lock()) {
+      if (std::chrono::steady_clock::now() >= deadline)
+        return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Err(
+            {"test_kernel_lease_timeout", "scoped settlement retained a reversed blocking lock", {}});
+      std::this_thread::yield();
+    }
     std::unique_ptr<ICellCloseAdmissionLease> lease =
         std::make_unique<Lease>(*this, std::move(lock), first);
     return Result<std::unique_ptr<ICellCloseAdmissionLease>>::Ok(std::move(lease));
@@ -5665,7 +5669,7 @@ class ContendedCloseLeaseAdmissionPort final : public FakeCellAdmissionPort {
                              [&] { return at_final_validation_; });
   }
  private:
-  std::timed_mutex admission_;
+  std::mutex admission_;
   std::mutex barrier_;
   std::condition_variable changed_;
   std::atomic<int> acquires_{};

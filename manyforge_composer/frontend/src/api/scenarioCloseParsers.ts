@@ -1,5 +1,5 @@
 import type {
-  CanonicalEmptySelection, ForceCloseResult, ForceCloseStep, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
+  SceneClearStatus, CanonicalEmptySelection, ForceCloseResult, ForceCloseStep, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
   LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult,
   LifecycleTargetRetirementRow, LifecycleTargetRetirementScope,
 } from '../types/scenarioClose';
@@ -130,4 +130,46 @@ export function parseForceCloseResult(value: unknown, step: ForceCloseStep): For
           commandTargetId: identity(item.command_target_id), outputUnknown: item.output_unknown };
       }) };
   }) };
+}
+
+/** Only the HTTP status has this transient field; the streamed cycle shape is unchanged. */
+export function parseSceneClearStatus(value: unknown): SceneClearStatus | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Program cycle status is invalid.');
+  const raw = (value as Record<string, unknown>).scene_clear;
+  if (raw === null || raw === undefined) return null;
+  const direct = typeof raw === 'object' && Object.hasOwn(raw, 'request_id');
+  const row = object(raw, direct ? ['request_id', 'state', 'remaining', 'reason']
+    : ['apply_id', 'apply_generation', 'state', 'remaining', 'reason']);
+  const states = ['pending', 'succeeded', 'partial', 'failed', 'unknown', 'superseded'];
+  if (typeof row.state !== 'string' || !states.includes(row.state)) throw new Error('Scene clear state is invalid.');
+  if (row.remaining !== null && (!Array.isArray(row.remaining) || !row.remaining.every((id) => typeof id === 'string' && id.length > 0)))
+    throw new Error('Scene clear remaining objects are invalid.');
+  let reason: SceneClearStatus['reason'] = null;
+  if (row.reason !== null) {
+    const failure = object(row.reason, ['code', 'message', 'details']);
+    if (typeof failure.code !== 'string' || !failure.code || typeof failure.message !== 'string'
+      || failure.details === null || typeof failure.details !== 'object' || Array.isArray(failure.details))
+      throw new Error('Scene clear reason is invalid.');
+    reason = { code: failure.code, message: failure.message, details: failure.details as Record<string, unknown> };
+  }
+  if (row.state === 'succeeded' && (!Array.isArray(row.remaining) || row.remaining.length !== 0 || reason !== null))
+    throw new Error('Scene clear success must have no remaining objects or failure.');
+  if ((row.state === 'failed' || row.state === 'unknown')
+    && reason?.code !== `scene_clear_${row.state}`)
+    throw new Error('Scene clear failure must carry its matching typed reason.');
+  if ((row.state === 'pending' || row.state === 'superseded') && reason !== null)
+    throw new Error('Scene clear pending or superseded status cannot carry a failure.');
+  if (row.state === 'partial') {
+    const refused = reason?.details.refused;
+    if (!Array.isArray(row.remaining) || row.remaining.length === 0 || reason?.code !== 'scene_clear_partial'
+      || !Array.isArray(refused) || refused.length === 0 || !refused.every((item: unknown) => {
+        if (item === null || typeof item !== 'object' || Array.isArray(item)) return false;
+        const row = item as Record<string, unknown>;
+        return typeof row.resource_id === 'string' && row.resource_id.length > 0
+          && typeof row.code === 'string' && row.code.length > 0 && typeof row.message === 'string';
+      })) throw new Error('Scene clear partial must name remaining objects and typed refusals.');
+  }
+  return { ...(direct ? { requestId: identity(row.request_id) }
+    : { applyId: identity(row.apply_id), applyGeneration: generation(row.apply_generation) }),
+    state: row.state as SceneClearStatus['state'], remaining: row.remaining as string[] | null, reason };
 }

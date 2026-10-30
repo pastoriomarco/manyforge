@@ -1468,7 +1468,9 @@ def test_f6a_on_signal_failure_default_policy_closes_then_fails_into_the_tree(pe
     During terminal cleanup the node rereads instead of retaining it (W)."""
 
     ready = _program_stop_trip(pending=False)
-    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    trip = _program_stop_trip(pending=pending)
+    observes = [trip, ready] if pending else [ready] * 3
+    port = _MotionPort([trip], observes=observes)
     adapter, store, _ = _interrupt_motion(port, on_signal="failure")
     statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
     assert statuses[-1] is _FAILURE
@@ -1485,11 +1487,15 @@ def test_f6a_on_signal_failure_with_intervention_policy_holds_the_live_operation
     on the decided assessment, never the cleanup wait."""
 
     ready = _program_stop_trip(pending=False)
-    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    trip = _program_stop_trip(pending=pending)
+    observes = [trip, ready] if pending else [ready] * 3
+    port = _MotionPort([trip], observes=observes)
     adapter, _, _ = _interrupt_motion(port, on_signal="failure")
     adapter.hold_failures_for_intervention()
-    statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
-    assert statuses[-1] is _FAILURE
+    if pending:
+        assert _tick(adapter) is _RUNNING
+        assert port.closes == []  # The pending assessment does not authorize a close.
+    assert _tick(adapter) is _FAILURE
     assert port.closes == []
     context = adapter.owner_recovery_context
     assert context is not None
@@ -1504,10 +1510,13 @@ def test_f6a_on_signal_success_succeeds_after_the_stop(pending) -> None:
     """(b) stop and succeed: the stopped operation is closed, then success."""
 
     ready = _program_stop_trip(pending=False)
-    port = _MotionPort([_program_stop_trip(pending=pending)], observes=[ready] * 3)
+    trip = _program_stop_trip(pending=pending)
+    observes = [trip, ready] if pending else [ready] * 3
+    port = _MotionPort([trip], observes=observes)
     adapter, store, _ = _interrupt_motion(port, on_signal="success")
-    statuses = [_tick(adapter) for _ in range(2 if pending else 1)]
-    assert statuses[-1] is _SUCCESS
+    if pending:
+        assert _tick(adapter) is _RUNNING
+    assert _tick(adapter) is _SUCCESS
     assert len(port.closes) == 1
     assert store.writes[0][1] == "signal_trip"
 
@@ -1703,7 +1712,7 @@ def test_item11_reset_still_releases_an_unconfirmed_stop_hold(monkeypatch) -> No
     assert len(port.starts) == 1
     assert len(interventions.required) == 1
     assert store.writes == []  # No trip outcome: the node never finished.
-    assert adapter.has_pending_drain()  # Retained, as for any halted attempt.
+    assert adapter.has_pending_drain  # Retained, as for any halted attempt.
 
 
 @pytest.mark.parametrize("read", ["raises", "another_task", "malformed_assessment"])

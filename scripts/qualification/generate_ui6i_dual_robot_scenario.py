@@ -39,6 +39,20 @@ GRAPH_ID_FIELDS: Final = {
     "controllable_components": "controllable_component_id",
     "control_domains": "control_domain_id",
     "control_bindings": "control_binding_id",
+    "component_attachments": "component_attachment_id",
+}
+# Merge 6: each robot carries its gripper as a separate, mounted tool.
+TOOLS: Final = {
+    "lite6_robot": {
+        "component_occurrence_id": "lite_gripper",
+        "model_family_id": "lite_gripper",
+        "runtime_restoration_profile_id": "lite_gripper_mock_commanded_v0",
+    },
+    "ur5e_robot": {
+        "component_occurrence_id": "robotiq_2f_85",
+        "model_family_id": "robotiq_2f_85",
+        "runtime_restoration_profile_id": "robotiq_2f_85_mock_commanded_v0",
+    },
 }
 
 
@@ -131,6 +145,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
             "description": "UI6-I dual-robot wall qualification occurrence",
             "component_occurrence_id": component,
             "runtime_restoration_profile_id": runtime_profile,
+            "tool": TOOLS[component],
             # T qualifies cell-level grouped execution. Native lifecycle is
             # selected by the same verified provider product for both robots.
             "assistant_profile_id": None,
@@ -153,29 +168,23 @@ def build_deployment(root: Path) -> dict[str, Any]:
             refs,
             {},
             sources,
+            tool_family=families[TOOLS[component]["model_family_id"]],
         )
 
     lite6 = occurrence(
         component="lite6_robot",
-        family="lite6_lite_gripper",
+        family="lite6",
         runtime_profile="lite6_mock_commanded_v0",
         y_m=0.0,
     )
     ur5e = occurrence(
         component="ur5e_robot",
-        family="ur5e_robotiq_2f_85",
-        runtime_profile="ur5e_robotiq_mock_commanded_v0",
+        family="ur5e",
+        runtime_profile="ur5e_mock_commanded_v0",
         y_m=1.0,
     )
     candidates = (lite6, ur5e)
-    candidates_by_component = {
-        candidate["graph"]["controllable_components"][0][
-            "controllable_component_id"
-        ]: candidate
-        for candidate in candidates
-    }
-    if set(candidates_by_component) != {"lite6_robot", "ur5e_robot"}:
-        raise GenerationError("dual native scenario has unexpected component identities")
+    candidates_by_component = {"lite6_robot": lite6, "ur5e_robot": ur5e}
 
     graph = {
         collection: [
@@ -185,7 +194,6 @@ def build_deployment(root: Path) -> dict[str, Any]:
         ]
         for collection in GRAPH_ID_FIELDS
     }
-    graph["component_attachments"] = []
     for collection, id_field in GRAPH_ID_FIELDS.items():
         graph[collection].sort(key=lambda row: row[id_field])
 
@@ -383,7 +391,7 @@ def motion_node(
         "parameters": {
             "target_role": target_role,
             "base_frame_role": "base",
-            "tcp_endpoint": {"target_role": target_role, "frame_role": "tcp"},
+            "tcp_endpoint": {"kind": "current"},
             "goal": [
                 {"joint_name": joint_name, "position_rad": position}
                 for joint_name, position in goal
@@ -713,6 +721,7 @@ def main() -> int:
                         "runtime_restoration_profile_id": (
                             "lite6_mock_commanded_v0"
                         ),
+                        "tool": TOOLS["lite6_robot"],
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
                             "position_m": [0.0, 0.0, 0.0],
@@ -724,7 +733,7 @@ def main() -> int:
                             "tags": ["dual-robot"],
                         },
                     },
-                    "lite6_lite_gripper",
+                    "lite6",
                     "lite6_mock_commanded_v0",
                 ),
                 (
@@ -737,8 +746,9 @@ def main() -> int:
                         ),
                         "component_occurrence_id": "ur5e_robot",
                         "runtime_restoration_profile_id": (
-                            "ur5e_robotiq_mock_commanded_v0"
+                            "ur5e_mock_commanded_v0"
                         ),
+                        "tool": TOOLS["ur5e_robot"],
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
                             "position_m": [0.0, 1.0, 0.0],
@@ -750,8 +760,8 @@ def main() -> int:
                             "tags": ["dual-robot"],
                         },
                     },
-                    "ur5e_robotiq_2f_85",
-                    "ur5e_robotiq_mock_commanded_v0",
+                    "ur5e",
+                    "ur5e_mock_commanded_v0",
                 ),
             )
             intents = [
@@ -761,6 +771,10 @@ def main() -> int:
                     deployment=component,
                     family=families[family_id],
                     runtime_profile=runtime_profiles[runtime_profile_id],
+                    tool_family=families[component["tool"]["model_family_id"]],
+                    tool_runtime_profile=runtime_profiles[
+                        component["tool"]["runtime_restoration_profile_id"]
+                    ],
                 )
                 for component, family_id, runtime_profile_id in component_inputs
             ]
@@ -768,6 +782,10 @@ def main() -> int:
             intent["components"] = sorted(
                 [row for value in intents for row in value["components"]],
                 key=lambda row: row["component_id"],
+            )
+            intent["attachments"] = sorted(
+                [row for value in intents for row in value["attachments"]],
+                key=lambda row: row["child"]["component_id"],
             )
             intent["compatibility"] = {
                 "lane": "manyforge-only",

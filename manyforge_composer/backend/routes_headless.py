@@ -59,6 +59,7 @@ from manyforge_headless_api.models import (
     CellRecoverRequest,
     StopFaultRecoveryRequest,
     ProgramRunStartRequest,
+    ProgramScenePreparationRequest,
     ProgramRunStopRequest,
     ProgramSelectionStartRequest,
     ProgramSelectionStopRequest,
@@ -503,6 +504,10 @@ def create_headless_router(
     def program_applied_status() -> dict[str, Any]:
         # Derived executable/non-executable status of the Applied Program.
         return _call(client.program_applied_status)
+
+    @router.post("/api/program/scene-preparations")
+    async def program_scene_prepare(body: ProgramScenePreparationRequest) -> JSONResponse:
+        return await control_call(lambda: client.program_scene_prepare(body.model_dump(mode="json")))
 
     @router.get("/api/program/runs")
     def program_runs(

@@ -78,7 +78,7 @@ export const DEFAULT_COMPOSER_SETTINGS: ComposerSettings = {
       antialias: true,
       outlineSmoothing: true,
       poseRateHz: 30,
-      motionSmoothing: true,
+      motionSmoothing: false,
       cameraDamping: true,
     },
     software: {

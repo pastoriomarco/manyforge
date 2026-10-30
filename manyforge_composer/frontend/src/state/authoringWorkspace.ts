@@ -257,9 +257,20 @@ export function programLocalFence(
   requestOwnerEpoch: string,
   requestId: string,
 ): LocalWorkspaceFenceRequest {
+  return programLocalFenceFromAdmission(
+    published, snapshot.authoringAdmission.admissionGeneration, requestOwnerEpoch, requestId,
+  );
+}
+
+export function programLocalFenceFromAdmission(
+  published: PublishedAuthoringWorkspace,
+  admissionGeneration: number,
+  requestOwnerEpoch: string,
+  requestId: string,
+): LocalWorkspaceFenceRequest {
   return {
     ...localDraftFence(published),
-    expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
+    expectedAdmissionGeneration: admissionGeneration,
     requestOwnerEpoch,
     requestId,
   };

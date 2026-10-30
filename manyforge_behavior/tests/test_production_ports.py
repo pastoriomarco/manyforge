@@ -4110,6 +4110,125 @@ def _authored_scene() -> list[dict[str, Any]]:
     ]
 
 
+def test_empty_apply_clears_scene_through_owner_transactions() -> None:
+    transport = _SceneTransport(populated=True)
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: True,
+    )
+    assert result["state"] == "succeeded"
+    assert result["last_observed_remaining"] == []
+    assert [request["operation"]["kind"] for request in transport.submissions] == [
+        "detach_carried_object_at_current_pose", "remove_object", "remove_object",
+    ]
+    assert [request["operation"].get("scene_resource_id") for request in transport.submissions[1:]] == [
+        "old-part", "old-support",
+    ]
+
+
+def test_empty_apply_supersession_stops_before_next_scene_write() -> None:
+    transport = _SceneTransport(populated=True)
+    calls = iter([True, False])
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: next(calls),
+    )
+    assert result["state"] == "superseded"
+    assert len(transport.submissions) == 1
+    assert sorted(transport.objects) == ["old-part", "old-support"]
+
+
+@pytest.mark.parametrize("completed_writes", [0, 1])
+def test_empty_apply_unavailable_selection_stops_without_inventing_refusal(completed_writes):
+    transport = _SceneTransport(populated=True)
+    transport.objects["old-part-2"] = deepcopy(transport.objects["old-part"])
+    transport.objects["old-part-2"]["scene_resource_id"] = "old-part-2"
+    transport.objects["old-part-2"]["placement"]["carried_object_attachment_id"] = "attachment.second"
+    second = deepcopy(transport.attachments[0])
+    second.update(carried_object_attachment_id="attachment.second", scene_resource_id="old-part-2")
+    transport.attachments.append(second)
+    checks = 0
+    def is_current():
+        nonlocal checks
+        checks += 1
+        if checks > completed_writes:
+            raise RuntimeError("Applied selection unavailable")
+        return True
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=is_current,
+    )
+    assert result["state"] == "failed"
+    assert result["reason"] == "apply_status_unavailable"
+    assert result.get("refused", []) == []
+    assert result["last_observed_remaining"] == ["old-part", "old-part-2", "old-support"]
+    assert len(transport.submissions) == completed_writes
+
+
+def test_empty_apply_unknown_does_not_resend_or_claim_no_effect() -> None:
+    class LostScene(_SceneTransport):
+        def commit_scene_transaction(self, body):
+            self.submissions.append(dict(body))
+            raise RuntimeError("delivery unknown")
+
+    transport = LostScene(populated=True)
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: True,
+    )
+    assert result["state"] == "unknown"
+    assert result["last_observed_remaining"] == ["old-part", "old-support"]
+    assert len(transport.submissions) == 1
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_empty_apply_foreign_receipt_is_unknown(refused):
+    class ForeignReceipt(_SceneTransport):
+        def commit_scene_transaction(self, body):
+            if refused:
+                self.submissions.append(dict(body))
+                return {"api_version": "manyforge.manager_command_response.v1", "ok": False,
+                        "projection_status": "not_attempted", "request_id": "another.request",
+                        "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+                        "error": {"code": "missing_reference", "message": "unavailable"}}
+            result = super().commit_scene_transaction(body)
+            result["request_id"] = "another.request"
+            return result
+    transport = ForeignReceipt(populated=True)
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: True,
+    )
+    assert result["state"] == "unknown"
+    assert len(transport.submissions) == 1
+
+
+def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
+    class RefusedDetach(_SceneTransport):
+        def commit_scene_transaction(self, body):
+            if body["operation"]["kind"] == "detach_carried_object_at_current_pose":
+                self.submissions.append(dict(body))
+                return {
+                    "api_version": "manyforge.manager_command_response.v1",
+                    "request_id": body["request_context"]["request_id"],
+                    "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+                    "ok": False, "projection_status": "not_attempted",
+                    "error": {"code": "missing_reference", "message": "carrier unavailable"},
+                }
+            return super().commit_scene_transaction(body)
+
+    transport = RefusedDetach(populated=True)
+    result = _scene_port(transport).clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C,
+        request_id="apply.1", is_current=lambda: True,
+    )
+    assert result["state"] == "partial"
+    assert result["last_observed_remaining"] == ["old-part", "old-support"]
+    assert result["refused"] == [{"resource_id": "old-part", "code": "missing_reference",
+                                   "message": "carrier unavailable"}]
+    assert len(transport.submissions) == 1
+
+
 def test_scene_initialization_adds_pick_resources_last() -> None:
     transport = _SceneTransport(populated=True)
     port = _scene_port(transport)
@@ -5768,7 +5887,7 @@ def test_a_refused_close_keeps_the_operation_retained_for_reset() -> None:
         ({"observed_state_available": True},
          {"observed_state_available": True, "observed_state_fresh": True,
           "observed_state_at_rest": True,
-          "observed_state_valid_until_ns": 2**62}, None),
+          "observed_state_valid_until_ns": str(2**62)}, None),
         ({"observed_state_available": True},
          {"observed_state_available": True, "observed_state_fresh": True,
           "observed_state_at_rest": True, "observed_state_valid_until_ns": 0}, None),
@@ -5810,6 +5929,8 @@ def test_manual_result_press_reads_the_owner_fresh_not_the_cached_terminal(
         task_id=task_id,
         state=OwnerTaskState.INTERRUPTED,
         metadata={"recovery_assessment": cached},
+        reason_code="operation_stopped",
+        message="native operation was interrupted",
     )
     # The ordinary observation answers from the cached terminal.
     assert (

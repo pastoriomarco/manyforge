@@ -769,11 +769,6 @@ class ManagerApplyRequest(CallerAttributionRequest):
 
     @model_validator(mode="after")
     def require_busy_rejection(self) -> "ManagerApplyRequest":
-        if (
-            self.prepared_activation.origin.kind == "sealed_canonical_empty"
-            and self.scene_initialization != "preserve"
-        ):
-            raise ValueError("sealed canonical empty Apply requires Scene preservation")
         if not self.reject_if_affected_busy:
             raise ValueError("reject_if_affected_busy must be true")
         if (self.expected_admission_generation is None) == (
@@ -826,11 +821,23 @@ class ProgramRunStartRequest(ExecutionControlAttributionRequest):
 class ProgramScenePreparationRequest(CallerAttributionRequest):
     """Prepare the exact current Applied Program scene while the cycle is Idle."""
 
+    clear_empty_scene: bool = False
+
     expected_applied_record_digest: Annotated[
-        str,
+        str | None,
         Field(pattern=SHA256_PATTERN),
     ]
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    expected_publication_generation: Annotated[int | None, Field(ge=1, le=9_007_199_254_740_991)] = None
+
+    @model_validator(mode="after")
+    def exact_scene_preparation_target(self) -> "ProgramScenePreparationRequest":
+        direct = self.clear_empty_scene and self.expected_applied_record_digest is None
+        if direct != (self.expected_publication_generation is not None):
+            raise ValueError("direct empty Scene clear requires the current publication generation")
+        if self.expected_applied_record_digest is None and not direct:
+            raise ValueError("Program scene preparation requires an Applied record")
+        return self
 
 
 class ProgramRunStopRequest(ExecutionControlAttributionRequest):

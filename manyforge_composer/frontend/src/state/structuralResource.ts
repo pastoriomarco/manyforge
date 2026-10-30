@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useReducer, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 
 export type StructuralResourceState<T> =
   | { status: 'loading' }
   | { status: 'ready'; data: T }
   | { status: 'absent'; message: string }
-  | { status: 'error'; message: string };
+  | { status: 'error'; message: string; retryable?: boolean; requestId?: number };
 
 export type StructuralResourceAction<T> =
   | { type: 'load' }
   | { type: 'resolve'; data: T }
   | { type: 'absent'; message: string }
-  | { type: 'reject'; message: string };
+  | { type: 'reject'; message: string; retryable?: boolean; requestId?: number };
 
 export function structuralResourceReducer<T>(
   state: StructuralResourceState<T>,
@@ -29,7 +29,12 @@ export function structuralResourceReducer<T>(
     case 'absent':
       return { status: 'absent', message: action.message };
     case 'reject':
-      return { status: 'error', message: action.message };
+      return {
+        status: 'error',
+        message: action.message,
+        ...(action.retryable === true ? { retryable: true } : {}),
+        ...(action.requestId !== undefined ? { requestId: action.requestId } : {}),
+      };
   }
 }
 
@@ -60,12 +65,13 @@ interface StructuralResourceOptions {
   disabledMessage?: string;
   enabled?: boolean;
   failureMessage: string;
+  retryableWhen?: (error: unknown) => boolean;
 }
 
 export function useStructuralResource<T>(
   load: (signal: AbortSignal) => Promise<T>,
   options: StructuralResourceOptions,
-): [StructuralResourceState<T>, () => void] {
+): [StructuralResourceState<T>, () => number] {
   const [reloadToken, setReloadToken] = useState(0);
   const [state, dispatch] = useReducer(structuralResourceReducer<T>, {
     status: 'loading',
@@ -76,6 +82,7 @@ export function useStructuralResource<T>(
     disabledMessage,
     enabled = true,
     failureMessage,
+    retryableWhen,
   } = options;
 
   useEffect(() => {
@@ -109,6 +116,8 @@ export function useStructuralResource<T>(
         dispatch({
           type: 'reject',
           message: errorMessage(error, failureMessage),
+          ...(retryableWhen?.(error) === true ? { retryable: true } : {}),
+          requestId: reloadToken,
         });
       });
     return () => {
@@ -123,10 +132,15 @@ export function useStructuralResource<T>(
     failureMessage,
     load,
     reloadToken,
+    retryableWhen,
   ]);
 
-  const retry = useCallback(() => {
-    setReloadToken((current) => current + 1);
+  const reloadTokenRef = useRef(0);
+  const retry = useCallback((): number => {
+    const next = reloadTokenRef.current + 1;
+    reloadTokenRef.current = next;
+    setReloadToken(next);
+    return next;
   }, []);
 
   return [state, retry];

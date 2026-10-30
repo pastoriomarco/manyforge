@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -13,7 +15,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -423,6 +425,161 @@ def _wait_for_current_cclc_routes(
     )
 
 
+@contextmanager
+def _controller_manager_activity_ready(
+    component_id: str, process: subprocess.Popen[bytes], deadline: float,
+    *, arm_controller: str | None = None, gripper_controller: str | None = None,
+) -> Iterator[None]:
+    """Observe the CM activity and keep the observer alive during qualification."""
+    import rclpy
+    from controller_manager_msgs.msg import ControllerManagerActivity
+    from lifecycle_msgs.msg import State
+    from rclpy.context import Context
+    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+    context = Context()
+    node = None
+    executor = None
+    subscription = None
+    topic = f"/manyforge/{component_id}/controller_manager/activity"
+    observed_gids: set[bytes] = set()
+    gripper_states: dict[bytes, list[tuple[str, int]]] = {}
+    state_topic = (
+        f"/manyforge/{component_id}/{arm_controller}/controller_state"
+        if arm_controller else None
+    )
+    last_endpoints: list[tuple[str, str, str, str]] = []
+    last_state_endpoints: list[tuple[str, str, str, str]] = []
+
+    def observe(message: ControllerManagerActivity, info: Any) -> None:
+        publisher_gid = info.get("publisher_gid")
+        if isinstance(publisher_gid, dict):
+            data = publisher_gid.get("data")
+            if data is not None:
+                gid = bytes(data)
+                observed_gids.add(gid)
+                gripper_states[gid] = [
+                    (row.name, row.state.id) for row in message.controllers
+                ]
+
+    try:
+        rclpy.init(context=context)
+        node = rclpy.create_node("native_process_readiness_probe", context=context)
+        executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        subscription = node.create_subscription(
+            ControllerManagerActivity, topic, observe,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"native host exited while waiting for {topic}: {process.returncode}"
+                )
+            executor.spin_once(timeout_sec=0.05)
+            endpoints = node.get_publishers_info_by_topic(topic)
+            last_endpoints = [
+                (endpoint.node_namespace, endpoint.node_name,
+                 endpoint.topic_type, bytes(endpoint.endpoint_gid).hex())
+                for endpoint in endpoints
+            ]
+            if len(endpoints) != 1:
+                continue
+            endpoint = endpoints[0]
+            gid = bytes(endpoint.endpoint_gid)
+            if (endpoint.node_namespace == f"/manyforge/{component_id}"
+                and endpoint.node_name == "controller_manager"
+                and endpoint.topic_type ==
+                    "controller_manager_msgs/msg/ControllerManagerActivity"
+                and any(gid) and gid in observed_gids):
+                if gripper_controller is not None:
+                    matches = [state for name, state in gripper_states.get(gid, [])
+                               if name == gripper_controller]
+                    if matches != [State.PRIMARY_STATE_INACTIVE]:
+                        continue
+                if state_topic is not None:
+                    state_endpoints = node.get_publishers_info_by_topic(state_topic)
+                    last_state_endpoints = [
+                        (item.node_namespace, item.node_name, item.topic_type,
+                         bytes(item.endpoint_gid).hex())
+                        for item in state_endpoints
+                    ]
+                    if len(state_endpoints) != 1:
+                        continue
+                    state = state_endpoints[0]
+                    if not (state.node_namespace == f"/manyforge/{component_id}"
+                            and state.node_name == arm_controller
+                            and state.topic_type ==
+                                "control_msgs/msg/JointTrajectoryControllerState"
+                            and any(bytes(state.endpoint_gid))):
+                        continue
+                yield
+                return
+        raise RuntimeError(
+            f"native controller activity did not become available: {topic}; "
+            f"endpoints={last_endpoints}; observed_gids={[x.hex() for x in observed_gids]}; "
+            f"state_topic={state_topic}; state_endpoints={last_state_endpoints}; "
+            f"gripper_controller={gripper_controller}; gripper_states={gripper_states}"
+        )
+    finally:
+        if executor is not None:
+            if node is not None:
+                executor.remove_node(node)
+            executor.shutdown()
+        if node is not None:
+            if subscription is not None:
+                node.destroy_subscription(subscription)
+            node.destroy_node()
+        if context.ok():
+            rclpy.shutdown(context=context)
+
+
+def _ros_provider_epochs(snapshot: Mapping[str, Any]) -> set[tuple[str, str, str]]:
+    return {
+        (row["control_domain_id"], row["provider_runtime_unit_id"],
+         row["provider_runtime_epoch"])
+        for row in snapshot["provider_occurrences"]
+        if row["provider_manifest_id"] == "manyforge.provider.ros2_control"
+    }
+
+
+def _fixture_controllers(
+    execution_run_root: Path, component_id: str, snapshot: Mapping[str, Any],
+) -> tuple[str, str | None]:
+    # Select the launch artifact for the current provider incarnation, not a
+    # predecessor left in the run root after a host restart.
+    epochs = {
+        row["provider_runtime_epoch"] for row in snapshot["provider_occurrences"]
+        if row["provider_manifest_id"] == "manyforge.provider.ros2_control"
+    }
+    artifacts = [
+        path
+        for epoch in epochs
+        for path in (execution_run_root / "controller-launch-artifacts").glob(
+            f"*/{epoch}/{component_id}/controller_launch_artifacts.json"
+        )
+    ]
+    if len(artifacts) != 1:
+        raise RuntimeError(f"expected one current controller launch artifact: {artifacts}")
+    artifact = json.loads(artifacts[0].read_text("utf-8"))
+    if artifact["controllable_component_id"] != component_id:
+        raise RuntimeError(f"controller launch artifact has another component: {artifact}")
+    args = dict(value.split(":=", 1) for value in artifact["launch_arguments"])
+    controller = args.get("arm_controller_name")
+    if not controller:
+        raise RuntimeError(f"controller launch artifact has no arm controller: {artifact}")
+    has_gripper_domain = any(
+        domain.get("control_domain_id") == "lite6_gripper_domain"
+        for domain in snapshot["domains"]
+    )
+    gripper = args.get("gripper_controller_name") or None
+    if has_gripper_domain and gripper is None:
+        raise RuntimeError(f"controller launch artifact has no gripper controller: {artifact}")
+    return controller, gripper if has_gripper_domain else None
+
+
 def _start_host(
     fixture_root: Path,
     execution_state_root: Path,
@@ -527,15 +684,41 @@ def _start_host(
                             ):
                                 assert time.monotonic() < deadline
                                 time.sleep(0.01)
-                            _qualify_native_cclc_product(
-                                execution_run_root,
-                                gripper_only=manifest.get("gripper_only") is True,
-                                component_id=component_id,
-                                expected_domain_ids=expected_domain_ids,
-                            )
-                            _wait_for_current_cclc_routes(
-                                execution_run_root, component_id=component_id
-                            )
+                            arm_controller = None
+                            gripper_controller = None
+                            provider_epochs = None
+                            if manifest.get("gripper_only") is not True:
+                                snapshot = _wait_for_cclc_component(
+                                    execution_run_root, component_id=component_id
+                                )
+                                provider_epochs = _ros_provider_epochs(snapshot)
+                                if not provider_epochs:
+                                    raise RuntimeError("no current ROS control provider")
+                                arm_controller, gripper_controller = _fixture_controllers(
+                                    execution_run_root, component_id, snapshot
+                                )
+                            with _controller_manager_activity_ready(
+                                component_id, process, time.monotonic() + 10.0,
+                                arm_controller=arm_controller,
+                                gripper_controller=gripper_controller,
+                            ):
+                                if provider_epochs is not None:
+                                    current = _wait_for_cclc_component(
+                                        execution_run_root, component_id=component_id
+                                    )
+                                    if _ros_provider_epochs(current) != provider_epochs:
+                                        raise RuntimeError(
+                                            "ROS control provider changed during readiness wait"
+                                        )
+                                _qualify_native_cclc_product(
+                                    execution_run_root,
+                                    gripper_only=manifest.get("gripper_only") is True,
+                                    component_id=component_id,
+                                    expected_domain_ids=expected_domain_ids,
+                                )
+                                _wait_for_current_cclc_routes(
+                                    execution_run_root, component_id=component_id
+                                )
                     except Exception as error:
                         _stop_host(process)
                         detail = (
@@ -1239,24 +1422,55 @@ def test_production_standalone_cclc_remains_closed_without_manager_liveness(
     execution_state_root.mkdir()
     execution_run_root.mkdir()
 
-    process = _start_host(
-        fixture_root,
-        execution_state_root,
-        execution_run_root,
-        manifest,
-        host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
-        qualify_cclc=False,
-    )
-    try:
-        admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0).get()
-        assert admission["authoring_allowed"] is False
-        before = _wait_for_cclc_component(execution_run_root)
-        with pytest.raises(HeadlessApiError) as rejected:
-            _qualify_native_cclc_product(execution_run_root)
-        assert rejected.value.code == "authoring_not_ready"
-        assert _wait_for_cclc_component(execution_run_root) == before
-    finally:
-        _stop_host(process)
+    # Reopen the same durable journals after shutdown: both starts must retain
+    # the closed production admission state without synthetic Manager liveness.
+    for _ in range(2):
+        process = _start_host(
+            fixture_root,
+            execution_state_root,
+            execution_run_root,
+            manifest,
+            host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
+            qualify_cclc=False,
+        )
+        try:
+            admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0).get()
+            assert admission["authoring_allowed"] is False
+            before = _wait_for_cclc_component(execution_run_root)
+            with pytest.raises(HeadlessApiError) as rejected:
+                _qualify_native_cclc_product(execution_run_root)
+            assert rejected.value.code == "authoring_not_ready"
+            after = _wait_for_cclc_component(execution_run_root)
+            # Readiness is a live observation and its timestamp, measured
+            # source facts, digest and output counters may advance without a
+            # lifecycle effect. Compare the actual ownership and lifecycle.
+            unchanged = (
+                "active_public_pointer_digest", "component_lifecycle_generation",
+                "component_lifecycle_state", "controllable_component_id",
+                "graph_revision", "lifecycle_progress", "lifecycle_target",
+                "provider_occurrences", "publication_generation", "retained_bundle_id",
+            )
+            assert {key: after[key] for key in unchanged} == {
+                key: before[key] for key in unchanged
+            }
+            domain_facts = (
+                "control_domain_id", "control_domain_revision", "kind",
+                "controller_topology_id", "topology_revision", "resources",
+                "current_control_bindings", "active_control_configuration",
+            )
+            assert [
+                {key: domain[key] for key in domain_facts}
+                for domain in after["domains"]
+            ] == [
+                {key: domain[key] for key in domain_facts}
+                for domain in before["domains"]
+            ]
+            assert CellAdmissionClient(execution_run_root, timeout_seconds=5.0).get()[
+                "authoring_allowed"
+            ] is False
+        finally:
+            _stop_host(process)
+        assert process.returncode == 0
 
 
 def test_arm_only_native_process_publishes_component_based_status(
@@ -1801,10 +2015,34 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
             errors="replace"
         )
 
-        assert stderr == (
-            "native command-free orphan reconciliation: resources=0\n"
-            f"{injected_failure}\n"
+        lines = stderr.splitlines()
+        measured_source_diagnostic = (
+            "manyforge measured source preparation: component=lite6_arm "
+            "code=runtime_measured_source_unavailable "
+            "message=Current measured sources are unavailable"
         )
+        mandatory_lines = [
+            line for line in lines if line != measured_source_diagnostic
+        ]
+        assert len(mandatory_lines) == 4
+        assert stderr == "\n".join(lines) + "\n"
+        prefix = "manyforge controller launch artifacts: "
+        assert mandatory_lines[0].startswith(prefix)
+        artifact = json.loads(mandatory_lines[0][len(prefix):])
+        artifacts = list((execution_run_root / "controller-launch-artifacts").glob(
+            "*/*/lite6_arm/controller_launch_artifacts.json"
+        ))
+        assert len(artifacts) == 1
+        assert artifact == json.loads(artifacts[0].read_text("utf-8"))
+        assert artifact["controllable_component_id"] == "lite6_arm"
+        assert re.fullmatch(
+            r"manyforge controller launch: component=lite6_arm decision=started pid=[1-9][0-9]*",
+            mandatory_lines[1],
+        )
+        assert mandatory_lines[2:] == [
+            "native command-free orphan reconciliation: resources=0",
+            injected_failure,
+        ]
         assert process.poll() == 70
         assert not (execution_run_root / "execution-command.sock").exists()
         assert not (execution_run_root / "execution-control.sock").exists()
@@ -4126,7 +4364,7 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
         _stop_host(process)
 
 
-def test_robotiq_position_direct_cli_without_manager_refuses_missing_cell_time(
+def test_robotiq_position_direct_cli_starts_with_closed_admission(
     tmp_path: Path,
 ) -> None:
     fixture_root = tmp_path / "fixture"
@@ -4139,23 +4377,98 @@ def test_robotiq_position_direct_cli_without_manager_refuses_missing_cell_time(
     state_root, run_root = tmp_path / "state", tmp_path / "run"
     state_root.mkdir()
     run_root.mkdir()
-    # M1 uses the Manager's stable cell time/Kernel owner. The retiring direct
-    # CLI remains explicitly closed; no alternate clock or owner is invented.
-    process = None
+    process = _start_host(
+        fixture_root, state_root, run_root, manifest,
+        host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
+        qualify_cclc=False,
+    )
     try:
-        with pytest.raises(RuntimeError, match=(
-            r"(?s)status 70.*ROS gripper-only component requires its exact physical "
-            r"target and stable cell time"
-        )):
-            process = _start_host(
-                fixture_root, state_root, run_root, manifest,
-                host_environment="MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST",
-                qualify_cclc=False,
-            )
+        client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+        identity = client.identity()["identity"]
+        assert identity["schema_version"] == "manyforge.execution_identity.v2"
+        assert identity["cell_id"] == manifest["cell_id"]
+        assert identity["retained_bundle_id"] == manifest["retained_bundle_id"]
+        assert identity["graph_revision"] == manifest["graph_revision"]
+        assert identity["active_publication_generation"] == manifest[
+            "active_publication_generation"
+        ]
+        assert identity["owner_epoch"]
+        assert CellAdmissionClient(run_root, timeout_seconds=5.0).get()[
+            "authoring_allowed"
+        ] is False
+        targets = client.targets()["targets"]
+        component, target = _execution_target(targets, presentation="gripper")
+        assert target["command"] is not None
+        assert component["availability"]["command_eligible"] is False
+        assert all(
+            row["presentation"] != "motion"
+            for item in targets["components"] for row in item["targets"]
+        )
+        snapshot = _wait_for_cclc_component(
+            run_root, component_id=component["controllable_component_id"]
+        )
+        assert snapshot["component_lifecycle_state"] == "declared"
+        assert all(
+            domain["active_control_configuration"] is None
+            for domain in snapshot["domains"]
+        )
     finally:
-        if process is not None:
-            _stop_host(process)
+        _stop_host(process)
+    assert process.returncode == 0
 
+
+
+def _assert_delayed_first_packet(
+    execution_run_root: Path, get: dict[str, Any], first: dict[str, Any],
+) -> None:
+    # A connected private client may be descheduled before its first
+    # packet. A second request stays queued during the 300 ms delay.
+    # Connect does not prove when the host accepted: a scheduling delay
+    # before accept can let the old timeout pass this test.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as delayed:
+        delayed.settimeout(5.0)
+        pinned = PinnedRunRoot(execution_run_root)
+        with pinned.socket_address("execution-command.sock") as address:
+            delayed.connect(address)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as queued:
+            with pinned.socket_address("execution-command.sock") as address:
+                queued.connect(address)
+            queued.sendall(rfc8785.dumps(get))
+            queued.settimeout(0.3)
+            with pytest.raises(socket.timeout):
+                queued.recv(4 * 1024 * 1024)
+            delayed.sendall(rfc8785.dumps(get))
+            delayed_response = json.loads(delayed.recv(4 * 1024 * 1024))
+            queued.settimeout(5.0)
+            queued_response = json.loads(queued.recv(4 * 1024 * 1024))
+    assert delayed_response == first
+    assert queued_response == first
+
+
+def test_ordinary_socket_accepts_delayed_first_packet(tmp_path: Path) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
+    process = _start_host(
+        fixture_root, execution_state_root, execution_run_root, manifest,
+        qualify_cclc=False,
+    )
+    try:
+        client = ExecutionCommandClient(execution_run_root, timeout_seconds=5.0)
+        get = {
+            "api_version": "manyforge.execution_command.v1",
+            "command": "cell_admission_get",
+        }
+        first = client._exchange(get)
+        replay = client._exchange(get)
+        assert replay == first
+        _assert_delayed_first_packet(execution_run_root, get, first)
+    finally:
+        _stop_host(process)
 
 
 def test_cell_admission_crosses_real_execution_seqpacket_surface(
@@ -4181,6 +4494,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         first = client._exchange(get)
         replay = client._exchange(get)
         assert replay == first
+        _assert_delayed_first_packet(execution_run_root, get, first)
         assert set(first) == {
             "api_version",
             "authoring_admission",

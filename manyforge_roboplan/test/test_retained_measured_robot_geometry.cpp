@@ -57,6 +57,7 @@ public:
       : package_root_(bootstrap_root),
         bundle_(load_ui6i_bundle(bootstrap_root)), map_(load_map()) {
     project_bindings(core::ControllableComponentId("lite6_robot"), true);
+    project_bindings(core::ControllableComponentId("lite_gripper"), true);
   }
 
 private:
@@ -70,7 +71,7 @@ private:
           row.control_binding_id.value() !=
               "lite6_robot.arm.execution-trajectory-execute" &&
           row.control_binding_id.value() !=
-              "lite6_robot.gripper.tool-gripper-command")
+              "lite_gripper.gripper.tool-gripper-command")
         continue;
       const auto physical = std::find_if(
           graph.control_bindings.begin(), graph.control_bindings.end(),
@@ -276,11 +277,16 @@ private:
                         map->control_bindings().end(), [](const auto &row) {
                           return row.controllable_component_id.value() ==
                                  "lite6_robot";
-                        }) == 10)
+                        }) == 8 &&
+          std::count_if(map->control_bindings().begin(),
+                        map->control_bindings().end(), [](const auto &row) {
+                          return row.controllable_component_id.value() ==
+                                 "lite_gripper";
+                        }) == 2)
         return bundle;
     }
     throw std::runtime_error(
-        "actual UI6-I Lite6 ten-binding retained bundle missing");
+        "actual UI6-I split Lite6 arm and tool retained bundle missing");
   }
   product_test::PackageRoot root_;
   std::filesystem::path package_root_;
@@ -355,19 +361,20 @@ TEST(RetainedMeasuredRobotGeometry, ActualUi6iTenAliasesUseTwoPhysicalGroups) {
       << "build manyforge_ui6i_cell_bootstrap and supply its retained-package";
   GeometryFixture fixture{std::filesystem::path(root)};
   ASSERT_EQ(fixture.bindings.size(), 2U);
+  ASSERT_EQ(fixture.ids.size(), 2U);
   unsigned arm_aliases = 0, tool_aliases = 0, owned_coordinates = 0;
   for (const auto &row : fixture.map().control_bindings()) {
-    if (row.controllable_component_id != fixture.ids.front())
-      continue;
-    if (row.resources.size() == 6)
+    if (row.controllable_component_id == fixture.ids[0]) {
+      ASSERT_EQ(row.resources.size(), 6U);
       ++arm_aliases;
-    else if (row.resources.size() == 1)
+    } else if (row.controllable_component_id == fixture.ids[1]) {
+      ASSERT_EQ(row.resources.size(), 1U);
       ++tool_aliases;
-    else
-      FAIL() << "unexpected actual Lite6 resource group";
+    }
   }
   for (const auto &coordinate : fixture.map().coordinates())
-    if (coordinate.owner_component_id == fixture.ids.front() &&
+    if ((coordinate.owner_component_id == fixture.ids[0] ||
+         coordinate.owner_component_id == fixture.ids[1]) &&
         coordinate.coordinate_kind != deployment::UrdfCoordinateKind::kNone)
       ++owned_coordinates;
   EXPECT_EQ(arm_aliases, 8U);
@@ -375,9 +382,11 @@ TEST(RetainedMeasuredRobotGeometry, ActualUi6iTenAliasesUseTwoPhysicalGroups) {
   EXPECT_EQ(owned_coordinates, 8U);
   const auto result = fixture.qualify();
   ASSERT_TRUE(result.ok()) << result.error().message;
-  ASSERT_EQ(result.value().size(), 1U);
-  EXPECT_EQ(result.value().front().required_resources.size(), 7U);
-  EXPECT_TRUE(result.value().front().sources.empty());
+  ASSERT_EQ(result.value().size(), 2U);
+  EXPECT_EQ(result.value()[0].required_resources.size(), 6U);
+  EXPECT_EQ(result.value()[1].required_resources.size(), 1U);
+  EXPECT_TRUE(result.value()[0].sources.empty());
+  EXPECT_TRUE(result.value()[1].sources.empty());
   fixture.bindings.pop_back();
   const auto missing_tool = fixture.qualify();
   ASSERT_FALSE(missing_tool.ok());

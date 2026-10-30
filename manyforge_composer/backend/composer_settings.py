@@ -118,7 +118,7 @@ class ViewerGraphicsProfile(BaseModel):
 def _gpu_graphics() -> ViewerGraphicsProfile:
     return ViewerGraphicsProfile(
         max_pixel_ratio=1.5, antialias=True, outline_smoothing=True,
-        pose_rate_hz=30, motion_smoothing=True, camera_damping=True,
+        pose_rate_hz=30, motion_smoothing=False, camera_damping=True,
     )
 
 

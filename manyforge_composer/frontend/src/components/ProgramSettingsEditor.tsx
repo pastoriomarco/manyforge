@@ -793,9 +793,10 @@ export function ProgramSettingsEditor({
               {motionConflict.count} node {motionConflict.count === 1 ? 'value is' : 'values are'}
               {' '}higher than the proposed global limit.
             </p>
-            <div>
+            <div className="dialog-actions">
               <button
                 type="button"
+                className="primary-action"
                 onClick={() => void performMotionUpdate(motionConflict.values, 'reduce')}
               >Reduce node limits</button>
               <button

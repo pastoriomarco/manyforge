@@ -1704,10 +1704,11 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
           : component_manager::ManagerSceneInitialization::kPreserve;
   const auto prepared = content_identity::parse_canonical_json(
       result.prepared_activation->canonical_receipt_json);
-  Require(initialization == "preserve" ||
-              RequiredString(RequiredMember(prepared, "origin"), "kind") ==
-                  "scenario",
-          "sealed canonical-empty Apply must preserve Scene initialization");
+  const auto origin_kind =
+      RequiredString(RequiredMember(prepared, "origin"), "kind");
+  Require(initialization == "preserve" || origin_kind == "scenario" ||
+              origin_kind == "sealed_canonical_empty",
+          "Apply origin does not support Scene initialization");
   result.expected_current_retained_bundle_id =
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =

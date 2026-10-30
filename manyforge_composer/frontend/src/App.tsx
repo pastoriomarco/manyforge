@@ -53,14 +53,18 @@ import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
-import { closeScenario as closeCurrentScenario, forceCloseScenario, type ClosePreparationInputs } from './state/scenarioClose';
+import { closeScenario as closeCurrentScenario, closeErrorCode, forceCloseScenario, sceneClearDescription, type ClosePreparationInputs } from './state/scenarioClose';
 import { useCCLC, waitForObservation } from './hooks/useCCLC';
 import type { ManagerActiveProjection } from './types/api';
 import {
   managerActivationSettlementKey,
   nodeEnvironmentRefreshKey,
   refreshOnManagerActivationSettled,
+  managerReadinessTransientRetryKey,
+  refreshTransientResourcesOnManagerReadiness,
   refreshViewerModelsOnManagerChange,
+  isTransientManagerReadinessErrorCode,
+  type ReadinessTransientRefreshAttempts,
   viewerModelRefreshKey,
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
@@ -107,6 +111,7 @@ import {
   type WorkbenchNotice,
 } from './state/workbenchNotices';
 import { startupScenarioNotices } from './state/startupScenarioNotice';
+import { initialSceneNotice } from './state/initialSceneNotice';
 import {
   onOpenGlobalRulesRequest,
   takeOpenGlobalRulesRequest,
@@ -131,6 +136,10 @@ function isNotFound(error: unknown): boolean {
 
 function isAssistantProfileAbsent(error: unknown): boolean {
   return apiErrorCode(error) === 'assistant_mode_projection_unavailable';
+}
+
+function isTransientManagerReadinessError(error: unknown): boolean {
+  return isTransientManagerReadinessErrorCode(apiErrorCode(error));
 }
 
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
@@ -255,7 +264,14 @@ export default function App() {
   const headlessEnabled = structuralMode === 'headless_client';
   const [catalog, retryCatalog] = useStructuralResource(api.catalog.list, {
     failureMessage: 'Could not read the immutable v2 node catalog.',
+    retryableWhen: isTransientManagerReadinessError,
   });
+  const catalogLatestRequestId = useRef(0);
+  const retryCatalogTracked = useCallback(() => {
+    const requestId = retryCatalog();
+    catalogLatestRequestId.current = requestId;
+    return requestId;
+  }, [retryCatalog]);
   const [manifest, retryManifest] = useStructuralResource(api.urdf.manifest, {
     absentWhen: isNotFound,
     absentMessage: 'No complete URDF is available for the active retained deployment.',
@@ -267,8 +283,19 @@ export default function App() {
       enabled: headlessEnabled,
       disabledMessage: 'Node-environment facts require a connected headless owner.',
       failureMessage: 'Could not read the active v2 node environment.',
+      retryableWhen: isTransientManagerReadinessError,
     },
   );
+  const nodeEnvironmentLatestRequestId = useRef(0);
+  const retryNodeEnvironmentTracked = useCallback(() => {
+    const requestId = retryNodeEnvironment();
+    nodeEnvironmentLatestRequestId.current = requestId;
+    return requestId;
+  }, [retryNodeEnvironment]);
+  const readinessTransientRefreshAttempts = useRef<ReadinessTransientRefreshAttempts>({
+    catalog: new Set(),
+    nodeEnvironment: new Set(),
+  });
   const nodeEnvironmentWakeKey = useRef<string | null>(null);
   const viewerModelWakeKey = useRef<string | null>(null);
   const managerActivationWakeKey = useRef<string | null>(null);
@@ -333,9 +360,9 @@ export default function App() {
     }
     if (nodeEnvironmentWakeKey.current === key) return;
     nodeEnvironmentWakeKey.current = key;
-    retryNodeEnvironment();
+    retryNodeEnvironmentTracked();
     retryAssistantModes();
-  }, [headlessEnabled, headlessSnapshot, retryAssistantModes, retryNodeEnvironment]);
+  }, [headlessEnabled, headlessSnapshot, retryAssistantModes, retryNodeEnvironmentTracked]);
   // The catalog and the Deployment workspace (its Applied/runAdmission half)
   // depend on the active applied selection, which settles after an accepted
   // Load/Apply from any client. Re-read both once when it settles.
@@ -349,9 +376,44 @@ export default function App() {
     managerActivationWakeKey.current = refreshOnManagerActivationSettled(
       managerActivationWakeKey.current,
       managerActivationSettlementKey(headlessSnapshot),
-      [retryCatalog, refreshDeploymentWorkspace],
+      [retryCatalogTracked, refreshDeploymentWorkspace],
     );
-  }, [headlessEnabled, headlessSnapshot, refreshDeploymentWorkspace, retryCatalog]);
+  }, [headlessEnabled, headlessSnapshot, refreshDeploymentWorkspace, retryCatalogTracked]);
+  // A settled read may fail after its transition. Retry only the latest transient
+  // failure once for the verified Apply identity; an older error cannot consume it.
+  useEffect(() => {
+    if (!headlessEnabled || headlessSnapshot === null) return;
+    readinessTransientRefreshAttempts.current = refreshTransientResourcesOnManagerReadiness(
+      readinessTransientRefreshAttempts.current,
+      managerReadinessTransientRetryKey(headlessSnapshot, {
+        transportStatus: headlessState.transportStatus,
+        semanticStatus: headlessState.semanticStatus,
+      }),
+      {
+        failureRequestId: catalog.status === 'error' ? catalog.requestId ?? null : null,
+        latestRequestId: catalogLatestRequestId.current,
+        retryable: catalog.status === 'error' && catalog.retryable === true,
+        refresh: retryCatalogTracked,
+      },
+      {
+        failureRequestId: nodeEnvironment.status === 'error'
+          ? nodeEnvironment.requestId ?? null
+          : null,
+        latestRequestId: nodeEnvironmentLatestRequestId.current,
+        retryable: nodeEnvironment.status === 'error' && nodeEnvironment.retryable === true,
+        refresh: retryNodeEnvironmentTracked,
+      },
+    );
+  }, [
+    catalog,
+    headlessEnabled,
+    headlessSnapshot,
+    headlessState.semanticStatus,
+    headlessState.transportStatus,
+    nodeEnvironment,
+    retryCatalogTracked,
+    retryNodeEnvironmentTracked,
+  ]);
   useEffect(() => {
     if (!headlessEnabled) {
       viewerModelWakeKey.current = null;
@@ -617,6 +679,7 @@ export default function App() {
   const [dismissedActivationNotice, setDismissedActivationNotice] = useState<string | null>(null);
   const closeAbort = useRef<AbortController | null>(null);
   const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
+  const [sceneClearFailure, setSceneClearFailure] = useState<{ code: string; message: string } | null>(null);
   // Bumped by Reset reaching Idle and by Scenario Close: clears every warning.
   const [warningClearEpoch, setWarningClearEpoch] = useState(0);
   useEffect(() => () => closeAbort.current?.abort(), []);
@@ -637,6 +700,7 @@ export default function App() {
     const abort = new AbortController();
     closeAbort.current = abort;
     setCloseRunning(true);
+    setSceneClearFailure(null);
     const abortFromCaller = () => abort.abort(callerSignal?.reason);
     callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
     if (callerSignal?.aborted) abortFromCaller();
@@ -669,10 +733,17 @@ export default function App() {
         },
         waitForObservation: (signal) => waitForObservation(signal),
         trackApply: setTrackedApply, progress: setScenarioCloseProgress,
+        sceneClearNotice: (_apply, error) => {
+          setSceneClearFailure({ code: closeErrorCode(error) ?? 'scene_clear_unknown', message: error.message });
+        },
         cellRecoverRunning: () => latestRobotControl.current.stopFaultRecoveryPending,
       });
       if (closed !== null) setWarningClearEpoch((epoch) => epoch + 1);
       return closed;
+    } catch (error) {
+      const code = closeErrorCode(error);
+      if (code?.startsWith('scene_clear_')) setSceneClearFailure({ code, message: error instanceof Error ? error.message : code });
+      throw error;
     } finally {
       callerSignal?.removeEventListener('abort', abortFromCaller);
       closeAbort.current = null; setScenarioCloseProgress(null); setCloseRunning(false);
@@ -874,12 +945,103 @@ export default function App() {
   const authoringCause = headlessEnabled
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
     : null;
+  // New's accepted Scenario Apply may clear after Manager activation completes.
+  const [newSceneClearNotice, setNewSceneClearNotice] = useState<WorkbenchNotice | null>(null);
+  const newSceneClearApply = programController.newSceneClearApply;
+  useEffect(() => {
+    if (newSceneClearApply == null) return;
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let sawPublication = false;
+    const deadline = performance.now() + 10_000;
+    const noticeDeadline = setTimeout(() => {
+      setNewSceneClearNotice({ id: 'scene.clear.unknown', severity: 'error', domain: 'activation',
+        title: 'Scene clearing outcome unknown', message: 'Scene clear outcome unknown; check the Scene.' });
+      programController.clearNewSceneClearApply?.(newSceneClearApply);
+    }, 10_000);
+    const poll = async () => {
+      try {
+        const status = await api.programs.sceneClearStatus(abort.signal);
+        if (abort.signal.aborted) return;
+        if (status !== null && status.applyId === newSceneClearApply.applyId
+          && status.applyGeneration === newSceneClearApply.applyGeneration && status.state !== 'pending') {
+          // DX-3270: the newer New clear describes the final Scene and replaces
+          // a timed-out Close's notice when its own terminal result arrives.
+          if (programController.newSceneClearApply?.applyId === status.applyId
+            && programController.newSceneClearApply.applyGeneration === status.applyGeneration
+            && status.state !== 'superseded') {
+            setSceneClearFailure(null);
+          }
+          if (status.state !== 'unknown') clearTimeout(noticeDeadline);
+          if (status.state === 'succeeded' || status.state === 'superseded') {
+            setNewSceneClearNotice(null);
+          }
+          else {
+            setNewSceneClearNotice({ id: `scene.clear.${status.state}`, severity: 'error', domain: 'activation',
+              title: 'Scene clearing failed', message: sceneClearDescription(status) });
+          }
+          programController.clearNewSceneClearApply?.(newSceneClearApply);
+          return;
+        }
+        const activation = await api.manager.applyStatus(newSceneClearApply.applyId, newSceneClearApply.applyGeneration, abort.signal);
+        if (abort.signal.aborted) return;
+        if (activation.state === 'failed' || activation.state === 'unknown_effect') {
+          clearTimeout(noticeDeadline);
+          setNewSceneClearNotice(null);
+          programController.clearNewSceneClearApply?.(newSceneClearApply);
+          return;
+        }
+        if (activation.state === 'succeeded') {
+          const current = await api.manager.status(abort.signal);
+          const transaction = current.status.active.publication.transaction;
+          const same = transaction !== null && typeof transaction === 'object' && !Array.isArray(transaction)
+            && transaction.kind === 'named_apply' && transaction.apply_id === newSceneClearApply.applyId
+            && transaction.apply_generation === newSceneClearApply.applyGeneration;
+          if (current.source.available && current.source.freshness === 'fresh') {
+            if (same) sawPublication = true;
+            else if (sawPublication) { clearTimeout(noticeDeadline); setNewSceneClearNotice(null); programController.clearNewSceneClearApply?.(newSceneClearApply); return; }
+          }
+        }
+        setNewSceneClearNotice(performance.now() >= deadline
+          ? { id: 'scene.clear.unknown', severity: 'error', domain: 'activation', title: 'Scene clearing outcome unknown',
+            message: 'Scene clear outcome unknown; check the Scene.' }
+          : { id: 'scene.clear.pending', severity: 'info', domain: 'activation',
+            title: 'Clearing the Scene', message: 'Waiting for Scene clearing to finish.', busy: true });
+        timer = setTimeout(poll, 250);
+      } catch {
+        if (!abort.signal.aborted) setNewSceneClearNotice({ id: 'scene.clear.unknown', severity: 'error', domain: 'activation',
+          title: 'Scene clearing outcome unknown', message: 'Scene clear outcome unknown; check the Scene.' });
+        if (!abort.signal.aborted) programController.clearNewSceneClearApply?.(newSceneClearApply);
+      }
+    };
+    void poll();
+    return () => { abort.abort(); clearTimeout(noticeDeadline); if (timer !== undefined) clearTimeout(timer); };
+  }, [newSceneClearApply, programController.clearNewSceneClearApply]);
+  const [resetReloadRequest, setResetReloadRequest] = useState(0);
+  const initialSceneFailure = headlessSnapshot?.runtime.initialSceneFailure ?? null;
   const operationNotices = useMemo<WorkbenchNotice[]>(() => {
     const notices: WorkbenchNotice[] = [
+      ...(newSceneClearNotice === null ? [] : [{ ...newSceneClearNotice,
+        ...(newSceneClearNotice.severity === 'error' ? { actions: [{ id: 'dismiss', label: 'Dismiss',
+          run: () => setNewSceneClearNotice(null) }] } : {}) }]),
       ...requiredComponentFaultNotices(headlessSnapshot),
       ...authoringContainmentNotices(headlessSnapshot),
       ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
     ];
+    const sceneNotice = initialSceneNotice(initialSceneFailure, () => {
+      setActiveWorkspace('program');
+      setResetReloadRequest((value) => value + 1);
+    });
+    if (sceneNotice !== null) notices.push(sceneNotice);
+    if (scenarioCloseProgress !== null) notices.push({
+      id: 'scenario.close', severity: 'info', domain: 'activation', title: 'Scenario Close in progress',
+      message: scenarioCloseProgress, busy: true,
+    });
+    if (sceneClearFailure !== null) notices.push({
+      id: `scene.clear.${sceneClearFailure.code}`, severity: 'error', domain: 'activation',
+      title: 'Scene clearing failed', message: sceneClearFailure.message,
+      actions: [{ id: 'dismiss', label: 'Dismiss', run: () => setSceneClearFailure(null) }],
+    });
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];
@@ -937,6 +1099,10 @@ export default function App() {
     return notices;
   }, [
     authoringCause,
+    scenarioCloseProgress,
+    sceneClearFailure,
+    initialSceneFailure,
+    newSceneClearNotice,
     authoringWorkspace.unavailableReason,
     controlNotices.length,
     deploymentController.applying,
@@ -1512,8 +1678,8 @@ export default function App() {
                 (target) => target.targetDescriptor,
               )}
               stopChains={robotControl.motionTargets}
-              onRetryCatalog={retryCatalog}
-              onRetryEnvironment={retryNodeEnvironment}
+              onRetryCatalog={retryCatalogTracked}
+              onRetryEnvironment={retryNodeEnvironmentTracked}
               onInvalidEditChange={setProgramInvalidEdit}
               onOpenScene={() => setActiveWorkspace('scene')}
               inspectorTarget={programInspectorTarget}
@@ -1687,6 +1853,7 @@ export default function App() {
                 robotControl={robotControl}
                 correctionGhost={heldNodePreview.ghost}
                 runtimeEnabled={connectedProjection}
+                resetReloadRequest={resetReloadRequest}
                 sourceModel={sourceModel}
                 viewerActive
                 viewerInspectorTarget={viewerInspectorTarget}

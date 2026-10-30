@@ -1691,12 +1691,15 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
         entry = environment.catalog.get(disposition.row.node_id)
         if entry.kind != "leaf" or not disposition.adapter_build_qualified:
             continue
+        parameters = {"duration_s": 1.0}
+        if entry.category == "motion":
+            parameters["target_role"] = "arm"
         adapter = resolver.instantiate(
             disposition.row,
             NodeAdapterBuildContext(
                 name="leaf",
                 node_instance_id="leaf",
-                parameters={"duration_s": 1.0},
+                parameters=parameters,
                 input_resolver=input_resolver,
                 attempt_source=ProgramRunAttemptSource("run.flags"),
                 ports=_ports(),
@@ -1721,6 +1724,7 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
         "motion.move_to_pose",
         "motion.move_until_signal",
         "motion.probe_search",
+        "motion.set_tcp",
         "planning.plan_pick_sequence",
         "planning.plan_place_sequence",
         "simulation.reset",

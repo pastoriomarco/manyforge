@@ -59,6 +59,12 @@ jobs:
           - name: core-tsan
             suite: core-tsan
             command: bash scripts/ci/run-core-tsan.sh
+          - name: ros-integration-and-e2e
+            suite: ros-e2e
+            image: manyforge-ros-lyrical-full
+            command: |
+              ./scripts/test-all.sh ros
+              ./scripts/test-all.sh ros-e2e
     steps:
       - name: Prepare local clone
         id: checkout
@@ -93,12 +99,13 @@ jobs:
         shell: bash
         env:
           LOCAL_CI_COMMAND: ${{ matrix.command }}
+          LOCAL_CI_IMAGE: ${{ matrix.image }}
           TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 history_size=7
           CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           set -euo pipefail
           worktree="${{ steps.checkout.outputs.worktree }}"
-          image="${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}"
+          image="${LOCAL_CI_IMAGE:-${MANYFORGE_LOCAL_CI_IMAGE:-manyforge-dev:latest}}"
 
           image_id="$(docker image inspect "${image}" --format '{{.Id}}')"
           if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then

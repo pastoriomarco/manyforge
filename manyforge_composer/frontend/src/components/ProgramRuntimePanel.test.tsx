@@ -43,6 +43,7 @@ import {
 import { readStyleSource } from '../styles/readStyleSource';
 import { formatStructuredError } from '../state/structuredError';
 import { api } from '../api/client';
+import { initialSceneNotice } from '../state/initialSceneNotice';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -2007,7 +2008,7 @@ async function mountTransport(program: ProgramRuntimeController, robot = robotCo
   const root = createRoot(node('div') as unknown as Element);
   await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} />); });
   return {
-    rerender: async () => { await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} />); }); },
+    rerender: async (resetReloadRequest = 0) => { await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} resetReloadRequest={resetReloadRequest} />); }); },
     press: async (match: (props: Props) => boolean) => {
       const found = created.map(propsOf).filter((candidate): candidate is Props => (
         candidate !== undefined && match(candidate)
@@ -2034,6 +2035,21 @@ async function mountTransport(program: ProgramRuntimeController, robot = robotCo
 }
 
 describe('Reset confirmation and persistent keys', () => {
+  it('notice opens Reset with reload selected without sending Reset', async () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    const open = await mountTransport(program);
+    try {
+      let resetReloadRequest = 0;
+      const notice = initialSceneNotice({ state: 'unknown', reason: { code: 'offline', message: 'connection lost' } }, () => { resetReloadRequest += 1; });
+      expect(notice?.title).toBe('Initial scene may be incomplete');
+      notice!.actions![0].run();
+      await open.rerender(resetReloadRequest);
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+      expect(open.mounted((props) => props.name === 'reloadInitialScene' && props.checked === true)).toBe(true);
+      expect(program.reset).not.toHaveBeenCalled();
+    } finally { await open.unmount(); }
+  });
+
   it('mentions and lists persistent keys only when the Program has them and Reload is checked', async () => {
     for (const persistence of ['run', 'persistent'] as const) {
       const program = controller('intervention_required');
@@ -2604,7 +2620,7 @@ describe('Active TCP Resume confirmation', () => {
       await transport.press((p) => p.children === 'Cancel');
       expect(program.resumeMotion).not.toHaveBeenCalled();
       await transport.press((p) => p.className === 'transport-group-resume');
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
     } finally { await transport.unmount(); }
   });
@@ -2634,7 +2650,7 @@ describe('Active TCP Resume confirmation', () => {
       }, display: 'robot-a.flange', sequence: 2 };
       second.activeTcp = { ...second.activeTcp!, entry: null, display: null, sequence: 1 };
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).not.toHaveBeenCalled();
       expect(transport.mounted((p) => Array.isArray(p.children)
         && p.children.every((child) => typeof child === 'string')
@@ -2646,7 +2662,7 @@ describe('Active TCP Resume confirmation', () => {
         && JSON.stringify(p.children) === JSON.stringify([
         'robot-b', ': Active TCP is now ', 'No TCP', ' (was ', 'robot-b.tcp', ').',
       ]))).toBe(true);
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2674,14 +2690,14 @@ describe('Active TCP Resume confirmation', () => {
       await transport.press((p) => p.className === 'transport-group-resume');
       second.activeTcp = null;
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).not.toHaveBeenCalled();
       expect(transport.mounted((p) => Array.isArray(p.children)
         && p.children.every((child) => typeof child === 'string')
         && JSON.stringify(p.children) === JSON.stringify([
         'robot-a', ': Active TCP is now ', 'No TCP', ' (was ', 'robot-a.tcp', ').',
       ]))).toBe(true);
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2699,12 +2715,12 @@ describe('Active TCP Resume confirmation', () => {
       await transport.press((p) => p.className === 'transport-group-resume');
       group.resumeAllowed = false;
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).not.toHaveBeenCalled();
       expect(transport.mounted((p) => p.children === 'Resume is no longer available.')).toBe(true);
       group.resumeAllowed = true;
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeMotion).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2844,7 +2860,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
       expect(program.resumeFullStop).not.toHaveBeenCalled();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeFullStop).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2863,14 +2879,14 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
         componentId: 'robot-a', targetId: 'arm', frameRoleId: 'flange',
       }, display: 'robot-a.flange', sequence: 2 };
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeFullStop).not.toHaveBeenCalled();
       expect(transport.mounted((p) => Array.isArray(p.children)
         && p.children.every((child) => typeof child === 'string')
         && JSON.stringify(p.children) === JSON.stringify([
         'robot-a', ': Active TCP is now ', 'robot-a.flange', ' (was ', 'robot-a.tcp', ').',
       ]))).toBe(true);
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeFullStop).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2888,7 +2904,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
       motion.activeTcp = { ...initial, sequence: 2 };
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeFullStop).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
@@ -2954,7 +2970,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       expect(program.resumeFullStop).not.toHaveBeenCalled();
       robot.tcpResumeStatus = null;
       await transport.rerender();
-      await transport.press((p) => p.children === 'Resume' && p.className === undefined);
+      await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
       expect(program.resumeFullStop).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });

@@ -1403,6 +1403,8 @@ describe('Program authoring panels', () => {
     const controller = {
       mutationAvailable: true,
       acceptedApply: null,
+      newSceneClearApply: null,
+      clearNewSceneClearApply: vi.fn(),
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
       scenarioReplacementIdentity: null,
@@ -1635,6 +1637,8 @@ describe('Program authoring panels', () => {
     const controller = {
       mutationAvailable: true,
       acceptedApply: null,
+      newSceneClearApply: null,
+      clearNewSceneClearApply: vi.fn(),
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
       scenarioReplacementIdentity: null,

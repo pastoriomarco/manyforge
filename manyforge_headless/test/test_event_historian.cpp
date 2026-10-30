@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -2046,11 +2047,27 @@ TEST(EventHistorian, Revision4SearchIndexMigratesToHumanTextAndKeepsOriginals) {
 // migrates: the old index is verified and dropped before code keys and the
 // new index take pages, all in the one open transaction.
 TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
+  // Diagnostic only: flush each phase boundary so a timeout identifies the
+  // in-flight phase as well as the durations of completed phases.
+  auto phase_started = std::chrono::steady_clock::now();
+  const char *phase = "setup";
+  const auto next_phase = [&](const char *next) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - phase_started).count();
+    std::fprintf(stderr, "HISTORIAN_PHASE completed=%s elapsed_ms=%lld next=%s\n",
+                 phase, static_cast<long long>(elapsed), next);
+    std::fflush(stderr);
+    phase_started = now;
+    phase = next;
+  };
+  std::fprintf(stderr, "HISTORIAN_PHASE started=%s\n", phase);
+  std::fflush(stderr);
   TemporaryDirectory directory;
   const auto path = directory.path() / "near-capacity-revision4.sqlite3";
   std::vector<std::string> originals;
   {
     SqliteEventHistoryStore store(path, 100U);
+    next_phase("append_events");
     std::mt19937 random(7U);
     for (std::int64_t i = 1; i <= 60; ++i) {
       std::string blob(200000U, ' ');
@@ -2065,9 +2082,11 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
       originals.push_back(content_identity::canonical_json(HistorianPersistenceValue(event)));
     }
   }
+  next_phase("restore_old_index");
   sqlite3 *database = nullptr;
   ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
   ASSERT_EQ(sqlite3_exec(database, kRestorePayloadSearchIndex, nullptr, nullptr, nullptr), SQLITE_OK);
+  next_phase("prepare_pressure");
   // Grow the old index with unmerged segments (still consistent) until the
   // product page ceiling refuses the next one, leaving no free page.
   ASSERT_EQ(sqlite3_exec(database,
@@ -2075,6 +2094,26 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
       "INSERT INTO historian_search(historian_search,rank) VALUES('automerge',0);"
       "INSERT INTO historian_search(historian_search,rank) VALUES('crisismerge',2000);"
       "PRAGMA max_page_count=131072;", nullptr, nullptr, nullptr), SQLITE_OK);
+  next_phase("fill_old_index_to_full");
+  // Fill most of the index in batches. If a batch exceeds the remaining
+  // capacity, roll it back and finish with the original single-row loop.
+  // Each committed batch restores the same external-content index rows.
+  const char *bulk_pressure =
+      "BEGIN;"
+      "INSERT INTO historian_search(historian_search,rowid,component,event_type,details) "
+      "SELECT 'delete',sequence,component,event_type,details FROM historian_search_content;"
+      "INSERT INTO historian_search(rowid,component,event_type,details) "
+      "SELECT sequence,component,event_type,details FROM historian_search_content;"
+      "COMMIT;";
+  for (int batch = 0; batch < 10; ++batch) {
+    if (sqlite3_exec(database, bulk_pressure, nullptr, nullptr, nullptr) != SQLITE_OK) {
+      EXPECT_EQ(sqlite3_extended_errcode(database) & 0xff, SQLITE_FULL);
+      if (!sqlite3_get_autocommit(database)) {
+        ASSERT_EQ(sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr), SQLITE_OK);
+      }
+      break;
+    }
+  }
   for (int cycle = 0;; ++cycle) {
     const auto sequence = std::to_string(cycle % 60 + 1);
     const auto sql = "BEGIN;"
@@ -2091,18 +2130,22 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
       break;
     }
   }
+  next_phase("fixture_integrity_and_close");
   ASSERT_EQ(sqlite3_exec(database, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)",
                          nullptr, nullptr, nullptr), SQLITE_OK);
   ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
   EXPECT_GT(std::filesystem::file_size(path), 500U * 1024U * 1024U);
   {
+    next_phase("migration_open");
     SqliteEventHistoryStore migrated(path, 100U);
+    next_phase("verify_originals");
     for (std::size_t i = 0; i < originals.size(); ++i) {
       const auto stored = migrated.Read(i + 1U);
       ASSERT_TRUE(stored);
       EXPECT_EQ(content_identity::canonical_json(HistorianPersistenceValue(stored->event)), originals[i]);
     }
     // One 240 KB row per page keeps each query inside the 100 ms budget.
+    next_phase("query_all_pages");
     HistorianQuery query;
     query.search = "code.1999";
     query.limit = 1U;
@@ -2115,6 +2158,7 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
     }
     EXPECT_EQ(found, 60U);
   }
+  next_phase("verify_version");
   ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
   sqlite3_stmt *version = nullptr;
   ASSERT_EQ(sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &version, nullptr), SQLITE_OK);
@@ -2122,6 +2166,7 @@ TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
   EXPECT_EQ(sqlite3_column_int(version, 0), 6);
   sqlite3_finalize(version);
   ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  next_phase("cleanup");
 }
 
 // Live finding (M5 session 10): incident cause and closure codes were not

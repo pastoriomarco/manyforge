@@ -209,7 +209,7 @@ export function FolderPicker({
       {!choosingRoot && insideProject && !chooseProject && (
         <p className="field-error" role="status">This is a Scenario project. Choose the folder that contains it.</p>
       )}
-      <div className="dactions">
+      <div className="dialog-actions folder-picker-actions">
         <button type="button" onClick={onCancel}>Cancel</button>
         {chooseProject && !choosingRoot && insideProject && state.status === 'ready' && !roots.includes(state.data.currentPath) && (
           <button type="button" className="primary-action" onClick={() => onChoose(state.data.currentPath)}>

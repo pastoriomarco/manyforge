@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
-import { styleFiles } from './readStyleSource';
+import { readStyleSource, styleFiles, styleTokens } from './readStyleSource';
 
 // UI6-I-VC guard: colors live only in the two token files, every class the
 // components use has a rule, and no rule prelude is written twice in one file.
@@ -124,6 +124,45 @@ describe('UI6-I-VC style system', () => {
       }
     }
     expect([...missing]).toEqual([]);
+  });
+
+  it('gives dialog action buttons one shared confirmation size and color treatment', () => {
+    const css = readStyleSource();
+    const tokens = styleTokens();
+    const sizing = css.match(/\.dialog-actions > button \{([^}]*)\}/)?.[1] ?? '';
+    const sizingRules = [...css.matchAll(/\.dialog-actions > button \{/g)];
+    const primary = css.match(
+      /\.dialog-actions > \.primary-action:not\(:disabled\),\s*\.dialog-actions > \.transport-run:not\(:disabled\) \{([^}]*)\}/,
+    )?.[1] ?? '';
+    const primaryHover = css.match(
+      /\.dialog-actions > \.primary-action:hover:not\(:disabled\),\s*\.dialog-actions > \.transport-run:hover:not\(:disabled\) \{([^}]*)\}/,
+    )?.[1] ?? '';
+    const danger = css.match(/\.danger-button:not\(:disabled\) \{([^}]*)\}/)?.[1] ?? '';
+
+    expect(sizingRules).toHaveLength(1);
+    expect(sizing).toContain('min-width: 0;');
+    expect(sizing).toContain('min-height: 1.9rem;');
+    expect(sizing).toContain('height: auto;');
+    expect(sizing).toContain('padding: 0.3rem 0.8rem;');
+    expect(sizing).toContain('font-size: 0.72rem;');
+    expect(primary).toContain('border-color: ' + tokens.get('--mf-border-success-35') + ';');
+    expect(primary).toContain('color: ' + tokens.get('--mf-text-success-82') + ';');
+    expect(primary).toContain('background: ' + tokens.get('--mf-bg-success-15') + ';');
+    expect(primaryHover).toContain('border-color: ' + tokens.get('--mf-border-success-51') + ';');
+    expect(primaryHover).toContain('background: ' + tokens.get('--mf-bg-success-20') + ';');
+    expect(danger).toContain('border-color: ' + tokens.get('--mf-border-danger-38') + ';');
+    expect(danger).toContain('color: ' + tokens.get('--mf-text-danger-81') + ';');
+    expect(danger).toContain('background: ' + tokens.get('--mf-bg-danger-16') + ';');
+    expect(css).toContain('.dialog-actions > .primary-action:hover:not(:disabled)');
+    expect(css).not.toContain('.transport-confirmation .dialog-actions > button');
+  });
+
+  it('keeps the selected Scenario description inside standard card spacing', () => {
+    const css = readStyleSource();
+    expect(css).toMatch(
+      /\.dcard > \.scenario-status:not\(:first-child\) \{[^}]*margin: 0 0\.65rem 0\.65rem;[^}]*padding: 0\.4rem 0\.6rem;/s,
+    );
+    expect(css).toContain(':not(.scenario-status)');
   });
 
   it('writes each rule prelude once per file and context', () => {

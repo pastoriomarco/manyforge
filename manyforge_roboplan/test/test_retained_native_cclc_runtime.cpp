@@ -2671,6 +2671,24 @@ void CheckCapturedNodeExecution(
   auto &motion = std::get<core::MotionParticipantIntentDTO>(
       intent.participants.front().payload);
   motion.motion = core::PoseGoalDTO{{{0.1, 0.1, 0.1}, {0.0, 0.0, 0.0, 1.0}}};
+  // A Program's Current selector is sent as the robot's Active TCP entry.
+  // Derive the reset value from the actual compiled robot TCP list.
+  const auto &targets = fixture.binding->value().target_role_bindings;
+  const auto arm = std::find_if(targets.begin(), targets.end(), [](const auto &row) {
+    return row.target_role_id == core::TargetRoleId("arm");
+  });
+  ASSERT_NE(arm, targets.end());
+  ASSERT_TRUE(arm->robot_tcps.has_value());
+  const ActiveTcp active_tcp(*arm->robot_tcps);
+  ASSERT_TRUE(active_tcp.value().has_value());
+  const core::TcpEntryDTO tool_tcp{core::ControllableComponentId("lite_gripper"),
+                                   core::CommandTargetId("gripper"),
+                                   core::FrameRoleId("tcp")};
+  ASSERT_EQ(active_tcp.value()->entry, tool_tcp);
+  ASSERT_TRUE(fixture.model_map.kinematic_index().carries(
+      physical.participant_binding.value().controllable_component_id,
+      tool_tcp.component_id));
+  motion.tcp_endpoint = active_tcp.value()->entry;
   motion.motion_interrupt_scopes.clear();
   intent.participants.front().execution_scope =
       core::ProgramNodeExecutionScopeDTO{core::ProgramNodeInstanceId("move"),
@@ -2865,6 +2883,11 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
             path.provider_manifest_revision, path.provider_runtime_unit_id,
             path.provider_runtime_epoch, catalog.catalog_digest},
            port});
+      // Lifecycle requests address one component, even though the captured
+      // package also contains its separately controlled mounted tool.
+      if (physical->value().controllable_component_id !=
+          runtime.component->controllable_component_id)
+        continue;
       std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
       for (const auto &route : desired.binding_routes)
         bindings.push_back({route.control_binding_id,
@@ -3003,13 +3026,22 @@ void CheckRetainedProductReadiness(ReadinessCase test_case) {
   EXPECT_EQ(active_snapshot.component_state, core::ComponentLifecycleStateDTO::kActive);
   EXPECT_TRUE(active_snapshot.exact_controller_configuration_active);
   EXPECT_EQ(active_snapshot.source_generation, prepared_snapshot.source_generation + 1U);
-  if (captured_fixture)
+  if (captured_fixture) {
+    ASSERT_TRUE(std::any_of(physical_bindings.begin(), physical_bindings.end(),
+                            [&](const auto &binding) {
+      return binding.value().controllable_component_id !=
+             runtime.component->controllable_component_id;
+    }));
     for (const auto &[domain, port] : domain_ports) {
-      (void)domain;
-      EXPECT_EQ(port->dispatch_count(), 2U);
+      const bool addressed = std::any_of(
+          expected_domains.begin(), expected_domains.end(),
+          [&](const auto &expected) { return expected.control_domain_id == domain; });
+      EXPECT_EQ(port->dispatch_count(), addressed ? 2U : 0U);
       EXPECT_EQ(port->controller_snapshot().component_state,
-                core::ComponentLifecycleStateDTO::kActive);
+                addressed ? core::ComponentLifecycleStateDTO::kActive
+                          : core::ComponentLifecycleStateDTO::kDeclared);
     }
+  }
 
   core::RouteSelectionIntentDTO route{
       {core::RequestId("route.native.readiness"), current_request_owner, "test",

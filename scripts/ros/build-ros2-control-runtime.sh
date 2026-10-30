@@ -182,14 +182,25 @@ IFS=${MANYFORGE_SAVED_IFS}
 export CMAKE_PREFIX_PATH=${MANYFORGE_ROS_CMAKE_PREFIX_PATH}
 unset BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR
 
+ROS_OVERLAY_BASE_PATHS=(
+    "${WORKSPACE}/manyforge_cclc_msgs"
+    "${WORKSPACE}/manyforge_ros_bringup"
+)
+ROS_OVERLAY_PACKAGES=(manyforge_cclc_msgs manyforge_ros_bringup)
+if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" == ON ]]; then
+    ROS_OVERLAY_BASE_PATHS=(
+        "${WORKSPACE}/manyforge_perception_interfaces"
+        "${ROS_OVERLAY_BASE_PATHS[@]}"
+    )
+    ROS_OVERLAY_PACKAGES=(manyforge_perception_interfaces "${ROS_OVERLAY_PACKAGES[@]}")
+fi
+
 colcon --log-base "${ROS_OVERLAY}/log" build \
-    --base-paths \
-        "${WORKSPACE}/manyforge_cclc_msgs" \
-        "${WORKSPACE}/manyforge_ros_bringup" \
+    --base-paths "${ROS_OVERLAY_BASE_PATHS[@]}" \
     --build-base "${ROS_OVERLAY}/build" \
     --install-base "${ROS_OVERLAY}/install" \
     --symlink-install \
-    --packages-select manyforge_cclc_msgs manyforge_ros_bringup \
+    --packages-select "${ROS_OVERLAY_PACKAGES[@]}" \
     --cmake-args \
         -DBUILD_TESTING="${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}"
 

@@ -328,6 +328,11 @@
   font-size: var(--mf-font-size-068);
 }
 
+.dcard > .scenario-status:not(:first-child) {
+  margin: 0 0.65rem 0.65rem;
+  padding: 0.4rem 0.6rem;
+}
+
 .scenario-status-ready {
   border-color: var(--mf-border-neutral-47);
   color: var(--mf-text-neutral-94b);
@@ -369,11 +374,6 @@
 
 .compact-confirmation p {
   justify-self: stretch;
-}
-
-.compact-confirmation .primary-action {
-  width: auto;
-  padding: 0.38rem 0.7rem;
 }
 
 .document-save-as-path,
@@ -537,11 +537,11 @@
 }
 
 .new-scenario-actions {
-  justify-content: flex-end;
+  flex-wrap: wrap;
 }
 
-.new-scenario-actions > button {
-  flex: 0 1 auto;
+.folder-picker-actions {
+  flex-wrap: wrap;
 }
 
 /* Folder picker: folders only, inside the backend-approved roots. */

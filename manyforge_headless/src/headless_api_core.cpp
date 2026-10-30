@@ -1796,9 +1796,7 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
         RequiredString(apply_record, "scene_initialization");
     const auto origin =
         ReadPreparedOrigin(RequiredMember(apply_record, "prepared_activation"));
-    Require((initialization == "preserve" || initialization == "initialize") &&
-                (initialization == "preserve" ||
-                 RequiredString(origin, "kind") == "scenario"),
+    Require(initialization == "preserve" || initialization == "initialize",
             "program_activation_invalid",
             "Manager Scene initialization purpose is invalid");
     return CommittedApply(RequiredString(apply_record, "intent_digest"),

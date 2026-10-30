@@ -204,7 +204,7 @@ def test_routes_report_conflict_with_current_state_and_validate_input(tmp_path: 
     graphics = settings["viewerGraphics"]
     assert graphics["gpu"] == {
         "maxPixelRatio": 1.5, "antialias": True, "outlineSmoothing": True,
-        "poseRateHz": 30, "motionSmoothing": True, "cameraDamping": True,
+        "poseRateHz": 30, "motionSmoothing": False, "cameraDamping": True,
     }
     assert graphics["software"]["maxPixelRatio"] == 1.0
     assert graphics["software"]["poseRateHz"] == 10

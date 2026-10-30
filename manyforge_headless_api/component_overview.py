@@ -23,6 +23,7 @@ _WAITING = "waiting"
 _WARNING = "warning"
 _FAULT = "fault"
 _OFFLINE = "offline"
+_NOT_APPLICABLE = "not_applicable"
 
 _ADMITTED_MANAGER_APPLY_PHASES = {
     "fence_held",
@@ -915,8 +916,13 @@ def build_component_overview(
         for component in components:
             if component["id"] in empty_prerequisites:
                 component.update(
-                    required=False, status=_OFFLINE,
-                    detail="No components", reason_code=empty_reason,
+                    required=False,
+                    status=(_NOT_APPLICABLE if component["id"] in {
+                        "execution_target", "planner_collision", "stop_capability"
+                    } else _OFFLINE),
+                    detail=("No robot in this Scenario" if component["id"] in {
+                        "execution_target", "planner_collision", "stop_capability"
+                    } else "No components"), reason_code=empty_reason,
                 )
 
     components_by_id = {component["id"]: component for component in components}
@@ -954,14 +960,20 @@ def build_component_overview(
     scope_components: list[dict[str, Any]] = []
     for tile_id, label, contributors in scopes:
         empty_scope = quiet_empty and tile_id in {"plan_preview", "execute_control"}
-        status = _OFFLINE if empty_scope else _scope_status(components_by_id, contributors)
+        status = (
+            _NOT_APPLICABLE if empty_scope and tile_id == "execute_control"
+            else _OFFLINE if empty_scope
+            else _scope_status(components_by_id, contributors)
+        )
         scope_components.append(
             _component(
                 tile_id,
                 label,
                 status,
                 (
-                    "No components"
+                    "No robot in this Scenario"
+                    if empty_scope and tile_id == "execute_control"
+                    else "No components"
                     if empty_scope
                     else f"{label} prerequisites are current"
                     if status == _HEALTHY
@@ -976,6 +988,12 @@ def build_component_overview(
                 scope="functional_scope",
                 contributor_ids=contributors,
             )
+        )
+
+    if quiet_empty:
+        components_by_id["viewer_model"].update(
+            required=False, status=_NOT_APPLICABLE,
+            detail="No robot in this Scenario", reason_code=empty_reason,
         )
 
     functional_statuses = [

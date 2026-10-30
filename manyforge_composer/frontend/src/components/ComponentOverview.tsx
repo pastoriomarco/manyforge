@@ -90,7 +90,7 @@ export function ComponentOverview({
                       {component.reasonCode ? ` · ${component.reasonCode}` : ''}
                     </small>
                   </span>
-                  <code>{component.status}</code>
+                  <code>{component.status === 'not_applicable' ? 'Not applicable' : component.status}</code>
                 </div>
               ))}
             </div>

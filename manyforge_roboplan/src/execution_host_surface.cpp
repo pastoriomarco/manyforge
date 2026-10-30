@@ -4371,7 +4371,9 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
         do {
           packet_ready =
               ::poll(&inbound, 1,
-                     first_packet ? kClientPacketDeadlineMilliseconds : 1'000);
+                     first_packet ? (ordinary ? kOrdinaryFirstPacketDeadlineMilliseconds
+                                              : kClientPacketDeadlineMilliseconds)
+                                  : 1'000);
         } while (packet_ready < 0 && errno == EINTR);
         if (lane == CommandLane::kObservation && !first_packet &&
             packet_ready == 0) {

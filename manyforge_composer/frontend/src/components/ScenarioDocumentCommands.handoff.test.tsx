@@ -320,6 +320,30 @@ it('does not repeat an unresolved Load when later owner updates arrive', async (
   expect(test.all().some((p) => typeof p.children === 'string' && p.children.includes('nothing was retried'))).toBe(true);
 });
 
+it('shows and keeps the typed Load refusal after Close while it remains unresolved', async () => {
+  const test = await mount();
+  apiMock.scenarioDocuments.load.mockRejectedValueOnce(new ApiError(
+    'The candidate was not prepared.', 409, { detail: {
+      code: 'activation_preparation_failed',
+      message: 'The candidate was not prepared.',
+      effect: 'none',
+      details: { cause_code: 'pneumatic_io_presets_coincident' },
+    } },
+  ));
+  await test.openLoad();
+  await act(async () => { test.close.resolve(test.closed); });
+  await test.observe(snapshot(test.closed, test.published));
+  const refusal = 'Not applied: the candidate could not be prepared. The gripper\'s Open and Close presets resolve to the same position, '
+    + 'so its pneumatic I/O cannot tell them apart. Choose distinct preset positions.';
+  const visibleRefusal = () => test.all().some((p) => p.className === 'inline-message severity-error'
+    && p.children === refusal);
+  expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
+  expect(visibleRefusal()).toBe(true);
+  await test.observe(snapshot(test.closed, test.published));
+  expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
+  expect(visibleRefusal()).toBe(true);
+});
+
 it('preserves a post-Close Program workspace read failure without sending Load', async () => {
   const test = await mount(false);
   await test.openLoad();
@@ -457,6 +481,42 @@ it.each(['load', 'new'])('canonical-empty with dirty Program Draft requires popu
   }), expect.any(AbortSignal));
 });
 
+
+it.each(['new', 'load'])('names attached parts before %s from a canonical-empty Scenario', async (kind) => {
+  const test = await mount(true);
+  const current = snapshot(test.predecessor, test.published);
+  const payload = current.runtime.sections.logicalScene.payload as unknown as LogicalSceneProjection;
+  const revision = `sha256:${'a'.repeat(64)}`;
+  payload.snapshot!.objects = [{ ...fixedObject('held'), placement: { kind: 'carried',
+    carried_object_attachment_id: 'attachment.held', carried_object_attachment_revision: revision } }];
+  payload.snapshot!.carried_object_attachments = [{ carried_object_attachment_id: 'attachment.held',
+    carried_object_attachment_revision: revision, scene_resource_id: 'held', controllable_component_id: 'arm',
+    command_target_id: 'gripper', carrier_frame_ref: { kind: 'component', controllable_component_id: 'arm',
+      model_instance_id: 'robot', frame_role_id: 'tool' },
+    pose_in_carrier_frame: { position_m: { x: 0, y: 0, z: 0 }, orientation_xyzw: [0, 0, 0, 1] }, touch_body_roles: [] }];
+  await test.observe(current);
+  if (kind === 'new') await test.click(test.find((p) => p['aria-label'] === 'New'));
+  else {
+    await test.click(test.find((p) => p['aria-label'] === 'Load Scenario'));
+    await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
+    await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Load Scenario'));
+  }
+  expect(test.find((p) => p.children === 'Close Scenario?')).toBeDefined();
+  expect(test.all().some((p) => Array.isArray(p.children) && p.children.join('').includes('Attached parts to detach and remove: held.'))).toBe(true);
+  expect(test.closeScenario).not.toHaveBeenCalled();
+});
+
+it('New does not ask for Scene confirmation for only free objects', async () => {
+  const test = await mount(true);
+  const current = snapshot(test.predecessor, test.published);
+  const payload = current.runtime.sections.logicalScene.payload as unknown as LogicalSceneProjection;
+  payload.snapshot!.objects = [fixedObject('free.part')];
+  payload.snapshot!.carried_object_attachments = [];
+  await test.observe(current);
+  await test.click(test.find((p) => p['aria-label'] === 'New'));
+  expect(test.all().some((p) => p.children === 'Close Scenario?')).toBe(false);
+  expect(test.closeScenario).toHaveBeenCalledOnce();
+});
 
 it.each(['reset', 'detach'])('unmounting only the initiating header during %s aborts the New continuation while its workspace owner stays mounted', async (phase) => {
   const resetReceipt = deferred<ProgramResetOutcome>();

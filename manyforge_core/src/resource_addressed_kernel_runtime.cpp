@@ -2261,7 +2261,10 @@ ResourceAddressedExecutionKernel::preview_capability_command(const OperationInte
         "runtime_participant_engine_missing", ErrorCode::kInvariantViolation);
   }
   const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
-  auto request = build_command_request(command, resolved.value().binding.value());
+  const auto& binding = resolved.value().binding.value();
+  auto request = build_command_request(
+      command, binding, engine->gripper_actuation_kind(binding.command_target_id.value()),
+      engine->gripper_output_mode(binding.command_target_id.value()));
   if (!request.ok()) {
     return Result<CapabilityCommandPreviewResultDTO>::Err(request.error());
   }

@@ -13,7 +13,8 @@ import type {
   SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
-import { resolvedTargetRoles } from '../utils/targetRoleResolution';
+import type { NodePresentationStatus } from '../store/composerStore';
+import { resolvedTargetRoles, type ResolvedTargetRole } from '../utils/targetRoleResolution';
 import { globalRuleIds, interruptConditionKeyUses, type TargetStopChain } from '../utils/interruptAuthoring';
 import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import {
@@ -46,6 +47,10 @@ import { onOpenSettingsRequest } from '../state/settingsNavigation';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { PROGRAM_TOOLS_WIDTH_PX } from '../state/composerSettings';
+
+const EMPTY_MOTION_DESCRIPTORS: ManualControlMotionDescriptor[] = [];
+const EMPTY_BOUND_TARGETS: ResolvedTargetRole[] = [];
+const EMPTY_NODE_STATUSES: Record<string, NodePresentationStatus> = {};
 
 const PROGRAM_TOOL_MIN = PROGRAM_TOOLS_WIDTH_PX.min;
 const PROGRAM_TOOL_MAX = PROGRAM_TOOLS_WIDTH_PX.max;
@@ -118,7 +123,7 @@ export function ProgramWorkspace({
   systemSignalChoices = [],
   systemSignalsNeedApply = false,
   programRoleAssignment = null,
-  motionDescriptors = [],
+  motionDescriptors = EMPTY_MOTION_DESCRIPTORS,
   stopChains,
   onRetryCatalog,
   onRetryEnvironment,
@@ -249,6 +254,16 @@ export function ProgramWorkspace({
   }, []);
   const workspace = state.workspace;
   const authoring = workspace?.draft.authoring ?? null;
+  const boundTargets = useMemo(() => programRoleAssignment == null
+    ? deploymentWorkspace?.binding?.target_role_bindings ?? EMPTY_BOUND_TARGETS
+    : authoring === null ? EMPTY_BOUND_TARGETS : resolvedTargetRoles(authoring, programRoleAssignment),
+  [authoring, deploymentWorkspace?.binding?.target_role_bindings, programRoleAssignment]);
+  // Descriptors arrive in runtime snapshots as JSON. Retain the original values
+  // while their complete serialized content is unchanged, including every field
+  // used by the authoring template.
+  const descriptorContent = JSON.stringify(motionDescriptors);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const paletteMotionDescriptors = useMemo(() => motionDescriptors, [descriptorContent]);
   // Contract 87: keys read by node or global interrupt rules must declare `initial:`.
   const interruptKeyUses = useMemo(() => interruptConditionKeyUses(
     authoring?.forest ?? [], deploymentDraftDocument as Record<string, JsonValue> | null,
@@ -542,10 +557,8 @@ export function ProgramWorkspace({
           <ProgramNodePalette
             roots={authoring.forest}
             program={authoring}
-            boundTargets={programRoleAssignment == null
-              ? deploymentWorkspace?.binding?.target_role_bindings ?? []
-              : resolvedTargetRoles(authoring, programRoleAssignment)}
-            motionDescriptors={motionDescriptors}
+            boundTargets={boundTargets}
+            motionDescriptors={paletteMotionDescriptors}
             catalogEntries={catalogEntries}
             catalogIdentity={catalogIdentity}
             environment={nodeEnvironment}
@@ -622,8 +635,8 @@ export function ProgramWorkspace({
             selectedId={selectedNodeId}
             invalidNodeIds={invalidNodeIds}
             nodeStatuses={runtime.cycleState === 'idle_after_reset'
-              ? {}
-              : runtime.state.run?.nodeStatuses ?? {}}
+              ? EMPTY_NODE_STATUSES
+              : runtime.state.run?.nodeStatuses ?? EMPTY_NODE_STATUSES}
             busy={authoringBusy}
             onSelect={selectNode}
             onMutate={mutate}

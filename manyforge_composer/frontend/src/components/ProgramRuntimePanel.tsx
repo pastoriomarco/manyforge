@@ -1575,6 +1575,7 @@ export function ProgramTransportControls({
   onOpenRobotControls,
   onOpenViewerSettings,
   viewerPreviewActive = false,
+  resetReloadRequest = 0,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
@@ -1586,6 +1587,7 @@ export function ProgramTransportControls({
   onOpenViewerSettings?: () => void;
   /** A Draft scene or target preview is visible in the viewer. */
   viewerPreviewActive?: boolean;
+  resetReloadRequest?: number;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const tcpHoldHistory = useRef(new ActiveTcpHoldHistory());
@@ -1921,6 +1923,15 @@ export function ProgramTransportControls({
     : positionAvailability.reason;
   // Reload needs an applied Program: with none there is no initial scene.
   const reloadAvailable = state.applied !== null;
+  const handledReloadRequest = useRef(0);
+  useEffect(() => {
+    if (resetReloadRequest === 0 || resetReloadRequest === handledReloadRequest.current) return;
+    handledReloadRequest.current = resetReloadRequest;
+    setApprovedUncertain(new Set());
+    setUncertainResetError(null);
+    setResetSelection({ ...NO_RESET_OPTIONS, reloadInitialScene: true });
+    setResetIntent('confirm');
+  }, [resetReloadRequest]);
   const reloadUnavailableReason = reloadAvailable
     ? null
     : 'No applied Program is available, so there is no initial scene to reload. Load a Scenario first.';
@@ -2698,7 +2709,7 @@ export function ProgramTransportControls({
           {resumeIntent?.error && <p>{resumeIntent.error}</p>}
           <div className="dialog-actions">
             <button type="button" onClick={() => setResumeIntent(null)}>Cancel</button>
-            <button type="button" onClick={() => {
+            <button type="button" className="primary-action" onClick={() => {
               if (resumeIntent === null || runCapture?.programRunId !== resumeIntent.runId) {
                 if (resumeIntent !== null) setResumeIntent({ ...resumeIntent, error: 'Resume is no longer available.' });
                 return;

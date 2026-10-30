@@ -89,6 +89,7 @@ import {
   type ProgramNoticeInput,
 } from './ProgramNoticeRail';
 import { statusEdgePath } from './StatusEdge';
+import { projectNodeStatuses, projectEdgeStatuses } from './programGraphStatuses';
 import { valuePathParameter } from '../utils/valuePaths';
 import { CANVAS_COLORS, STATUS_COLORS } from '../styles/tokens';
 
@@ -514,14 +515,14 @@ export function ProgramTreeCanvas({
     label: child.instance_id,
     catalogId: child.node_id,
     category: catalog.get(child.node_id)?.category ?? 'unknown',
-    status: nodeStatuses[child.instance_id] ?? 'idle',
+    status: 'idle' as const,
     invalid: invalidNodeIds.has(child.instance_id),
     selected: selectedId === child.instance_id,
-  }), [catalog, invalidNodeIds, nodeStatuses, selectedId]);
+  }), [catalog, invalidNodeIds, selectedId]);
   const openItemMenu = useCallback((event: ReactMouseEvent, instanceId: string) => {
     openMenuRef.current(event, instanceId);
   }, []);
-  const graphNodes = useMemo<ProgramFlowNode[]>(
+  const baseGraphNodes = useMemo<ProgramFlowNode[]>(
     () => (collapsedLayout ?? laidOut).filter((node) => !hidden.has(node.id)).map((node) => {
       const row = flatById.get(node.id);
       const entry = catalog.get(row?.node.node_id ?? '');
@@ -560,7 +561,7 @@ export function ProgramTreeCanvas({
             childCount: row?.node.children.length ?? 0,
             hasParent: row?.parentId !== null,
             isRoot: row?.parentId === null,
-            status: nodeStatuses[node.id] ?? 'idle',
+            status: 'idle',
             selected: selectedId === node.id,
             layoutDirection: view.layoutDirection,
             executionAvailable: nodeAvailability?.execution ?? false,
@@ -605,10 +606,11 @@ export function ProgramTreeCanvas({
       registerElement,
       selectedId,
       view.layoutDirection,
-      nodeStatuses,
     ],
   );
-  const graphEdges = useMemo<ProgramFlowEdge[]>(
+  const nodeStatusProjector = useMemo(() => projectNodeStatuses(baseGraphNodes), [baseGraphNodes]);
+  const graphNodes = useMemo(() => nodeStatusProjector(nodeStatuses), [nodeStatusProjector, nodeStatuses]);
+  const baseGraphEdges = useMemo<ProgramFlowEdge[]>(
     () => edges.filter((edge) => !hidden.has(edge.target)).map((edge) => ({
       id: `${edge.source}:${edge.target}`,
       source: edge.source,
@@ -617,11 +619,13 @@ export function ProgramTreeCanvas({
       data: {
         edgeStyle,
         layoutDirection: view.layoutDirection,
-        targetStatus: nodeStatuses[edge.target] ?? 'idle',
+        targetStatus: 'idle',
       },
     })),
-    [edgeStyle, edges, hidden, nodeStatuses, view.layoutDirection],
+    [edgeStyle, edges, hidden, view.layoutDirection],
   );
+  const edgeStatusProjector = useMemo(() => projectEdgeStatuses(baseGraphEdges), [baseGraphEdges]);
+  const graphEdges = useMemo(() => edgeStatusProjector(nodeStatuses), [edgeStatusProjector, nodeStatuses]);
   const positions = useMemo(
     () => new Map(graphNodes.map((node) => [node.id, node.position])),
     [graphNodes],

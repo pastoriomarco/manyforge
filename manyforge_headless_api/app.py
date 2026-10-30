@@ -619,6 +619,8 @@ def create_app(
             service.core.observe_program_failure_condition if owns_core else None
         ),
     )
+    if isinstance(service, HeadlessService):
+        service.initial_scene_observer = control_state_source.notify_cold
     if alarm_attention is not None:
         # Alarm projections carry the Kernel-held attention copy; a change of
         # it republishes them (Composer enables Run only once the Kernel
@@ -1344,7 +1346,7 @@ def create_app(
 
     @app.get("/api/cycle/status")
     def program_cycle_status() -> dict[str, Any]:
-        return service.program_cycle_status()
+        return service.program_cycle_status(include_scene_clear=True)
 
     @app.get("/api/control/state")
     def execution_control_projection() -> dict[str, Any]:

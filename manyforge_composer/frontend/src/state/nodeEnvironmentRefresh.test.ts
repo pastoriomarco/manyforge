@@ -4,8 +4,12 @@ import type { ComposerHeadlessState } from '../types/headless';
 import {
   MANAGER_ACTIVATION_PENDING,
   managerActivationSettlementKey,
+  managerReadinessTransientRetryKey,
   nodeEnvironmentRefreshKey,
   refreshOnManagerActivationSettled,
+  refreshTransientResourcesOnManagerReadiness,
+  isTransientManagerReadinessErrorCode,
+  type ReadinessTransientRefreshAttempts,
   refreshViewerModelsOnManagerChange,
   viewerModelRefreshKey,
 } from './nodeEnvironmentRefresh';
@@ -181,20 +185,66 @@ describe('viewerModelRefreshKey', () => {
   });
 });
 
+const connectedCurrentControl = { transportStatus: 'connected', semanticStatus: 'current' } as const;
+const currentRetryKey = (state: ComposerHeadlessState) => (
+  managerReadinessTransientRetryKey(state, connectedCurrentControl)
+);
+
 function activeManager(): ComposerHeadlessState {
   const state = snapshot();
   state.runtime.sections.manager.sourceGeneration = 1;
-  const payload = state.runtime.sections.manager.payload as Record<string, unknown>;
+  const payload = managerPayload(state);
   payload.cell_id = 'cell';
   payload.manager_ready = true;
   payload.runtime = { converged: true };
-  payload.apply = { records: [{ incomplete: false }] };
+  const active = payload.active as Record<string, unknown>;
+  active.publication = { transaction: {
+    kind: 'named_apply', apply_id: 'apply.1', apply_generation: 1,
+  } };
+  payload.apply = { records: [currentApplyRecord('apply.1', 1)] };
   state.componentOverview.maintenanceOperation = null;
   return state;
 }
 
 function managerPayload(state: ComposerHeadlessState): Record<string, unknown> {
   return state.runtime.sections.manager.payload as Record<string, unknown>;
+}
+
+function currentApplyRecord(
+  applyId: string,
+  applyGeneration: number,
+  retainedBundleId = 'sha256:bundle',
+  graphRevision = 'sha256:graph',
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    incomplete: false,
+    apply_id: applyId,
+    apply_generation: applyGeneration,
+    committed: true,
+    terminal_state: 'succeeded',
+    prepared_activation: {
+      retained_bundle_id: retainedBundleId,
+      graph_revision: graphRevision,
+    },
+    ...overrides,
+  };
+}
+
+function setCurrentApply(state: ComposerHeadlessState, applyId: string, applyGeneration: number): void {
+  const payload = managerPayload(state);
+  const active = payload.active as Record<string, unknown>;
+  active.publication = { transaction: {
+    kind: 'named_apply', apply_id: applyId, apply_generation: applyGeneration,
+  } };
+  payload.apply = {
+    records: [currentApplyRecord(
+      applyId,
+      applyGeneration,
+      String(active.retained_bundle_id),
+      String(active.graph_revision),
+    )],
+  };
 }
 
 describe('managerActivationSettlementKey', () => {
@@ -336,5 +386,209 @@ describe('refreshOnManagerActivationSettled', () => {
     ]);
     expect(refreshCatalog).not.toHaveBeenCalled();
     expect(refreshDeploymentWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe('managerReadinessTransientRetryKey', () => {
+  it('requires strict readiness and the exact active committed Apply transaction', () => {
+    expect(isTransientManagerReadinessErrorCode('program_applied_selection_not_active')).toBe(true);
+    expect(isTransientManagerReadinessErrorCode('headless_http_timeout')).toBe(true);
+    expect(isTransientManagerReadinessErrorCode('catalog_digest_mismatch')).toBe(false);
+    const settled = activeManager();
+    const key = currentRetryKey(settled);
+    expect(key).not.toBeNull();
+    expect(managerReadinessTransientRetryKey(settled, {
+      transportStatus: 'disconnected', semanticStatus: 'current',
+    })).toBeNull();
+    expect(managerReadinessTransientRetryKey(settled, {
+      transportStatus: 'stale', semanticStatus: 'current',
+    })).toBeNull();
+    expect(managerReadinessTransientRetryKey(settled, {
+      transportStatus: 'connected', semanticStatus: 'synchronizing',
+    })).toBeNull();
+    expect(managerReadinessTransientRetryKey(settled, connectedCurrentControl)).toBe(key);
+
+    const missingReady = structuredClone(settled);
+    delete managerPayload(missingReady).manager_ready;
+    expect(currentRetryKey(missingReady)).toBeNull();
+
+    const missingConvergence = structuredClone(settled);
+    delete managerPayload(missingConvergence).runtime;
+    expect(currentRetryKey(missingConvergence)).toBeNull();
+
+    const missingGeneration = structuredClone(settled);
+    missingGeneration.runtime.sections.manager.sourceGeneration = null;
+    expect(currentRetryKey(missingGeneration)).toBeNull();
+
+    const missingOwner = structuredClone(settled);
+    missingOwner.runtime.sections.manager.sourceOwnerEpoch = null;
+    expect(currentRetryKey(missingOwner)).toBeNull();
+
+    const missingCurrentRecord = structuredClone(settled);
+    managerPayload(missingCurrentRecord).apply = { records: [] };
+    expect(currentRetryKey(missingCurrentRecord)).toBeNull();
+
+    // Apply generations are per Apply ID. A failed newer request with the same
+    // generation must not displace the active publication's committed Apply.
+    const failedNewerApply = structuredClone(settled);
+    const failedPayload = managerPayload(failedNewerApply);
+    const apply = failedPayload.apply as { records: Record<string, unknown>[] };
+    apply.records.push(currentApplyRecord('apply.failed', 1, 'sha256:failed', 'sha256:failed', {
+      committed: false,
+      terminal_state: 'failed',
+    }));
+    expect(currentRetryKey(failedNewerApply)).toBe(key);
+
+    // A later successful Apply can reuse generation 1 under a different ID.
+    // The active publication pointer, rather than generation/history order,
+    // identifies the current committed Apply.
+    const distinctApplyIdsSameGeneration = structuredClone(settled);
+    const distinctPayload = managerPayload(distinctApplyIdsSameGeneration);
+    (distinctPayload.apply as { records: Record<string, unknown>[] }).records.push(
+      currentApplyRecord('apply.2', 1),
+    );
+    (distinctPayload.active as Record<string, unknown>).publication = { transaction: {
+      kind: 'named_apply', apply_id: 'apply.2', apply_generation: 1,
+    } };
+    const apply2Key = currentRetryKey(distinctApplyIdsSameGeneration);
+    expect(apply2Key).not.toBeNull();
+    expect(apply2Key).not.toBe(key);
+    expect(apply2Key).toContain('"applyId":"apply.2"');
+
+    const duplicateCurrentApply = structuredClone(distinctApplyIdsSameGeneration);
+    (managerPayload(duplicateCurrentApply).apply as { records: Record<string, unknown>[] })
+      .records.push(currentApplyRecord('apply.2', 1));
+    expect(currentRetryKey(duplicateCurrentApply)).toBeNull();
+
+    const failedCurrentApply = structuredClone(failedNewerApply);
+    const failedCurrentPayload = managerPayload(failedCurrentApply);
+    const failedActive = failedCurrentPayload.active as Record<string, unknown>;
+    failedActive.publication = { transaction: {
+      kind: 'named_apply', apply_id: 'apply.failed', apply_generation: 1,
+    } };
+    expect(currentRetryKey(failedCurrentApply)).toBeNull();
+
+    const mismatchedPrepared = structuredClone(settled);
+    const record = ((managerPayload(mismatchedPrepared).apply as { records: Record<string, unknown>[] })
+      .records[0]!);
+    record.prepared_activation = {
+      retained_bundle_id: 'sha256:other',
+      graph_revision: 'sha256:graph',
+    };
+    expect(currentRetryKey(mismatchedPrepared)).toBeNull();
+
+    // A bootstrap publication has no named Apply history and is not retried.
+    const bootstrap = structuredClone(settled);
+    const bootstrapPayload = managerPayload(bootstrap);
+    const bootstrapActive = bootstrapPayload.active as Record<string, unknown>;
+    bootstrapActive.publication = { transaction: {
+      kind: 'bootstrap', bootstrap_id: 'bootstrap.cell', bootstrap_generation: 1,
+    } };
+    bootstrapPayload.apply = { records: [] };
+    expect(currentRetryKey(bootstrap)).toBeNull();
+
+    const uiReceiverReconnect = structuredClone(settled);
+    uiReceiverReconnect.receiverEpoch = 'receiver.2';
+    expect(currentRetryKey(uiReceiverReconnect)).toBe(key);
+  });
+});
+
+describe('refreshTransientResourcesOnManagerReadiness', () => {
+  const idleResource = {
+    failureRequestId: null,
+    latestRequestId: 0,
+    retryable: false,
+    refresh: () => 0,
+  };
+
+  it('ignores an old error after settlement refresh, then retries its late transient failure once', () => {
+    const readinessKey = currentRetryKey(activeManager());
+    const retryCatalog = vi.fn(() => 2);
+    let attempts: ReadinessTransientRefreshAttempts = {
+      catalog: new Set(), nodeEnvironment: new Set(),
+    };
+
+    // Settlement started request 1; request 0 is stale in this render.
+    attempts = refreshTransientResourcesOnManagerReadiness(attempts, readinessKey, {
+      failureRequestId: 0,
+      latestRequestId: 1,
+      retryable: true,
+      refresh: retryCatalog,
+    }, idleResource);
+    expect(retryCatalog).not.toHaveBeenCalled();
+
+    // Request 1 fails after readiness is current, so exactly one request 2 follows.
+    attempts = refreshTransientResourcesOnManagerReadiness(attempts, readinessKey, {
+      failureRequestId: 1,
+      latestRequestId: 1,
+      retryable: true,
+      refresh: retryCatalog,
+    }, idleResource);
+    expect(retryCatalog).toHaveBeenCalledOnce();
+    expect(attempts.catalog.has(readinessKey!)).toBe(true);
+
+    attempts = refreshTransientResourcesOnManagerReadiness(attempts, readinessKey, {
+      failureRequestId: 2,
+      latestRequestId: 2,
+      retryable: true,
+      refresh: retryCatalog,
+    }, idleResource);
+    expect(retryCatalog).toHaveBeenCalledOnce();
+  });
+
+  it('keeps one budget per exact Apply across flapping, receiver reconnects, and identity revisits', () => {
+    const active = activeManager();
+    const firstKey = currentRetryKey(active);
+    const retryCatalog = vi.fn(() => 2);
+    let attempts: ReadinessTransientRefreshAttempts = {
+      catalog: new Set(), nodeEnvironment: new Set(),
+    };
+    const transientFailure = {
+      failureRequestId: 1,
+      latestRequestId: 1,
+      retryable: true,
+      refresh: retryCatalog,
+    };
+
+    attempts = refreshTransientResourcesOnManagerReadiness(
+      attempts, firstKey, transientFailure, idleResource,
+    );
+    const reconnect = structuredClone(active);
+    reconnect.receiverEpoch = 'receiver.2';
+    attempts = refreshTransientResourcesOnManagerReadiness(
+      attempts, currentRetryKey(reconnect), transientFailure, idleResource,
+    );
+    expect(retryCatalog).toHaveBeenCalledOnce();
+
+    const secondApply = structuredClone(active);
+    setCurrentApply(secondApply, 'apply.2', 1);
+    const secondKey = currentRetryKey(secondApply);
+    expect(secondKey).not.toBe(firstKey);
+    attempts = refreshTransientResourcesOnManagerReadiness(
+      attempts,
+      secondKey,
+      { ...transientFailure, failureRequestId: 2, latestRequestId: 2 },
+      idleResource,
+    );
+    expect(retryCatalog).toHaveBeenCalledTimes(2);
+
+    // Returning to the first active identity cannot reopen its exhausted budget.
+    attempts = refreshTransientResourcesOnManagerReadiness(
+      attempts,
+      firstKey,
+      { ...transientFailure, failureRequestId: 3, latestRequestId: 3 },
+      idleResource,
+    );
+    expect(retryCatalog).toHaveBeenCalledTimes(2);
+
+    const ordinaryFailure = { ...transientFailure, retryable: false };
+    const ordinaryAttempts = refreshTransientResourcesOnManagerReadiness(
+      { catalog: new Set(), nodeEnvironment: new Set() },
+      secondKey,
+      ordinaryFailure,
+      idleResource,
+    );
+    expect(ordinaryAttempts.catalog.size).toBe(0);
+    expect(retryCatalog).toHaveBeenCalledTimes(2);
   });
 });

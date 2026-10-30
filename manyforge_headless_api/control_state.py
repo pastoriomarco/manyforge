@@ -167,6 +167,7 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
         )
 
     return (
+        json.dumps(runtime.get("initial_scene_failure"), sort_keys=True),
         runtime.get("projection_owner_id"),
         runtime.get("projection_owner_epoch"),
         runtime.get("complete"),

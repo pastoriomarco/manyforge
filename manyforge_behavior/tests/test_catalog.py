@@ -176,6 +176,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "automatic_retry_delay_s",
         "base_frame_role",
         "cache_mode",
+        "clearance_m",
         "contact_scene_resource_id",
         "contact_policy_id",
         "execution_timeout_s",

@@ -65,25 +65,25 @@ export function pendingManagerApply(payload: Record<string, unknown>): boolean |
   return false;
 }
 
-/** Current zero-physical graph evidence, independent of its Scenario/Close origin. */
-export function verifiedNoPhysicalComponents(
+/** Current identity-verified Applied cell graph, independent of Scenario/Close origin. */
+function verifiedAppliedCellGraph(
   snapshot: ComposerHeadlessState | null,
   transportStatus: ControlTransportStatus,
-): boolean {
-  if (snapshot === null || transportStatus !== 'connected' || !snapshot.runtime.complete) return false;
+): Record<string, unknown> | null {
+  if (snapshot === null || transportStatus !== 'connected' || !snapshot.runtime.complete) return null;
   const manager = snapshot.runtime.sections.manager;
   const payload = manager.payload;
   if (!manager.available || manager.freshness !== 'fresh' || manager.knownGaps.length !== 0
       || !Number.isSafeInteger(manager.sourceGeneration) || (manager.sourceGeneration ?? 0) <= 0
       || !manager.sourceOwnerId || !manager.sourceOwnerEpoch || payload === null
-      || payload.manager_ready !== true || pendingManagerApply(payload) !== false) return false;
+      || payload.manager_ready !== true || pendingManagerApply(payload) !== false) return null;
   const active = recordValue(payload.active);
   const graph = recordValue(active?.cell_graph);
   const publication = recordValue(active?.publication);
   const revision = recordValue(publication?.projection_revision);
   const runtime = recordValue(payload.runtime);
   const configuration = snapshot.runtime.activeConfiguration;
-  return typeof active?.canonical_empty === 'boolean' && runtime?.converged === true
+  const verified = typeof active?.canonical_empty === 'boolean' && runtime?.converged === true
     && typeof payload.cell_id === 'string' && payload.cell_id.length > 0
     && graph?.cell_id === payload.cell_id
     && typeof active.retained_bundle_id === 'string' && active.retained_bundle_id.length > 0
@@ -94,10 +94,30 @@ export function verifiedNoPhysicalComponents(
     && revision?.retained_bundle_id === active.retained_bundle_id
     && revision?.graph_revision === active.graph_revision
     && Number.isSafeInteger(publication?.publication_generation)
-    && (publication?.publication_generation as number) > 0
+    && (publication?.publication_generation as number) > 0;
+  return verified ? graph : null;
+}
+
+/** True only when the current, identity-verified Applied graph has no model instances. */
+export function verifiedAppliedGraphHasNoModels(
+  snapshot: ComposerHeadlessState | null,
+  transportStatus: ControlTransportStatus,
+): boolean {
+  const graph = verifiedAppliedCellGraph(snapshot, transportStatus);
+  const models = graph?.model_instances;
+  return Array.isArray(models) && models.length === 0;
+}
+
+/** Current zero-physical graph evidence, independent of its Scenario/Close origin. */
+export function verifiedNoPhysicalComponents(
+  snapshot: ComposerHeadlessState | null,
+  transportStatus: ControlTransportStatus,
+): boolean {
+  const graph = verifiedAppliedCellGraph(snapshot, transportStatus);
+  return graph !== null
     && ['model_instances', 'controllable_components', 'control_bindings', 'control_domains']
       .every((key) => {
-        const rows = graph?.[key];
+        const rows = graph[key];
         return Array.isArray(rows) && rows.length === 0;
       });
 }

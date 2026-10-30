@@ -951,6 +951,19 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
     assert "Extra inputs are not permitted" in str(captured.value)
 
 
+def test_direct_empty_scene_preparation_requires_publication_and_no_applied_digest() -> None:
+    from manyforge_headless_api.models import ProgramScenePreparationRequest
+    body = {**_caller(), "clear_empty_scene": True, "expected_applied_record_digest": None,
+            "expected_admission_generation": 1, "expected_publication_generation": 1}
+    assert ProgramScenePreparationRequest.model_validate(body).expected_publication_generation == 1
+    with pytest.raises(ValidationError):
+        ProgramScenePreparationRequest.model_validate({**body, "expected_publication_generation": None})
+    with pytest.raises(ValidationError):
+        ProgramScenePreparationRequest.model_validate({**body, "clear_empty_scene": False})
+    with pytest.raises(ValidationError):
+        ProgramScenePreparationRequest.model_validate({**body, "expected_applied_record_digest": "sha256:" + "a" * 64})
+
+
 def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
     body = {
         **_caller(),
@@ -983,9 +996,8 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
     }
     assert ManagerApplyRequest.model_validate(body).scene_initialization == "preserve"
     assert ManagerApplyRequest.model_validate({**body, "scene_initialization": "initialize"}).scene_initialization == "initialize"
-    with pytest.raises(ValidationError, match="sealed canonical empty"):
-        ManagerApplyRequest.model_validate({**body, "prepared_activation": _sealed_prepared_activation(),
-                                           "scene_initialization": "initialize"})
+    assert ManagerApplyRequest.model_validate({**body, "prepared_activation": _sealed_prepared_activation(),
+                                               "scene_initialization": "initialize"}).scene_initialization == "initialize"
     with pytest.raises(ValidationError):
         ManagerApplyRequest.model_validate({**body, "scene_initialization": "inferred"})
     request = ManagerApplyRequest.model_validate(body)

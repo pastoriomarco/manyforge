@@ -1361,6 +1361,16 @@ if(BUILD_TESTING)
     add_executable(test_program_io_condition_compiler
       test/test_program_io_condition_compiler.cpp
       test/test_retained_io_policy_compiler.cpp)
+    if(NOT TARGET manyforge_core)
+      # The standalone test directly exercises the Core Stop profile codec.
+      # Include its translation-unit dependencies without changing production libraries.
+      target_sources(test_program_io_condition_compiler PRIVATE
+        "${MANYFORGE_CORE_SOURCE_DIR}/src/prepared_participant_stop_plan_codec.cpp"
+        "${MANYFORGE_CORE_SOURCE_DIR}/src/resolved_stop_base_plan_codec.cpp"
+        "${MANYFORGE_CORE_SOURCE_DIR}/src/stop_profile_mapper.cpp"
+        "${MANYFORGE_CORE_SOURCE_DIR}/src/interrupt_structured_value.cpp"
+        "${MANYFORGE_CORE_SOURCE_DIR}/src/execution_stop_support.cpp")
+    endif()
     target_compile_definitions(test_program_io_condition_compiler PRIVATE
       MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}"
       MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"

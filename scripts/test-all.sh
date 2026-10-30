@@ -803,6 +803,7 @@ run_ros_tests() {
                "JtcExecutionPort" "Ros2GripperCommandBackendTest" \
                "RetainedRos2ControlBackendFactoryTest" \
                "RetainedRos2ControlRuntimeHandleTest" \
+               "test_xarm_robot_states_transport" "test_xarm_driver_services" \
                "Ros2ControlKernelStopIntegrationTest" ); then
         FAIL=$((FAIL + 1))
     elif ( source_ros_integration_environment

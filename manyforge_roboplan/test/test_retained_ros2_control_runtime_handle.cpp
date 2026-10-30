@@ -188,6 +188,13 @@ public:
   return std::move(sealed.value());
 }
 
+[[nodiscard]] std::string DescribeError(const core::ErrorDTO &error) {
+  std::string description = error.code + ": " + error.message;
+  for (const auto &[key, value] : error.details)
+    description += " " + key + "=" + value;
+  return description;
+}
+
 /// One handle over the fake controller manager and trajectory controller.
 struct ArmWorld final {
   explicit ArmWorld(
@@ -275,7 +282,7 @@ struct ArmWorld final {
   [[nodiscard]] RetainedExternallyManagedDomainSnapshot Snapshot() {
     const auto read = handle->ReadLifecycleSnapshot(core::ControlDomainId("domain.arm"),
                                                     clock.now());
-    if (!read.ok()) throw std::logic_error(read.error().message);
+    if (!read.ok()) throw std::logic_error("Snapshot: " + DescribeError(read.error()));
     return read.value();
   }
 
@@ -4660,7 +4667,8 @@ struct RealArmWorld final {
   [[nodiscard]] core::LifecycleDomainHealthDTO HealthAt(core::TimePoint boundary) {
     const auto health = world.handle->ReadLifecycleHealth(
         core::ControlDomainId("domain.arm"), boundary);
-    if (!health.ok()) throw std::logic_error(health.error().message);
+    if (!health.ok())
+      throw std::logic_error("HealthAt: " + DescribeError(health.error()));
     return health.value();
   }
 

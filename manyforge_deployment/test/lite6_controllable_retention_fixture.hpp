@@ -2592,7 +2592,7 @@ assistant_source(const bool composer_draft_enabled = false) {
             for (auto &[key, setting] : profile) {
               if (key == "isaac_profile") {
                 key = "mock_profile";
-                setting = CanonicalValue("lite6_lite_gripper");
+                setting = CanonicalValue(aggregate ? "lite6_lite_gripper" : "lite6");
               }
             }
             selected = CanonicalValue(

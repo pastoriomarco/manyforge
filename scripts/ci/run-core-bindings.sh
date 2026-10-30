@@ -10,6 +10,13 @@ export PYTHONDONTWRITEBYTECODE=1
 export TZ=UTC
 unset PYTHONPATH PYTHONHOME 2>/dev/null || true
 
+PYTHON_EXECUTABLE="${MANYFORGE_I2_PYTHON_EXECUTABLE:-$(command -v python3 || true)}"
+if [[ -z "${PYTHON_EXECUTABLE}" || ! -x "${PYTHON_EXECUTABLE}" ]]; then
+  echo "a CPython 3.12 interpreter is required (set MANYFORGE_I2_PYTHON_EXECUTABLE)" >&2
+  exit 2
+fi
+export MANYFORGE_I2_PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}"
+
 usage() {
   echo "usage: $0 release --build-root <path> --stage-root <path> --generated-output-root <path> [--prepare-only]" >&2
   exit 2
@@ -119,6 +126,7 @@ prepare_cmake_metadata "${CORE_BUILD}"
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
+  -DPython3_EXECUTABLE="${PYTHON_EXECUTABLE}" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   --graphviz="${CORE_BUILD}/manyforge-i2-target-graph.dot" \
   -S "${REPO_ROOT}/manyforge_core" \
@@ -131,6 +139,7 @@ prepare_cmake_metadata "${DEPLOYMENT_BUILD}"
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
+  -DPython3_EXECUTABLE="${PYTHON_EXECUTABLE}" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   --graphviz="${DEPLOYMENT_BUILD}/manyforge-i2-target-graph.dot" \
   -DMANYFORGE_CORE_INCLUDE_DIR="${REPO_ROOT}/manyforge_core/include" \
@@ -145,12 +154,16 @@ prepare_cmake_metadata "${DEPLOYMENT_BUILD}"
   manyforge_generate_canonical_empty_package
 
 prepare_cmake_metadata "${MODULE_BUILD}"
+PYBIND11_CMAKE_DIR="$("${PYTHON_EXECUTABLE}" -c 'import pybind11; print(pybind11.get_cmake_dir())')"
 /usr/bin/cmake \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   --graphviz="${MODULE_BUILD}/manyforge-i2-target-graph.dot" \
-  -Dpybind11_DIR=/usr/local/lib/python3.12/site-packages/pybind11/share/cmake/pybind11 \
+  -DPython_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+  -DPython3_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+  -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+  -Dpybind11_DIR="${PYBIND11_CMAKE_DIR}" \
   -DMANYFORGE_CORE_DIR="${CORE_BUILD}" \
   -DMANYFORGE_CORE_INCLUDE_DIR="${REPO_ROOT}/manyforge_core/include" \
   -DMANYFORGE_DEPLOYMENT_DIR="${DEPLOYMENT_BUILD}" \
@@ -161,7 +174,7 @@ prepare_cmake_metadata "${MODULE_BUILD}"
 /usr/bin/ninja -C "${MODULE_BUILD}" -j "${PARALLEL}" -d keeprsp \
   manyforge_core_py
 
-EXTENSION_SUFFIX="$(/usr/local/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+EXTENSION_SUFFIX="$("${PYTHON_EXECUTABLE}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 case "${EXTENSION_SUFFIX}" in
   .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
   *)
@@ -212,10 +225,10 @@ export MANYFORGE_I2_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
 export MANYFORGE_I2_BINDING_STAGED_ROOT="${STAGE_ROOT}"
 export MANYFORGE_I2_BINDING_GENERATED_ROOT="${GENERATED_ROOT}"
 export MANYFORGE_I2_BINDING_SOURCE_ROOT="${REPO_ROOT}"
-export MANYFORGE_I2_BINDING_EXECUTABLE=/usr/local/bin/python3
+export MANYFORGE_I2_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 cd "${REPO_ROOT}"
-/usr/local/bin/python3 -m pytest -p no:cacheprovider -q \
+"${PYTHON_EXECUTABLE}" -m pytest -p no:cacheprovider -q \
   manyforge_core/python/tests/test_bindings_smoke.py \
   manyforge_core/python/tests/test_collision_bindings.py \
   manyforge_core/python/tests/test_command_schema_bindings.py \

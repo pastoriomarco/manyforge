@@ -174,7 +174,7 @@ export function FormulaEditor({
             ))}
           </div>
         )}
-        <div className="dactions">
+        <div className="dialog-actions formula-editor-actions">
           <button type="button" onClick={close}>Cancel</button>
           <button
             type="button"

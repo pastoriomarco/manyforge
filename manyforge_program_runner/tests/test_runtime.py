@@ -1772,6 +1772,84 @@ class _PreparedRunAdmission:
         )
 
 
+def test_empty_scenario_clear_uses_current_apply_and_not_program_binding(monkeypatch, tmp_path):
+    class IdleAdmission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+
+    class EmptyHeadless(_Headless):
+        def program_applied_status(self):
+            return {"program_id": None, "record_digest": _DIGEST_B,
+                    "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
+
+        def committed_scenario_activation(self):
+            return {"apply_id": "apply.1", "apply_generation": 1,
+                    "record_digest": _DIGEST_B, "scene_initialization": "initialize",
+                    "origin": {"kind": "scenario"}}
+
+    headless = EmptyHeadless()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.clear.1"),
+        headless_client=headless, execution_transport=_Headless(), admission_client=IdleAdmission(),
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.clear.1"),
+    )
+    calls = []
+    def clear(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["is_current"]()
+        return {"state": "succeeded", "last_observed_remaining": [], "refused": []}
+    monkeypatch.setattr(runtime._scene, "clear_applied_scene", clear)
+    runtime.start()
+    result = runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
+        "request_id": "apply-scene.1", "request_owner_epoch": "runner.clear.1",
+        "source_label": "headless_apply_completion", "correlation_id": None,
+        "expected_applied_record_digest": _DIGEST_B, "expected_admission_generation": 1,
+        "clear_empty_scene": True,
+    }))
+    assert result["prepared_scene"]["state"] == "succeeded"
+    assert calls[0]["retained_bundle_id"] == _DIGEST_A
+    assert headless.applied_reads == 0
+    runtime.shutdown()
+
+
+def test_direct_empty_clear_accepts_bootstrap_and_checks_publication(monkeypatch, tmp_path):
+    class IdleAdmission(_Admission):
+        def get(self):
+            return {"admission_generation": 1, "authoring_allowed": True}
+
+    class BootstrapHeadless(_Headless):
+        generation = 1
+        def manager_status(self):
+            return {"source": {"available": True, "freshness": "fresh"},
+                    "status": {"manager_ready": True, "runtime": {"converged": True},
+                               "active": {"canonical_empty": True, "retained_bundle_id": _DIGEST_A,
+                                          "graph_revision": _DIGEST_B,
+                                          "publication": {"publication_generation": self.generation}}}}
+
+    headless = BootstrapHeadless()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.clear.1"),
+        headless_client=headless, execution_transport=_Headless(), admission_client=IdleAdmission(),
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.clear.1"),
+    )
+    def clear(**kwargs):
+        assert kwargs["is_current"]()
+        headless.generation = 2
+        assert not kwargs["is_current"]()
+        return {"state": "superseded", "last_observed_remaining": ["part"]}
+    monkeypatch.setattr(runtime._scene, "clear_applied_scene", clear)
+    runtime.start()
+    result = runtime.prepare_applied_scene(ProgramScenePreparationRequest.model_validate({
+        "request_id": "clear.1", "request_owner_epoch": "runner.clear.1",
+        "source_label": "composer_ui", "correlation_id": None,
+        "expected_applied_record_digest": None, "expected_admission_generation": 1,
+        "clear_empty_scene": True, "expected_publication_generation": 1,
+    }))
+    assert result["prepared_scene"]["state"] == "superseded"
+    assert headless.applied_reads == 0
+    runtime.shutdown()
+
+
 def test_applied_activation_prepares_scene_while_idle_without_run_claim(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

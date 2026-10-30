@@ -1371,7 +1371,8 @@ std::string ApplyRequest(
     const std::string_view accepted_impact = "receipt",
     const std::string_view prepared_activation_id_override = {},
     const deployment::CanonicalEmptyRetainedBundleAdmission *sealed_admission =
-        nullptr) {
+        nullptr,
+    const std::string_view scene_initialization = "preserve") {
   using content_identity::CanonicalValue;
   std::string resolved_graph_revision(expected_graph_revision);
   std::string resolved_retained_bundle_id(expected_retained_bundle_id);
@@ -1518,7 +1519,7 @@ std::string ApplyRequest(
       {"expected_current", expected},
       {"prepared_activation", prepared_summary},
       {"reject_if_affected_busy", CanonicalValue(true)},
-      {"scene_initialization", CanonicalValue("preserve")},
+      {"scene_initialization", CanonicalValue(std::string(scene_initialization))},
       {"request_id", CanonicalValue(std::string(request_id))},
       {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
       {"source_label", CanonicalValue("manager-process-test")},
@@ -2972,8 +2973,7 @@ TEST(ManagerDaemonProcess,
   EXPECT_TRUE(WIFEXITED(stopped));
 }
 
-TEST(ManagerDaemonProcess,
-     GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
+void RunGripperOnlyNativeApply(const std::string_view close_initialization) {
   const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata();
   DaemonDirectory directory(true);
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT,
@@ -3039,6 +3039,33 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
       << status;
 
+  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                           "logical-scene-source.json");
+  if (close_initialization == "initialize") {
+    // Populate the actual Scene owner before testing the Close Apply.
+    const auto before_add = scene_source.Read();
+    ASSERT_TRUE(before_add.has_value());
+    const auto added = SendCommand(
+        directory.socket_path(),
+        SceneAddRequest(*before_add, "manager-close-scene-object.1",
+                        WaitForAuthoringAdmission(directory).admission_generation));
+    ASSERT_NE(added.find("\"ok\":true"), std::string::npos) << added;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::optional<SourceSnapshot> observed;
+    while (std::chrono::steady_clock::now() < deadline) {
+      observed = scene_source.Read();
+      if (observed.has_value() &&
+          content_identity::canonical_json(RequiredMember(observed->payload, "snapshot"))
+                  .find("scene-process-box") != std::string::npos) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(observed.has_value());
+    ASSERT_NE(content_identity::canonical_json(RequiredMember(observed->payload, "snapshot"))
+                  .find("scene-process-box"), std::string::npos);
+  }
+
   // The first physical Apply used the selected-product path, not the current
   // bootstrap builder. Empty installation must retain that exact ownership
   // through the interval before the public pointer switches to empty.
@@ -3054,13 +3081,79 @@ TEST(ManagerDaemonProcess,
   const auto empty_prepared = deployment::assemble_sealed_canonical_empty_activation(
       empty_admission, empty_catalog, empty_raw);
   ASSERT_TRUE(daemon_activations.put_if_absent(empty_prepared));
-  const auto empty_submitted = SendCommand(directory.socket_path(), ApplyRequest(
+  const auto empty_request = ApplyRequest(
       directory, initial->source_owner_epoch,
       WaitForAuthoringAdmission(directory).admission_generation,
       empty_admission.deployment_artifact_id().value(),
       empty_admission.deployment_revision().value(), "current-graph",
       "current-bundle", "manager-gripper-only-empty.2", {}, false, "receipt",
-      empty_prepared.prepared_activation_id().value(), &empty_admission));
+      empty_prepared.prepared_activation_id().value(), &empty_admission,
+      close_initialization);
+  if (close_initialization == "initialize") {
+    component_manager::SqliteManagerApplyJournal journal(
+        directory.manager_root() /
+            std::string(component_manager::kManagerApplyJournalFilename),
+        core::CellId(fixture.cell_id));
+    const auto inventory_before = journal.ReadStatusInventory().size();
+    const auto admission_before = ReadAuthoringAdmissionProjection(directory);
+    const auto scene_before = scene_source.Read();
+    const auto manager_before = manager_source.Read();
+    ASSERT_TRUE(scene_before.has_value());
+    ASSERT_TRUE(manager_before.has_value());
+    const auto expect_no_effect = [&] {
+      EXPECT_EQ(journal.ReadStatusInventory().size(), inventory_before);
+      const auto admission_after = ReadAuthoringAdmissionProjection(directory);
+      EXPECT_EQ(admission_after.authoring_allowed, admission_before.authoring_allowed);
+      EXPECT_EQ(admission_after.admission_generation, admission_before.admission_generation);
+      const auto scene_after = scene_source.Read();
+      const auto manager_after = manager_source.Read();
+      ASSERT_TRUE(scene_after.has_value());
+      ASSERT_TRUE(manager_after.has_value());
+      EXPECT_EQ(RequiredMember(scene_after->payload, "snapshot"),
+                RequiredMember(scene_before->payload, "snapshot"));
+      EXPECT_EQ(RequiredMember(manager_after->payload, "active"),
+                RequiredMember(manager_before->payload, "active"));
+      EXPECT_EQ(RequiredMember(manager_after->payload, "apply"),
+                RequiredMember(manager_before->payload, "apply"));
+    };
+    // A forged but internally consistent sealed summary must not pass the
+    // stored activation/admission check. No Apply is accepted for it.
+    auto forged = empty_request;
+    auto forged_origin = *empty_prepared.sealed_canonical_empty_origin();
+    forged_origin.admission_digest = core::ContentDigest(
+        "sha256:" + std::string(64U, '0'));
+    const auto replace_once = [&forged](const std::string &from,
+                                        const std::string &to) {
+      const auto position = forged.find(from);
+      ASSERT_NE(position, std::string::npos);
+      forged.replace(position, from.size(), to);
+    };
+    replace_once(empty_admission.admission_digest().value(),
+                 forged_origin.admission_digest.value());
+    replace_once(empty_prepared.captured_input_digest().value(),
+                 deployment::sealed_canonical_empty_capture_digest(forged_origin)
+                     .value());
+    const auto bytes = SendCommand(directory.socket_path(), forged);
+    const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
+    EXPECT_EQ(RequiredMember(rejected, "ok"), content_identity::CanonicalValue(false))
+        << bytes;
+    EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "code"),
+              "prepared_activation_unverified") << bytes;
+    expect_no_effect();
+
+    auto unsupported = empty_request;
+    const std::string kind = "\"kind\":\"sealed_canonical_empty\"";
+    const auto position = unsupported.find(kind);
+    ASSERT_NE(position, std::string::npos);
+    unsupported.replace(position, kind.size(), "\"kind\":\"unsupported\"");
+    const auto unsupported_bytes = SendCommand(directory.socket_path(), unsupported);
+    const auto unsupported_result =
+        deployment::parse_strict_json_model_yaml(unsupported_bytes).root();
+    EXPECT_EQ(RequiredText(RequiredMember(unsupported_result, "error"), "code"),
+              "invalid_request") << unsupported_bytes;
+    expect_no_effect();
+  }
+  const auto empty_submitted = SendCommand(directory.socket_path(), empty_request);
   ASSERT_NE(empty_submitted.find("\"apply_id\""), std::string::npos)
       << empty_submitted;
   auto emptied = empty_submitted;
@@ -3085,6 +3178,15 @@ TEST(ManagerDaemonProcess,
             empty_admission.retained_bundle_id().value());
   EXPECT_EQ(RequiredText(empty_active, "graph_revision"),
             empty_admission.graph_revision().value());
+  if (close_initialization == "initialize") {
+    const auto records = content_identity::canonical_json(
+        RequiredMember(empty_current->payload, "apply"));
+    EXPECT_NE(records.find("\"scene_initialization\":\"initialize\""),
+              std::string::npos) << records;
+    const auto replay = SendCommand(directory.socket_path(), empty_request);
+    EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
+              std::string::npos) << replay;
+  }
   EXPECT_EQ(ReadDirectChildren(manager.pid()), native_children);
   EXPECT_EQ(ReadStartupStderr(directory).find(
                 "native composition phase: materializing runtime"),
@@ -3123,6 +3225,15 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(ReadStartupStderr(directory).find(
                 "native composition phase: materializing runtime"),
             std::string::npos);
+}
+
+TEST(ManagerDaemonProcess,
+     GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
+  RunGripperOnlyNativeApply("preserve");
+}
+
+TEST(ManagerDaemonProcess, SealedCanonicalEmptyCloseInitializesScene) {
+  RunGripperOnlyNativeApply("initialize");
 }
 
 TEST(

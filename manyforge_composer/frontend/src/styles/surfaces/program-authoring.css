@@ -1513,14 +1513,7 @@
   box-shadow: 0 0.8rem 2rem var(--mf-shadow-neutral-00-a45);
 }
 
-.program-motion-conflict > div {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.45rem;
-}
-
-/* Halt / Reset confirmations: compact text and ordinary-size buttons, not
-   the large transport buttons they are opened from. */
+/* Halt / Reset confirmations keep their copy compact. */
 .transport-confirmation ul {
   display: grid;
   gap: 0.2rem;
@@ -1556,33 +1549,11 @@
   margin-bottom: 0;
 }
 
-.transport-confirmation .dialog-actions > button {
-  min-width: 0;
-  min-height: 1.9rem;
-  height: auto;
-  padding: 0.3rem 0.8rem;
-  font-size: var(--mf-font-size-072);
-}
-
-/* The confirm button of the activate-and-execute popup reuses Execute's look. */
-.transport-confirmation .dialog-actions > .transport-run:not(:disabled) {
-  border-color: var(--mf-border-success-35);
-  color: var(--mf-text-success-82);
-  background: var(--mf-bg-success-15);
-}
-
-.transport-confirmation .dialog-actions > .transport-run:hover:not(:disabled) {
-  border-color: var(--mf-border-success-51);
-  background: var(--mf-bg-success-20);
-}
-
-.overlay-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.5rem;
-}
-
 /* Editor-only "Show collapsed by default" toggle below the node policies. */
+.formula-editor-actions {
+  flex-wrap: wrap;
+}
+
 .program-node-presentation {
   display: flex;
   align-items: center;

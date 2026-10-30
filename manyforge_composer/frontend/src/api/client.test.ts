@@ -68,6 +68,32 @@ it('reads the typed cause of a refused preparation, never its text', () => {
   expect(preparationCauseCode(new Error('pneumatic_io_presets_coincident'))).toBeNull();
 });
 
+it('uses the error catalog detail for a typed preparation cause', () => {
+  const refusal = new ApiError('candidate refused', 409, { detail: {
+    code: 'activation_preparation_failed',
+    message: 'candidate refused',
+    effect: 'none',
+    details: { cause_code: 'pneumatic_io_presets_coincident' },
+  } });
+  expect(authoringRefusalMessage(refusal)).toBe(
+    'Not applied: the candidate could not be prepared. The gripper\'s Open and Close presets resolve to the same position, '
+      + 'so its pneumatic I/O cannot tell them apart. Choose distinct preset positions.',
+  );
+});
+
+it('keeps an unlisted typed preparation cause visible when no catalog row exists', () => {
+  const causeCode = 'unlisted_preparer_reason';
+  const refusal = new ApiError('candidate refused', 409, { detail: {
+    code: 'activation_preparation_failed',
+    message: 'candidate refused',
+    effect: 'none',
+    details: { cause_code: causeCode },
+  } });
+  expect(authoringRefusalMessage(refusal)).toBe(
+    `Not applied: the candidate could not be prepared (${causeCode}). Correct it and try again.`,
+  );
+});
+
 it('exposes a refusal ErrorDTO as one structured error with no origin', () => {
   const error = new ApiError('refused', 409, { detail: {
     code: 'stale_generation',

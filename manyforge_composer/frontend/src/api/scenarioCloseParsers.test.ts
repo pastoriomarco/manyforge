@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { api } from './client';
-import { parseCanonicalEmptySelection, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
+import { parseSceneClearStatus, parseCanonicalEmptySelection, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
   parseLifecycleTargetRetirementResult } from './scenarioCloseParsers';
 import type { LifecycleTargetRetirementIntent } from '../types/scenarioClose';
 
@@ -151,4 +151,70 @@ it('parses a Force close step reply and refuses another step or shape', () => {
   expect(() => parseForceCloseResult({ ...reply, ok: false }, 'close_operations')).toThrow();
   expect(() => parseForceCloseResult({ ...reply, result: { ...reply.result, operations: [{ operation_id: 'op.io' }] } },
     'close_operations')).toThrow('operation row is invalid');
+});
+
+it('parses transient Scene clear status and keeps unknown remaining distinct', () => {
+  const row = { apply_id: 'apply.1', apply_generation: 3, state: 'unknown', remaining: null,
+    reason: { code: 'scene_clear_unknown', message: 'Receipt unavailable', details: { reason: 'response_unavailable' } } };
+  expect(parseSceneClearStatus({ scene_clear: row })).toEqual({ applyId: 'apply.1', applyGeneration: 3,
+    state: 'unknown', remaining: null, reason: row.reason });
+  expect(parseSceneClearStatus({ scene_clear: null })).toBeNull();
+  expect(() => parseSceneClearStatus({ scene_clear: { ...row, remaining: [null] } })).toThrow();
+});
+
+it('reads the follower status carried by a typed cycle-status outage', async () => {
+  const scene_clear = { apply_id: 'apply.1', apply_generation: 3, state: 'pending', remaining: null, reason: null };
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ detail: {
+    code: 'program_runner_unavailable', message: 'Runner unavailable', producer: 'headless', details: { scene_clear },
+  } }), { status: 503 })));
+  expect(await api.programs.sceneClearStatus()).toEqual({ applyId: 'apply.1', applyGeneration: 3,
+    state: 'pending', remaining: null, reason: null });
+});
+
+it.each([
+  { remaining: null, reason: null },
+  { remaining: ['held'], reason: null },
+  { remaining: [], reason: { code: 'fault', message: 'Fault', details: {} } },
+])('rejects malformed Scene clear success: %j', (fields) => {
+  expect(() => parseSceneClearStatus({ scene_clear: { apply_id: 'apply.1', apply_generation: 3,
+    state: 'succeeded', ...fields } })).toThrow('success must have no remaining objects or failure');
+});
+
+it('accepts a Scene clear success only with an empty remainder and no reason', () => {
+  expect(parseSceneClearStatus({ scene_clear: { apply_id: 'apply.1', apply_generation: 3,
+    state: 'succeeded', remaining: [], reason: null } })).toMatchObject({ state: 'succeeded', remaining: [], reason: null });
+});
+
+it('requires a partial result to name remaining parts and typed refusals', () => {
+  const partial = { apply_id: 'apply.1', apply_generation: 3, state: 'partial', remaining: ['held'],
+    reason: { code: 'scene_clear_partial', message: 'Detach refused',
+      details: { refused: [{ resource_id: 'held', code: 'detach_refused', message: 'No carrier pose' }] } } };
+  expect(parseSceneClearStatus({ scene_clear: partial })).toMatchObject({ state: 'partial', remaining: ['held'] });
+  expect(() => parseSceneClearStatus({ scene_clear: { ...partial, remaining: [] } })).toThrow();
+  expect(() => parseSceneClearStatus({ scene_clear: { ...partial, reason: { ...partial.reason, details: { refused: [] } } } })).toThrow();
+});
+
+it('parses request-keyed direct Scene-clear status without inventing an Apply identity', () => {
+  expect(parseSceneClearStatus({ scene_clear: { request_id: 'clear.1', state: 'succeeded', remaining: [], reason: null } }))
+    .toEqual({ requestId: 'clear.1', state: 'succeeded', remaining: [], reason: null });
+});
+
+it.each(['failed', 'unknown'] as const)('requires the matching typed reason for %s', (state) => {
+  const row = { apply_id: 'apply.1', apply_generation: 3, state, remaining: null };
+  expect(() => parseSceneClearStatus({ scene_clear: { ...row, reason: null } })).toThrow('matching typed reason');
+  expect(() => parseSceneClearStatus({ scene_clear: { ...row,
+    reason: { code: state === 'failed' ? 'scene_clear_unknown' : 'scene_clear_failed', message: 'wrong', details: {} } } }))
+    .toThrow('matching typed reason');
+  const reason = { code: `scene_clear_${state}`, message: 'owner detail', details: { reason: 'owner_unavailable' } };
+  expect(parseSceneClearStatus({ scene_clear: { ...row, reason } })).toMatchObject({ state, reason });
+});
+
+it.each(['pending', 'superseded'] as const)('rejects a failure reason for %s', (state) => {
+  expect(() => parseSceneClearStatus({ scene_clear: { request_id: 'clear.1', state, remaining: null,
+    reason: { code: 'scene_clear_failed', message: 'wrong', details: {} } } })).toThrow();
+});
+
+it.each(['pending', 'superseded'] as const)('accepts a %s record with no failure reason', (state) => {
+  expect(parseSceneClearStatus({ scene_clear: { request_id: 'clear.1', state, remaining: null, reason: null } }))
+    .toEqual({ requestId: 'clear.1', state, remaining: null, reason: null });
 });

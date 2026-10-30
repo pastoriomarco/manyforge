@@ -654,6 +654,9 @@ inline constexpr std::string_view kHeadlessReadResponseInvalid{"headless_read_re
 inline constexpr std::string_view kHeadlessRuntimeFaultInvalid{"headless_runtime_fault_invalid"};
 inline constexpr std::string_view kHeadlessRuntimeProjectionInvalid{"headless_runtime_projection_invalid"};
 inline constexpr std::string_view kHeadlessSourceInvalid{"headless_source_invalid"};
+inline constexpr std::string_view kHeadlessViewerPoseCancelled{"headless_viewer_pose_cancelled"};
+inline constexpr std::string_view kHeadlessViewerPoseClosed{"headless_viewer_pose_closed"};
+inline constexpr std::string_view kHeadlessViewerPoseInvalid{"headless_viewer_pose_invalid"};
 inline constexpr std::string_view kHistorianDeliveryUnavailable{"historian_delivery_unavailable"};
 inline constexpr std::string_view kHistorianProjectionFailure{"historian_projection_failure"};
 inline constexpr std::string_view kHistorianResponseInvalid{"historian_response_invalid"};
@@ -876,6 +879,7 @@ inline constexpr std::string_view kManagerSourceInvalid{"manager_source_invalid"
 inline constexpr std::string_view kManagerSourceStale{"manager_source_stale"};
 inline constexpr std::string_view kManagerSourceUnavailable{"manager_source_unavailable"};
 inline constexpr std::string_view kManagerStateMarkerIntegrityError{"manager_state_marker_integrity_error"};
+inline constexpr std::string_view kManagerUnavailable{"manager_unavailable"};
 inline constexpr std::string_view kManifestOfferLimitExceeded{"manifest_offer_limit_exceeded"};
 inline constexpr std::string_view kManualHandoverCleanupIncomplete{"manual_handover_cleanup_incomplete"};
 inline constexpr std::string_view kManualHandoverQueryUnavailable{"manual_handover_query_unavailable"};
@@ -1196,6 +1200,7 @@ inline constexpr std::string_view kPathSyntaxInvalid{"path_syntax_invalid"};
 inline constexpr std::string_view kPathTooDeep{"path_too_deep"};
 inline constexpr std::string_view kPathTooLong{"path_too_long"};
 inline constexpr std::string_view kPayloadTagInvalid{"payload_tag_invalid"};
+inline constexpr std::string_view kPeerClosed{"peer_closed"};
 inline constexpr std::string_view kPendingReplacementHasNoControlledSource{"pending_replacement_has_no_controlled_source"};
 inline constexpr std::string_view kPendingReplacementNotSettled{"pending_replacement_not_settled"};
 inline constexpr std::string_view kPersistenceOutcomeUnknown{"persistence_outcome_unknown"};
@@ -1309,6 +1314,7 @@ inline constexpr std::string_view kProductPinUnavailable{"product_pin_unavailabl
 inline constexpr std::string_view kProgramActivationInvalid{"program_activation_invalid"};
 inline constexpr std::string_view kProgramAppliedChanged{"program_applied_changed"};
 inline constexpr std::string_view kProgramAppliedSelectionInvalid{"program_applied_selection_invalid"};
+inline constexpr std::string_view kProgramAppliedSelectionNotActive{"program_applied_selection_not_active"};
 inline constexpr std::string_view kProgramAppliedSelectionNotFound{"program_applied_selection_not_found"};
 inline constexpr std::string_view kProgramApplyConfirmationRequired{"program_apply_confirmation_required"};
 inline constexpr std::string_view kProgramApplyNothingToApply{"program_apply_nothing_to_apply"};
@@ -1642,6 +1648,8 @@ inline constexpr std::string_view kScenarioExportSourceUnavailable{"scenario_exp
 inline constexpr std::string_view kScenarioExportValidationFailed{"scenario_export_validation_failed"};
 inline constexpr std::string_view kScenarioForceCloseNotClosing{"scenario_force_close_not_closing"};
 inline constexpr std::string_view kScenarioForceCloseOperationBusy{"scenario_force_close_operation_busy"};
+inline constexpr std::string_view kScenarioForceCloseStopNotContained{"scenario_force_close_stop_not_contained"};
+inline constexpr std::string_view kScenarioForceCloseStopPending{"scenario_force_close_stop_pending"};
 inline constexpr std::string_view kScenarioForceCloseStopUnconfirmed{"scenario_force_close_stop_unconfirmed"};
 inline constexpr std::string_view kScenarioLoadActivationNotConfirmed{"scenario_load_activation_not_confirmed"};
 inline constexpr std::string_view kScenarioLoadCurrentConfigurationUnavailable{"scenario_load_current_configuration_unavailable"};
@@ -1660,6 +1668,9 @@ inline constexpr std::string_view kScenarioSourceInvalid{"scenario_source_invali
 inline constexpr std::string_view kScenarioWorkspaceStale{"scenario_workspace_stale"};
 inline constexpr std::string_view kSceneCandidatePreviewOversized{"scene_candidate_preview_oversized"};
 inline constexpr std::string_view kSceneChangedDuringValidation{"scene_changed_during_validation"};
+inline constexpr std::string_view kSceneClearFailed{"scene_clear_failed"};
+inline constexpr std::string_view kSceneClearPartial{"scene_clear_partial"};
+inline constexpr std::string_view kSceneClearUnknown{"scene_clear_unknown"};
 inline constexpr std::string_view kSceneInitializationFailed{"scene_initialization_failed"};
 inline constexpr std::string_view kSceneMeshAssetUnknown{"scene_mesh_asset_unknown"};
 inline constexpr std::string_view kSceneMeshBoundsExceeded{"scene_mesh_bounds_exceeded"};

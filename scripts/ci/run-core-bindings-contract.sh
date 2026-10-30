@@ -9,6 +9,13 @@ export PYTHONDONTWRITEBYTECODE=1
 export TZ=UTC
 unset PYTHONPATH PYTHONHOME 2>/dev/null || true
 
+PYTHON_EXECUTABLE="${MANYFORGE_I2_PYTHON_EXECUTABLE:-$(command -v python3 || true)}"
+if [[ -z "${PYTHON_EXECUTABLE}" || ! -x "${PYTHON_EXECUTABLE}" ]]; then
+  echo "a CPython 3.12 interpreter is required (set MANYFORGE_I2_PYTHON_EXECUTABLE)" >&2
+  exit 2
+fi
+export MANYFORGE_I2_PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}"
+
 usage() {
   echo "usage: $0 generated-api --extension <path> --generated-output-root <path> [--prepare-only]" >&2
   exit 2
@@ -45,7 +52,7 @@ require_plain_file() {
 }
 
 require_plain_file "${EXTENSION}" "candidate extension"
-EXPECTED_SUFFIX="$(/usr/local/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+EXPECTED_SUFFIX="$("${PYTHON_EXECUTABLE}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 case "${EXPECTED_SUFFIX}" in
   .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
   *) echo "active CPython extension suffix differs from the supported I2 ABI" >&2; exit 2 ;;
@@ -73,7 +80,7 @@ fi
 mkdir -p "$(dirname "${GENERATED_ROOT}")"
 mkdir "${GENERATED_ROOT}"
 /usr/bin/install -m 0755 "${EXTENSION}" "${GENERATED_ROOT}/${EXPECTED_EXTENSION}"
-/usr/local/bin/python3 "${SCRIPT_DIR}/generate-core-bindings-contract.py" \
+"${PYTHON_EXECUTABLE}" "${SCRIPT_DIR}/generate-core-bindings-contract.py" \
   --extension "${EXTENSION}" \
   --output-root "${GENERATED_ROOT}"
 
@@ -112,9 +119,9 @@ export MANYFORGE_I2_BINDING_EVIDENCE_ROOT="${TEST_ROOT}/evidence"
 export MANYFORGE_I2_BINDING_STAGED_ROOT="$(dirname "${EXTENSION}")"
 export MANYFORGE_I2_BINDING_GENERATED_ROOT="${GENERATED_ROOT}"
 export MANYFORGE_I2_BINDING_SOURCE_ROOT="${REPO_ROOT}"
-export MANYFORGE_I2_BINDING_EXECUTABLE=/usr/local/bin/python3
+export MANYFORGE_I2_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 cd "${REPO_ROOT}"
-/usr/local/bin/python3 -m pytest -p no:cacheprovider -q \
+"${PYTHON_EXECUTABLE}" -m pytest -p no:cacheprovider -q \
   verification/composable_cell_i2/binding_contract_tests.py::test_generated_stub_inventory_and_documentation_parity \
   verification/composable_cell_i2/binding_contract_tests.py::test_complete_forbidden_surface_absence

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type DragEvent } from 'react';
+import { memo, useCallback, useRef, useState, type DragEvent } from 'react';
 import type { CatalogEntry } from '../types/api';
 import {
   programPaletteClickIntent,
@@ -17,7 +17,7 @@ interface NodePaletteItemProps {
   allowDrag?: boolean;
 }
 
-export function NodePaletteItem({
+export const NodePaletteItem = memo(function NodePaletteItem({
   entry,
   disabled = false,
   onActivate,
@@ -137,4 +137,4 @@ export function NodePaletteItem({
       </OverlayPanel>}
     </div>
   );
-}
+});

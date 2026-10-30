@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <sstream>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -358,18 +359,28 @@ TEST(JtcExecutionPort, EndpointFactsKeepRetainedBindingsAndScalingPublishersSepa
 
 TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
   Rig rig;
+  std::optional<ErrorDTO> observed;
+  const auto describe = [&] {
+    if (!observed) return std::string("clean");
+    std::ostringstream out;
+    out << observed->code << ": " << observed->message;
+    for (const auto &[key, value] : observed->details)
+      out << " " << key << "=" << value;
+    return out.str();
+  };
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
-    return !rig.adapter->ReadEndpointDiagnostic();
-  }));
+    observed = rig.adapter->ReadEndpointDiagnostic();
+    return !observed;
+  })) << "initial publisher: " << describe();
   const auto topic = rig.config(1).state_topic;
   auto second = rig.resources.node()->create_publisher<
       control_msgs::msg::JointTrajectoryControllerState>(topic, rclcpp::QoS(10));
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
-    const auto error = rig.adapter->ReadEndpointDiagnostic();
-    return error && error->code == "duplicate_component_instance";
-  }));
+    observed = rig.adapter->ReadEndpointDiagnostic();
+    return observed && observed->code == "duplicate_component_instance";
+  })) << "second publisher: " << describe();
   const auto error = rig.adapter->ReadEndpointDiagnostic();
   ASSERT_TRUE(error);
   EXPECT_EQ(error->details.at("topic"), topic);
@@ -377,8 +388,9 @@ TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
   second.reset();
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
-    return !rig.adapter->ReadEndpointDiagnostic();
-  }));
+    observed = rig.adapter->ReadEndpointDiagnostic();
+    return !observed;
+  })) << "publisher removed: " << describe();
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 

@@ -1,4 +1,4 @@
-import { act, createElement, useEffect, useMemo, type ReactNode } from 'react';
+import { act, createElement, memo, useEffect, useMemo, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
@@ -10,6 +10,8 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 
 const apiMock = vi.hoisted(() => ({
+  programs: { sceneClearStatus: vi.fn() },
+  manager: { applyStatus: vi.fn() },
   programWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
@@ -49,6 +51,10 @@ import { ApiError } from '../api/client';
  * the hook is exercised against the real contract rather than a behavioural
  * stub; only the read loop itself belongs to `useAuthoringWorkspace`'s own test.
  */
+const testRefresh = async () => undefined;
+const testBeginMutation = () => true;
+const testFinishMutation = () => undefined;
+
 function testAuthoringController(
   published: PublishedAuthoringWorkspace | null,
   snapshot: ComposerHeadlessState | null,
@@ -61,9 +67,9 @@ function testAuthoringController(
     project: projectFacts(published),
     reading: false,
     error: null,
-    refresh: async () => undefined,
-    beginMutation: () => true,
-    finishMutation: () => undefined,
+    refresh: testRefresh,
+    beginMutation: testBeginMutation,
+    finishMutation: testFinishMutation,
     observeApply: () => undefined,
     submissionUnconfirmed: false,
     correlatedApply: null,
@@ -233,6 +239,7 @@ async function mountHarness(
   initial: Deferred<ProgramWorkspaceResponse>,
   snapshot: ComposerHeadlessState | null = null,
   published: PublishedAuthoringWorkspace | null = null,
+  onConsumerRender?: () => void,
 ) {
   const document = {
     nodeType: 9,
@@ -273,28 +280,38 @@ async function mountHarness(
 
   const { createRoot } = await import('react-dom/client');
   root = createRoot(makeNode('div') as unknown as Element);
+  const Consumer = memo((_props: { mutate: ReturnType<typeof useProgramWorkspace>['mutate'] }) => {
+    onConsumerRender?.();
+    return null;
+  });
   function Harness({ currentSnapshot }: { currentSnapshot: ComposerHeadlessState | null }) {
+    const observed = currentSnapshot?.authoringWorkspace;
+    const workspaceEpoch = observed?.workspaceEpoch;
+    const workspaceRevision = observed?.workspaceRevision;
+    const programDraftRevision = observed?.programDraftRevision;
+    const deploymentDraftId = observed?.deploymentDraftId;
+    const deploymentDraftRevision = observed?.deploymentDraftRevision;
     const currentPublication = useMemo(() => {
-      if (published === null || currentSnapshot === null) return published;
-      const current = workspace(
-        currentSnapshot.authoringWorkspace.programDraftRevision,
-      );
+      if (published === null || workspaceEpoch === undefined || workspaceRevision === undefined
+        || programDraftRevision === undefined || deploymentDraftId === undefined
+        || deploymentDraftRevision === undefined) return published;
+      const current = workspace(programDraftRevision);
       const nextSnapshot = {
         ...published.snapshot,
-        workspaceEpoch: currentSnapshot.authoringWorkspace.workspaceEpoch,
-        workspaceRevision: currentSnapshot.authoringWorkspace.workspaceRevision,
+        workspaceEpoch,
+        workspaceRevision,
         program: { draft: current.draft, saved: current.saved },
         deployment: {
           ...published.snapshot.deployment,
-          draftId: currentSnapshot.authoringWorkspace.deploymentDraftId,
-          draftRevision: currentSnapshot.authoringWorkspace.deploymentDraftRevision,
+          draftId: deploymentDraftId,
+          draftRevision: deploymentDraftRevision,
         },
       };
       return {
         identity: authoringWorkspaceIdentity(nextSnapshot),
         snapshot: nextSnapshot,
       };
-    }, [currentSnapshot]);
+    }, [published, workspaceEpoch, workspaceRevision, programDraftRevision, deploymentDraftId, deploymentDraftRevision]);
     const authoring = useMemo(
       () => testAuthoringController(currentPublication, currentSnapshot),
       [currentPublication, currentSnapshot],
@@ -306,7 +323,7 @@ async function mountHarness(
         latest = null;
       };
     }, [controller]);
-    return null;
+    return onConsumerRender ? createElement(Consumer, { mutate: controller.mutate }) : null;
   }
   apiMock.programWorkspace.get.mockReturnValueOnce(initial.promise);
   await act(async () => {
@@ -454,6 +471,44 @@ afterEach(async () => {
 describe('useProgramWorkspace Draft policy interaction', () => {
   beforeEach(() => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  });
+
+  it('keeps an unrelated status update out of a memoized mutation consumer and retains captured admission', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    const snapshot = authoringSnapshot(workspace(1));
+    const onConsumerRender = vi.fn();
+    const rerender = await mountHarness(initial, snapshot, testPublication(workspace(1)), onConsumerRender);
+    await act(async () => initial.resolve(workspace(1)));
+    const oldMutate = latest!.mutate;
+    const count = onConsumerRender.mock.calls.length;
+    await rerender({ ...snapshot, componentOverview: { ...snapshot.componentOverview, userMessage: 'Updated status.' } });
+    expect(latest!.mutate).toBe(oldMutate);
+    expect(onConsumerRender).toHaveBeenCalledTimes(count);
+
+    const next = { ...snapshot, authoringAdmission: { ...snapshot.authoringAdmission, admissionGeneration: 8 } };
+    await rerender(next);
+    const currentMutate = latest!.mutate;
+    expect(currentMutate).not.toBe(oldMutate);
+    apiMock.programWorkspace.mutate.mockRejectedValueOnce(new ApiError('refused', 409, {
+      detail: { code: 'stale_generation', effect: 'none' },
+    }));
+    await act(async () => { await oldMutate('test', {}); });
+    expect(apiMock.programWorkspace.mutate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ expectedAdmissionGeneration: 7 }), 'test', {},
+    );
+    expect(latest!.state.error).toContain('Edit not applied');
+    apiMock.programWorkspace.mutate.mockResolvedValueOnce({
+      mutation: 'test', details: {}, workspace: workspace(1),
+      authoringWorkspace: testPublication(workspace(1)).snapshot,
+    });
+    await act(async () => { await currentMutate('test', {}); });
+    expect(apiMock.programWorkspace.mutate).toHaveBeenLastCalledWith(
+      expect.objectContaining({ expectedAdmissionGeneration: 8 }), 'test', {},
+    );
+    await rerender(null);
+    expect(latest!.mutationAvailable).toBe(false);
+    await act(async () => { await latest!.mutate('test', {}); });
+    expect(apiMock.programWorkspace.mutate).toHaveBeenCalledTimes(2);
   });
 
   it('coalesces one workspace read for a newer backend Draft identity', async () => {
@@ -668,6 +723,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       status: 'accepted', workspace: workspace(1),
       activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
     });
+    apiMock.programs.sceneClearStatus.mockResolvedValue({ applyId: 'apply.new', applyGeneration: 9, state: 'succeeded', remaining: [], reason: null });
     const confirmedAuthoring = {
       workspaceEpoch: 'confirmed.workspace', workspaceRevision: 5,
       programDraftId: 'confirmed.program', programDraftRevision: 8,
@@ -685,6 +741,42 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).toContain('New Scenario accepted (apply.new)');
     expect(latest?.state.message).toContain('Motion does not start automatically');
     expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
+  });
+
+  it('New waits for the correlated clear and opens its workspace after a partial result', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    apiMock.scenarioDocuments.new.mockResolvedValue({ status: 'accepted', workspace: workspace(2),
+      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 } });
+    const clearing = deferred<{ applyId: string; applyGeneration: number; state: string; remaining: string[]; reason: object }>();
+    apiMock.programs.sceneClearStatus.mockReturnValueOnce(clearing.promise);
+    let result: unknown;
+    await act(async () => { void latest!.newScenarioDocument(true).then((value) => { result = value; }); });
+    expect(result).toBeUndefined();
+    expect(latest?.newSceneClearApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
+    await act(async () => { clearing.resolve({ applyId: 'apply.new', applyGeneration: 9, state: 'partial',
+      remaining: ['held'], reason: { code: 'scene_clear_partial', message: 'Detach refused', details: {} } }); });
+    expect(result).toBeDefined();
+    expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+  });
+
+  it('New opens its workspace when the Scene clear status times out', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    apiMock.scenarioDocuments.new.mockResolvedValue({ status: 'accepted', workspace: workspace(2),
+      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 } });
+    apiMock.programs.sceneClearStatus.mockReturnValue(new Promise(() => {}));
+    vi.useFakeTimers();
+    try {
+      let result: unknown;
+      await act(async () => { void latest!.newScenarioDocument(true).then((value) => { result = value; }); });
+      expect(result).toBeUndefined();
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+      expect(result).toBeDefined();
+      expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    } finally { vi.useRealTimers(); }
   });
 
   it('shows a written-but-not-adopted Scenario Save with its path and refreshes once', async () => {

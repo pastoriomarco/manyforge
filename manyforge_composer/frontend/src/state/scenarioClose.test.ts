@@ -8,7 +8,7 @@ const apiMock = vi.hoisted(() => ({ manager: { status: vi.fn(), canonicalEmptySe
   execution: { identity: vi.fn(), forceClose: vi.fn() }, cclc: { targetRetirementOffer: vi.fn(), retireTargets: vi.fn(),
     ownerSettlement: vi.fn(), owner: vi.fn(), component: vi.fn(), submitLifecycle: vi.fn(), lifecycleStatus: vi.fn(),
     componentProcessStopOffer: vi.fn(), stopComponentProcess: vi.fn(), componentProcessStopResult: vi.fn() },
-  scene: { commit: vi.fn() } }));
+  scene: { commit: vi.fn() }, programs: { sceneClearStatus: vi.fn(), clearEmptyScene: vi.fn() } }));
 vi.mock('../api/client', () => ({ api: apiMock }));
 import { closeErrorCode, closeScenario, forceCloseScenario, prepareSceneForClose, resetCloseSnapshot, sceneAtOrAfter,
   type ClosePreparationInputs } from './scenarioClose';
@@ -68,7 +68,51 @@ beforeEach(() => {
   apiMock.manager.previewCandidate.mockResolvedValue({ candidateReceipt: receipt });
   apiMock.manager.applyCandidate.mockResolvedValue({ applyId: 'apply.empty', applyGeneration: 4, state: 'pending' });
   apiMock.manager.applyStatus.mockResolvedValueOnce({ state: 'pending' }).mockResolvedValue({ state: 'succeeded' });
+  apiMock.programs.sceneClearStatus.mockResolvedValue({ applyId: 'apply.empty', applyGeneration: 4, state: 'succeeded', remaining: [], reason: null });
 });
+it('times out an unavailable clear as unknown and permits the replacement to continue', async () => {
+  vi.useFakeTimers();
+  try {
+    const request = { ...inputs(), sceneClearNotice: vi.fn() };
+    apiMock.programs.sceneClearStatus.mockReturnValue(new Promise(() => {}));
+    const result = closeScenario(request);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await result).toEqual(empty);
+    expect(request.sceneClearNotice).toHaveBeenCalledWith({ applyId: 'apply.empty', applyGeneration: 4 }, expect.objectContaining({ code: 'scene_clear_unknown' }));
+    expect(request.progress).not.toHaveBeenCalledWith('Scenario closed.');
+  } finally { vi.useRealTimers(); }
+});
+
+it.each(['partial', 'failed', 'unknown'])('reports %s and permits replacement without claiming clearing succeeded', async (state) => {
+  const request = { ...inputs(), sceneClearNotice: vi.fn() };
+  apiMock.programs.sceneClearStatus.mockResolvedValue({ applyId: 'apply.empty', applyGeneration: 4, state,
+    remaining: ['held.1'], reason: { code: 'detach_refused', message: 'Detach refused', details: {} } });
+  expect(await closeScenario(request)).toEqual(empty);
+  const error = (request.sceneClearNotice.mock.calls as unknown as [unknown, Error][])[0][1];
+  expect(closeErrorCode(error)).toBe(`scene_clear_${state}`);
+  expect(error.message).toContain('held.1');
+  expect(error.message).toContain(state === 'unknown' ? 'Last observed objects' : 'Remaining objects');
+  expect(request.progress).not.toHaveBeenCalledWith('Scenario closed.');
+});
+
+it('reports a status read error as unknown and permits replacement', async () => {
+  const request = { ...inputs(), sceneClearNotice: vi.fn() };
+  apiMock.programs.sceneClearStatus.mockRejectedValue(new Error('Unavailable'));
+  expect(await closeScenario(request)).toEqual(empty);
+  expect(closeErrorCode((request.sceneClearNotice.mock.calls as unknown as [unknown, Error][])[0][1])).toBe('scene_clear_unknown');
+  expect(request.progress).not.toHaveBeenCalledWith('Scenario closed.');
+});
+
+it('does not accept a different Apply as the completed clear', async () => {
+  const request = inputs();
+  apiMock.programs.sceneClearStatus.mockResolvedValue({ applyId: 'apply.other', applyGeneration: 5,
+    state: 'succeeded', remaining: [], reason: null });
+  apiMock.manager.status.mockResolvedValueOnce(projection(active)).mockResolvedValueOnce(projection(empty))
+    .mockResolvedValue(projection(active));
+  await expect(closeScenario(request)).rejects.toMatchObject({ code: 'scene_clear_superseded' });
+  expect(request.progress).not.toHaveBeenCalledWith('Scenario closed.');
+});
+
 it('composes existing owner commands in order and waits for drain and terminal empty Apply', async () => {
   const request = inputs();
   expect(await closeScenario(request)).toEqual(empty);
@@ -78,7 +122,7 @@ it('composes existing owner commands in order and waits for drain and terminal e
   expect(ordered.map((call) => call.mock.invocationCallOrder[0])).toEqual([...ordered.map((call) => call.mock.invocationCallOrder[0])].sort((a,b) => a-b));
   expect(apiMock.cclc.submitLifecycle.mock.calls[0][0].intent).toBe('disable');
   expect(apiMock.cclc.stopComponentProcess.mock.calls[0][0]).toMatchObject({ ...processScope, launch_identity: 'actual-launch', leader_pid: 42 });
-  expect(apiMock.manager.applyCandidate.mock.calls[0][0]).toMatchObject({ scene_initialization: 'preserve', prepared_activation: prepared,
+  expect(apiMock.manager.applyCandidate.mock.calls[0][0]).toMatchObject({ scene_initialization: 'initialize', prepared_activation: prepared,
     candidate_receipt: receipt, accepted_impact_digest: receipt.impact_digest, expected_current: {
       retained_bundle_id: active.retainedBundleId, graph_revision: active.graphRevision } });
   expect(request.trackApply).toHaveBeenCalledWith({ applyId: 'apply.empty', applyGeneration: 4 });
@@ -253,8 +297,10 @@ it('observes several exact predecessor projections before the one accepted empty
   const request = inputs();
   apiMock.manager.status.mockReset().mockResolvedValueOnce(projection(active))
     .mockResolvedValueOnce(projection(active)).mockResolvedValueOnce(projection(active))
-    .mockResolvedValueOnce(projection(active)).mockResolvedValueOnce(projection(empty));
+    .mockResolvedValueOnce(projection(active)).mockResolvedValueOnce(projection(empty))
+    .mockResolvedValue(projection(empty));
   expect(await closeScenario(request)).toEqual(empty);
+  expect(apiMock.manager.status).toHaveBeenCalledTimes(6);
   expect(request.waitForObservation).toHaveBeenCalledTimes(5);
   expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
   expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
@@ -267,8 +313,10 @@ it('compares the exact predecessor publication independently of object key order
   const request = inputs();
   const reordered = { ...active, publication: Object.fromEntries(Object.entries(active.publication).reverse()) };
   apiMock.manager.status.mockReset().mockResolvedValueOnce(projection(active))
-    .mockResolvedValueOnce(projection(reordered)).mockResolvedValueOnce(projection(empty));
+    .mockResolvedValueOnce(projection(reordered)).mockResolvedValueOnce(projection(empty))
+    .mockResolvedValue(projection(empty));
   expect(await closeScenario(request)).toEqual(empty);
+  expect(apiMock.manager.status).toHaveBeenCalledTimes(4);
   expect(request.waitForObservation).toHaveBeenCalledTimes(3);
 });
 
@@ -392,7 +440,9 @@ it('C06 succeeded second Close waits on fresh generation 4 New before exact gene
     retained_bundle_id: candidate.retainedBundleId, graph_revision: candidate.graphRevision };
   apiMock.manager.status.mockReset().mockResolvedValueOnce(projection(predecessor, predecessorSource))
     .mockResolvedValueOnce(projection(predecessor, predecessorSource))
-    .mockResolvedValueOnce(projection(candidate, candidateSource));
+    .mockResolvedValueOnce(projection(candidate, candidateSource))
+    .mockResolvedValue(projection(candidate, candidateSource));
+  apiMock.programs.sceneClearStatus.mockResolvedValue({ ...accepted, state: 'succeeded', remaining: [], reason: null });
   apiMock.manager.canonicalEmptySelection.mockResolvedValue({ request_owner_epoch: predecessorSource.sourceOwnerEpoch,
     cell_id: 'ui6i_ur5e_lite6_wall_cell', deployment_artifact_id: actualPrepared.deployment_artifact_id,
     deployment_revision: actualPrepared.deployment_revision, candidate_retained_bundle_id: candidate.retainedBundleId,
@@ -402,7 +452,7 @@ it('C06 succeeded second Close waits on fresh generation 4 New before exact gene
   apiMock.manager.applyStatus.mockReset().mockResolvedValue({ ...accepted, state: 'succeeded' });
   expect(await closeScenario(request)).toEqual(candidate);
   expect(request.waitForObservation).toHaveBeenCalledTimes(1);
-  expect(apiMock.manager.status).toHaveBeenCalledTimes(3);
+  expect(apiMock.manager.status).toHaveBeenCalledTimes(4);
   expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
   expect(apiMock.manager.applyStatus).toHaveBeenCalledTimes(1);
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
@@ -820,16 +870,31 @@ it('D6: an unavailable control projection stops Close before any Reset or detach
   expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
 });
 
-it('Load from a canonical-empty cell sends no Close, also without cell control state', async () => {
-  const test = standaloneFixture();
-  test.change({ ...test.current, executionControlStatus: null } as unknown as ComposerHeadlessState);
-  apiMock.manager.status.mockReset().mockResolvedValue(projection(empty));
-  expect(await closeScenario({ ...test.request, expected: empty })).toEqual(empty);
-  expect(test.reset).not.toHaveBeenCalled();
-  expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
-  expect(apiMock.manager.canonicalEmptySelection).not.toHaveBeenCalled();
+it('clears a canonical-empty Scene through one direct owner request, without an Apply', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1']);
+  const predecessor: ManagerActiveProjection = { ...empty, publication: { ...empty.publication,
+    publication_generation: 2, transaction: { kind: 'named_apply', apply_id: 'apply.previous', apply_generation: 3 } } };
+  const previousPayload = { canonical_empty: true, retained_bundle_id: predecessor.retainedBundleId,
+    graph_revision: predecessor.graphRevision, publication: predecessor.publication };
+  const manager = test.current.runtime.sections.manager;
+  const section = test.current.runtime.sections.logicalScene!;
+  const scene = structuredClone(section.payload) as unknown as LogicalSceneProjection;
+  scene.access.active_projection!.retained_bundle_id = predecessor.retainedBundleId;
+  scene.access.active_projection!.graph_revision = predecessor.graphRevision;
+  const confirmedScene = { ...section, payload: scene as unknown as Record<string, unknown> };
+  test.change({ ...test.current, runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+    logicalScene: confirmedScene, manager: { ...manager, payload: { active: previousPayload } } } } });
+  test.request.preparation.confirmed.closeScene = confirmedScene;
+  test.request.preparation.confirmed.managerActive = previousPayload;
+  apiMock.manager.status.mockReset().mockResolvedValue(projection(predecessor));
+  apiMock.programs.clearEmptyScene.mockImplementation(async (request: { request_id: string }) => ({
+    requestId: request.request_id, state: 'succeeded', remaining: [], reason: null }));
+  expect(await closeScenario({ ...test.request, expected: predecessor })).toEqual(predecessor);
+  expect(apiMock.programs.clearEmptyScene).toHaveBeenCalledOnce();
+  expect(apiMock.programs.clearEmptyScene).toHaveBeenCalledWith(expect.objectContaining({ clear_empty_scene: true,
+    expected_publication_generation: 2, request_owner_epoch: 'runner.1' }), expect.any(AbortSignal));
   expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
 });
 
 it('a non-empty cell without cell control state still refuses Close as cell_state_unavailable', async () => {

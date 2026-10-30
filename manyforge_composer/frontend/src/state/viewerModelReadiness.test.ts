@@ -1,12 +1,19 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
+import { ViewerSceneEmptyState } from '../components/StructuralViewer';
 import type {
   SceneUrdfManifest,
   SourceModelProjection,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { StructuralResourceState } from './structuralResource';
-import { verifiedNoPhysicalComponents, viewerModelPresentation } from './viewerModelReadiness';
+import {
+  verifiedAppliedGraphHasNoModels,
+  verifiedNoPhysicalComponents,
+  viewerModelPresentation,
+} from './viewerModelReadiness';
 
 const CELL_ID = 'cell-a';
 const BUNDLE_ID = 'sha256:bundle-a';
@@ -198,6 +205,70 @@ describe('verifiedNoPhysicalComponents', () => {
       change(value);
       expect(verifiedNoPhysicalComponents(value, 'connected')).toBe(false);
     }
+  });
+});
+
+function renderVerifiedEmptyState(value: ComposerHeadlessState, manifestReady: boolean): string {
+  return renderToStaticMarkup(createElement(ViewerSceneEmptyState, {
+    noRobotScenario: verifiedAppliedGraphHasNoModels(value, 'connected'),
+    visibleGeometryCount: 0,
+    pointCloudEnabled: false,
+    manifestReady,
+    collisionCount: 0,
+  }));
+}
+
+describe('verified Applied graph no-model presentation', () => {
+  it('shows the neutral empty-Scenario label for an identity-verified empty graph', () => {
+    const value = emptySnapshot();
+    expect(verifiedAppliedGraphHasNoModels(value, 'connected')).toBe(true);
+    const markup = renderVerifiedEmptyState(value, false);
+    expect(markup).toContain('No robot in this Scenario');
+    expect(markup).toContain('role="status"');
+    expect(markup).not.toContain('No geometry selected for display');
+  });
+
+  it('recognizes an I/O-only graph with no models without weakening the physical-component proof', () => {
+    const value = emptySnapshot(false);
+    const active = value.runtime.sections.manager.payload!.active as Record<string, unknown>;
+    const graph = active.cell_graph as Record<string, unknown>;
+    graph.controllable_components = [{ controllable_component_id: 'io' }];
+    graph.control_bindings = [{ binding_id: 'io.binding' }];
+    graph.control_domains = [{ control_domain_id: 'io.domain' }];
+    graph.runtime_units = [{ runtime_unit_id: 'io.runtime' }];
+
+    expect(verifiedAppliedGraphHasNoModels(value, 'connected')).toBe(true);
+    expect(verifiedNoPhysicalComponents(value, 'connected')).toBe(false);
+    const markup = renderVerifiedEmptyState(value, false);
+    expect(markup).toContain('No robot in this Scenario');
+    expect(markup).not.toContain('No geometry selected for display');
+  });
+
+  it('keeps technical no-geometry guidance when the verified Applied graph has a model', () => {
+    const value = emptySnapshot(false);
+    const active = value.runtime.sections.manager.payload!.active as Record<string, unknown>;
+    const graph = active.cell_graph as Record<string, unknown>;
+    graph.model_instances = [{ model_instance_id: 'robot.model' }];
+
+    expect(verifiedAppliedGraphHasNoModels(value, 'connected')).toBe(false);
+    const markup = renderVerifiedEmptyState(value, true);
+    expect(markup).toContain('No geometry selected for display');
+    expect(markup).toContain('The retained link tree contains no renderable visual or collision geometry.');
+    expect(markup).not.toContain('No robot in this Scenario');
+  });
+
+  it('requires a connected, current Manager publication and matching Applied identity', () => {
+    const value = emptySnapshot();
+    expect(verifiedAppliedGraphHasNoModels(value, 'stale')).toBe(false);
+    expect(verifiedAppliedGraphHasNoModels(value, 'disconnected')).toBe(false);
+
+    const wrongAppliedIdentity = emptySnapshot();
+    wrongAppliedIdentity.runtime.activeConfiguration!.graphRevision = 'other.graph';
+    expect(verifiedAppliedGraphHasNoModels(wrongAppliedIdentity, 'connected')).toBe(false);
+
+    const incompleteApply = emptySnapshot();
+    incompleteApply.runtime.sections.manager.payload!.apply = { records: [{ incomplete: true }] };
+    expect(verifiedAppliedGraphHasNoModels(incompleteApply, 'connected')).toBe(false);
   });
 });
 

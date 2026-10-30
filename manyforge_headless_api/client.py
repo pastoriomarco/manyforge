@@ -727,6 +727,13 @@ class HeadlessHttpClient:
 
     def program_scene_prepare(self, body: Mapping[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/program/scene-preparations", body=body)
+        if body.get("clear_empty_scene") is True and body.get("expected_applied_record_digest") is None:
+            clear = result.get("scene_clear")
+            if (not isinstance(clear, dict) or clear.get("request_id") != body.get("request_id")
+                or clear.get("state") not in {"succeeded", "partial", "failed", "unknown", "superseded"}):
+                raise HeadlessClientError("program_scene_preparation_invalid",
+                                          "headless API returned an invalid Scene clear result", status_code=502)
+            return result
         if (
             result.get("schema_version") != "manyforge.program_scene_preparation.v1"
             or result.get("status") != "prepared"

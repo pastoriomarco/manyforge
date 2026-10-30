@@ -176,7 +176,7 @@ details.dcard[open] > summary:first-child::before {
   padding: 0.4rem 0;
 }
 
-.dcard > :not(:first-child) + :not(:first-child),
+.dcard > :not(:first-child) + :not(:first-child):not(.scenario-status),
 .drows > * + * {
   border-top: 1px solid var(--mf-border-neutral-19);
 }

@@ -300,6 +300,8 @@ if(BUILD_TESTING)
     PROPERTIES
       RUN_SERIAL TRUE
       TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+  set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/event_historian_ctest_properties.cmake")
 
   set(
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT
@@ -855,11 +857,15 @@ if(BUILD_TESTING)
   add_dependencies(test_source_model_projection
     manyforge_headless_test_canonical_empty_package
     manyforge_headless_test_assistant_package)
+  target_include_directories(test_source_model_projection PRIVATE
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
   target_compile_definitions(test_source_model_projection PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
     MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
     MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
   target_link_libraries(test_source_model_projection PRIVATE
+    manyforge_preparation_support
     manyforge_node_environment_projection
     manyforge::deployment_admission
     GTest::gtest_main)

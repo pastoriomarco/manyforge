@@ -331,8 +331,6 @@ def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, 
     if initialization not in ("preserve", "initialize"):
         _fail(f"{label}.scene_initialization", "preserve or initialize")
     origin = validate_prepared_activation_origin(value.get("origin"), label=f"{label}.origin")
-    if origin["kind"] == "sealed_canonical_empty" and initialization != "preserve":
-        _fail(f"{label}.scene_initialization", "preserve for sealed canonical-empty origin")
     return (
         _sha256(value.get("record_digest"), f"{label}.record_digest"),
         origin,

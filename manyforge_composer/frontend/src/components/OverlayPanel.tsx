@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useRef,
@@ -23,7 +24,7 @@ interface OverlayPanelProps {
  * One bounded, dismissible presentation layer for document workflows and
  * information/status detail. It owns no workflow or backend state.
  */
-export function OverlayPanel({
+function OverlayPanelContent({
   open,
   title,
   titleId,
@@ -87,3 +88,9 @@ export function OverlayPanel({
     </div>
   );
 }
+
+// A closed panel renders nothing and has no active effect. Open panels must
+// receive every update, including new close callbacks and children.
+export const OverlayPanel = memo(OverlayPanelContent, (previous, next) => (
+  !previous.open && !next.open
+));

@@ -1112,7 +1112,7 @@ def main() -> None:
             motion["parameters"] = {
                 "target_role": "arm",
                 "base_frame_role": "base",
-                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+                "tcp_endpoint": {"kind": "current"},
                 "target_mode": "relative",
                 "target_reference": {"type": "frame_role", "frame_role_id": "tcp"},
                 "path": [

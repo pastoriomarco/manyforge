@@ -68,3 +68,13 @@ export interface ForceCloseResult {
   /** The cell-wide motion block of an unresolved operation closure was cleared. */
   motionBlockCleared: boolean;
 }
+
+/** Transient follower result for one Scene-clearing Apply. */
+export interface SceneClearStatus {
+  applyId?: string;
+  applyGeneration?: number;
+  requestId?: string;
+  state: 'pending' | 'succeeded' | 'partial' | 'failed' | 'unknown' | 'superseded';
+  remaining: string[] | null;
+  reason: { code: string; message: string; details: Record<string, unknown> } | null;
+}

@@ -34,6 +34,27 @@
   border-color: var(--mf-border-neutral-37);
 }
 
+.dialog-actions > button {
+  min-width: 0;
+  min-height: 1.9rem;
+  height: auto;
+  padding: 0.3rem 0.8rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.dialog-actions > .primary-action:not(:disabled),
+.dialog-actions > .transport-run:not(:disabled) {
+  border-color: var(--mf-border-success-35);
+  color: var(--mf-text-success-82);
+  background: var(--mf-bg-success-15);
+}
+
+.dialog-actions > .primary-action:hover:not(:disabled),
+.dialog-actions > .transport-run:hover:not(:disabled) {
+  border-color: var(--mf-border-success-51);
+  background: var(--mf-bg-success-20);
+}
+
 .danger-button:not(:disabled) {
   border-color: var(--mf-border-danger-38);
   color: var(--mf-text-danger-81);

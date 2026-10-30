@@ -732,10 +732,12 @@ Result<void> ResourceAddressedExecutionKernel::SetGlobalIoSourcesPlannedDisabled
     const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled) {
   std::lock_guard submit_lock(submission_mutex_);
   std::lock_guard admission_lock(*admission_mutex_);
+  // Claim changes use the same admission mutex. Read the owner before state
+  // to avoid inverting the owner callbacks that inspect Kernel state.
+  const auto authority = require_held_lifecycle_claim_locked(actual_lifecycle_transaction);
   std::lock_guard lock(state_mutex_);
   if (expected_service != io_signal_service_)
     return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
-  const auto authority = require_held_lifecycle_claim_locked(actual_lifecycle_transaction);
   if (!authority.ok()) return authority;
   if (!disabled) {
     for (const auto& source : sources) planned_disabled_io_sources_.erase(source);

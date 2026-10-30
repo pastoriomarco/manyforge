@@ -444,16 +444,18 @@ def test_verified_empty_publication_has_no_required_equipment_faults(canonical_e
     rows = _by_id(overview)
     expected_absent = {
         "plan_preview", "execute_control", "applied_program", "execution_owner",
-        "execution_target", "planner_collision", "stop_capability",
+        "execution_target", "planner_collision", "stop_capability", "viewer_model",
     }
+    neutral = {"execute_control", "execution_target", "planner_collision",
+               "stop_capability", "viewer_model"}
     assert overview["readiness"] == "ready"
     assert overview["summary_label"] == "No components"
     assert "ready for authoring" in overview["user_message"]
     assert {key for key, row in rows.items() if row["reason_code"] == ("canonical_empty" if canonical_empty else "no_physical_components")} == expected_absent
     for key in expected_absent:
         assert rows[key]["required"] is False
-        assert rows[key]["status"] == "offline"
-        assert rows[key]["detail"] == "No components"
+        assert rows[key]["status"] == ("not_applicable" if key in neutral else "offline")
+        assert rows[key]["detail"] == ("No robot in this Scenario" if key in neutral else "No components")
     assert rows["runtime_unit:robot.native"]["required"] is True
     assert rows["runtime_unit:robot.native"]["status"] == "healthy"
     assert rows["observe_render"]["status"] == "healthy"
@@ -578,3 +580,14 @@ def test_named_scenario_with_any_physical_row_keeps_required_faults(physical_arr
     assert overview["readiness"] == "fault"
     assert _by_id(overview)["execution_owner"]["required"] is True
     assert _by_id(overview)["execution_owner"]["status"] == "fault"
+
+
+def test_empty_real_returned_alarm_remains_visible() -> None:
+    facts = _empty_facts()
+    facts["alarms"].update({
+        "unacknowledged_count": 1,
+        "alarms": [{"lifecycle_state": "returned_unacknowledged", "priority": "high"}],
+    })
+    overview = build_component_overview(**facts)
+    assert _by_id(overview)["execute_control"]["status"] == "not_applicable"
+    assert overview["basis"]["alarm_state_revision"] == facts["alarms"]["state_revision"]

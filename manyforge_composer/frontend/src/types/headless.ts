@@ -26,6 +26,7 @@ export interface HeadlessRuntimeSnapshot {
   /** The configuration Manager publishes as active; null before one. */
   activeConfiguration: ActiveConfigurationIdentity | null;
   complete: boolean;
+  initialSceneFailure?: { state: 'failed' | 'unknown'; reason: { code: string; message: string } } | null;
   projectionGeneration: number;
   projectionOwnerEpoch: string;
   projectionOwnerId: string;
@@ -129,6 +130,7 @@ export type ComponentOverviewReadiness =
   | 'offline';
 
 export type ComponentOverviewComponentStatus =
+  | 'not_applicable'
   | 'healthy'
   | 'waiting'
   | 'warning'

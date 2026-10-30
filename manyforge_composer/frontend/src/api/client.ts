@@ -1,8 +1,9 @@
 import { normalizePublicRequestContext, parseComponentProcessStopResult, parseComponentProcessStopOffer } from './processStopParsers';
+import { errorCatalogRow } from '../state/commandRefusal';
 import type { ManualValveIntent } from '../state/pneumaticManual';
-import { parseCanonicalEmptySelection, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
+import { parseCanonicalEmptySelection, parseSceneClearStatus, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
   parseLifecycleTargetRetirementResult, parseLifecycleTargetRetirementLookup } from './scenarioCloseParsers';
-import type { CanonicalEmptySelection, ForceCloseRequest, ForceCloseResult, LifecycleOwnerSettlementResult,
+import type { SceneClearStatus, CanonicalEmptySelection, ForceCloseRequest, ForceCloseResult, LifecycleOwnerSettlementResult,
   LifecycleTargetRetirementIntent, LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult,
   LifecycleTargetRetirementScope } from '../types/scenarioClose';
 import type { ComponentProcessStopRequest, ComponentProcessStopResult } from '../types/cclc';
@@ -405,9 +406,18 @@ export function authoringRefusalMessage(error: unknown): string | null {
   if (code === 'stale_generation') return 'Edit not applied: backend state changed. Review the current state before trying again.';
   if (code === 'activation_preparation_failed') {
     const details = refusal.structuredError?.details?.preparer_detail;
+    const typedCause = preparationCauseCode(refusal);
+    const catalogRow = typedCause === null ? null : errorCatalogRow(typedCause);
+    if (catalogRow !== null) {
+      return 'Not applied: the candidate could not be prepared. '
+        + (catalogRow[1] || catalogRow[0]);
+    }
     const cause = typeof details === 'string'
-      ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim() : '';
-    return `Not applied: the candidate could not be prepared${cause ? ` (${cause})` : ''}. Correct it and try again.`;
+      ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim()
+      : typedCause ?? '';
+    return 'Not applied: the candidate could not be prepared'
+      + (cause ? ' (' + cause + ')' : '')
+      + '. Correct it and try again.';
   }
   return `Not applied: ${message}. Nothing was changed.`;
 }
@@ -1284,12 +1294,27 @@ export const api = {
     ),
   },
   programs: {
+    sceneClearStatus: async (signal?: AbortSignal): Promise<SceneClearStatus | null> => {
+      try { return await requestJson('/api/cycle/status', parseSceneClearStatus, signal); }
+      catch (error) {
+        const detail = error instanceof ApiError && error.structuredError !== null
+          ? (error.payload as { detail?: { details?: { scene_clear?: unknown } } } | null)?.detail : undefined;
+        const clear = detail?.details?.scene_clear;
+        if (clear !== undefined && clear !== null) return parseSceneClearStatus({ scene_clear: clear });
+        throw error;
+      }
+    },
     currentScenario: (signal?: AbortSignal): Promise<CurrentScenarioResponse> =>
       requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
     appliedStatus: (signal?: AbortSignal): Promise<AppliedProgramStatus> =>
       requestJson('/api/program/applied/status', parseAppliedProgramStatus, signal),
+    clearEmptyScene: (request: { request_id: string; request_owner_epoch: string; source_label: string;
+      correlation_id: null; expected_admission_generation: number; clear_empty_scene: true;
+      expected_applied_record_digest: null; expected_publication_generation: number }, signal?: AbortSignal): Promise<SceneClearStatus | null> =>
+      requestJson('/api/program/scene-preparations', parseSceneClearStatus, signal,
+        { method: 'POST', body: JSON.stringify(request) }),
     /** Advisory, effect-free preview of one held motion node (D4). */
     nodeCorrectionPreview: (
       request: ProgramNodeCorrectionPreviewRequest,

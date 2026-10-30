@@ -148,20 +148,34 @@ public:
     return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
   }
   Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
-      const RequestOwnerEpoch &, const core::CellAdmissionClaimDTO &) override {
-    return Result<std::uint64_t>::Ok(++sequence_);
+      const RequestOwnerEpoch &,
+      const core::CellAdmissionClaimDTO &claim) override {
+    const auto sequence = ++sequence_;
+    if (watched_acquire_intent_.has_value() &&
+        claim.intent == *watched_acquire_intent_) {
+      observed_acquired_claim_ = claim;
+      observed_acquire_sequence_ = sequence;
+    }
+    return Result<std::uint64_t>::Ok(sequence);
   }
-  Result<std::uint64_t>
-  RecordCellAdmissionClaimReleased(const RequestOwnerEpoch &,
-                                   const core::CellAdmissionClaimDTO &,
-                                   const core::CellAdmissionClaimReleaseDTO &,
-                                   core::AdmissionGeneration) override {
+  Result<std::uint64_t> RecordCellAdmissionClaimReleased(
+      const RequestOwnerEpoch &,
+      const core::CellAdmissionClaimDTO &claim,
+      const core::CellAdmissionClaimReleaseDTO &release,
+      core::AdmissionGeneration) override {
     if (fail_next_claim_release_) {
       fail_next_claim_release_ = false;
       return Result<std::uint64_t>::Err(
           {"kernel_owner_unavailable", "injected release reply loss", {}});
     }
-    return Result<std::uint64_t>::Ok(++sequence_);
+    const auto sequence = ++sequence_;
+    if (watched_release_claim_.has_value() &&
+        claim == *watched_release_claim_) {
+      observed_released_claim_ = claim;
+      observed_release_ = release;
+      observed_release_sequence_ = sequence;
+    }
+    return Result<std::uint64_t>::Ok(sequence);
   }
   Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
       const RequestOwnerEpoch &, const core::CellAdmissionReconcileDTO &,
@@ -178,9 +192,54 @@ public:
 
   void FailNextClaimRelease() { fail_next_claim_release_ = true; }
 
+  // Retain only the two targeted callbacks needed for claim-order assertions.
+  void ObserveClaimReleaseThenAcquire(
+      const core::CellAdmissionClaimDTO &released_claim,
+      const core::CellAdmissionClaimIntentDTO &acquired_intent) {
+    watched_release_claim_ = released_claim;
+    watched_acquire_intent_ = acquired_intent;
+    observed_released_claim_.reset();
+    observed_release_.reset();
+    observed_acquired_claim_.reset();
+    observed_release_sequence_.reset();
+    observed_acquire_sequence_.reset();
+  }
+
+  [[nodiscard]] const std::optional<core::CellAdmissionClaimDTO> &
+  observed_released_claim() const noexcept {
+    return observed_released_claim_;
+  }
+
+  [[nodiscard]] const std::optional<core::CellAdmissionClaimReleaseDTO> &
+  observed_release() const noexcept {
+    return observed_release_;
+  }
+
+  [[nodiscard]] const std::optional<core::CellAdmissionClaimDTO> &
+  observed_acquired_claim() const noexcept {
+    return observed_acquired_claim_;
+  }
+
+  [[nodiscard]] const std::optional<std::uint64_t> &
+  observed_release_sequence() const noexcept {
+    return observed_release_sequence_;
+  }
+
+  [[nodiscard]] const std::optional<std::uint64_t> &
+  observed_acquire_sequence() const noexcept {
+    return observed_acquire_sequence_;
+  }
+
 private:
   bool fail_next_claim_release_{};
   std::uint64_t sequence_{};
+  std::optional<core::CellAdmissionClaimDTO> watched_release_claim_;
+  std::optional<core::CellAdmissionClaimIntentDTO> watched_acquire_intent_;
+  std::optional<core::CellAdmissionClaimDTO> observed_released_claim_;
+  std::optional<core::CellAdmissionClaimReleaseDTO> observed_release_;
+  std::optional<core::CellAdmissionClaimDTO> observed_acquired_claim_;
+  std::optional<std::uint64_t> observed_release_sequence_;
+  std::optional<std::uint64_t> observed_acquire_sequence_;
 };
 
 constexpr std::string_view kExpectedSceneId =
@@ -7494,6 +7553,9 @@ TEST(CanonicalEmptySceneOwner,
     ASSERT_TRUE(unresolved.ok());
     ASSERT_EQ(unresolved.value().status,
               core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+    ASSERT_TRUE(unresolved.value().matched_claim.has_value());
+    const auto unknown_claim = *unresolved.value().matched_claim;
+    EXPECT_EQ(unknown_claim.intent, scene_claim_intent(unknown_release));
 
     auto compaction_probe =
         make_pose_update(owner, "scene-program-compaction-retry",
@@ -7516,6 +7578,10 @@ TEST(CanonicalEmptySceneOwner,
     ASSERT_TRUE(still_held.ok());
     EXPECT_EQ(still_held.value().status,
               core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+    const auto compaction_probe_intent = scene_claim_intent(compaction_probe);
+    journal.ObserveClaimReleaseThenAcquire(unknown_claim,
+                                           compaction_probe_intent);
 
     // Compaction is transparent: the triggering request settles the held
     // claim, prunes, and then continues in the unchanged epoch. Settling
@@ -7542,12 +7608,36 @@ TEST(CanonicalEmptySceneOwner,
     const auto after_compaction = owner.VerifyIntegrity();
     EXPECT_EQ(after_compaction.transaction_intent_count, 1);
     EXPECT_EQ(after_compaction.request_outcome_count, 1);
-    const auto released_before_prune =
+    ASSERT_TRUE(journal.observed_released_claim().has_value());
+    EXPECT_EQ(*journal.observed_released_claim(), unknown_claim);
+    ASSERT_TRUE(journal.observed_release().has_value());
+    const auto &recorded_release = *journal.observed_release();
+    EXPECT_EQ(recorded_release.owner_role, unknown_claim.intent.owner_role);
+    EXPECT_EQ(recorded_release.owner_epoch, unknown_claim.intent.owner_epoch);
+    EXPECT_EQ(recorded_release.owner_transaction_id,
+              unknown_claim.intent.owner_transaction_id);
+    EXPECT_EQ(recorded_release.request_id, unknown_claim.intent.request_id);
+    EXPECT_EQ(recorded_release.request_payload_digest,
+              unknown_claim.intent.request_payload_digest);
+    EXPECT_EQ(recorded_release.acquired_admission_generation,
+              unknown_claim.acquired_admission_generation);
+    EXPECT_EQ(recorded_release.claim_generation,
+              unknown_claim.claim_generation);
+    ASSERT_TRUE(journal.observed_release_sequence().has_value());
+    ASSERT_TRUE(journal.observed_acquired_claim().has_value());
+    EXPECT_EQ(journal.observed_acquired_claim()->intent,
+              compaction_probe_intent);
+    ASSERT_TRUE(journal.observed_acquire_sequence().has_value());
+    EXPECT_LT(*journal.observed_release_sequence(),
+              *journal.observed_acquire_sequence());
+
+    const auto retired_old_receipt =
         cell_admission.GetCellAdmissionRecoveryReceipt(
             {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
-    ASSERT_TRUE(released_before_prune.ok());
-    EXPECT_EQ(released_before_prune.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+    ASSERT_TRUE(retired_old_receipt.ok());
+    EXPECT_EQ(retired_old_receipt.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+    EXPECT_FALSE(retired_old_receipt.value().matched_claim.has_value());
 
     // The next request reads the current admission generation and commits
     // in the same epoch; its resend replays exactly.

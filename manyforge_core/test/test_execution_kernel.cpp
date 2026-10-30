@@ -3342,17 +3342,22 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
       ([&] {
         ::alarm(10U);
         const auto verify = [&] {
+          // Destroy and join this child-owned Kernel before the death-test exit.
+          ExecutionKernel owner(planner, context, execution, clock, scheduler, cache);
+          owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
+          owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+                                        {collision_engine});
           PlanResultDTO failed;
           failed.error = ErrorDTO{kErrorIkFailed, "no path", {}};
           planner.next_result = failed;
-          const auto prepared = kernel.PrepareMotion(
+          const auto prepared = owner.PrepareMotion(
               prepared_motion_request(make_test_request("reentrant_recovery_poll")));
           ASSERT_TRUE(prepared.ok());
-          ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
-          ASSERT_EQ(ended_as(kernel), "failed");
+          ASSERT_TRUE(owner.wait_for_completion(2'000'000'000));
+          ASSERT_EQ(ended_as(owner), "failed");
           scheduler.advance_to(clock.now());
           install_at_rest_recovery_observation();
-          const auto before = kernel.get_recovery_assessment();
+          const auto before = owner.get_recovery_assessment();
           ASSERT_TRUE(before.observed_state_fresh);
           ASSERT_TRUE(before.observed_state_at_rest);
           // Use the existing pure terminal reducer's typed empty-Full-Stop
@@ -3372,7 +3377,7 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
           ASSERT_TRUE(certificate.ok()) << certificate.error().message;
           unsigned reentered = 0U;
           std::optional<KernelEvent> published;
-          const auto subscription = kernel.subscribe_events([&](const KernelEvent& event) {
+          const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
             const auto trigger = event.details.find("trigger");
             if (event.type != KernelEventType::kRecoveryAssessmentChanged ||
                 trigger == event.details.end() ||
@@ -3382,18 +3387,23 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
             // This is the same lifecycle-taking boundary reached by the real
             // addressed fallback subscriber. A foreign ID refuses without an
             // effect after acquiring the existing lifecycle mutex.
-            const auto nested = kernel.PrepareColdMotionAfterStop(
+            const auto nested = owner.PrepareColdMotionAfterStop(
                 std::numeric_limits<std::uint64_t>::max(), certificate.value());
             ASSERT_FALSE(nested.ok());
             EXPECT_EQ(nested.error().details.at("reason"), "spring_return_candidate_stale");
             ++reentered;
           });
+          struct UnsubscribeOnExit {
+            ExecutionKernel& owner;
+            SubscriptionHandle handle;
+            ~UnsubscribeOnExit() { owner.unsubscribe_events(handle); }
+          } unsubscribe_on_exit{owner, subscription};
           execution.publish_observed_state(clock.now(), {1.0, 1.0}, {1.0, 0.0});
           clock.advance(20'000'000);
           scheduler.advance_to(clock.now());
           EXPECT_EQ(reentered, 1U);
           ASSERT_TRUE(published);
-          const auto after = kernel.get_recovery_assessment();
+          const auto after = owner.get_recovery_assessment();
           EXPECT_EQ(published->execution_id, prepared.value());
           EXPECT_EQ(published->details.at("assessment_revision"),
                     std::to_string(after.assessment_revision));
@@ -3407,7 +3417,6 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
           EXPECT_EQ(execution.execute_count, 0);
           EXPECT_EQ(execution.reset_count, 0);
           EXPECT_EQ(planner.plan_count, 1);
-          kernel.unsubscribe_events(subscription);
         };
         verify();
         if (::testing::Test::HasFailure()) {
@@ -13858,6 +13867,39 @@ class ColdPreparationExecution final : public ReplacementObservationExecution {
     ++preparations;
     return ControlledExecution::Prepare(product, id);
   }
+
+  ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
+                           const ControllerGoalId& goal,
+                           ControllerGoalGeneration generation) override {
+    auto handle = ReplacementObservationExecution::Dispatch(product, goal, generation);
+    auto wait = std::move(handle.wait_for_completion);
+    handle.wait_for_completion = [this, wait = std::move(wait), goal, generation](
+                                     std::int64_t timeout) {
+      {
+        std::lock_guard lock(poll_mutex_);
+        const ExecutionGoalKey key{goal, generation};
+        if (std::find(polled_goals_.begin(), polled_goals_.end(), key) == polled_goals_.end())
+          polled_goals_.push_back(key);
+      }
+      poll_changed_.notify_all();
+      return wait(timeout);
+    };
+    return handle;
+  }
+
+  bool wait_until_goal_polled(const ExecutionGoalKey& goal) {
+    std::unique_lock lock(poll_mutex_);
+    return poll_changed_.wait_for(lock, std::chrono::seconds(2),
+                                  [&] {
+                                    return std::find(polled_goals_.begin(), polled_goals_.end(),
+                                                     goal) != polled_goals_.end();
+                                  });
+  }
+
+ private:
+  std::mutex poll_mutex_;
+  std::condition_variable poll_changed_;
+  std::vector<ExecutionGoalKey> polled_goals_;
 };
 
 ResolvedPreparedMotionExecutionRequestDTO kernel_spring_authority(
@@ -14152,11 +14194,12 @@ class HeldCleanupExecution final : public ReplacementObservationExecution {
 TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsCloseEligible) {
   HeldCleanupExecution backend;
   backend.enable_execution_progress_publication();
+  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
+  // Release the held callback before owner destruction joins its worker.
   struct ReleaseOnExit {
     HeldCleanupExecution& backend;
     ~ReleaseOnExit() { backend.Release(); }
   } release_on_exit{backend};
-  ExecutionKernel owner(planner, context, backend, clock, scheduler, cache);
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
                                 {collision_engine});
@@ -14165,8 +14208,17 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
   ASSERT_TRUE(started.ok());
   ASSERT_TRUE(backend.wait_until_execute_called());
   ASSERT_TRUE(wait_for_state(owner, ExecutionState::kExecuting));
-  const auto observed = owner.ObservePreparedMotion(started.value());
-  ASSERT_TRUE(observed.ok());
+  // The backend can report execution before the worker publishes its exact
+  // dispatched source. Wait only for that transient publication boundary.
+  const auto dispatch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto observed = owner.ObservePreparedMotion(started.value());
+  while (!observed.ok() && observed.error().details.contains("reason") &&
+         observed.error().details.at("reason") == "prepared_motion_dispatch_outcome_unresolved" &&
+         std::chrono::steady_clock::now() < dispatch_deadline) {
+    std::this_thread::yield();
+    observed = owner.ObservePreparedMotion(started.value());
+  }
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
   ASSERT_TRUE(observed.value().last_dispatched_participant);
   const auto& binding = authority.execution_request.binding;
   const auto stage = kernel_spring_stage(
@@ -14406,18 +14458,14 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     ASSERT_TRUE(next_started.ok()) << next_started.error().message;
     ASSERT_TRUE(backend.wait_until_execute_count(next_run ? 4 : 3));
     ASSERT_TRUE(wait_for_state(owner, ExecutionState::kExecuting));
-    // Executing is published by the backend just before the worker records
-    // the dispatched product; wait for that record, not only for the state.
-    auto next_observed = owner.ObservePreparedMotion(next_started.value());
-    const auto record_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (next_observed.ok() && !next_observed.value().last_dispatched_participant &&
-           std::chrono::steady_clock::now() < record_deadline) {
-      std::this_thread::yield();
-      next_observed = owner.ObservePreparedMotion(next_started.value());
-    }
+    // The worker records the dispatched product before its first completion
+    // poll. Wait for this goal's poll rather than the earlier backend state.
+    const auto& next_binding = next_authority.execution_request.binding;
+    ASSERT_TRUE(backend.wait_until_goal_polled(
+        {next_binding.controller_goal_id, next_binding.controller_goal_generation}));
+    const auto next_observed = owner.ObservePreparedMotion(next_started.value());
     ASSERT_TRUE(next_observed.ok()) << next_observed.error().message;
     ASSERT_TRUE(next_observed.value().last_dispatched_participant);
-    const auto& next_binding = next_authority.execution_request.binding;
     const auto next_stage = kernel_spring_stage(
         *next_observed.value().last_dispatched_participant,
         {next_binding.controller_goal_id, next_binding.controller_goal_generation}, next_authority,

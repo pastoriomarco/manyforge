@@ -163,7 +163,7 @@ export function CarriedObjectPoseCard({ measurement, attachment, detachUnavailab
                 command_target_id: attachment.command_target_id,
               });
             }}
-          >Detach here</button>
+          >Detach</button>
           {detachUnavailableReason !== null && detachUnavailableReason !== undefined && (
             <p className="field-hint" role="status">{detachUnavailableReason}</p>
           )}

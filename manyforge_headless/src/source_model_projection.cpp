@@ -522,7 +522,8 @@ CanonicalValue ActiveSourceModelProjection::Project(
     const deployment::RetainedBundle& active_bundle) const {
   const auto& bundle = active_bundle.value();
   const auto& products = bundle.compiled_products.symbol_role_maps;
-  Require(products.size() == (bundle.cell_graph.model_instances.empty() ? 0U : 1U),
+  Require(bundle.cell_graph.model_instances.empty() ? products.size() <= 1U
+                                                    : products.size() == 1U,
           "retained model-map cardinality disagrees with the active graph");
 
   CanonicalValue::Array occurrences;

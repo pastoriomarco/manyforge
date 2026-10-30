@@ -88,7 +88,15 @@ export function parseHeadlessRuntimeSnapshot(
     );
   }
   const sections = objectAt(record.sections, 'runtime.sections');
+  const reason = (value: unknown, path: string) => {
+    const row = objectAt(value, path);
+    return { code: stringAt(row.code, `${path}.code`), message: stringAt(row.message, `${path}.message`) };
+  };
+  const failure = record.initial_scene_failure == null ? null : objectAt(record.initial_scene_failure, 'runtime.initial_scene_failure');
+  const failureState = failure === null ? null : stringAt(failure.state, 'runtime.initial_scene_failure.state');
+  if (failureState !== null && failureState !== 'failed' && failureState !== 'unknown') return fail('runtime.initial_scene_failure.state', 'failed or unknown');
   return {
+    initialSceneFailure: failure === null ? null : { state: failureState as 'failed' | 'unknown', reason: reason(failure.reason, 'runtime.initial_scene_failure.reason') },
     schemaVersion,
     activeConfiguration: parseActiveConfigurationPair(
       record.active_retained_bundle_id,
@@ -342,7 +350,7 @@ export function parseComponentOverviewProjection(
     return fail(`${path}.readiness`, 'a supported Component Overview readiness');
   }
   const componentStatuses = new Set([
-    'healthy', 'waiting', 'warning', 'fault', 'offline',
+    'healthy', 'waiting', 'warning', 'fault', 'offline', 'not_applicable',
   ]);
   const components = arrayAt(record.components, `${path}.components`).map(
     (valueAtIndex, index) => {

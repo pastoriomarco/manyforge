@@ -3301,6 +3301,399 @@ def test_failed_apply_scene_placement_is_not_retried_by_status_notification(capl
     assert "program_scene_preparation_failed" in caplog.text
 
 
+@pytest.mark.parametrize("state", ["succeeded", "partial", "unknown"])
+def test_empty_apply_clear_publishes_one_correlated_transient_result(state):
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    status = core.applied_program_status_projection
+    status.update(executable=False, program_id=None, program_revision=None,
+                  program_binding_id=None, program=None, non_executable=None)
+    calls = []
+    def clear(body):
+        calls.append(body)
+        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+                "program_revision": None, "applied_record_digest": core.committed_activation["record_digest"],
+                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1",
+                                   "state": state, "last_observed_remaining": ["part"] if state != "succeeded" else [],
+                                   **({"reason": "scene_outcome_unknown", "message": "unconfirmed"} if state == "unknown" else {}),
+                                   "refused": [{"resource_id": "part", "code": "missing_reference", "message": "unavailable"}] if state == "partial" else []}}
+    runner.prepare_applied_scene = clear
+    service._empty_scene_applies.add(("apply.2", 1))
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    observed = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert observed["apply_id"] == "apply.2"
+    assert observed["apply_generation"] == 1
+    assert observed["state"] == state
+    assert len(calls) == 1 and calls[0]["clear_empty_scene"] is True
+    if state == "partial":
+        assert observed["reason"]["details"]["refused"][0]["resource_id"] == "part"
+
+
+def test_empty_apply_old_status_after_headless_restart_does_not_retry():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service.notify_committed_apply()
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+    assert service.program_cycle_status(include_scene_clear=True)["scene_clear"] is None
+
+
+def test_empty_apply_owner_unavailable_reports_failure_without_submission():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service._empty_scene_applies.add(("apply.2", 1))
+    def unavailable():
+        raise ProgramRunnerClientError("program_runner_unavailable", "owner unavailable", 503)
+    runner.cycle_status = unavailable
+    service.notify_committed_apply()
+    assert service._scene_clear["state"] == "failed"
+    assert service._scene_clear["reason"]["code"] == "scene_clear_failed"
+    assert service._scene_clear["reason"]["details"]["reason"] == "program_runner_unavailable"
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+    with pytest.raises(HeadlessApiError) as caught:
+        service.program_cycle_status(include_scene_clear=True)
+    assert caught.value.details["scene_clear"]["apply_id"] == "apply.2"
+    assert caught.value.details["scene_clear"]["state"] == "failed"
+
+
+def test_empty_apply_lost_runner_response_is_unknown_and_not_retried():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service._empty_scene_applies.add(("apply.2", 1))
+    calls = []
+    def lost(body):
+        calls.append(body)
+        raise ProgramRunnerClientError("program_runner_unavailable", "response lost")
+    runner.prepare_applied_scene = lost
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert status["state"] == "unknown" and status["remaining"] is None
+    assert status["reason"]["code"] == "scene_clear_unknown"
+    assert len(calls) == 1
+
+
+def test_empty_apply_malformed_success_is_unknown():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service._empty_scene_applies.add(("apply.2", 1))
+    runner.prepare_applied_scene = lambda body: {
+        "schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+        "program_revision": None, "applied_record_digest": core.committed_activation["record_digest"],
+        "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1", "state": "succeeded",
+                           "last_observed_remaining": ["part"], "refused": []},
+    }
+    service.notify_committed_apply()
+    status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert status["state"] == "unknown" and status["remaining"] is None
+
+
+def test_new_apply_does_not_mark_an_in_flight_clear_settled():
+    from threading import Event, Thread
+
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    old_digest = core.committed_activation["record_digest"]
+    entered, release = Event(), Event()
+    def delayed(body):
+        entered.set()
+        assert release.wait(5)
+        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+                "program_revision": None, "applied_record_digest": old_digest,
+                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1",
+                                   "state": "unknown", "reason": "scene_outcome_unknown",
+                                   "message": "transaction not confirmed", "last_observed_remaining": ["part"]}}
+    runner.prepare_applied_scene = delayed
+    service._empty_scene_applies.add(("apply.2", 1))
+    worker = Thread(target=service.notify_committed_apply)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        current = core.committed_activation
+        current["apply_id"] = "apply.3"
+        current["apply_generation"] = 2
+        current["scene_initialization"] = "preserve"
+        current["committed_applies"][-1].update(
+            apply_id="apply.3", apply_generation=2, scene_initialization="preserve")
+        service.notify_committed_apply()
+        assert service.program_cycle_status(include_scene_clear=True)["scene_clear"]["state"] == "pending"
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert status["apply_id"] == "apply.2" and status["state"] == "unknown"
+
+
+def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    normal_status = copy.deepcopy(core.applied_program_status_projection)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service._empty_scene_applies.add(("apply.2", 1))
+    old_selected, release_old = Event(), Event()
+    new_latched, release_new = Event(), Event()
+    clear = service._clear_empty_applied
+    cycle_status = service.program_cycle_status
+
+    def delayed_clear(identity):
+        old_selected.set()
+        assert release_old.wait(5)
+        clear(identity)
+
+    def delayed_cycle_status(*args, **kwargs):
+        new_latched.set()
+        assert release_new.wait(5)
+        return cycle_status(*args, **kwargs)
+
+    service._clear_empty_applied = delayed_clear
+    old = threading.Thread(target=service.notify_committed_apply)
+    new = threading.Thread(target=service.notify_committed_apply)
+    old.start()
+    try:
+        assert old_selected.wait(5)
+        current = core.committed_activation
+        current.update(apply_id="apply.3", apply_generation=2,
+                       record_digest="sha256:" + "f" * 64)
+        current["committed_applies"][-1].update(
+            apply_id="apply.3", apply_generation=2, record_digest=current["record_digest"])
+        normal_status["record_digest"] = current["record_digest"]
+        core.applied_program_status_projection = normal_status
+        core.applied_program["source"]["record_digest"] = current["record_digest"]
+        service.program_cycle_status = delayed_cycle_status
+        new.start()
+        assert new_latched.wait(5)
+        release_old.set()
+        old.join(5)
+        assert not old.is_alive()
+        assert service._apply_scene_attempted == ("apply.3", 2, current["record_digest"])
+        assert service._scene_clear == {"apply_id": "apply.2", "apply_generation": 1,
+                                       "state": "superseded", "remaining": None, "reason": None}
+    finally:
+        release_old.set()
+        release_new.set()
+        old.join(5)
+        if new.ident is not None:
+            new.join(5)
+    assert not new.is_alive()
+    preparations = [body for kind, body in runner.calls if kind == "prepare_scene"]
+    assert len(preparations) == 1
+    assert preparations[0]["expected_applied_record_digest"] == current["record_digest"]
+
+
+def test_empty_apply_identity_read_failure_preserves_newer_attempt(caplog):
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    old = ("apply.2", 1, "sha256:" + "a" * 64)
+    new = ("apply.3", 2, "sha256:" + "b" * 64)
+    service._empty_scene_applies.add(old[:2])
+    service._apply_scene_attempted = new
+
+    def unavailable():
+        raise RuntimeError("activation unavailable")
+
+    service.committed_scenario_activation = unavailable
+    service._clear_empty_applied(old)
+    assert service._apply_scene_attempted == new
+    assert service._scene_clear is None
+    assert old[:2] in service._empty_scene_applies
+    assert "Cannot confirm committed Apply for Scene clear: activation unavailable" in caplog.text
+    assert not runner.calls
+
+
+@pytest.mark.parametrize("condition", ["superseded", "identity_unavailable"])
+@pytest.mark.parametrize("status_owner", ["apply", "direct"])
+def test_unstarted_empty_apply_preserves_another_clear_status(condition, status_owner):
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    old = ("apply.2", 1, "sha256:" + "a" * 64)
+    new = ("apply.3", 2, "sha256:" + "b" * 64)
+    service._empty_scene_applies.add(old[:2])
+    service._apply_scene_attempted = new
+    status = ({"apply_id": new[0], "apply_generation": new[1]} if status_owner == "apply"
+              else {"request_id": "clear.new"})
+    status.update(state="unknown", remaining=None,
+                  reason={"code": "scene_clear_unknown", "message": "response unavailable",
+                          "details": {"reason": "scene_outcome_unknown"}})
+    service._scene_clear = copy.deepcopy(status)
+
+    def current():
+        if condition == "identity_unavailable":
+            raise RuntimeError("activation unavailable")
+        return {"apply_id": new[0], "apply_generation": new[1], "record_digest": new[2]}
+
+    service.committed_scenario_activation = current
+    service._clear_empty_applied(old)
+    assert service._scene_clear == status
+    assert service._apply_scene_attempted == new
+    assert (old[:2] in service._empty_scene_applies) == (condition == "identity_unavailable")
+    assert not runner.calls
+
+
+def test_empty_apply_identity_read_failure_allows_later_notification_retry():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    identity = ("apply.2", 1, core.committed_activation["record_digest"])
+    service._empty_scene_applies.add(identity[:2])
+    read_activation = service.committed_scenario_activation
+    reads = 0
+
+    def transient_failure():
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("activation unavailable")
+        return read_activation()
+
+    service.committed_scenario_activation = transient_failure
+    service.notify_committed_apply()
+    assert identity[:2] in service._empty_scene_applies
+    assert service._apply_scene_attempted is None
+    assert service._scene_clear is None
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+
+    calls = []
+    def clear(body):
+        calls.append(body)
+        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+                "program_revision": None, "applied_record_digest": identity[2],
+                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1",
+                                   "state": "succeeded", "last_observed_remaining": [],
+                                   "refused": []}}
+    runner.prepare_applied_scene = clear
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert identity[:2] not in service._empty_scene_applies
+    assert service._apply_scene_attempted == identity
+    assert service._scene_clear == {"apply_id": identity[0], "apply_generation": identity[1],
+                                    "state": "succeeded", "remaining": [], "reason": None}
+    assert len(calls) == 1 and calls[0]["clear_empty_scene"] is True
+    assert calls[0]["expected_applied_record_digest"] == identity[2]
+
+
+def test_newer_queued_clear_replaces_old_status_and_preserves_unknown():
+    from threading import Event, Thread
+
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    first = ("apply.2", 1, "sha256:" + "a" * 64)
+    second = ("apply.3", 2, "sha256:" + "b" * 64)
+    current = {"apply_id": first[0], "apply_generation": first[1], "record_digest": first[2]}
+    service.committed_scenario_activation = lambda: dict(current)
+    service._empty_scene_applies.update({first[:2], second[:2]})
+    entered, release = Event(), Event()
+    calls = []
+    def clear(body):
+        calls.append(body["expected_applied_record_digest"])
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(5)
+        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+                "program_revision": None, "applied_record_digest": body["expected_applied_record_digest"],
+                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1", "state": "unknown",
+                                   "reason": "scene_outcome_unknown", "message": "unconfirmed",
+                                   "last_observed_remaining": ["part"]}}
+    runner.prepare_applied_scene = clear
+    a = Thread(target=service._clear_empty_applied, args=(first,))
+    b = Thread(target=service._clear_empty_applied, args=(second,))
+    a.start()
+    try:
+        assert entered.wait(5)
+        current.update(apply_id=second[0], apply_generation=second[1], record_digest=second[2])
+        b.start()
+        assert service.program_cycle_status(include_scene_clear=True)["scene_clear"]["apply_id"] == first[0]
+    finally:
+        release.set()
+        a.join(5)
+        if b.ident is not None:
+            b.join(5)
+    assert not a.is_alive() and not b.is_alive()
+    status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert calls == [first[2], second[2]]
+    assert status["apply_id"] == second[0] and status["state"] == "unknown"
+
+
+def test_direct_clear_handles_bootstrap_and_does_not_repeat_request():
+    from manyforge_headless_api.models import ProgramScenePreparationRequest
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    service.manager_status = lambda: {
+        "source": {"available": True, "freshness": "fresh"},
+        "status": {"manager_ready": True, "runtime": {"converged": True},
+                   "active": {"canonical_empty": True, "publication": {"publication_generation": 1}}},
+    }
+    calls = []
+    def clear(body):
+        calls.append(body)
+        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
+                "program_revision": None, "applied_record_digest": None,
+                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1", "state": "partial",
+                                   "last_observed_remaining": ["part"],
+                                   "refused": [{"resource_id": "part", "code": "missing_reference", "message": "unavailable"}]}}
+    runner.prepare_applied_scene = clear
+    request = ProgramScenePreparationRequest.model_validate({
+        "request_id": "clear.1", "request_owner_epoch": "program-runner.epoch.1",
+        "source_label": "composer_ui", "expected_admission_generation": _ADMISSION_GENERATION,
+        "clear_empty_scene": True, "expected_applied_record_digest": None,
+        "expected_publication_generation": 1,
+    })
+    response = service.program_scene_prepare(request)
+    assert response["scene_clear"]["request_id"] == "clear.1"
+    assert response["scene_clear"]["state"] == "partial"
+    assert service.program_cycle_status(include_scene_clear=True)["scene_clear"] == response["scene_clear"]
+    with pytest.raises(HeadlessApiError):
+        service.program_scene_prepare(request)
+    assert len(calls) == 1
+
+
+def test_direct_clear_rejects_nonempty_or_changed_publication_before_runner_call():
+    from manyforge_headless_api.models import ProgramScenePreparationRequest
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    service.manager_status = lambda: {
+        "source": {"available": True, "freshness": "fresh"},
+        "status": {"manager_ready": True, "runtime": {"converged": True},
+                   "active": {"canonical_empty": False, "publication": {"publication_generation": 2}}},
+    }
+    request = ProgramScenePreparationRequest.model_validate({
+        "request_id": "clear.2", "request_owner_epoch": "program-runner.epoch.1",
+        "source_label": "composer_ui", "expected_admission_generation": _ADMISSION_GENERATION,
+        "clear_empty_scene": True, "expected_applied_record_digest": None,
+        "expected_publication_generation": 1,
+    })
+    result = service.program_scene_prepare(request)["scene_clear"]
+    assert result["state"] == "failed"
+    assert result["reason"]["details"]["reason"] == "program_run_applied_selection_stale"
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+
+
 def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
     return {
         "schema_version": "manyforge.committed_scenario_activation.v3",
@@ -5468,3 +5861,158 @@ def test_apply_scene_initial_attempt_reports_deadline_after_slow_status_reads(
     assert attempts == []
     assert "program_scene_preparation_failed" in caplog.text
     assert "deadline expired before dispatch" in caplog.text
+
+
+def test_initial_scene_failure_status_is_apply_scoped_and_runner_independent():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    def failed(_body):
+        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable", 409)
+    runner.prepare_applied_scene = failed
+    service.notify_committed_apply()
+    runner.cycle_status = lambda: (_ for _ in ()).throw(
+        ProgramRunnerClientError("program_runner_unavailable", "offline"))
+    failure = service.runtime()["initial_scene_failure"]
+    assert failure["state"] == "unknown"
+    assert failure["reason"] == {"code": "program_scene_preparation_failed", "message": "scene unavailable"}
+    assert failure["apply_id"] == "apply.2"
+    core.committed_activation["apply_id"] = "apply.3"
+    core.committed_activation["apply_generation"] = 2
+    core.committed_activation["committed_applies"][-1].update(apply_id="apply.3", apply_generation=2)
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+
+
+def test_initial_scene_status_preserves_condition_if_identity_read_fails():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    runner.prepare_applied_scene = lambda _body: (_ for _ in ()).throw(
+        ProgramRunnerClientError("program_scene_preparation_failed", "broken", 409))
+    service.notify_committed_apply()
+    original = service.committed_scenario_activation
+    service.committed_scenario_activation = lambda: (_ for _ in ()).throw(
+        HeadlessApiError("manager_unavailable", "identity unavailable"))
+    status = service.initial_scene_status()
+    assert status["initial_scene_failure"]["reason"]["message"] == "broken"
+    assert "identity_error" not in status
+    service.committed_scenario_activation = original
+    assert service.initial_scene_status()["initial_scene_failure"] is not None
+
+
+def test_initial_scene_condition_clears_only_after_successful_reload_reset():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    identity = service._current_apply_identity()
+    service._record_initial_scene_failure(identity, HeadlessApiError("authoring_not_ready", "not ready"), dispatched=False)
+    request = _cycle_reset_request().model_copy(update={"reload_initial_scene": True})
+    runner.reset_cycle = lambda _body: (_ for _ in ()).throw(
+        ProgramRunnerClientError("program_runner_unavailable", "offline"))
+    with pytest.raises(HeadlessApiError):
+        service.program_cycle_reset(request)
+    assert service.initial_scene_status()["initial_scene_failure"] is not None
+    runner.reset_cycle = lambda _body: {"schema_version": "manyforge.program_cycle_reset_result.v1", "program_run_id": request.program_run_id, "reset_cycle_generation": request.expected_cycle_generation, "idle_cycle_generation": request.expected_cycle_generation + 1}
+    service.program_cycle_reset(request)
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+
+
+def test_initial_scene_success_clears_condition_for_same_apply():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    identity = service._current_apply_identity()
+    service._record_initial_scene_failure(identity, HeadlessApiError("authoring_not_ready", "not ready"), dispatched=False)
+    service.notify_committed_apply()
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+
+
+def test_initial_scene_transport_loss_is_unknown_and_not_retried():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    def lost(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("program_runner_unavailable", "connection lost")
+    runner.prepare_applied_scene = lost
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+    failure = service.initial_scene_status()["initial_scene_failure"]
+    assert failure["state"] == "unknown"
+    assert failure["reason"]["message"] == "connection lost"
+
+
+def test_initial_scene_failure_before_runner_call_is_known_and_wakes_status():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    wakes = []
+    service.initial_scene_observer = lambda: wakes.append(True)
+    service.authoring_admission = lambda: (_ for _ in ()).throw(
+        HeadlessApiError("admission_unavailable", "admission offline"))
+    service.notify_committed_apply()
+    failure = service.runtime()["initial_scene_failure"]
+    assert failure["state"] == "failed"
+    assert failure["reason"]["message"] == "admission offline"
+    assert wakes
+    assert not [row for row in runner.calls if row[0] == "prepare_scene"]
+
+
+def test_initial_scene_applied_status_failure_is_attributed_to_confirmed_apply():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    service.program_applied_status = lambda: (_ for _ in ()).throw(
+        HeadlessApiError("program_status_unavailable", "selection unavailable"))
+    service.notify_committed_apply()
+    failure = service.runtime()["initial_scene_failure"]
+    assert failure["apply_id"] == "apply.2"
+    assert failure["state"] == "failed"
+    assert failure["reason"]["message"] == "selection unavailable"
+
+
+def test_initial_scene_last_confirmed_arrival_wins_for_same_apply():
+    service, _core = _scene_completion_service(_NotifiedRunner())
+    identity = service._current_apply_identity()
+    first = HeadlessApiError("scene_failed", "first failure")
+    later = HeadlessApiError("scene_failed", "later failure")
+    service._record_initial_scene_failure(identity, first, dispatched=True)
+    service._clear_initial_scene_failure(identity)
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+    service._record_initial_scene_failure(identity, later, dispatched=True)
+    assert service.initial_scene_status()["initial_scene_failure"]["reason"]["message"] == "later failure"
+    service._clear_initial_scene_failure(identity)
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+
+
+def test_initial_scene_unconfirmed_identity_does_not_change_existing_condition():
+    service, _core = _scene_completion_service(_NotifiedRunner())
+    identity = service._current_apply_identity()
+    service._record_initial_scene_failure(identity, HeadlessApiError("first", "first failure"), dispatched=False)
+    original = service.committed_scenario_activation
+    service.committed_scenario_activation = lambda: (_ for _ in ()).throw(
+        HeadlessApiError("manager_unavailable", "identity unavailable"))
+    service._record_initial_scene_failure(identity, HeadlessApiError("later", "later failure"), dispatched=True)
+    service._clear_initial_scene_failure(identity)
+    service.committed_scenario_activation = original
+    assert service.initial_scene_status()["initial_scene_failure"]["reason"]["message"] == "first failure"
+
+
+def test_preserve_apply_does_not_read_applied_status_or_create_scene_failure():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.committed_activation["scene_initialization"] = "preserve"
+    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
+    reads = []
+    def failed_status():
+        reads.append(True)
+        raise HeadlessApiError("program_status_unavailable", "selection unavailable")
+    service.program_applied_status = failed_status
+    service.notify_committed_apply()
+    assert reads == []
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+
+
+def test_unconfirmed_apply_follower_does_not_create_or_replace_a_condition():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    service.committed_scenario_activation = lambda: (_ for _ in ()).throw(
+        HeadlessApiError("manager_unavailable", "identity unavailable"))
+    service.notify_committed_apply()
+    assert service.initial_scene_status() == {"initial_scene_failure": None}
+    assert not [row for row in runner.calls if row[0] == "prepare_scene"]

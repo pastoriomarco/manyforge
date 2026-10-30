@@ -3992,6 +3992,9 @@ enum class Lite6AggregateCheck {
   kCompose,
   kMovingValidation,
   kResealInventory,
+  kNarrowAliasAtRouteRebind,
+  kForeignFrameAtStartup,
+  kForeignFrameAtRouteRebind,
   kRetainedRouteGenerationReseal,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
@@ -4925,6 +4928,47 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     return;
   }
   runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, !maintained_product_check);
+  // Sealing a Program DTO alone does not establish physical-owner membership.
+  const auto foreign_frame_binding = [&]() {
+    auto dto = arm_binding.value();
+    auto frame = dto.frame_bindings.front();
+    frame.frame_role_id = core::FrameRoleId("foreign-frame-role");
+    frame.compiled_frame_name = "foreign-frame-not-on-arm";
+    dto.frame_bindings.push_back(std::move(frame));
+    return core::verify_runtime_participant_binding(std::move(dto));
+  };
+  if (check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
+      check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
+    auto dto = arm_binding.value();
+    dto.program_binding_id = core::ProgramBindingId("narrow-program-binding");
+    ASSERT_NE(dto.program_binding_id, arm_binding.value().program_binding_id);
+    ASSERT_GE(dto.frame_bindings.size(), 2U);
+    dto.frame_bindings.pop_back();
+    auto narrow_alias = core::verify_runtime_participant_binding(std::move(dto));
+    ASSERT_TRUE(narrow_alias.ok()) << narrow_alias.error().message;
+    runtime_input.motion_binding_aliases.push_back(narrow_alias.value());
+  }
+  if (check == Lite6AggregateCheck::kForeignFrameAtStartup) {
+    ASSERT_FALSE(arm_binding.value().frame_bindings.empty());
+    auto foreign_frame_alias = foreign_frame_binding();
+    ASSERT_TRUE(foreign_frame_alias.ok()) << foreign_frame_alias.error().message;
+    runtime_input.motion_binding_aliases.push_back(foreign_frame_alias.value());
+    testing::internal::CaptureStderr();
+    try {
+      static_cast<void>(create_retained_native_runtime(
+          std::move(runtime_input), std::move(runtime_config)));
+      ADD_FAILURE() << "foreign Program frame must be refused at startup";
+    } catch (const std::invalid_argument &error) {
+      EXPECT_STREQ(error.what(),
+                   "native control inventory is incomplete, duplicated, or crosses its "
+                   "physical backend owner");
+    }
+    const auto diagnostic = testing::internal::GetCapturedStderr();
+    EXPECT_NE(diagnostic.find("native control inventory guard: motion alias crosses or widens physical binding"),
+              std::string::npos);
+    EXPECT_EQ(port_participant, nullptr);
+    return;
+  }
   if (check == Lite6AggregateCheck::kCompose ||
       check == Lite6AggregateCheck::kRefreshCellModel)
     runtime_input.participant_resolver_factory =
@@ -6480,8 +6524,17 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     }
     return;
   }
-  if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification) {
+  if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification ||
+      check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
+      check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
     const auto before = runtime->motion_binding;
+    const bool narrow_check = check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
+                              check == Lite6AggregateCheck::kForeignFrameAtRouteRebind;
+    if (narrow_check) {
+      ASSERT_EQ(runtime->motion_binding_aliases.size(), 1U);
+      ASSERT_LT(runtime->motion_binding_aliases.front().value().frame_bindings.size(),
+                before.value().frame_bindings.size());
+    }
     const auto &path = *before.value().control_path;
     ASSERT_TRUE(path.runtime_scale_qualification.has_value());
     const auto qualification = *path.runtime_scale_qualification;
@@ -6518,9 +6571,36 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_FALSE(runtime->AdoptAndReadBackRouteConfigurationPredecessor(foreign).ok());
     EXPECT_EQ(runtime->motion_binding.value(), before.value());
     EXPECT_EQ(channel->binding().value(), before.value());
+    if (check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
+      // Inject the already sealed invalid view to exercise rebind's guard;
+      // normal startup refuses it before a runtime can retain it.
+      ASSERT_FALSE(arm_binding.value().frame_bindings.empty());
+      auto foreign_frame_alias = foreign_frame_binding();
+      ASSERT_TRUE(foreign_frame_alias.ok()) << foreign_frame_alias.error().message;
+      runtime->motion_binding_aliases.push_back(foreign_frame_alias.value());
+      const auto rejected =
+          runtime->AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+      ASSERT_FALSE(rejected.ok());
+      EXPECT_EQ(rejected.error().code,
+                core::to_string(core::ErrorCode::kInvariantViolation));
+      EXPECT_EQ(rejected.error().details.at("reason"),
+                "route_publication_alias_crosses_physical_owner");
+      EXPECT_EQ(runtime->motion_binding.value(), before.value());
+      EXPECT_EQ(channel->binding().value(), before.value());
+      runtime->motion_binding_aliases.pop_back();
+    }
     const auto adopted =
         runtime->AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
     ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+    if (narrow_check) {
+      ASSERT_EQ(runtime->motion_binding_aliases.size(), 1U);
+      EXPECT_EQ(runtime->motion_binding_aliases.front().value().program_binding_id,
+                core::ProgramBindingId("narrow-program-binding"));
+      EXPECT_LT(runtime->motion_binding_aliases.front().value().frame_bindings.size(),
+                runtime->motion_binding.value().frame_bindings.size());
+      EXPECT_EQ(runtime->motion_binding_aliases.front().value().control_path,
+                runtime->motion_binding.value().control_path);
+    }
     EXPECT_EQ(adopted.value().active_configuration, predecessor);
     EXPECT_FALSE(adopted.value().operation_admission_open);
     EXPECT_TRUE(adopted.value().readiness_rows.empty());
@@ -7551,6 +7631,18 @@ TEST(RetainedNativeMeasuredRoutePublication, NullStageRefusesOptionalDomainAppea
 TEST(RetainedProductCrossConsumer,
      RetainedControllerRefreshesEveryModelConsumerWithTheCellModel) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
+}
+
+TEST(RetainedProductCrossConsumer, NarrowProgramAliasSurvivesRouteRebind) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kNarrowAliasAtRouteRebind);
+}
+
+TEST(RetainedProductCrossConsumer, ForeignProgramFrameRefusedAtStartup) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kForeignFrameAtStartup);
+}
+
+TEST(RetainedProductCrossConsumer, ForeignProgramFrameRefusedAtRouteRebind) {
+  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kForeignFrameAtRouteRebind);
 }
 
 TEST(RetainedProductCrossConsumer,

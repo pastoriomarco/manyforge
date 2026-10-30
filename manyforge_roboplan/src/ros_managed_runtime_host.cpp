@@ -14581,24 +14581,24 @@ public:
       : config_(std::move(config)),
         owner_epoch_(RandomToken("execution-host-")),
         runtime_epoch_(RandomToken("native-runtime-")), admission_gate_(),
-#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
-        fixture_clock_(std::make_shared<WallClock>()),
-        fixture_scheduler_(std::make_shared<SimpleScheduler>(
+        standalone_clock_(std::make_shared<WallClock>()),
+        standalone_scheduler_(std::make_shared<SimpleScheduler>(
             SimpleSchedulerConfig::from_environment())),
         composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_,
-                                      &admission_gate_, false, fixture_clock_,
-                                      fixture_scheduler_, ros_context_provider_)) {
-    struct FixtureStartupCleanup final {
+                                      &admission_gate_, false, standalone_clock_,
+                                      standalone_scheduler_, ros_context_provider_)) {
+    struct StandaloneStartupCleanup final {
       Composition& composition;
       std::unique_ptr<RetainedNativeCellRuntime>& cell;
       bool completed{};
-      ~FixtureStartupCleanup() {
+      ~StandaloneStartupCleanup() {
         if (!completed) {
           DetachRetainedCCLC(composition);
+          if (composition.io_transport) composition.io_transport->quiesce();
           cell.reset();
         }
       }
-    } fixture_startup_cleanup{*composition_, fixture_cell_runtime_};
+    } standalone_startup_cleanup{*composition_, standalone_cell_runtime_};
     // Use the actual component engines with the same stable cell authority as
     // the managed host. No component-local addressed Kernel/journal is made.
     auto registrations = NativeCellComponentRegistrations(*composition_);
@@ -14607,12 +14607,15 @@ public:
         owner_epoch_, core::CellId(config_.cell_id), 1024U,
         NativeCellParticipantResolver(*composition_, registrations, &staged_factory),
         &admission_gate_, composition_->bundle->value().cell_graph.graph_revision};
+#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     cell_config.io_rule_evidence_processing_notification =
         [](const std::shared_ptr<core::IIoSignalService>& affected) {
           if (auto runtime = std::dynamic_pointer_cast<HostIoSignalRuntime>(affected))
             runtime->RequestRuleEvidenceProcessing();
         };
+#endif
     cell_config.cell_admission_claim_capacity = 1024U;
+#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     const std::vector<core::RequiredManagerLivenessReceiverDTO> fixture_receivers;
     cell_config.manager_liveness_required_set = core::ManagerLivenessRequiredSetDTO{
         core::CellId(config_.cell_id), composition_->bundle->retained_bundle_id(),
@@ -14621,7 +14624,28 @@ public:
         core::RuntimeEpoch("standalone-admission-fixture.manager-epoch"),
         core::RequestOwnerEpoch("standalone-admission-fixture.manager-owner"),
         fixture_receivers};
-    // Preserve the standalone fixture's existing owner-evidence sources.
+#else
+    cell_config.prequalified_max_live_stop_participants =
+        std::min(kNativeMaximumLiveStopParticipants, registrations.size());
+    // Preserve the existing component recovery configuration source after
+    // CCLC attaches, while the cell owns the one addressed Kernel.
+    if (composition_->runtime) {
+      cell_config.stop_fault_recovery_facts_resolver =
+          [runtime = composition_->runtime, gate = &admission_gate_](
+              const core::StopStatusDTO &status, std::int64_t assessed_at_ns) {
+            auto *kernel = runtime->active_addressed_kernel();
+            if (!kernel)
+              return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+                  {std::string(core::to_string(core::ErrorCode::kMissingReference)),
+                   "native Stop recovery owner is unavailable",
+                   {{"reason", "native_stop_recovery_owner_unavailable"}}});
+            return build_retained_native_stop_recovery_facts(
+                *runtime, *kernel, gate, status, assessed_at_ns);
+          };
+    }
+#endif
+    // BuildComposition passes an empty manager state root to its component
+    // owner, so preserve its relative Manager journal lookup here.
     cell_config.cell_admission_settlement_validator = BuildOwnerSettlementValidator(
         std::filesystem::path(std::string(component_manager::kManagerApplyJournalFilename)),
         {}, {}, config_.execution_state_root / std::string(core::kCCLCJournalFilename),
@@ -14634,9 +14658,9 @@ public:
         [](const auto purpose, const auto& intent, const auto& claim) {
           return detail::ReadProgramResetStatusReadOnly({}, purpose, intent, claim);
         };
-    fixture_cell_runtime_ = std::make_unique<RetainedNativeCellRuntime>(
+    standalone_cell_runtime_ = std::make_unique<RetainedNativeCellRuntime>(
         RetainedNativeCellRuntimeInput{
-            .clock = fixture_clock_, .scheduler = fixture_scheduler_,
+            .clock = standalone_clock_, .scheduler = standalone_scheduler_,
             .operation_journal_path = config_.execution_state_root /
                                       std::string(core::kOperationJournalFilename),
             .participant_registrations = std::move(registrations),
@@ -14644,17 +14668,17 @@ public:
             .stop_sources = NativeCellStopSources(*composition_),
             .stop_source_mode = RetainedStopSurveillanceEmptySourceMode::kRequireNonEmpty});
     AdoptNativeCellParticipantResolverFactory(*composition_, std::move(staged_factory));
-    composition_->cell_runtime = fixture_cell_runtime_.get();
-    auto& cell_kernel = fixture_cell_runtime_->addressed_kernel();
+    composition_->cell_runtime = standalone_cell_runtime_.get();
+    auto& cell_kernel = standalone_cell_runtime_->addressed_kernel();
     std::vector<std::shared_ptr<RetainedNativeGripperRuntime>> independent_grippers;
     const auto bind = [&](Composition& view) {
-      view.cell_runtime = fixture_cell_runtime_.get();
+      view.cell_runtime = standalone_cell_runtime_.get();
       if (view.runtime) {
-        view.runtime->stop_surveillance_owner = fixture_cell_runtime_->stop_surveillance_owner();
-        view.runtime->BindCellRuntimeOwner(*fixture_cell_runtime_, runtime_epoch_.value(), config_.cell_id);
-        view.runtime->cell_runtime_owner = fixture_cell_runtime_.get();
+        view.runtime->stop_surveillance_owner = standalone_cell_runtime_->stop_surveillance_owner();
+        view.runtime->BindCellRuntimeOwner(*standalone_cell_runtime_, runtime_epoch_.value(), config_.cell_id);
+        view.runtime->cell_runtime_owner = standalone_cell_runtime_.get();
         Require(view.runtime->addressed_request_owner_epoch == cell_kernel.request_owner_epoch(),
-                "standalone fixture runtime differs from the actual Kernel owner");
+                "standalone runtime differs from the actual Kernel owner");
       }
       if (view.gripper_runtime) {
         view.gripper_runtime->BindCellKernel(cell_kernel);
@@ -14670,10 +14694,6 @@ public:
       composition_->runtime->BindIndependentGripperPeers(
           composition_->runtime, std::move(independent_grippers));
     AttachProductPickPlacePlanningOwner(*composition_);
-#else
-        composition_(BuildComposition(config_, owner_epoch_, runtime_epoch_,
-                                      &admission_gate_, true, {}, {}, ros_context_provider_)) {
-#endif
     // Motion compositions bind this shared admission gate while constructing
     // their Kernel. The standalone gripper-only composition creates its
     // stable cell Kernel above, so bind its resource table explicitly before
@@ -14722,11 +14742,13 @@ public:
     Require(fixture_readiness.ok(),
             "standalone admission fixture could not publish readiness");
 #endif
+#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     if (composition_->cell_runtime) {
       PrepareCompositionIoResources(*composition_, *composition_->cell_runtime,
                                     composition_->io_transport, ros_context_provider_);
       InstallCompositionIoSignals(*composition_, *composition_->cell_runtime);
     }
+#endif
     {
       std::unique_lock lock(composition_access_.mutex);
       composition_access_.replace_current(composition_.get());
@@ -14760,21 +14782,17 @@ public:
     command_surface_ = std::make_unique<ExecutionCommandSurface>(
         config_.execution_run_root, composition_access_,
         standalone_command_admission_, owner_epoch_);
-#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
-    fixture_startup_cleanup.completed = true;
-#endif
+    standalone_startup_cleanup.completed = true;
   }
 
   ~NativeExecutionHost() {
     command_surface_.reset();
     composition_access_.detach_addressed_owner();
-#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     DetachRetainedCCLC(*composition_);
     // The generic I/O transport's executor fault reaches the cell
     // scheduler's sink: quiesce it before the cell removes that sink.
     if (composition_->io_transport) composition_->io_transport->quiesce();
-    fixture_cell_runtime_.reset();
-#endif
+    standalone_cell_runtime_.reset();
   }
 
   [[nodiscard]] int Run() {
@@ -14794,15 +14812,13 @@ private:
   core::RuntimeEpoch runtime_epoch_;
   ManagedKernelAdmissionGate admission_gate_;
   std::unique_ptr<ManagedKernelApplyFenceOwner> fence_owner_;
-#if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
-  std::shared_ptr<WallClock> fixture_clock_;
-  std::shared_ptr<SimpleScheduler> fixture_scheduler_;
-#endif
+  std::shared_ptr<WallClock> standalone_clock_;
+  std::shared_ptr<SimpleScheduler> standalone_scheduler_;
   const ros2_control_execution::Ros2TransportResources::ContextProvider
       ros_context_provider_ = MakeHostRosContextProvider();
   std::unique_ptr<Composition> composition_;
   // Retire the stable Kernel before the component engines it borrows.
-  std::unique_ptr<RetainedNativeCellRuntime> fixture_cell_runtime_;
+  std::unique_ptr<RetainedNativeCellRuntime> standalone_cell_runtime_;
   std::shared_ptr<ExecutionCompositionAccess> composition_access_owner_ =
       std::make_shared<ExecutionCompositionAccess>();
   ExecutionCompositionAccess &composition_access_ = *composition_access_owner_;

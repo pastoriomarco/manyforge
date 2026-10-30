@@ -9,6 +9,7 @@ import { browserRequestIdentity, lifecycleRequestFromSnapshot, requestContext } 
 import type { CarriedObjectAttachment, JsonValue, LogicalSceneProjection, ManagerActiveProjection, ManagerStatusProjection,
   ProjectionRevision, SceneTransactionResponse } from '../types/api';
 import type { ComponentProcessStopResult } from '../types/cclc';
+import type { SceneClearStatus } from '../types/scenarioClose';
 import type { ManagerApplyIdentity } from './managerApply';
 import { errorMessage } from './structuralResource';
 
@@ -25,6 +26,7 @@ interface CloseInputs {
   waitForObservation: (signal: AbortSignal) => Promise<void>;
   trackApply: (identity: ManagerApplyIdentity) => void;
   progress: (message: string) => void;
+  sceneClearNotice?: (source: ManagerApplyIdentity | { requestId: string }, error: Error) => void;
   /** Every confirmed Close prepares the live runtime before unloading. */
   preparation?: ClosePreparationInputs;
   /** SX-679: whether a Recover cell press runs now; Close then starts nothing. */
@@ -222,7 +224,9 @@ export function closeErrorCode(error: unknown): string | null {
 /** Close's wrapped message keeps the typed code of its cause. */
 function closeError(message: string, cause: unknown): Error {
   const code = closeErrorCode(cause);
-  return code === null ? new Error(message) : typedError(code, message);
+  const error = code === null ? new Error(message) : typedError(code, message);
+  const structuredError = (cause as { structuredError?: unknown } | null)?.structuredError;
+  return structuredError === undefined ? error : Object.assign(error, { structuredError });
 }
 
 /** Close always uses ordinary Reset with no optional restoration selected. Its
@@ -659,6 +663,31 @@ function closeCheck({ expected, signal, preparation: confirmed }: CloseInputs, p
   };
 }
 
+export function sceneClearDescription(status: SceneClearStatus): string {
+  const objects = status.remaining === null ? 'Remaining objects are unknown.'
+    : status.state === 'unknown' ? `Last observed objects: ${status.remaining.join(', ') || 'none'}; the outcome is unknown.`
+      : `Remaining objects: ${status.remaining.join(', ') || 'none'}.`;
+  const refused = status.reason?.details.refused;
+  const reasons = Array.isArray(refused) ? refused.flatMap((item: unknown) => {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return [];
+    const row = item as Record<string, unknown>;
+    return typeof row.resource_id === 'string' && typeof row.message === 'string'
+      ? [`${row.resource_id}: ${row.message}${typeof row.code === 'string' ? ` (${row.code})` : ''}`] : [];
+  }) : [];
+  return `${status.reason?.message ?? 'No further detail is available.'} ${objects}${reasons.length > 0 ? ` ${reasons.join('; ')}.` : ''}`;
+}
+
+const SCENE_CLEAR_POLL_MS = 250;
+function waitForSceneClearPoll(signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, SCENE_CLEAR_POLL_MS);
+    const abort = () => { clearTimeout(timer); reject(signal.reason); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
 /** The canonical-empty Apply that ends every Close, verified on its publication. */
 async function applyCanonicalEmpty(input: CloseInputs, current: ManagerStatusProjection, correlationId: string,
   check: () => void): Promise<ManagerActiveProjection> {
@@ -686,7 +715,7 @@ async function applyCanonicalEmpty(input: CloseInputs, current: ManagerStatusPro
   const accepted = await api.manager.applyCandidate({ request_id: identity(), request_owner_epoch: selection.request_owner_epoch,
     source_label: 'composer_ui', correlation_id: correlationId,
     deployment_artifact_id: prepared.deployment_artifact_id, deployment_revision: prepared.deployment_revision,
-    expected_current: expectedCurrent, expected_admission_generation: admissionGeneration(), reject_if_affected_busy: true, scene_initialization: 'preserve',
+    expected_current: expectedCurrent, expected_admission_generation: admissionGeneration(), reject_if_affected_busy: true, scene_initialization: 'initialize',
     prepared_activation: prepared, candidate_receipt: preview.candidateReceipt, accepted_impact_digest: preview.candidateReceipt.impact_digest });
   const apply = { applyId: accepted.applyId, applyGeneration: accepted.applyGeneration };
   trackApply(apply);
@@ -708,8 +737,65 @@ async function applyCanonicalEmpty(input: CloseInputs, current: ManagerStatusPro
       && active.graphRevision === prepared.graph_revision && object(transaction)
       && transaction.kind === 'named_apply' && transaction.apply_id === apply.applyId
       && transaction.apply_generation === apply.applyGeneration) {
-      progress('Scenario closed.');
-      return active;
+      progress('Clearing the Scene…');
+      const pollAbort = new AbortController();
+      const abortPoll = () => pollAbort.abort(signal.reason);
+      signal.addEventListener('abort', abortPoll, { once: true });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<null>((resolve) => { timer = setTimeout(() => { resolve(null); pollAbort.abort(); }, 10_000); });
+      const poll = async (): Promise<ManagerActiveProjection> => {
+      for (;;) {
+        pollAbort.signal.throwIfAborted();
+        let clearing: Awaited<ReturnType<typeof api.programs.sceneClearStatus>>;
+        try { clearing = await api.programs.sceneClearStatus(pollAbort.signal); }
+        catch {
+          pollAbort.signal.throwIfAborted();
+          input.sceneClearNotice?.(apply, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+          return active;
+        }
+        let latest: ManagerStatusProjection;
+        try { latest = await api.manager.status(pollAbort.signal); }
+        catch {
+          pollAbort.signal.throwIfAborted();
+          input.sceneClearNotice?.(apply, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+          return active;
+        }
+        pollAbort.signal.throwIfAborted();
+        const transaction = latest.status.active.publication.transaction;
+        if (!latest.source.available || latest.source.freshness !== 'fresh') {
+          input.sceneClearNotice?.(apply, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+          return active;
+        }
+        if (!object(transaction) || transaction.kind !== 'named_apply' || transaction.apply_id !== apply.applyId
+          || transaction.apply_generation !== apply.applyGeneration)
+          throw typedError('scene_clear_superseded', 'A newer Apply superseded Scene clearing.');
+        if (clearing !== null && clearing.applyId === apply.applyId && clearing.applyGeneration === apply.applyGeneration) {
+          if (clearing.state === 'succeeded') { progress('Scenario closed.'); return active; }
+          if (clearing.state !== 'pending') {
+            const reason = clearing.reason;
+            const error = Object.assign(typedError(`scene_clear_${clearing.state}`,
+              `Scene clearing ${clearing.state}: ${sceneClearDescription(clearing)}`),
+            { structuredError: { code: `scene_clear_${clearing.state}`,
+              message: reason?.message ?? '', details: { ...reason?.details, reason_code: reason?.code ?? null, remaining: clearing.remaining } } });
+            if (clearing.state === 'superseded') throw error;
+            input.sceneClearNotice?.(apply, error);
+            return active;
+          }
+        }
+        await waitForSceneClearPoll(pollAbort.signal);
+      }
+      };
+      try {
+        const result = await Promise.race([poll(), deadline]);
+        if (result !== null) return result;
+        signal.throwIfAborted();
+        input.sceneClearNotice?.(apply, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+        return active;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener('abort', abortPoll);
+        pollAbort.abort();
+      }
     }
     const predecessor = current.status.active;
     if (!validPublication(predecessor) || active.canonicalEmpty !== predecessor.canonicalEmpty
@@ -722,14 +808,83 @@ async function applyCanonicalEmpty(input: CloseInputs, current: ManagerStatusPro
   }
 }
 
+/** One direct Scene-owner clear when canonical empty is already Applied. */
+async function clearAlreadyEmpty(input: CloseInputs, current: ManagerStatusProjection): Promise<ManagerActiveProjection> {
+  const { expected, preparation, signal, progress } = input;
+  if (preparation === undefined) throw new Error('A confirmed Scenario is required to clear the Scene.');
+  const snapshot = currentCloseSnapshot(expected, preparation, signal);
+  const section = snapshot.runtime.sections.logicalScene;
+  if (!section?.available || section.freshness !== 'fresh' || section.knownGaps.length > 0 || section.payload === null
+    || !sameSceneStructure(section.payload as JsonValue, preparation.confirmed.closeScene?.payload as JsonValue | undefined))
+    throw new Error('The confirmed logical Scene is unavailable or changed.');
+  const projection = parseLogicalSceneProjection(section.payload).access.active_projection;
+  if (projection === null || projection.retained_bundle_id !== expected.retainedBundleId
+    || projection.graph_revision !== expected.graphRevision)
+    throw new Error('The current logical Scene is unavailable or fenced.');
+  const publicationGeneration = expected.publication.publication_generation;
+  if (typeof publicationGeneration !== 'number' || !Number.isSafeInteger(publicationGeneration) || publicationGeneration < 1)
+    throw new Error('The current Applied publication is unavailable.');
+  const requestId = identity();
+  const source = { requestId };
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal.reason);
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => { resolve(null); controller.abort(); }, 10_000);
+  });
+  progress('Clearing the Scene…');
+  const request = api.programs.clearEmptyScene({ request_id: requestId,
+    request_owner_epoch: snapshot.programCycle.programRunnerOwnerEpoch, source_label: 'composer_ui', correlation_id: null,
+    expected_admission_generation: input.admissionGeneration(), clear_empty_scene: true,
+    expected_applied_record_digest: null, expected_publication_generation: publicationGeneration }, controller.signal)
+    .then((status) => {
+      if (status === null || status.requestId !== requestId || status.state === 'pending')
+        throw new Error('Direct Scene clear has no terminal receipt.');
+      return status;
+    });
+  const poll = async (): Promise<SceneClearStatus> => {
+    for (;;) {
+      controller.signal.throwIfAborted();
+      const status = await api.programs.sceneClearStatus(controller.signal);
+      controller.signal.throwIfAborted();
+      if (status !== null && status.requestId === requestId && status.state !== 'pending') return status;
+      await waitForSceneClearPoll(controller.signal);
+    }
+  };
+  try {
+    const status = await Promise.race([request, poll(), deadline]);
+    signal.throwIfAborted();
+    if (status === null) {
+      input.sceneClearNotice?.(source, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+    } else if (status.state === 'superseded') {
+      throw typedError('scene_clear_superseded', 'A newer request superseded Scene clearing.');
+    } else if (status.state !== 'succeeded') {
+      const error = Object.assign(typedError(`scene_clear_${status.state}`, sceneClearDescription(status)),
+        { structuredError: { code: `scene_clear_${status.state}`, message: status.reason?.message ?? '',
+          details: { ...status.reason?.details, remaining: status.remaining } } });
+      input.sceneClearNotice?.(source, error);
+    } else progress('Scenario closed.');
+    return current.status.active;
+  } catch (error) {
+    if (signal.aborted) throw typedError('scene_clear_unknown', 'Scene clear was requested; its outcome is unknown. Check the Scene.');
+    if (closeErrorCode(error) === 'scene_clear_superseded') throw error;
+    input.sceneClearNotice?.(source, typedError('scene_clear_unknown', 'Scene clear outcome unknown; check the Scene.'));
+    return current.status.active;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+    controller.abort();
+  }
+}
+
 /** GUI composition only. Every effect uses the existing owner command and refusal. */
 export async function closeScenario(input: CloseInputs): Promise<ManagerActiveProjection> {
   const { expected, signal, preparation } = input;
   const confirmed = preparation;
   const current = await confirmedManagerStatus(input);
-  // The Manager reports the cell canonical-empty: nothing to close (no
-  // product, so no cell control state either). New and Load proceed.
-  if (expected.canonicalEmpty) return current.status.active;
+  if (expected.canonicalEmpty) return clearAlreadyEmpty(input, current);
   refuseDuringCellRecover(input, 'Close');
   // D6: with an open cell Stop fault, Close retires the lifecycle targets
   // first. The Kernel then admits only Close's own claims (the verified

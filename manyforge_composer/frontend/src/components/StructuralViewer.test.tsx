@@ -695,6 +695,22 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('framed: camera !== null');
   });
 
+  it('shows neutral empty-Scenario text only from a verified empty composition and keeps real-model geometry guidance', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    const viewer = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    expect(workspace).toContain('verifiedAppliedGraphHasNoModels(');
+    expect(workspace).toContain('headlessState.snapshot,\n    headlessState.transportStatus,');
+    expect(workspace).toContain('noRobotScenario={noRobotScenario}');
+    expect(viewer).toContain('noRobotScenario = false');
+    expect(viewer).toContain('export function ViewerSceneEmptyState(');
+    expect(viewer).toContain('<strong>No robot in this Scenario</strong>');
+    expect(viewer).toContain('manifestReady={manifest.status === \'ready\'}');
+    expect(viewer).toContain('The retained link tree contains no renderable visual or collision geometry.');
+  });
+
   it('passes robot geometry only after Manager identity gating and leaves Stop controls mounted', () => {
     const workspace = readFileSync(
       new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),

@@ -121,6 +121,8 @@ interface StructuralViewerProps {
   onViewerPoseRateChange?: (rate: number) => void;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   modelPresentation: ViewerModelPresentation;
+  /** Exact current proof that the Applied graph has no model instances. */
+  noRobotScenario?: boolean;
   onRetry: () => void;
   sceneObjects?: readonly LogicalSceneObject[];
   programDraftPreview?: boolean;
@@ -229,6 +231,41 @@ interface StructuralViewerProps {
   onInspectorMinimizedChange?: (minimized: boolean) => void;
   onInspectorMaximize?: () => void;
   onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
+}
+
+export function ViewerSceneEmptyState({
+  noRobotScenario,
+  visibleGeometryCount,
+  pointCloudEnabled,
+  manifestReady,
+  collisionCount,
+}: {
+  noRobotScenario: boolean;
+  visibleGeometryCount: number;
+  pointCloudEnabled: boolean;
+  manifestReady: boolean;
+  collisionCount: number;
+}) {
+  if (visibleGeometryCount !== 0 || pointCloudEnabled) return null;
+  if (noRobotScenario) {
+    return (
+      <div className="viewer-state" role="status">
+        <strong>No robot in this Scenario</strong>
+      </div>
+    );
+  }
+  if (!manifestReady) return null;
+  return (
+    <div className="viewer-state">
+      <strong>No geometry selected for display</strong>
+      <span>
+        {collisionCount > 0
+          ? 'This URDF has no visual geometry. Enable collision geometry to inspect its retained collision shapes.'
+          : 'The retained link tree contains no renderable visual or collision geometry.'}
+      </span>
+      <span>No placeholder geometry is substituted.</span>
+    </div>
+  );
 }
 
 export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | 'io' | null;
@@ -3147,6 +3184,7 @@ function StructuralViewerContent({
   onViewerPoseRateChange,
   manifest,
   modelPresentation,
+  noRobotScenario = false,
   onRetry,
   sceneObjects = [],
   programDraftPreview = false,
@@ -3905,17 +3943,13 @@ function StructuralViewerContent({
           </div>
         )}
 
-        {visibleGeometryCount === 0 && manifest.status === 'ready' && !pointCloudEnabled && (
-          <div className="viewer-state">
-            <strong>No geometry selected for display</strong>
-            <span>
-              {collisionCount > 0
-                ? 'This URDF has no visual geometry. Enable collision geometry to inspect its retained collision shapes.'
-                : 'The retained link tree contains no renderable visual or collision geometry.'}
-            </span>
-            <span>No placeholder geometry is substituted.</span>
-          </div>
-        )}
+        <ViewerSceneEmptyState
+          noRobotScenario={noRobotScenario}
+          visibleGeometryCount={visibleGeometryCount}
+          pointCloudEnabled={pointCloudEnabled}
+          manifestReady={manifest.status === 'ready'}
+          collisionCount={collisionCount}
+        />
         {typeof transportControls === 'function' ? transportControls(() => {
           setInspectorPanel('robot');
           onInspectorMinimizedChange?.(false);

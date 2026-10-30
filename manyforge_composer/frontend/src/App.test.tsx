@@ -17,7 +17,7 @@ vi.mock('./state/structuralResource', async (importOriginal) => {
     useStructuralResource: (...args: Parameters<typeof actual.useStructuralResource>) => {
       const resource = actual.useStructuralResource(...args);
       return args[0] === api.health.get && healthProjection.value !== null
-        ? [{ status: 'ready', data: healthProjection.value }, () => {}]
+        ? [{ status: 'ready', data: healthProjection.value }, () => 0]
         : resource;
     },
   };
@@ -310,8 +310,15 @@ describe('Composer shell continuity', () => {
       /refreshViewerModelsOnManagerChange\([\s\S]*?retrySourceModel,\s*retryManifest,/,
     );
     expect(appSource).toMatch(
-      /refreshOnManagerActivationSettled\([\s\S]*?managerActivationSettlementKey\(headlessSnapshot\),\s*\[retryCatalog, refreshDeploymentWorkspace\],/,
+      /refreshOnManagerActivationSettled\([\s\S]*?managerActivationSettlementKey\(headlessSnapshot\),\s*\[retryCatalogTracked, refreshDeploymentWorkspace\],/,
     );
+    expect(appSource.match(/retryableWhen: isTransientManagerReadinessError/g)).toHaveLength(2);
+    expect(appSource).toContain('retryCatalogTracked');
+    expect(appSource).toContain('retryNodeEnvironmentTracked');
+    expect(appSource).toContain('managerReadinessTransientRetryKey(headlessSnapshot, {');
+    expect(appSource).toContain('refreshTransientResourcesOnManagerReadiness(');
+    expect(appSource).toContain("catalog.status === 'error' && catalog.retryable === true");
+    expect(appSource).toContain("nodeEnvironment.status === 'error' && nodeEnvironment.retryable === true");
     expect(appSource).toContain('runtimeStatusPresentation({');
     expect(appSource).toContain('className={`deployment-status-button readiness-');
     expect(appSource).not.toContain('<RuntimeStatusOverlay');

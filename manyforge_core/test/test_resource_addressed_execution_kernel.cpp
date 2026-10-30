@@ -180,7 +180,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<std::uint64_t> execute(const ExecuteRequestDTO& request) {
     ++execute_calls;
     Trace("engine:execute");
-    last_execute = request;
+    {
+      std::lock_guard lock(last_execute_mutex_);
+      last_execute = request;
+    }
     if (request.initial_runtime_scale.has_value()) {
       const auto initialized = set_runtime_scale(*request.initial_runtime_scale);
       if (!initialized.ok()) {
@@ -584,8 +587,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch &&
                            replacement_phase.load() == PreparedMotionReplacementPhaseDTO::kNoEffect;
     bool stopped = false;
+    const auto last_stage = LastStopStageSnapshot();
     if (replacement_request && replacement_request->replacement && settled_stop_certificate &&
-        last_stop_stage && prepared_snapshot && last_prepared_request &&
+        last_stage && prepared_snapshot && last_prepared_request &&
         last_dispatched_participant) {
       const auto& source = replacement_request->replacement->source;
       const auto& binding = last_prepared_request->execution_request.binding;
@@ -597,10 +601,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                 binding.controller_goal_generation} &&
                 source.prepared_contract_digest ==
                     last_dispatched_participant->prepared_contract_digest &&
-                settled_stop_certificate->stop_id == last_stop_stage->stop_id &&
-                settled_stop_certificate->stop_generation == last_stop_stage->stop_generation &&
-                source.goal == ExecutionGoalKey{last_stop_stage->controller_goal_id,
-                                                last_stop_stage->controller_goal_generation} &&
+                settled_stop_certificate->stop_id == last_stage->stop_id &&
+                settled_stop_certificate->stop_generation == last_stage->stop_generation &&
+                source.goal == ExecutionGoalKey{last_stage->controller_goal_id,
+                                                last_stage->controller_goal_generation} &&
                 current.execution_id == source.execution_id && current.fact &&
                 current.fact->kind == ParticipantExecutionFactKind::kPreemptedByAddressedStop &&
                 current.fact->effect == ParticipantEffectKnowledge::kEffectSettled;
@@ -757,7 +761,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     last_prepared_request = std::move(replacement_request);
     replacement_request.reset();
     last_dispatched_participant = prepared_snapshot->participant;
-    last_execute = last_prepared_request->execution_request;
+    {
+      std::lock_guard lock(last_execute_mutex_);
+      last_execute = last_prepared_request->execution_request;
+    }
     next_execution_id = candidate_id;
     next_execute_result = Result<std::uint64_t>::Ok(candidate_id);
     ++replacement_execution_generation;
@@ -994,12 +1001,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                    const RemainingStopBudgetDTO& budget,
                                                    std::stop_token) override {
     Trace("engine:translate_stop_stage");
-    last_stop_stage = stage;
-    last_stop_budget = budget;
-    ++translate_stop_stage_calls;
+    {
+      std::lock_guard lock(last_stop_mutex_);
+      last_stop_stage = stage;
+      last_stop_budget = budget;
+    }
+    const auto call = ++translate_stop_stage_calls;
     if (translate_stop_stage_hook) {
       translate_stop_stage_hook();
     }
+    const auto stop_result = stop_result_for_call ? stop_result_for_call(call) : next_stop_result;
     std::vector<StopEvidenceItemDTO> evidence;
     const auto& requirements = stage.participant_stop_plan.stage_commands.at(stage.stage_index)
                                    .resolved_stage.evidence_requirements;
@@ -1007,15 +1018,15 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     for (const auto& requirement : requirements) {
       evidence.push_back(StopEvidenceItemDTO{
           requirement.requirement.evidence_item_id, requirement.requirement.evidence_kind,
-          next_stop_result.accepted ? StopEvidenceItemStateDTO::kSatisfied
+          stop_result.accepted ? StopEvidenceItemStateDTO::kSatisfied
                                     : StopEvidenceItemStateDTO::kFailed,
           requirement.resolved_source,
           requirement.resolved_source.runtime_target.provider_runtime_epoch, 1U, 0,
-          next_stop_result.accepted
+          stop_result.accepted
               ? std::optional<JsonValueDTO>(next_stop_evidence.value_or(JsonValueDTO{true}))
               : std::nullopt,
-          next_stop_result.accepted ? std::nullopt
-                                    : std::optional(next_stop_result.error.value_or(
+          stop_result.accepted ? std::nullopt
+                                    : std::optional(stop_result.error.value_or(
                                           ErrorDTO{"controller_stop_rejected",
                                                    "controller rejected Stop",
                                                    {{"reason", "controller_stop_rejected"}}}))});
@@ -1033,7 +1044,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     auto result = ParticipantStopStageResultDTO{stage,
                                                 StopStageAttemptDispositionDTO::kDispatched,
-                                                next_stop_result.accepted
+                                                stop_result.accepted
                                                     ? ParticipantStopStageOutcomeDTO::kSucceeded
                                                     : ParticipantStopStageOutcomeDTO::kFailed,
                                                 actual_stop_mode,
@@ -1043,8 +1054,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                                 1U,
                                                 0,
                                                 std::move(evidence),
-                                                next_stop_result.error};
-    if (!next_stop_result.accepted) {
+                                                stop_result.error};
+    if (!stop_result.accepted) {
       const auto& first_error = result.error.value();
       for (auto& item : result.evidence_items) {
         item.state = StopEvidenceItemStateDTO::kFailed;
@@ -1136,10 +1147,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
       const OperationId& operation_id, const ControlBindingId& control_binding_id) const override {
+    const auto dispatched = LastExecuteSnapshot();
     if (!last_runtime_scale_command.has_value() ||
         last_runtime_scale_command->operation_id != operation_id ||
         last_runtime_scale_command->control_binding_id != control_binding_id ||
-        !last_execute.has_value()) {
+        !dispatched.has_value()) {
       return Result<ResolvedRuntimeScaleStatusDTO>::Err(
           ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
                    "fake runtime-scale status is not initialized",
@@ -1171,7 +1183,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         runtime_scale.commanded_scale,
         runtime_scale.applied_scale,
         runtime_scale.virtual_trajectory_time_s,
-        last_execute->binding.provider_runtime_epoch,
+        dispatched->binding.provider_runtime_epoch,
         runtime_scale.acknowledgement_sequence,
         runtime_scale.acknowledgement_timestamp_ns,
         runtime_scale.error.has_value() ? RuntimeScaleApplicationState::kFailed
@@ -1195,6 +1207,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
 
   GripperActuationKind gripper_actuation_kind(const std::string&) const override {
     return configured_gripper_actuation;
+  }
+  GripperOutputMode gripper_output_mode(const std::string&) const override {
+    return configured_gripper_output;
   }
   GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
     ++get_gripper_status_calls;
@@ -1418,6 +1433,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::atomic<int> validate_command_calls{};
   std::function<void()> validate_command_hook;
   GripperActuationKind configured_gripper_actuation{GripperActuationKind::kPositionCommanded};
+  GripperOutputMode configured_gripper_output{GripperOutputMode::kCommanded};
   mutable std::atomic<int> get_gripper_status_calls{};
   std::atomic<int> stop_gripper_calls{};
   std::atomic<int> reset_gripper_calls{};
@@ -1436,6 +1452,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   GripperCommandResultDTO next_command_result{true, 73U, 9U, std::nullopt};
   Result<void> next_command_validation = Result<void>::Ok();
   StopResultDTO next_stop_result{true, std::nullopt};
+  // Immutable per-call script for concurrent stage tests.
+  std::function<StopResultDTO(int)> stop_result_for_call;
   std::optional<JsonValueDTO> next_stop_evidence;
   ResetResultDTO next_reset_result{true, std::nullopt};
   AcknowledgeCompletedResultDTO next_acknowledge_result{true, std::nullopt};
@@ -1497,6 +1515,11 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   KernelRecoveryAssessmentDTO recovery_assessment{};
   std::optional<KernelRecoveryActionResultDTO> next_recovery_result;
   GripperCommandStatusDTO gripper_status{};
+  [[nodiscard]] std::optional<ExecuteRequestDTO> LastExecuteSnapshot() const {
+    std::lock_guard lock(last_execute_mutex_);
+    return last_execute;
+  }
+  mutable std::mutex last_execute_mutex_;
   std::optional<ExecuteRequestDTO> last_execute;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> last_prepared_request;
   mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
@@ -1508,6 +1531,15 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ExecuteRequestDTO> last_preview;
   std::optional<ResolvedRuntimeScaleCommandDTO> last_runtime_scale_command;
   std::optional<GripperCommandRequestDTO> last_command;
+  [[nodiscard]] std::optional<ResolvedParticipantStopStageDTO> LastStopStageSnapshot() const {
+    std::lock_guard lock(last_stop_mutex_);
+    return last_stop_stage;
+  }
+  [[nodiscard]] std::optional<RemainingStopBudgetDTO> LastStopBudgetSnapshot() const {
+    std::lock_guard lock(last_stop_mutex_);
+    return last_stop_budget;
+  }
+  mutable std::mutex last_stop_mutex_;
   std::optional<ResolvedParticipantStopStageDTO> last_stop_stage;
   std::optional<RemainingStopBudgetDTO> last_stop_budget;
   std::optional<KernelRecoveryActionRequestDTO> last_recovery_request;
@@ -2083,7 +2115,18 @@ class FakeOperationJournal final : public IOperationJournal {
     return Result<std::uint64_t>::Ok(next_sequence++);
   }
 
+  void SetConcurrentRecordHook(std::function<void(std::string_view)> hook) {
+    std::lock_guard lock(mutex);
+    concurrent_record_hook = std::move(hook);
+  }
+
   Result<std::uint64_t> Record(std::string kind, const OperationStateDTO& state) {
+    std::function<void(std::string_view)> concurrent_hook;
+    {
+      std::lock_guard lock(mutex);
+      concurrent_hook = concurrent_record_hook;
+    }
+    if (concurrent_hook) concurrent_hook(kind);
     if (record_hook) {
       record_hook(kind);
     }
@@ -2138,6 +2181,9 @@ class FakeOperationJournal final : public IOperationJournal {
   std::function<void()> cell_admission_acquire_hook;
   std::function<void()> cell_admission_generation_hook;
   std::function<void(std::string_view)> record_hook;
+  // Copy under mutex and invoke outside: a blocked callback must not block
+  // unrelated journal projection.
+  std::function<void(std::string_view)> concurrent_record_hook;
   std::function<void(const IoGlobalRuleRecoveryRecordDTO&)> global_rule_recovery_hook;
   std::vector<std::pair<IoGlobalRuleRecoveryRecordDTO, std::uint64_t>> global_rule_recoveries;
   std::size_t global_rule_recovery_calls{};
@@ -4951,14 +4997,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   a_engine.translate_stop_stage_hook = [&, hold = a_nominal.Blocker(),
                                         calls = std::make_shared<std::atomic<unsigned>>(0)] {
     if (calls->fetch_add(1U) == 0U) {
-      a_controlled_budget = a_engine.last_stop_budget;
+      a_controlled_budget = a_engine.LastStopBudgetSnapshot();
       hold();  // the controlled stage never confirms
     }
   };
   b_engine.translate_stop_stage_hook = [&, hold = b_nominal.Blocker(),
                                         calls = std::make_shared<std::atomic<unsigned>>(0)] {
     if (calls->fetch_add(1U) == 0U) {
-      b_controlled_budget = b_engine.last_stop_budget;
+      b_controlled_budget = b_engine.LastStopBudgetSnapshot();
       hold();
     }
   };
@@ -14501,10 +14547,30 @@ TEST(ResourceAddressedExecutionKernelTest, EnginePrecommitCancellationRetiresLoc
     }
     forwarder.observation_unavailable = false;
     forwarder.observation_foreign_identity = false;
-    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    // A reconciliation pass can skip a participant already claimed by a
+    // concurrent pass. Wait for the actual operation projection as well as
+    // the independent Stop certificate before retiring the reservation.
+    std::optional<ErrorDTO> wait_error;
     ASSERT_TRUE(wait_until([&] {
-      return kernel.get_stop_status(held.value().fresh_containment->stop_id).value().stop_certificate.has_value();
+      const auto reconciled = kernel.reconcile_subordinate_state();
+      if (!reconciled.ok()) {
+        wait_error = reconciled.error();
+        return true;
+      }
+      const auto projection = kernel.get_operation_projection(accepted.value().operation_id);
+      if (!projection.ok()) {
+        wait_error = projection.error();
+        return true;
+      }
+      const auto stop = kernel.get_stop_status(held.value().fresh_containment->stop_id);
+      if (!stop.ok()) {
+        wait_error = stop.error();
+        return true;
+      }
+      return stop.value().stop_certificate.has_value() &&
+          projection.value().operation.state == OperationStateKind::kCancelledPreDispatch;
     }));
+    ASSERT_FALSE(wait_error) << (wait_error ? wait_error->message : "");
     const auto cancelled = kernel.get_operation_projection(accepted.value().operation_id);
     ASSERT_TRUE(cancelled.ok());
     ASSERT_TRUE(cancelled.value().resident);
@@ -15672,6 +15738,50 @@ TEST(ResourceAddressedExecutionKernelTest, CapabilityCommandPreviewRejectsBusyTa
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
 }
 
+TEST(ResourceAddressedExecutionKernelTest, CapabilityPreviewUsesResolvedGripperTransportSemantics) {
+  struct Case {
+    GripperActuationKind actuation;
+    GripperOutputMode output;
+    const char* completion;
+    const char* grasp_confirmation;
+  };
+  const std::array cases{
+      Case{GripperActuationKind::kPneumatic, GripperOutputMode::kCommanded,
+           "output_delivery", "not_required"},
+      Case{GripperActuationKind::kPneumatic, GripperOutputMode::kNone,
+           "no_output", "not_required"},
+      Case{GripperActuationKind::kPositionCommanded, GripperOutputMode::kCommanded,
+           "goal_fenced_target_reached", "binding_feedback_required"},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.completion);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    engine.configured_gripper_actuation = test_case.actuation;
+    engine.configured_gripper_output = test_case.output;
+    engine.gripper_status.state = GripperCommandState::kIdle;
+    const ProgramCommandSchemaRefDTO schema{
+        CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+        CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+    FakeOperationJournal journal;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                   CoordinateKind::kLinear, schema), engine)},
+        clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+    const auto preview = kernel.preview_capability_command(command_operation());
+    ASSERT_TRUE(preview.ok()) << preview.error().message;
+    EXPECT_EQ(preview.value().command_request.completion_policy, test_case.completion);
+    EXPECT_EQ(preview.value().command_request.grasp_confirmation_policy, test_case.grasp_confirmation);
+    EXPECT_EQ(engine.validate_command_calls, 1);
+    EXPECT_EQ(engine.command_calls, 0);
+    EXPECT_EQ(engine.execute_calls, 0);
+    EXPECT_EQ(journal.calls, (std::vector<std::string>{"begin"}));
+    EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kFree);
+  }
+}
+
 TEST(ResourceAddressedExecutionKernelTest, CapabilityPreviewAllowsIndependentActiveArm) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -15886,14 +15996,15 @@ TEST(ResourceAddressedExecutionKernelTest,
         const std::string failure_kind = initial_reset
                                              ? "state:operation_reset_failed"
                                              : "state:operation_acknowledge_completed_failed";
-        std::atomic_int failure_records{};
-        journal.record_hook = [&](std::string_view kind) {
+        auto failure_records = std::make_shared<std::atomic_int>();
+        journal.SetConcurrentRecordHook([failure_kind, persistence, failure_records](std::string_view kind) {
           if (kind != failure_kind) return;
-          ++failure_records;
+          ++*failure_records;
           if (std::string_view(persistence) == "threw")
             throw std::runtime_error("journal unavailable");
-        };
+        });
         if (std::string_view(persistence) == "rejected") {
+          std::lock_guard lock(journal.mutex);
           journal.fail_next_kind = failure_kind;
         }
         const auto before = kernel.get_operation_projection(executed.value().operation_id);
@@ -15907,7 +16018,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           const auto state = kernel.get_operation_projection(executed.value().operation_id);
           if (!state.ok() ||
               state.value().operation.state != OperationStateKind::kInterventionRequired ||
-              failure_records.load() != 1)
+              failure_records->load() != 1)
             return false;
           const auto& failure = state.value().operation.participants.front().terminal_error;
           return failure.has_value() && (std::string_view(persistence) == "recorded" ||
@@ -15924,7 +16035,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           EXPECT_EQ(details.at("settlement_fault_persistence"), "failed");
           EXPECT_FALSE(details.at("persistence_error_code").empty());
         }
-        EXPECT_EQ(failure_records.load(), 1);
+        EXPECT_EQ(failure_records->load(), 1);
         const auto terminal_records = journal.stop_terminal_calls.load();
         const auto stopped =
             kernel.full_stop(FullStopIntentDTO{{RequestId("request.failed-settlement.full-stop"),
@@ -15963,7 +16074,7 @@ TEST(ResourceAddressedExecutionKernelTest,
         }
         EXPECT_EQ(engine.acknowledge_calls.load(), initial_reset ? 0 : 1);
         EXPECT_EQ(engine.certified_reset_calls.load(), initial_reset ? 1 : 0);
-        EXPECT_EQ(failure_records.load(), 1);
+        EXPECT_EQ(failure_records->load(), 1);
         {
           std::lock_guard lock(journal.mutex);
           EXPECT_EQ(journal.calls.size(), journal_size);
@@ -16031,9 +16142,11 @@ TEST(ResourceAddressedExecutionKernelTest,
         first_engine.next_acknowledge_result = {
             false, ErrorDTO{"settlement_rejected", "settlement rejected", {}}};
       }
-      if (fault_write_fails)
+      if (fault_write_fails) {
+        std::lock_guard lock(journal.mutex);
         journal.fail_next_kind = initial_reset ? "state:operation_reset_failed"
                                                : "state:operation_acknowledge_completed_failed";
+      }
       const auto before = kernel.get_operation_state(executed.value().operation_id);
       ASSERT_TRUE(before.ok());
       const auto request = control_request("request.scoped-fault.cleanup", executed.value(),
@@ -16069,7 +16182,10 @@ TEST(ResourceAddressedExecutionKernelTest,
       // Even after a failed fault write, recovery must first persist the exact
       // fault-bearing state. A failed acceptance cannot issue cleanup effects.
       if (fault_write_fails) {
-        journal.fail_next_kind = "control_accepted";
+        {
+          std::lock_guard lock(journal.mutex);
+          journal.fail_next_kind = "control_accepted";
+        }
         const auto reset_request =
             control_request("request.scoped-fault.reset-rejected", executed.value(),
                             failed.value().operation_revision.value());
@@ -22066,14 +22182,22 @@ TEST(ResourceAddressedExecutionKernelTest,
   CCLCLifecycleTargetRetirementResultDTO accepted{
       RequestReplayStatusDTO::kAcceptedNew, intent.scope,
       intent.expected_targets, intent.request_context};
+  auto foreign = accepted;
+  foreign.request_context.request_id = RequestId("close.foreign");
   {
     auto acquired = kernel.AcquireCellCloseAdmissionLease();
     ASSERT_TRUE(acquired.ok());
     ASSERT_TRUE(acquired.value()->PrepareCommandEligibilityClosure(intent).ok());
-    auto foreign = accepted;
-    foreign.request_context.request_id = RequestId("close.foreign");
     EXPECT_FALSE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, foreign));
-    EXPECT_TRUE(kernel.component_command_readiness(binding.value().controllable_component_id).value().command_eligible);
+  }
+  EXPECT_TRUE(kernel.component_command_readiness(binding.value().controllable_component_id).value().command_eligible);
+  {
+    auto acquired = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(acquired.ok());
+    ASSERT_TRUE(acquired.value()->PrepareCommandEligibilityClosure(intent).ok());
+    // Also prove that refusing a foreign result does not consume this exact
+    // prepared lease before the valid result arrives.
+    EXPECT_FALSE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, foreign));
     EXPECT_TRUE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
     EXPECT_FALSE(acquired.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
   }
@@ -22081,10 +22205,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   // result must remain passive rather than silently closing this publication.
   enable_component_commands(kernel, registered);
   accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
-  auto replay = kernel.AcquireCellCloseAdmissionLease();
-  ASSERT_TRUE(replay.ok());
-  ASSERT_TRUE(replay.value()->PrepareCommandEligibilityClosure(intent).ok());
-  EXPECT_FALSE(replay.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+  {
+    auto replay = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(replay.ok());
+    ASSERT_TRUE(replay.value()->PrepareCommandEligibilityClosure(intent).ok());
+    EXPECT_FALSE(replay.value()->CloseCommandEligibilityAfterRetirement(intent, accepted));
+  }
   EXPECT_TRUE(kernel.component_command_readiness(binding.value().controllable_component_id).value().command_eligible);
   EXPECT_EQ(engine.execute_calls, 0);
 }
@@ -22130,15 +22256,23 @@ TEST(ResourceAddressedExecutionKernelTest, UnknownCloseConsumesOnlyItsExactPrepa
   enable_component_commands(kernel, registered);
   const auto original = kernel.component_command_readiness(binding.value().controllable_component_id).value();
   const auto intent = KernelCloseIntent(binding.value().controllable_component_id);
-  auto lease = kernel.AcquireCellCloseAdmissionLease();
-  ASSERT_TRUE(lease.ok());
-  ASSERT_TRUE(lease.value()->PrepareCommandEligibilityClosure(intent).ok());
   auto foreign = intent;
   foreign.request_context.request_id = RequestId("foreign.uncertain.close");
-  EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(foreign));
+  {
+    auto lease = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(lease.ok());
+    ASSERT_TRUE(lease.value()->PrepareCommandEligibilityClosure(intent).ok());
+    EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(foreign));
+  }
   EXPECT_EQ(kernel.component_command_readiness(binding.value().controllable_component_id).value(), original);
-  EXPECT_TRUE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
-  EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
+  {
+    auto lease = kernel.AcquireCellCloseAdmissionLease();
+    ASSERT_TRUE(lease.ok());
+    ASSERT_TRUE(lease.value()->PrepareCommandEligibilityClosure(intent).ok());
+    EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(foreign));
+    EXPECT_TRUE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
+    EXPECT_FALSE(lease.value()->CloseCommandEligibilityForUnknownRetirement(intent));
+  }
   const auto closed = kernel.component_command_readiness(binding.value().controllable_component_id).value();
   EXPECT_FALSE(closed.command_eligible);
   EXPECT_EQ(closed.component_lifecycle_generation, original.component_lifecycle_generation);
@@ -29188,23 +29322,27 @@ TEST(ResourceAddressedExecutionKernelTest,
   returning.Release();
   ASSERT_TRUE(wait_until([&] {
     static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto dispatched = engine.LastExecuteSnapshot();
     return engine.dispatch_prepared_motion_calls.load() == 3 &&
-           engine.get_status().execution_id == cold_id;
+           engine.get_status().execution_id == cold_id && dispatched &&
+           dispatched->binding.operation_id == candidate.value().operation_id &&
+           dispatched->binding.controller_goal_generation == ControllerGoalGeneration(2U);
   }));
   const auto adopted = kernel.get_operation_state(candidate.value().operation_id);
   ASSERT_TRUE(adopted.ok());
   EXPECT_EQ(adopted.value().participants.front().command_id, old_key);
   EXPECT_EQ(adopted.value().participants.front().command_generation,
             ControllerGoalGeneration(2U));
-  ASSERT_TRUE(engine.last_execute);
-  EXPECT_EQ(engine.last_execute->binding.operation_id, candidate.value().operation_id);
-  EXPECT_EQ(engine.last_execute->binding.controller_goal_id, old_key);
-  EXPECT_EQ(engine.last_execute->binding.controller_goal_generation, ControllerGoalGeneration(2U));
-  ASSERT_TRUE(engine.last_execute->initial_runtime_scale.has_value());
-  EXPECT_EQ(engine.last_execute->initial_runtime_scale->controller_goal_id,
-            engine.last_execute->binding.controller_goal_id);
-  EXPECT_EQ(engine.last_execute->initial_runtime_scale->controller_goal_generation,
-            engine.last_execute->binding.controller_goal_generation);
+  const auto dispatched = engine.LastExecuteSnapshot();
+  ASSERT_TRUE(dispatched);
+  EXPECT_EQ(dispatched->binding.operation_id, candidate.value().operation_id);
+  EXPECT_EQ(dispatched->binding.controller_goal_id, old_key);
+  EXPECT_EQ(dispatched->binding.controller_goal_generation, ControllerGoalGeneration(2U));
+  ASSERT_TRUE(dispatched->initial_runtime_scale.has_value());
+  EXPECT_EQ(dispatched->initial_runtime_scale->controller_goal_id,
+            dispatched->binding.controller_goal_id);
+  EXPECT_EQ(dispatched->initial_runtime_scale->controller_goal_generation,
+            dispatched->binding.controller_goal_generation);
   {
     std::lock_guard lock(journal.mutex);
     EXPECT_TRUE(std::any_of(journal.states.begin(), journal.states.end(), [&](const auto& state) {
@@ -29213,7 +29351,6 @@ TEST(ResourceAddressedExecutionKernelTest,
              state.participants.front().command_generation == ControllerGoalGeneration(2U);
     }));
   }
-  engine.translate_stop_stage_hook = {};
 }
 }  // namespace
 
@@ -30890,20 +31027,11 @@ TEST(ResourceAddressedExecutionKernelTest, ScopedStopCoalescedToFullRefusesOwner
   const auto third = kernel.execute(third_intent);
   ASSERT_TRUE(third.ok()) << third.error().message;
 
-  std::promise<void> first_stage_entered_promise;
-  auto first_stage_entered = first_stage_entered_promise.get_future();
-  std::promise<void> release_first_stage_promise;
-  const auto release_first_stage = release_first_stage_promise.get_future().share();
-  first_engine.translate_stop_stage_hook = [&] {
-    first_stage_entered_promise.set_value();
-    release_first_stage.wait();
-  };
+  HeldSettlementCall first_stage;
+  first_engine.translate_stop_stage_hook = first_stage.Blocker();
   const auto predecessor = kernel.stop(stop_request("coalesce-drift.first.stop", first.value(), 1U));
   ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
-  if (first_stage_entered.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-    release_first_stage_promise.set_value();
-    FAIL() << "predecessor did not reach its blocking stage";
-  }
+  ASSERT_TRUE(first_stage.Entered()) << "predecessor did not reach its blocking stage";
   const auto open_probe = kernel.execute(admission_probe("coalesce-drift.probe.before"));
   drift_operation_owner(kernel, third.value().operation_id);
   auto slots = kernel.resource_admission_table();
@@ -30914,7 +31042,7 @@ TEST(ResourceAddressedExecutionKernelTest, ScopedStopCoalescedToFullRefusesOwner
   const auto refused = kernel.stop(stop_request("coalesce-drift.second.stop", second.value(), 1U));
   const auto closed_probe = kernel.execute(admission_probe("coalesce-drift.probe.after"));
   const auto generation_after = slots->coherent_snapshot().operation_resource_generation;
-  release_first_stage_promise.set_value();
+  first_stage.Release();
   ASSERT_FALSE(open_probe.ok());
   EXPECT_NE(open_probe.error().details.at("reason"), "motion_admission_closed");
   ASSERT_FALSE(refused.ok());
@@ -31172,11 +31300,9 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
     if (escalated) {
-      fixture.engine.next_stop_result = {false,
-                                         ErrorDTO{"nominal_rejected", "nominal refused", {}}};
-      fixture.engine.translate_stop_stage_hook = [&] {
-        if (fixture.engine.translate_stop_stage_calls >= 2)
-          fixture.engine.next_stop_result = {true, std::nullopt};
+      fixture.engine.stop_result_for_call = [](int call) {
+        return call < 2 ? StopResultDTO{false, ErrorDTO{"nominal_rejected", "nominal refused", {}}}
+                        : StopResultDTO{true, std::nullopt};
       };
     }
     ASSERT_TRUE(fixture.PublishOther(2, true).ok());
@@ -31208,7 +31334,6 @@ TEST(ResourceAddressedExecutionKernelTest,
     if (escalated) {
       EXPECT_GE(calls_before_containment, 2);
     }
-    fixture.engine.translate_stop_stage_hook = {};
   }
 }
 
@@ -31231,11 +31356,9 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
     if (escalated) {
-      fixture.engine.next_stop_result = {false,
-                                         ErrorDTO{"nominal_rejected", "nominal refused", {}}};
-      fixture.engine.translate_stop_stage_hook = [&] {
-        if (fixture.engine.translate_stop_stage_calls >= 2)
-          fixture.engine.next_stop_result = {true, std::nullopt};
+      fixture.engine.stop_result_for_call = [](int call) {
+        return call < 2 ? StopResultDTO{false, ErrorDTO{"nominal_rejected", "nominal refused", {}}}
+                        : StopResultDTO{true, std::nullopt};
       };
     }
     ASSERT_TRUE(fixture.service
@@ -31270,7 +31393,6 @@ TEST(ResourceAddressedExecutionKernelTest,
     ASSERT_TRUE(wait_until([&] {
       return fixture.engine.translate_stop_stage_calls.load() > calls_before_containment;
     }));
-    fixture.engine.translate_stop_stage_hook = {};
   }
 }
 
@@ -33082,18 +33204,52 @@ TEST(ResourceAddressedExecutionKernelTest,
 // S1: Reset resolves an old expected revision, but the unknown-output
 // acknowledgement must still name the operation's current revision.
 TEST(ResourceAddressedExecutionKernelTest, IoOutputUnknownResetRefusesAcknowledgementOfAnOldRevision) {
-  IoOutputKernelIntegrationFixture fixture;
+  IoOutputKernelIntegrationFixture fixture(false, {}, false, true);
   fixture.provider.next = IoOutputEvidence::kSubmitted;
   fixture.Enable();
-  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  const auto arm = registration(fixture.MixedArmBinding(), fixture.arm_engine);
+  const RuntimeParticipantExecutionRegistration output_registration{
+      fixture.binding, std::nullopt, {}, MotionInterruptNodeCategory::kGeneric,
+      &fixture.engine, nullptr, {}, &fixture.engine,
+      std::nullopt, std::nullopt, std::nullopt};
+  ASSERT_TRUE(fixture.kernel->publish_runtime_route_configuration(
+      route_configuration_for(arm), {output_registration, arm}).ok());
+  enable_component_commands(*fixture.kernel, arm);
+  auto intent = fixture.Intent();
+  intent.coordination_policy = OperationCoordinationPolicy::kCoordinatedAll;
+  auto motion_participant = motion_operation("request.output.unknown.motion").participants.front();
+  motion_participant.target_role_id = TargetRoleId("arm");
+  intent.participants.push_back(std::move(motion_participant));
+  const auto accepted = fixture.kernel->execute(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   fixture.clock.advance(2'000'000'000LL);
   ASSERT_TRUE(fixture.kernel->reconcile_subordinate_state().ok());
+  const auto unknown = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(unknown.state, OperationStateKind::kInterventionRequired);
+  ASSERT_GT(unknown.operation_revision.value(), 0U);
+  ASSERT_TRUE(unknown.participants.front().terminal_fact);
+  ASSERT_EQ(unknown.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  // A Full Stop advances the resident operation revision without undoing the
+  // already submitted non-motion transaction.
+  const auto stopped = fixture.kernel->full_stop(
+      {{RequestId("stop.output.unknown"), RequestOwnerEpoch("kernel.epoch.1"), "operator", {}},
+       StopGeneration(0U), {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(stopped.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  EXPECT_GT(fixture.arm_engine.translate_stop_stage_calls.load(), 0);
   const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
   ASSERT_EQ(state.state, OperationStateKind::kInterventionRequired);
-  // Reaching the unknown outcome moved the revision past the accepted one.
-  ASSERT_GT(state.operation_revision.value(), 1U);
-  const auto old_revision = state.operation_revision.value() - 1U;
+  ASSERT_TRUE(state.participants.front().terminal_fact);
+  ASSERT_EQ(state.participants.front().terminal_fact->effect,
+            ParticipantEffectKnowledge::kEffectUncertain);
+  ASSERT_EQ(state.participants.front().output_evidence, IoOutputEvidence::kAcceptanceUnknown);
+  ASSERT_EQ(fixture.provider.submissions, 1U);
+  ASSERT_GT(state.operation_revision.value(), unknown.operation_revision.value());
+  const auto old_revision = unknown.operation_revision.value();
   auto request = control_request("operator.reset.unknown.old", accepted.value(), old_revision);
   request.acknowledged_uncertain_outputs = std::vector<UncertainOutputAcknowledgementDTO>{
       {state.operation_id, OperationRevision(old_revision)}};
@@ -36295,8 +36451,10 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifySourceLossGatesStopsA
       "notify.loss.motion.reset", motion.value(), stopped.value().operation_revision.value()));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
   EXPECT_EQ(reset.value().operation_id, motion.value().operation_id);
-  ASSERT_TRUE(wait_until(
-      [&] { return !fixture.kernel->participant_engine_in_use(&fixture.engine); }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = fixture.kernel->get_operation_projection(motion.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
   const auto blocked = fixture.kernel->execute(fixture.Intent(false, "notify.loss.blocked"));
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_gated");
@@ -36369,8 +36527,10 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifyArmFailureGatesAndRec
       "notify.arm.motion.reset", motion.value(), stopped.value().operation_revision.value()));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
   EXPECT_EQ(reset.value().operation_id, motion.value().operation_id);
-  ASSERT_TRUE(wait_until(
-      [&] { return !fixture.kernel->participant_engine_in_use(&fixture.engine); }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = fixture.kernel->get_operation_projection(motion.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
   const auto blocked = fixture.kernel->execute(fixture.Intent(false, "notify.arm.blocked"));
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_gated");
@@ -36398,7 +36558,7 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifyRecoveryWaitsForStopT
   ASSERT_TRUE(held.Entered());
   ASSERT_TRUE(fixture.Publish(true).ok());
   ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
-  EXPECT_FALSE(fixture.kernel->participant_engine_in_use(&fixture.other_engine));
+  EXPECT_EQ(fixture.other_engine.execute_calls, 0);
   const auto blocked = fixture.kernel->execute(fixture.Intent(true, "notify.before.stop.done"));
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_gated");
@@ -36456,8 +36616,10 @@ TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifyLossAtDispatchWithCom
       target_state.value().operation_revision.value()));
   ASSERT_TRUE(reset.ok()) << reset.error().message;
   EXPECT_EQ(reset.value().operation_id, target.value().operation_id);
-  ASSERT_TRUE(wait_until(
-      [&] { return !fixture.kernel->participant_engine_in_use(&fixture.engine); }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto projection = fixture.kernel->get_operation_projection(target.value().operation_id);
+    return projection.ok() && !projection.value().resident;
+  }));
   const auto blocked = fixture.kernel->execute(fixture.Intent(false, "notify.after.competing"));
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_gated");
@@ -39024,6 +39186,80 @@ Result<void> planned_global_source_change(GlobalMotionRuleFixture& fixture,
        {CellAdmissionSettlementKindDTO::kProvenNoEffect, held.intent.request_payload_digest}});
   if (!released.ok()) return Result<void>::Err(released.error());
   return changed;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRulePlannedSourceChangeRequiresHeldLifecycleClaim) {
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease, IoRuleIdleBehaviourDTO::kIgnore,
+      {}, 20, "global.guard", false, false, false, nullptr, false, true, false, true);
+  ASSERT_TRUE(ready_cell_admission(*fixture.kernel).ok());
+  const auto admission = fixture.kernel->GetAuthoringAdmission();
+  ASSERT_TRUE(admission.authoring_allowed);
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kClear));
+  const std::array sources{program_io_descriptor().source_id};
+  const LifecycleTransactionId transaction("planned.claim");
+  const LifecycleTransactionId wrong("planned.wrong");
+  const auto initial = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(initial && initial->baseline);
+  ASSERT_EQ(initial->baseline->states.size(), 1U);
+  const auto initial_state = initial->baseline->states.front().state;
+
+  const auto identity = fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      {}, sources, wrong, true);
+  ASSERT_FALSE(identity.ok());
+  EXPECT_EQ(identity.error().details.at("reason"), "io_global_rule_service_identity_mismatch");
+  const auto missing = fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, transaction, true);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().details.at("reason"), "component_readiness_claim_not_held");
+  auto baseline = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(baseline && baseline->baseline);
+  ASSERT_EQ(baseline->baseline->states.size(), 1U);
+  EXPECT_EQ(baseline->baseline->states.front().state, initial_state);
+
+  const CellAdmissionClaimIntentDTO intent{
+      CellAdmissionClaimKindDTO::kComponentLifecycle,
+      CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
+      RequestOwnerEpoch("planned.source.owner"), transaction.value(),
+      RequestId("planned.claim"), ContentDigest(test_digest('e')),
+      admission.admission_generation, {}, {}, {}, {}};
+  const auto claim = fixture.kernel->AcquireCellAdmissionClaim(intent);
+  ASSERT_TRUE(claim.ok());
+  const auto mismatched = fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, wrong, true);
+  ASSERT_FALSE(mismatched.ok());
+  EXPECT_EQ(mismatched.error().details.at("reason"), "component_readiness_claim_not_held");
+  baseline = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(baseline && baseline->baseline);
+  EXPECT_EQ(baseline->baseline->states.front().state, initial_state);
+
+  ASSERT_TRUE(fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, transaction, true).ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kUnknown));
+  baseline = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(baseline && baseline->baseline);
+  EXPECT_EQ(baseline->baseline->states.front().state, IoGlobalRuleState::kUnknown);
+  ASSERT_TRUE(fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, transaction, false).ok());
+  ASSERT_TRUE(fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, transaction, true).ok());
+  const auto& held = claim.value();
+  ASSERT_TRUE(fixture.kernel->ReleaseCellAdmissionClaim(
+      {held.intent.owner_role, held.intent.owner_epoch, held.intent.owner_transaction_id,
+       held.intent.request_id, held.intent.request_payload_digest, held.acquired_admission_generation,
+       held.claim_generation,
+       {CellAdmissionSettlementKindDTO::kProvenNoEffect, held.intent.request_payload_digest}}).ok());
+  const auto released = fixture.kernel->SetGlobalIoSourcesPlannedDisabled(
+      fixture.service, sources, transaction, false);
+  ASSERT_FALSE(released.ok());
+  EXPECT_EQ(released.error().details.at("reason"), "component_readiness_claim_not_held");
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_global_rule_state(fixture, IoGlobalRuleState::kUnknown));
+  baseline = fixture.kernel->ReadInterruptRuleStateBaseline();
+  ASSERT_TRUE(baseline && baseline->baseline);
+  EXPECT_EQ(baseline->baseline->states.front().state, IoGlobalRuleState::kUnknown);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, GlobalRuleNotifyPlannedDisableAndFreshReenable) {

@@ -507,10 +507,13 @@ class ExecutionObservationSession(
     def __enter__(self) -> "ExecutionObservationSession":
         if self._socket is not None:
             raise RuntimeError("execution observation session is already open")
+        operation = "resolve_socket"
         try:
             context = self._run_root.socket_address(self._socket_path.name)
             socket_address = context.__enter__()
+            operation = "socket"
             client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            operation = "setsockopt"
             client.setsockopt(
                 socket.SOL_SOCKET,
                 socket.SO_RCVBUF,
@@ -518,9 +521,15 @@ class ExecutionObservationSession(
             )
             # A short receive timeout only makes cancellation observable. It
             # never causes another request or owner read.
+            operation = "settimeout"
             client.settimeout(0.25)
+            operation = "connect"
             client.connect(socket_address)
-        except Exception:
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Native observation transport failed: syscall=%s errno=%s peer_socket=%s exception_type=%s",
+                operation, getattr(exc, "errno", None), self._socket_path.name, type(exc).__name__,
+            )
             if "client" in locals():
                 client.close()
             if "context" in locals():
@@ -578,6 +587,7 @@ class ExecutionObservationSession(
                 "execution_owner_unavailable",
                 "native execution observation session is closed",
             )
+        operation = "send"
         try:
             sent = client.send(encoded)
             if sent != len(encoded):
@@ -587,6 +597,7 @@ class ExecutionObservationSession(
                 )
             while not cancelled.is_set():
                 try:
+                    operation = "recvmsg"
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAX_EXECUTION_RESPONSE_BYTES
                     )
@@ -610,6 +621,10 @@ class ExecutionObservationSession(
                     "execution_observation_cancelled",
                     "execution observation demand ended",
                 ) from exc
+            logging.getLogger(__name__).warning(
+                "Native observation transport failed: syscall=%s errno=%s peer_socket=%s exception_type=%s",
+                operation, getattr(exc, "errno", None), self._socket_path.name, type(exc).__name__,
+            )
             raise HeadlessApiError(
                 "execution_owner_unavailable",
                 f"native execution observation transport failed: {exc}",
@@ -680,33 +695,49 @@ class ExecutionCommandClient:
                 "execution_command_oversized",
                 "execution command exceeds its byte bound",
             )
+        operation = "resolve_socket"
         try:
             with self._run_root.socket_address(socket_path.name) as socket_address:
+                operation = "socket"
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    operation = "setsockopt"
                     client.setsockopt(
                         socket.SOL_SOCKET,
                         socket.SO_RCVBUF,
                         MAX_EXECUTION_RESPONSE_BYTES,
                     )
+                    operation = "settimeout"
                     client.settimeout(self._timeout_seconds)
+                    operation = "connect"
                     client.connect(socket_address)
+                    operation = "send"
                     sent = client.send(encoded)
                     if sent != len(encoded):
                         raise HeadlessApiError(
                             "execution_command_transport_failure",
                             "execution command packet was truncated",
                         )
+                    operation = "recvmsg"
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAX_EXECUTION_RESPONSE_BYTES
                     )
+                    operation = "validate_socket"
         except HeadlessApiError:
             raise
         except PrivateTransportCapabilityError as exc:
+            logging.getLogger(__name__).warning(
+                "Native execution transport failed: syscall=%s errno=%s peer_socket=%s exception_type=%s",
+                operation, getattr(exc, "errno", None), socket_path.name, type(exc).__name__,
+            )
             raise HeadlessApiError(
                 "execution_owner_unavailable",
                 f"native execution command socket is unavailable: {exc}",
             ) from exc
         except (OSError, TimeoutError) as exc:
+            logging.getLogger(__name__).warning(
+                "Native execution transport failed: syscall=%s errno=%s peer_socket=%s exception_type=%s",
+                operation, getattr(exc, "errno", None), socket_path.name, type(exc).__name__,
+            )
             raise HeadlessApiError(
                 "execution_owner_unavailable",
                 f"native execution transport failed: {exc}",

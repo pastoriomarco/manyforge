@@ -421,9 +421,11 @@ export function CCLCPanelView({
         <div className="dialog-copy compact-confirmation">
           <p>{confirmation?.detail}</p>
           <p>This uses a fresh owner snapshot immediately before submission.</p>
-          <button type="button" className="primary-action" onClick={() => void confirm()}>
-            Confirm
-          </button>
+          <div className="dialog-actions">
+            <button type="button" className="primary-action" onClick={() => void confirm()}>
+              Confirm
+            </button>
+          </div>
         </div>
       </OverlayPanel>
     </section>

@@ -2774,6 +2774,71 @@ class ProgramRuntime:
                     }
                 )[7:39]
             )
+            if request.clear_empty_scene:
+                if request.expected_applied_record_digest is None:
+                    def current_empty() -> Mapping[str, Any] | None:
+                        manager = self._headless.manager_status()
+                        source, status = manager.get("source"), manager.get("status")
+                        if (not isinstance(source, Mapping) or source.get("available") is not True
+                            or source.get("freshness") != "fresh" or not isinstance(status, Mapping)
+                            or status.get("manager_ready") is not True
+                            or not isinstance(status.get("runtime"), Mapping)
+                            or status["runtime"].get("converged") is not True):
+                            raise ProgramRunnerError("manager_unavailable", "Manager status is unavailable")
+                        active = status.get("active")
+                        if (not isinstance(active, Mapping) or active.get("canonical_empty") is not True
+                            or not isinstance(active.get("publication"), Mapping)
+                            or active["publication"].get("publication_generation") != request.expected_publication_generation):
+                            return None
+                        return active
+
+                    try:
+                        active = current_empty()
+                    except Exception as error:
+                        raise ProgramRunnerError("authoring_not_ready",
+                                                 "Canonical empty Scene status is unavailable") from error
+                    if active is None:
+                        raise ProgramRunnerError("program_run_applied_selection_stale", "Applied Scene changed before clearing")
+                    applied_status = active
+
+                    def is_current() -> bool:
+                        return current_empty() is not None
+                else:
+                    applied_status = self._headless.program_applied_status()
+                    committed = self._headless.committed_scenario_activation()
+                    if (
+                        committed.get("scene_initialization") != "initialize"
+                        or applied_status.get("program_id") is not None
+                        or committed.get("origin", {}).get("kind") not in {"scenario", "sealed_canonical_empty"}
+                        or committed.get("record_digest") != request.expected_applied_record_digest
+                        or applied_status.get("record_digest") != request.expected_applied_record_digest
+                    ):
+                        raise ProgramRunnerError("program_run_applied_selection_stale",
+                                                 "Applied Scene changed before clearing")
+
+                    def is_current() -> bool:
+                        current = self._headless.committed_scenario_activation()
+                        return (current.get("apply_id") == committed["apply_id"]
+                                and current.get("apply_generation") == committed["apply_generation"]
+                                and current.get("record_digest") == committed["record_digest"])
+
+                try:
+                    clear = self._scene.clear_applied_scene(
+                        retained_bundle_id=applied_status["retained_bundle_id"],
+                        graph_revision=applied_status["graph_revision"],
+                        request_id=request.request_id, is_current=is_current,
+                    )
+                except Exception as error:
+                    clear = {"state": "failed", "reason": "scene_owner_unavailable",
+                             "message": str(error) or type(error).__name__,
+                             "last_observed_remaining": None}
+                return {
+                    "schema_version": "manyforge.program_scene_preparation.v1",
+                    "status": "prepared", "applied_record_digest": request.expected_applied_record_digest,
+                    "program_revision": None,
+                    "admission_generation": self._admission_generation(admission_client.get()),
+                    "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1", **clear},
+                }
             try:
                 applied, proof = self._prepare_current_applied_scene(
                     expected_record_digest=request.expected_applied_record_digest,

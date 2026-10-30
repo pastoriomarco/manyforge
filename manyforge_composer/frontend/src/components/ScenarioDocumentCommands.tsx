@@ -8,8 +8,10 @@ import {
 } from 'react';
 
 import { api } from '../api/client';
+import { parseLogicalSceneProjection } from '../api/parsers';
 import { sameAuthoringWorkspaceIdentity } from '../hooks/useHeadlessState';
-import { managerPublicationMatches } from '../state/scenarioClose';
+import { closeErrorCode, managerPublicationMatches } from '../state/scenarioClose';
+import { errorCatalogRow } from '../state/commandRefusal';
 import type { ProgramWorkspaceController, ScenarioReplacementIdentity } from '../hooks/useProgramWorkspace';
 import type {
   ScenarioDocumentEntry,
@@ -58,8 +60,33 @@ interface ScenarioDocumentCommandsProps {
   motionActive?: boolean;
 }
 
+function confirmedAttachedParts(identity: ScenarioReplacementIdentity): string[] {
+  const scene = identity.closeScene;
+  if (!scene?.available || scene.freshness !== 'fresh' || scene.knownGaps.length > 0 || scene.payload === null)
+    return [];
+  try {
+    return parseLogicalSceneProjection(scene.payload).snapshot?.carried_object_attachments
+      .map((attachment) => attachment.scene_resource_id) ?? [];
+  } catch {
+    return [];
+  }
+}
+
 function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
   return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
+}
+
+function forceCloseStopRefusalMessage(error: unknown): string | null {
+  if (closeErrorCode(error) !== 'scenario_force_close_stop_unconfirmed') return null;
+  const details = (error as {
+    structuredError?: { details?: Record<string, unknown> | null };
+  } | null)?.structuredError?.details;
+  const catalogCode = details?.reason === 'stop_not_contained'
+    ? 'scenario_force_close_stop_not_contained'
+    : details?.reason === 'stop_pending'
+      ? 'scenario_force_close_stop_pending'
+      : null;
+  return catalogCode === null ? null : errorCatalogRow(catalogCode)?.[0] ?? null;
 }
 
 /** One icon-only header command; the tooltip shows at once on hover/focus. */
@@ -136,7 +163,7 @@ export function ScenarioDocumentCommands({
   const [afterClose, setAfterClose] = useState<AfterCloseReplacement | null>(null);
   // Item 37: the replacement whose Close was refused, and the open confirmation.
   const [forceCloseOffer, setForceCloseOffer] = useState<{ kind: 'new' | 'load'; path: string | null } | null>(null);
-  const [forceConfirmation, setForceConfirmation] = useState(false);
+  const [forceConfirmation, setForceConfirmation] = useState<ReplacementConfirmation | null>(null);
   const replacementMounted = useRef(true);
   const closeCallerAbort = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -300,7 +327,7 @@ export function ScenarioDocumentCommands({
     setAfterClose(null);
     setConfirmation(null);
     setForceCloseOffer(null);
-    setForceConfirmation(false);
+    setForceConfirmation(null);
     setReplacementPending(false);
     setAction(null);
     setConfirmOverwrite(false);
@@ -377,7 +404,7 @@ export function ScenarioDocumentCommands({
       }
     }
     if (kind === 'load' && confirmedPath === null) return;
-    if ((!expected.canonicalEmpty || replaceNeedsConfirmation) && acknowledged === undefined) {
+    if ((!expected.canonicalEmpty || replaceNeedsConfirmation || confirmedAttachedParts(confirmed).length > 0) && acknowledged === undefined) {
       setConfirmation({ kind, path: confirmedPath, confirmDiscard: true,
         predecessor: expected, confirmed });
       return;
@@ -405,7 +432,10 @@ export function ScenarioDocumentCommands({
       setAfterClose({ kind, path: confirmedPath, confirmDiscard: true,
         predecessor: expected, closed: empty, confirmed });
     } catch (error: unknown) {
-      const message = errorMessage(error, 'Scenario replacement is unresolved.');
+      const message = force
+        ? forceCloseStopRefusalMessage(error)
+          ?? errorMessage(error, 'Scenario replacement is unresolved.')
+        : errorMessage(error, 'Scenario replacement is unresolved.');
       if (!replacementMounted.current) latestController.current.reportCloseCancellation(message);
       else {
         setNewError(message);
@@ -443,12 +473,17 @@ export function ScenarioDocumentCommands({
     void (async () => {
       try {
         if (!replacementMounted.current) return;
+        let authoringRefusal: string | null = null;
         const result = afterClose.kind === 'new'
           ? await controller.newScenarioDocument(afterClose.confirmDiscard, afterClose.confirmed.authoring)
           : afterClose.path !== null
-            ? await controller.loadScenarioDocument(afterClose.path, afterClose.confirmDiscard, afterClose.confirmed.authoring) : null;
+            ? await controller.loadScenarioDocument(
+              afterClose.path, afterClose.confirmDiscard, afterClose.confirmed.authoring,
+              (message) => { authoringRefusal = message; },
+            ) : null;
         if (result !== null) setAction(null);
-        else setNewError('Scenario closed, but the replacement was refused or is unresolved. Review the current backend status; nothing was retried.');
+        else setNewError(authoringRefusal
+          ?? 'Scenario closed, but the replacement was refused or is unresolved. Review the current backend status; nothing was retried.');
       } catch (error: unknown) {
         setNewError(errorMessage(error, 'Scenario replacement is unresolved.'));
       } finally {
@@ -458,24 +493,29 @@ export function ScenarioDocumentCommands({
     })();
   }, [afterClose, controller, localInvalidEdit]);
   const confirmForceClose = () => {
-    const offer = forceCloseOffer;
-    const confirmed = latestController.current.scenarioReplacementIdentity;
-    setForceConfirmation(false);
-    if (offer === null || currentApplied === null || confirmed === null) {
-      setNewError('The shared workspace is not current. Force close was not started.');
-      return;
-    }
-    void completeReplacement(offer.kind, { kind: offer.kind, path: offer.path, confirmDiscard: true,
-      predecessor: currentApplied, confirmed }, true);
+    const confirmed = forceConfirmation;
+    setForceConfirmation(null);
+    if (confirmed === null) return;
+    void completeReplacement(confirmed.kind, confirmed, true);
   };
   const forceCloseAction = forceCloseOffer !== null && forceCloseScenario !== undefined && !replacementPending
     ? <div className="dialog-actions">
-      <button type="button" className="danger-button" onClick={() => setForceConfirmation(true)}>Force close…</button>
+      <button type="button" className="danger-button" onClick={() => {
+        const confirmed = latestController.current.scenarioReplacementIdentity;
+        if (confirmed === null || currentApplied === null) {
+          setNewError('The shared workspace is not current. Force close was not started.');
+          return;
+        }
+        setForceConfirmation({ kind: forceCloseOffer.kind, path: forceCloseOffer.path, confirmDiscard: true,
+          predecessor: currentApplied, confirmed });
+      }}>Force close…</button>
     </div>
     : null;
   const afterCloseMessage = afterClose === null ? null
     : controller.scenarioCloseHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed).message;
   const emptyConfirmation = (confirmation?.predecessor ?? currentApplied)?.canonicalEmpty === true;
+  const attachedParts = confirmation === null ? [] : confirmedAttachedParts(confirmation.confirmed);
+  const forceAttachedParts = forceConfirmation === null ? [] : confirmedAttachedParts(forceConfirmation.confirmed);
   // Same look as the Reset/Execute confirmations: a short lead, the consequences
   // as a list, then what stays physically true.
   const closeWarning = emptyConfirmation
@@ -636,7 +676,7 @@ export function ScenarioDocumentCommands({
                     <small className="field-hint">Free text, e.g. a readable title. Robot meshes and other referenced sources stay where they are.</small>
                   </label>
                 </section>
-                <div className="dactions new-scenario-actions">
+                <div className="dialog-actions new-scenario-actions">
                   <button type="button" onClick={closeAction}>Cancel</button>
                   <button
                     type="button"
@@ -691,7 +731,7 @@ export function ScenarioDocumentCommands({
                         : <>Written as <code>{exportPath}</code></>}
                   </small>
                 </section>
-                <div className="dactions new-scenario-actions">
+                <div className="dialog-actions new-scenario-actions">
                   <button type="button" onClick={closeAction}>Cancel</button>
                   <button
                     type="button"
@@ -781,7 +821,7 @@ export function ScenarioDocumentCommands({
             {forceCloseAction}
             {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
             {selectedIdentityUnknown && <p role="status">Selected Scenario identity cannot be verified.</p>}
-            <div className="dactions new-scenario-actions">
+            <div className="dialog-actions new-scenario-actions">
               <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
               <button
                 type="button"
@@ -807,6 +847,7 @@ export function ScenarioDocumentCommands({
         onClose={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>
         <div className="dialog-copy transport-confirmation">
           {closeWarning}
+          {attachedParts.length > 0 && <p>Attached parts to detach and remove: {attachedParts.join(', ')}.</p>}
           <div className="dialog-actions">
             <button type="button" onClick={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>Cancel</button>
             <button type="button" className="danger-button" onClick={() => {
@@ -815,10 +856,10 @@ export function ScenarioDocumentCommands({
           </div>
         </div>
       </OverlayPanel>
-      <OverlayPanel open={forceConfirmation}
+      <OverlayPanel open={forceConfirmation !== null}
         title="Force close Scenario?"
         titleId="scenario-force-close-confirmation-title" kind="dialog" compact
-        onClose={() => setForceConfirmation(false)}>
+        onClose={() => setForceConfirmation(null)}>
         <div className="dialog-copy transport-confirmation">
           <p>Close was refused. Force close ends the Scenario anyway, without proving what the stuck operations did:</p>
           <ul>
@@ -828,9 +869,10 @@ export function ScenarioDocumentCommands({
             <li>Force close never commands an output: an output&apos;s physical state may stay unknown, and a write already queued in a remote device may still act;</li>
             <li>an open cell Stop fault is kept: no robot moves in the next Scenario until you load its robots and press Recover cell.</li>
           </ul>
+          {forceAttachedParts.length > 0 && <p>Attached parts: {forceAttachedParts.join(', ')}. A part whose detach is refused stays attached.</p>}
           <p>Check every output, valve and gripper physically before the next Run.</p>
           <div className="dialog-actions">
-            <button type="button" onClick={() => setForceConfirmation(false)}>Cancel</button>
+            <button type="button" onClick={() => setForceConfirmation(null)}>Cancel</button>
             <button type="button" className="danger-button" onClick={confirmForceClose}>Force close and continue</button>
           </div>
         </div>

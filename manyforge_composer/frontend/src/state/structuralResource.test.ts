@@ -30,6 +30,17 @@ describe('structuralResourceReducer', () => {
       status: 'error',
       message: 'Authorization failed.',
     });
+    expect(structuralResourceReducer(loading, {
+      type: 'reject',
+      message: 'Applied selection is not active yet.',
+      retryable: true,
+      requestId: 1,
+    })).toEqual({
+      status: 'error',
+      message: 'Applied selection is not active yet.',
+      retryable: true,
+      requestId: 1,
+    });
   });
 
   it('retains one coherent structural value while its replacement is read', () => {

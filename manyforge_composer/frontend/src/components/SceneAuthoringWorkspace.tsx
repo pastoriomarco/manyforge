@@ -69,6 +69,7 @@ import {
   runtimeScenePresentation,
   candidateObservationEpoch,
   resolvedPreviewRobotPresentation,
+  type AttachedObjectPresentation,
 } from '../state/runtimeScenePresentation';
 import {
   quaternionFromRpyDegrees,
@@ -85,10 +86,11 @@ import {
   viewerPresentationDraftFromProgram,
   viewerPresentationDraftReducer,
 } from '../state/viewerPresentationDraft';
-import { viewerModelPresentation } from '../state/viewerModelReadiness';
+import { verifiedAppliedGraphHasNoModels, viewerModelPresentation } from '../state/viewerModelReadiness';
 import type {
   JsonValue,
   FileBrowserResponse,
+  CarriedObjectAttachment,
   LogicalSceneObject,
   LogicalScenePose,
   NodeEnvironmentResponse,
@@ -142,6 +144,7 @@ interface SceneAuthoringWorkspaceProps {
   /** The advisory failed-node correction preview, shown as its own ghost. */
   correctionGhost?: CorrectionGhost | null;
   runtimeEnabled: boolean;
+  resetReloadRequest?: number;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   viewerActive: boolean;
   viewerInspectorTarget?: HTMLElement | null;
@@ -919,6 +922,11 @@ export function ProgramSceneEditor({
   selectedResourceId,
   onSelectResource,
   deploymentController,
+  runtimeCarriedAttachments,
+  runtimeAttachedObjects,
+  getDetachUnavailableReason,
+  onDetach,
+  showRuntimeDetachAction = false,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
@@ -931,12 +939,51 @@ export function ProgramSceneEditor({
   onSelectResource: (sceneResourceId: string | null) => void;
   /** The Deployment Draft owner for the object's pose-source link; the card is hidden without it. */
   deploymentController?: DeploymentWorkspaceController;
+  /** Current Scene attachment identities; Draft placement alone never enables detach. */
+  runtimeCarriedAttachments?: readonly CarriedObjectAttachment[];
+  /** Current live placement and optional measurement, joined to the runtime attachment. */
+  runtimeAttachedObjects?: readonly AttachedObjectPresentation[];
+  getDetachUnavailableReason?: (attachment: CarriedObjectAttachment) => string | null;
+  onDetach?: (attachment: CarriedObjectAttachment) => Promise<void>;
+  /** The live detach action belongs to the viewer's Program Object inspector. */
+  showRuntimeDetachAction?: boolean;
 }) {
   const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const resources = program.scene ?? EMPTY_PROGRAM_RESOURCES;
   const selected = resources.find(
     (resource) => resource.scene_resource_id === selectedResourceId,
   ) ?? null;
+  const selectedRuntimeObject = selected === null ? null : liveObjects.find(
+    (object) => object.scene_resource_id === selected.scene_resource_id,
+  ) ?? null;
+  const selectedRuntimePlacement = selectedRuntimeObject?.placement.kind === 'carried'
+    ? selectedRuntimeObject.placement
+    : null;
+  const selectedRuntimeAttachment = selected === null || selectedRuntimeObject === null
+    || selectedRuntimePlacement === null
+    ? null
+    : runtimeCarriedAttachments?.find((attachment) => (
+      attachment.scene_resource_id === selected.scene_resource_id
+      && attachment.scene_resource_id === selectedRuntimeObject.scene_resource_id
+      && attachment.carried_object_attachment_id
+        === selectedRuntimePlacement.carried_object_attachment_id
+      && attachment.carried_object_attachment_revision
+        === selectedRuntimePlacement.carried_object_attachment_revision
+    )) ?? null;
+  const selectedRuntimeMeasurement = selectedRuntimeAttachment === null
+    ? null
+    : runtimeAttachedObjects?.find((attached) => (
+      attached.object.scene_resource_id === selectedRuntimeAttachment.scene_resource_id
+      && attached.object.placement.kind === 'carried'
+      && attached.object.placement.carried_object_attachment_id
+        === selectedRuntimeAttachment.carried_object_attachment_id
+      && attached.object.placement.carried_object_attachment_revision
+        === selectedRuntimeAttachment.carried_object_attachment_revision
+      && attached.attachmentId
+        === selectedRuntimeAttachment.carried_object_attachment_id
+      && attached.attachmentRevision
+        === selectedRuntimeAttachment.carried_object_attachment_revision
+    ))?.poseMeasurement ?? null;
   const [staged, setStaged] = useState<ProgramSceneResource | null>(selected);
 
   useEffect(() => {
@@ -1093,6 +1140,15 @@ export function ProgramSceneEditor({
       </select>
       </label>
       </section>
+      {showRuntimeDetachAction && selectedRuntimeAttachment !== null && (
+        <CarriedObjectPoseCard
+          key={selectedRuntimeAttachment.scene_resource_id}
+          measurement={selectedRuntimeMeasurement}
+          attachment={selectedRuntimeAttachment}
+          detachUnavailableReason={getDetachUnavailableReason?.(selectedRuntimeAttachment) ?? null}
+          onDetach={onDetach}
+        />
+      )}
       {staged !== null && (
         <>
           <section className="dcard">
@@ -1589,6 +1645,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorPanelChange,
   onOpenRuntimeHistory,
   runtimeOverlay,
+  resetReloadRequest,
   executionActive,
 }: {
   active: boolean;
@@ -1630,6 +1687,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   robotControl: RobotControlController;
   correctionGhost: CorrectionGhost | null;
   runtimeEnabled: boolean;
+  resetReloadRequest?: number;
   /** The object panel: the Draft editor while objects are editable, else the read-only live view. */
   objectControlSurface: (editable: boolean) => ReactNode;
   inspectorTarget?: HTMLElement | null;
@@ -1643,6 +1701,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const observationTransport = useExecutionObservationTransport(source);
+  const noRobotScenario = verifiedAppliedGraphHasNoModels(
+    headlessState.snapshot,
+    headlessState.transportStatus,
+  );
   const modelPresentation = useMemo(() => viewerModelPresentation(
     headlessState.snapshot,
     headlessState.transportStatus,
@@ -2239,6 +2301,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onViewerPoseRateChange={source.setViewerPoseRateHz}
       manifest={viewerManifest}
       modelPresentation={modelPresentation}
+      noRobotScenario={noRobotScenario}
       onRetry={retryViewerModel}
       sceneObjects={visibleObjects}
       staleScenePreview={!programDraftPreview && presentationFacts !== null && (
@@ -2356,6 +2419,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           onOpenRuntimeHistory={onOpenRuntimeHistory}
           onOpenViewerSettings={viewerSettings.open}
           viewerPreviewActive={viewerSettings.previewLayerActive}
+          resetReloadRequest={resetReloadRequest}
         />
       )}
       controlPanelSettings={<MotionControlSettings groups={draftGroupVisibility} />}
@@ -2399,6 +2463,7 @@ export function SceneAuthoringWorkspace({
   robotControl,
   correctionGhost = null,
   runtimeEnabled,
+  resetReloadRequest,
   sourceModel,
   viewerActive,
   viewerInspectorTarget = null,
@@ -2547,19 +2612,17 @@ export function SceneAuthoringWorkspace({
     semanticStatus: headlessState.semanticStatus,
     transportError: headlessState.transportError,
   }), [headlessState.semanticStatus, headlessState.transportError, headlessState.transportStatus]);
-  const detachUnavailableReason = sceneDetachUnavailableReason(
-    headlessState.snapshot,
-    facts,
-    selectedCarriedAttachment,
-    detachControlFreshness,
-  );
-  const detachCarriedObject = useCallback(async (attachment: NonNullable<typeof selectedCarriedAttachment>) => {
-    const unavailable = sceneDetachUnavailableReason(
+  const detachUnavailableReasonFor = useCallback((attachment: CarriedObjectAttachment | null) => (
+    sceneDetachUnavailableReason(
       headlessState.snapshot,
       facts,
       attachment,
       detachControlFreshness,
-    );
+    )
+  ), [detachControlFreshness, facts, headlessState.snapshot]);
+  const detachUnavailableReason = detachUnavailableReasonFor(selectedCarriedAttachment);
+  const detachCarriedObject = useCallback(async (attachment: NonNullable<typeof selectedCarriedAttachment>) => {
+    const unavailable = detachUnavailableReasonFor(attachment);
     if (unavailable !== null) throw new Error(unavailable);
     if (facts === null) throw new Error('The current logical Scene owner is unavailable.');
     const expectedProjection = facts.logicalScene.access.active_projection;
@@ -2569,7 +2632,7 @@ export function SceneAuthoringWorkspace({
     if (!sceneDetachReceiptAccepted(response, requestId, facts.sourceOwnerEpoch, expectedProjection)) {
       throw new Error('The detach receipt does not confirm a successor Scene revision.');
     }
-  }, [detachControlFreshness, facts, headlessState.snapshot]);
+  }, [detachUnavailableReasonFor, facts]);
   const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
@@ -2731,7 +2794,7 @@ export function SceneAuthoringWorkspace({
 
   // The viewer edits objects only through the Program Draft editor; the live
   // (Applied) Scene is shown read-only.
-  const programSceneEditor = program === null ? null : (
+  const renderProgramSceneEditor = (showRuntimeDetachAction = false) => program === null ? null : (
     <ProgramSceneEditor
       program={program}
       draftRevision={draftRevision}
@@ -2746,6 +2809,11 @@ export function SceneAuthoringWorkspace({
         ? null
         : { kind: 'program_resource', id: identity })}
       deploymentController={deploymentController}
+      runtimeCarriedAttachments={facts?.logicalScene.snapshot?.carried_object_attachments ?? []}
+      runtimeAttachedObjects={runtimePresentation.attachedObjects}
+      getDetachUnavailableReason={detachUnavailableReasonFor}
+      onDetach={detachCarriedObject}
+      showRuntimeDetachAction={showRuntimeDetachAction}
     />
   );
 
@@ -2924,7 +2992,10 @@ export function SceneAuthoringWorkspace({
       robotControl={robotControl}
       correctionGhost={correctionGhost}
       runtimeEnabled={runtimeEnabled}
-      objectControlSurface={(editable) => (editable ? programSceneEditor : liveObjectPanel)}
+      resetReloadRequest={resetReloadRequest}
+      objectControlSurface={(editable) => (
+        editable ? renderProgramSceneEditor(true) : liveObjectPanel
+      )}
       inspectorTarget={viewerInspectorTarget}
       inspectorMinimized={viewerInspectorMinimized}
       onInspectorMinimizedChange={onViewerInspectorMinimizedChange}
@@ -3047,7 +3118,7 @@ export function SceneAuthoringWorkspace({
             <span>Open a Program before authoring its initial scene or viewer metadata.</span>
           </div>
         )}
-        {activeSceneTool === 'program' && programSceneEditor}
+        {activeSceneTool === 'program' && renderProgramSceneEditor()}
         {activeSceneTool === 'contacts' && program !== null && (
           <ProgramContactPolicyEditor
             program={program}

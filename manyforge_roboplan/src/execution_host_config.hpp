@@ -62,6 +62,7 @@ inline constexpr int kReconcilePeriodMilliseconds = 5;
 // existing noncritical lane, independently of browser requests.
 inline constexpr core::Duration kRecoveryObservationPeriodNs = 50'000'000;
 inline constexpr int kClientPacketDeadlineMilliseconds = 100;
+inline constexpr int kOrdinaryFirstPacketDeadlineMilliseconds = 1'000;
 // Requests the ordinary socket handed to one deferred lane and that are not
 // yet answered: the one executing plus those queued behind it. Upstream
 // admits one preview per cell target; this host-side bound keeps a

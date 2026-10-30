@@ -1013,6 +1013,27 @@ def test_component_overview_route_reads_one_fresh_headless_projection() -> None:
         assert client.calls == 1
 
 
+def test_composer_proxies_direct_scene_clear_without_repeating_it():
+    class Client:
+        calls = []
+        def program_scene_prepare(self, body):
+            self.calls.append(body)
+            return {"scene_clear": {"request_id": body["request_id"], "state": "succeeded",
+                                    "remaining": [], "reason": None}}
+
+    client = Client()
+    app = FastAPI()
+    app.include_router(create_headless_router(client, ComposerState()))
+    body = {"request_id": "clear.1", "request_owner_epoch": "runner.1", "source_label": "composer_ui",
+            "expected_applied_record_digest": None, "expected_admission_generation": 1,
+            "clear_empty_scene": True, "expected_publication_generation": 1}
+    with TestClient(app) as composer:
+        response = composer.post("/api/program/scene-preparations", json=body)
+    assert response.status_code == 200
+    assert response.json()["scene_clear"]["request_id"] == "clear.1"
+    assert len(client.calls) == 1 and client.calls[0]["expected_publication_generation"] == 1
+
+
 def test_composer_projects_headless_reads_without_local_runtime_state(
     headless_client,
 ) -> None:

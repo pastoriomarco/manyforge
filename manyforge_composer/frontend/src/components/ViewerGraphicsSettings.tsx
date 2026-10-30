@@ -66,7 +66,7 @@ const ROWS: GraphicsRow[] = [
     field: 'motionSmoothing',
     label: 'Motion smoothing',
     help: 'Interpolates briefly between robot pose updates so live motion looks continuous. Adds frames '
-      + 'between updates. Suggested: on with a GPU, off with software rendering.',
+      + 'between updates. Off by default.',
   },
   {
     field: 'cameraDamping',

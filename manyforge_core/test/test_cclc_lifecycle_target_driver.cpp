@@ -4,6 +4,7 @@
 #include <array>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -15,6 +16,7 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -415,6 +417,13 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
                                                ObservedControllerPlans())
                      .value()) {}
 
+  Result<void> WithPinnedProduct(
+      const std::function<void(ICCLCLifecycleTargetDriverPorts&)>& pass) override {
+    if (on_pinned_pass) on_pinned_pass(pass);
+    else pass(*this);
+    return Result<void>::Ok();
+  }
+
   Result<ComponentLifecycleCurrentSnapshotDTO> ReadCurrentComponent(
       const ControllableComponentId& component) override {
     const ProjectionRevisionDTO projection{RetainedBundleId("bundle.1"), GraphRevision("graph.1"),
@@ -688,6 +697,9 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   bool lose_accepted_reply{};
   std::optional<bool> configured_membership;
   bool throw_membership_read{};
+  // Optional test-only observation of whole driver passes, installed before
+  // the worker starts and kept alive until it joins.
+  std::function<void(const std::function<void(ICCLCLifecycleTargetDriverPorts&)>&)> on_pinned_pass;
   std::function<void()> on_target_submit;
   /// The journal's acceptance commit of a driver request (item 35 stamp).
   std::function<void(const ComponentLifecycleIntentDTO&)> on_target_accepted;
@@ -3391,15 +3403,63 @@ TEST_F(LifecycleTargetDriverTest, SettledCellArmsNoRecheckTimer) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
   ports_.achieved = ComponentLifecycleStateDTO::kActive;
   ports_.BecomeReady();
+  struct PassGate final {
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned passes{};
+    bool first_finished{};
+    bool second_entered{};
+    bool release_second{};
+  };
+  auto gate = std::make_shared<PassGate>();
+  struct ReleaseOnExit final {
+    std::shared_ptr<PassGate> gate;
+    ~ReleaseOnExit() {
+      std::lock_guard lock(gate->mutex);
+      gate->release_second = true;
+      gate->changed.notify_all();
+    }
+  } release_on_exit{gate};
+  ports_.on_pinned_pass = [gate, this](const auto& pass) {
+    unsigned number;
+    {
+      std::unique_lock lock(gate->mutex);
+      number = ++gate->passes;
+      if (number == 2U) {
+        gate->second_entered = true;
+        gate->changed.notify_all();
+        gate->changed.wait(lock, [&] { return gate->release_second; });
+      }
+    }
+    pass(ports_);
+    if (number == 1U) {
+      std::lock_guard lock(gate->mutex);
+      gate->first_finished = true;
+      gate->changed.notify_all();
+    }
+  };
   ASSERT_TRUE(Driver().Start().ok());
-  for (int spin = 0; spin < 2000000 && !store_.targets.at(kComponent).reached; ++spin) {
-    std::this_thread::yield();
+  {
+    std::unique_lock lock(gate->mutex);
+    ASSERT_TRUE(gate->changed.wait_for(lock, std::chrono::seconds(10),
+                                      [&] { return gate->first_finished; }));
+  }
+  // Reaching the next pass proves the first pass's scheduling decision has
+  // completed. Hold the next pass before it can alter that decision.
+  Driver().Wake();
+  {
+    std::unique_lock lock(gate->mutex);
+    ASSERT_TRUE(gate->changed.wait_for(lock, std::chrono::seconds(10),
+                                      [&] { return gate->second_entered; }));
   }
   ASSERT_TRUE(store_.targets.at(kComponent).reached);
-  // Let the worker finish the pass and decide its re-check.
-  for (int spin = 0; spin < 20000; ++spin) std::this_thread::yield();
   // CP9: a satisfied cell is not polled; adapters push bad news.
   EXPECT_EQ(scheduler_.pending_count(SchedulerPriority::Lifecycle), 0U);
+  {
+    std::lock_guard lock(gate->mutex);
+    gate->release_second = true;
+    gate->changed.notify_all();
+  }
   Driver().Stop();
 }
 
@@ -4477,16 +4537,20 @@ TEST_F(ExternalMoveTest, AStatusGapDoesNotEndAnIdleMoveEpisode) {
   ports_.stale_observation = true;
   ++ports_.observation_generation;
   Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
   ports_.stale_observation = false;
   ports_.authoring_allowed = false;
   ++ports_.admission_generation;
   ++ports_.observation_generation;
   clock_.advance(100 * kMs);
   Settle();
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.status-gap"));
+  ASSERT_TRUE(recovered.ok() && recovered.value());
+  ASSERT_TRUE(recovered.value()->incident_recovery);
   Driver().RunOnce();
   const auto progress = Progress();
-  EXPECT_FALSE(progress.incident.has_value() &&
-               progress.incident->cause_class == LifecycleBlockingCauseClassDTO::kExternalControl);
+  EXPECT_FALSE(progress.incident.has_value());
   EXPECT_EQ(progress.blocking_reason, "moved_externally:rearm_at_next_motion");
 }
 

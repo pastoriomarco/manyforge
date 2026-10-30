@@ -104,6 +104,41 @@ describe('unavailable live Scene facts', () => {
   });
 });
 
+describe('current Scene detach action', () => {
+  it('keeps the shared detach card on a selected carried Scene object', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(workspace).toContain(
+      "const selectedCarriedAttachment = selectedObject?.placement.kind === 'carried'",
+    );
+    expect(workspace).toMatch(
+      /\{selectedObject\?\.placement\.kind === 'carried' && \(\s*<CarriedObjectPoseCard/,
+    );
+    expect(workspace).toContain('attachment={selectedCarriedAttachment}');
+    expect(workspace).toContain('detachUnavailableReason={detachUnavailableReason}');
+    expect(workspace).toContain('onDetach={detachCarriedObject}');
+  });
+});
+
+describe('Program Object inspector detach wiring', () => {
+  it('does not add the live detach action to the Program scene editor surface', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+
+    expect(workspace).toContain('editable ? renderProgramSceneEditor(true) : liveObjectPanel');
+    expect(workspace).toContain("{activeSceneTool === 'program' && renderProgramSceneEditor()}");
+    expect(workspace).toContain('showRuntimeDetachAction={showRuntimeDetachAction}');
+    expect(workspace).toContain('getDetachUnavailableReason={detachUnavailableReasonFor}');
+    expect(workspace).toContain('onDetach={detachCarriedObject}');
+    expect(workspace).toContain('const unavailable = detachUnavailableReasonFor(attachment);');
+  });
+});
+
 describe('Copy current position to Draft', () => {
   const box: LogicalSceneObject['collision_shapes'][number] = {
     type: 'box', dimensions_m: { x: 0.1, y: 0.1, z: 0.1 },

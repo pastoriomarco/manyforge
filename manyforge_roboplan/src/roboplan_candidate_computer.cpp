@@ -88,6 +88,7 @@ collision_failure_details(const roboplan::Scene &scene,
                           const Eigen::VectorXd &positions,
                           std::string failure_stage, std::string source_field,
                           std::string source_value) {
+  const bool start_state = failure_stage == "start_state";
   std::map<std::string, std::string> details{
       {"failure_stage", std::move(failure_stage)},
       {std::move(source_field), std::move(source_value)},
@@ -101,7 +102,7 @@ collision_failure_details(const roboplan::Scene &scene,
   const auto &data = scene.getCollisionData();
   const auto pair_count =
       std::min(model.collisionPairs.size(), data.collisionResults.size());
-  for (std::size_t index = 0U; index < pair_count; ++index) {
+  for (std::size_t index = 0U; !start_state && index < pair_count; ++index) {
     if (!data.collisionResults[index].isCollision()) {
       continue;
     }
@@ -122,6 +123,7 @@ collision_failure_details(const roboplan::Scene &scene,
   // `classification: clearance`.
   for (const bool clearance : {false, true}) {
     for (std::size_t index = 0U; index < distance_count; ++index) {
+      if (start_state && !data.activeCollisionPairs[index]) continue;
       const auto distance = data.distanceResults[index].min_distance;
       const double margin = index < data.collisionRequests.size()
                                 ? data.collisionRequests[index].security_margin

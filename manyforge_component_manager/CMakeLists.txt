@@ -477,6 +477,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
     SQLite::SQLite3)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
+    DISCOVERY_TIMEOUT 60
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
   # The read-only native-plan join uses the same sealed products as the
   # existing named coordinator tests, with no additional fixture generator.
