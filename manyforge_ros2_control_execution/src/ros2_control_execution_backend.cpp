@@ -237,9 +237,6 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
        configuration.scale_topic.empty()))
     throw std::invalid_argument(
         "JTC adapter requires an exact binding epoch, route and joint set");
-  action_client_ = rclcpp_action::create_client<Action>(
-      resources.node(), configuration.action_name);
-  state_->action_client = action_client_;
   state_->node = resources.node();
   state_->endpoints = std::make_shared<SelectedRosEndpointFacts>(
       resources.node(), configuration.state_topic,
@@ -268,6 +265,9 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
                      ->create_publisher<control_msgs::msg::SpeedScalingFactor>(
                          configuration.scale_topic,
                          rclcpp::QoS(1).reliable().transient_local());
+  action_client_ = rclcpp_action::create_client<Action>(
+      resources.node(), configuration.action_name);
+  state_->action_client = action_client_;
 }
 Ros2ControlExecutionBackend::~Ros2ControlExecutionBackend() { shutdown(); }
 
@@ -326,10 +326,13 @@ void Ros2ControlExecutionBackend::shutdown() noexcept {
     subscription = std::move(state_sub_);
     publisher = std::move(scale_pub_);
   }
-  // Client callbacks capture raw SDK this internally. The classic executor
-  // owns its selected waitable through execution; dropping our owners here
-  // cannot destroy that client in an executing callback. SDK destruction must
-  // run outside command/facts locks, which late callbacks may acquire.
+  // Remove the waitable while holding a strong client reference. Otherwise
+  // collect_all_ptrs() can drop the last reference while holding the callback
+  // group mutex, and the client deleter deadlocks removing that same waitable.
+  // Selected callbacks retain their own client reference until they finish.
+  // Keep SDK operations outside command/facts locks used by late callbacks.
+  if (const auto node = state_->node.lock(); node && client)
+    node->get_node_waitables_interface()->remove_waitable(client, nullptr);
   subscription.reset();
   publisher.reset();
   client.reset();

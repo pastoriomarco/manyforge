@@ -38,21 +38,74 @@ on:
       - ".github/workflows/cpp-asan.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  manyforge-cpp-asan:
-    name: ROS-free C++ ASan/UBSan (AMD64 Docker)
+  image-cache:
+    name: Build development image cache (asan)
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
       - name: Prepare pinned RoboPlan Docker context
         run: ./scripts/setup-docker.sh --prepare-only
 
-      - name: Build development image
-        run: docker build --platform linux/amd64 -t manyforge-asan-ci:${GITHUB_SHA} .
+      - name: Report free disk before image build
+        run: df -h
 
-      - name: Run sanitizer registries in immutable image
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and export image layers
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-to: type=gha,scope=manyforge-asan-${{ github.run_id }}-${{ github.run_attempt }},mode=max,ignore-error=true
+
+      - name: Report free disk after image build
+        if: always()
+        run: df -h
+
+  manyforge-cpp-asan:
+    name: ROS-free C++ ASan/UBSan (${{ matrix.suite }}, AMD64 Docker)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    needs: image-cache
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core, deployment, component-manager, relocation-packages]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare pinned RoboPlan Docker context
+        run: ./scripts/setup-docker.sh --prepare-only
+
+      - name: Report free disk before image build
+        run: df -h
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Load development image from cache or rebuild
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: manyforge-asan-ci:${{ github.sha }}
+          cache-from: type=gha,scope=manyforge-asan-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Report image size and free disk after build
+        run: |
+          docker image inspect "manyforge-asan-ci:${GITHUB_SHA}" --format 'Image size (bytes): {{.Size}}'
+          df -h
+
+      - name: Run sanitizer registry in immutable image
         shell: bash
+        env:
+          SANITIZER_SUITE: ${{ matrix.suite }}
         run: |
           set -euo pipefail
           image_id="$(docker image inspect "manyforge-asan-ci:${GITHUB_SHA}" --format '{{.Id}}')"
@@ -67,6 +120,7 @@ jobs:
             -e ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:exitcode=66 \
             -e UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=66 \
             -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e SANITIZER_SUITE \
             -e BUILD_DIR=/tmp/manyforge-asan/core \
             -e DEPLOYMENT_BUILD_DIR=/tmp/manyforge-asan/deployment \
             -e COMPONENT_MANAGER_BUILD_DIR=/tmp/manyforge-asan/component-manager \
@@ -84,8 +138,9 @@ jobs:
                 echo "ADDR_NO_RANDOMIZE inheritance check failed" >&2
                 exit 2
               fi
-              bash scripts/ci/run-core-asan.sh
-              bash scripts/ci/run-deployment-asan.sh
-              bash scripts/ci/run-component-manager-asan.sh
-              bash scripts/ci/run-relocation-packages-asan.sh
+              bash "scripts/ci/run-${SANITIZER_SUITE}-asan.sh"
             '
+
+      - name: Report free disk after sanitizer run
+        if: always()
+        run: df -h

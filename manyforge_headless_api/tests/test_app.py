@@ -5219,3 +5219,252 @@ def test_uncaught_failure_answers_with_the_typed_carrier() -> None:
         "message": "owner exploded",
         "producer": "headless_api",
     }
+
+
+class _SceneRetryWait:
+    def __init__(self, on_wait):
+        self.on_wait = on_wait
+        self.waits = []
+        self.stopped = False
+
+    def is_set(self):
+        return self.stopped
+
+    def set(self):
+        self.stopped = True
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.on_wait()
+        return self.stopped
+
+
+def test_apply_scene_retries_only_readiness_with_backoff_and_same_identity():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    waiter = _SceneRetryWait(lambda: None)
+    service._apply_scene_stop = waiter
+    original = runner.prepare_applied_scene
+    attempts = []
+
+    def prepare(body):
+        attempts.append(copy.deepcopy(body))
+        if len(attempts) < 3:
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+        return original(body)
+
+    runner.prepare_applied_scene = prepare
+    service.notify_committed_apply()
+    assert len(attempts) == 3
+    assert [body["request_id"] for body in attempts] == [attempts[0]["request_id"]] * 3
+    assert [body["request_owner_epoch"] for body in attempts] == [
+        attempts[0]["request_owner_epoch"]
+    ] * 3
+    assert waiter.waits == [0.25, 0.25]
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+    service.notify_committed_apply()
+    assert len(attempts) == 3
+
+
+def test_apply_scene_retry_stops_when_new_apply_is_committed():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    attempts = []
+    original = runner.prepare_applied_scene
+
+    def prepare(body):
+        attempts.append(copy.deepcopy(body))
+        if len(attempts) == 1:
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+        return original(body)
+
+    def supersede():
+        core.committed_activation["apply_id"] = "apply.3"
+        core.committed_activation["apply_generation"] = 2
+        core.committed_activation["record_digest"] = "sha256:" + "f" * 64
+        core.committed_activation["committed_applies"][-1].update(
+            apply_id="apply.3", apply_generation=2,
+            record_digest=core.committed_activation["record_digest"],
+        )
+        core.applied_program_status_projection["record_digest"] = core.committed_activation["record_digest"]
+        core.applied_program["source"]["record_digest"] = core.committed_activation["record_digest"]
+
+    runner.prepare_applied_scene = prepare
+    service._apply_scene_stop = _SceneRetryWait(supersede)
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+    service.notify_committed_apply()
+    assert len(attempts) == 2
+    assert attempts[1]["expected_applied_record_digest"] == "sha256:" + "f" * 64
+
+
+def test_apply_scene_retry_stops_on_service_close():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+
+    def prepare(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+
+    runner.prepare_applied_scene = prepare
+    waiter = _SceneRetryWait(service.close)
+    service._apply_scene_stop = waiter
+    service.notify_committed_apply()
+    assert waiter.stopped
+    assert len(attempts) == 1
+    assert waiter.waits == [0.25]
+
+
+def test_apply_scene_retry_reports_refusal_after_bound(monkeypatch, caplog):
+    import manyforge_headless_api.service as service_module
+
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    now = [0.0]
+
+    class Clock:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+    def prepare(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+
+    def advance():
+        now[0] += 0.25
+
+    monkeypatch.setattr(service_module, "time", Clock)
+    runner.prepare_applied_scene = prepare
+    waiter = _SceneRetryWait(advance)
+    service._apply_scene_stop = waiter
+    service.notify_committed_apply()
+    assert len(attempts) == 120
+    assert len(waiter.waits) == 120
+    assert "authoring_not_ready" in caplog.text
+    assert now[0] == 30.0
+
+
+def test_apply_scene_retry_does_not_start_after_slow_pre_dispatch_reads(monkeypatch, caplog):
+    import manyforge_headless_api.service as service_module
+
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    now = [0.0]
+
+    class Clock:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+    def prepare(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+
+    original_cycle_status = service.program_cycle_status
+
+    def slow_cycle_status():
+        result = original_cycle_status()
+        if attempts:
+            now[0] = 30.0
+        return result
+
+    monkeypatch.setattr(service_module, "time", Clock)
+    service.program_cycle_status = slow_cycle_status
+    runner.prepare_applied_scene = prepare
+    service._apply_scene_stop = _SceneRetryWait(lambda: now.__setitem__(0, 29.9))
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+    assert now[0] == 30.0
+    assert "authoring_not_ready" in caplog.text
+
+
+def test_apply_scene_does_not_retry_untyped_authoring_not_ready():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    waiter = _SceneRetryWait(lambda: None)
+
+    def prepare(body):
+        attempts.append(body)
+        raise HeadlessApiError("authoring_not_ready", "local refusal")
+
+    runner.prepare_applied_scene = prepare
+    service._apply_scene_stop = waiter
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+    assert waiter.waits == []
+
+
+def test_apply_scene_does_not_retry_unknown_runner_outcome():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+
+    def prepare(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("program_runner_unavailable", "request outcome unknown")
+
+    runner.prepare_applied_scene = prepare
+    service.notify_committed_apply()
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+
+
+
+def test_apply_scene_retry_stops_when_runner_owner_changes():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    old_cycle_status = runner.cycle_status
+    changed = [False]
+
+    def cycle_status():
+        result = old_cycle_status()
+        if changed[0]:
+            result["program_runner_owner_epoch"] = "program-runner.epoch.2"
+        return result
+
+    def prepare(body):
+        attempts.append(body)
+        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+
+    runner.cycle_status = cycle_status
+    runner.prepare_applied_scene = prepare
+    service._apply_scene_stop = _SceneRetryWait(
+        lambda: changed.__setitem__(0, True)
+    )
+    service.notify_committed_apply()
+    assert len(attempts) == 1
+
+
+def test_apply_scene_initial_attempt_reports_deadline_after_slow_status_reads(
+    monkeypatch, caplog
+):
+    import manyforge_headless_api.service as service_module
+
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    attempts = []
+    now = [0.0]
+
+    class Clock:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+    def cycle_status():
+        now[0] = 30.0
+        return runner.cycle_status()
+
+    runner.prepare_applied_scene = lambda body: attempts.append(body)
+    service.program_cycle_status = cycle_status
+    monkeypatch.setattr(service_module, "time", Clock)
+    service._apply_scene_stop = _SceneRetryWait(lambda: None)
+    service.notify_committed_apply()
+    assert attempts == []
+    assert "program_scene_preparation_failed" in caplog.text
+    assert "deadline expired before dispatch" in caplog.text

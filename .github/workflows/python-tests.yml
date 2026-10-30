@@ -89,6 +89,7 @@ jobs:
           fi
           echo "id=${image_id}" >> "${GITHUB_OUTPUT}"
           echo "Qualified image: ${image_id}"
+          docker image inspect "${image_id}" --format 'Image size (bytes): {{.Size}}'
 
       - name: Run I2 bindings, retained Python, and Composer qualification
         shell: bash
@@ -98,6 +99,7 @@ jobs:
           set -euo pipefail
           docker run --rm --platform linux/amd64 \
             -e WORKSPACE=/workspace \
+            -e MANYFORGE_BUILD_DIR=/tmp/manyforge-ci-build \
             -e PYTHONPYCACHEPREFIX=/tmp/manyforge-pycache \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \

@@ -877,6 +877,52 @@ TEST(JtcExecutionPort, ShutdownReleasesSdkOwnersWithoutSendingPendingCancel) {
   rig.adapter.reset();
 }
 
+TEST(JtcExecutionPort, ShutdownUnregistersClientWhileCollectionIsInProgress) {
+  Rig rig;
+  auto client = JtcExecutionPortTestPeer::client(*rig.adapter);
+  const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+  auto group = rig.resources.node()->get_node_base_interface()->get_default_callback_group();
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool entered = false;
+  bool release = false;
+  bool saw_client = false;
+  auto noop = [](const auto &) {};
+  std::thread collector([&] {
+    group->collect_all_ptrs(noop, noop, noop, noop, [&](const auto &waitable) {
+      if (waitable.get() != client.get())
+        return;
+      std::unique_lock lock(mutex);
+      saw_client = true;
+      entered = true;
+      cv.notify_all();
+      cv.wait_for(lock, 3s, [&] { return release; });
+    });
+  });
+  {
+    std::unique_lock lock(mutex);
+    cv.wait_for(lock, 3s, [&] { return entered; });
+  }
+  std::thread retire([&] { rig.adapter->shutdown(); });
+  {
+    std::lock_guard lock(mutex);
+    release = true;
+  }
+  cv.notify_all();
+  collector.join();
+  retire.join();
+  EXPECT_TRUE(saw_client);
+  bool still_registered = false;
+  group->collect_all_ptrs(noop, noop, noop, noop, [&](const auto &waitable) {
+    if (waitable.get() == client.get())
+      still_registered = true;
+  });
+  EXPECT_FALSE(still_registered);
+  client.reset();
+  ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+  EXPECT_TRUE(rig.resources.started());
+}
+
 TEST(JtcExecutionPort, IdleShutdownReclaimsEntitiesWhileSharedExecutorRuns) {
   Rig rig;
   const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
@@ -989,6 +1035,31 @@ TEST(JtcExecutionPort, RepeatedBindingsReturnAllSdkEntityCountsToBaseline) {
                                                                  rig.config(epoch + 1));
       rig.adapter->ObserveReadiness({true, true, true, ExecutionBindingEpoch{epoch + 1}});
     }
+  }
+}
+
+// Run this test under a process-level timeout: a deadlocked SDK shutdown or
+// executor join cannot be bounded by the loop deadline inside this process.
+TEST(JtcExecutionPort, RepeatedRebindAndTransportShutdownStress) {
+  const auto deadline = std::chrono::steady_clock::now() + 60s;
+  for (unsigned cycle = 0; cycle < 10U; ++cycle) {
+    Rig rig;
+    for (std::uint64_t epoch = 1; epoch <= 20; ++epoch) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+      const auto sdk = JtcExecutionPortTestPeer::sdk_owners(*rig.adapter);
+      rig.adapter->shutdown();
+      rig.adapter.reset();
+      ASSERT_TRUE(wait_until([&] { return sdk.expired(); }));
+      EXPECT_TRUE(rig.resources.started());
+      if (epoch < 20) {
+        rig.adapter = std::make_unique<Ros2ControlExecutionBackend>(
+            rig.resources, rig.clock, rig.config(epoch + 1));
+        rig.adapter->ObserveReadiness(
+            {true, true, true, ExecutionBindingEpoch{epoch + 1}});
+      }
+    }
+    rig.resources.quiesce();
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
   }
 }
 

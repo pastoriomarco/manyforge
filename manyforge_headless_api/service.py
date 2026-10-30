@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 import math
-from threading import Lock
+from threading import Event, Lock
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -369,6 +369,7 @@ class HeadlessService:
         self.kernel_attention_source: Callable[[], dict[str, Any] | None] | None = None
         # Admission bound only: exact node attempts whose advisory native
         # preview is in flight (see program_node_correction_preview).
+        self._apply_scene_stop = Event()
         self._apply_scene_completion_lock = Lock()
         self._apply_scene_attempted: tuple[str, int, str] | None = None
         self._node_previews_lock = Lock()
@@ -396,6 +397,7 @@ class HeadlessService:
     def close(self) -> None:
         """Stop following forwarded Applies; owners are untouched."""
 
+        self._apply_scene_stop.set()
         if self.apply_follower is not None:
             self.apply_follower.close()
 
@@ -1449,8 +1451,9 @@ class HeadlessService:
     def notify_committed_apply(self) -> None:
         """Reconcile values and initialize Scene only for an explicit Apply purpose.
 
-        Repeated status reads do not repeat placement or retry a failed
-        placement. The existing idle Reset with reload is the explicit retry path.
+        Repeated status reads do not repeat placement. A typed Runner
+        authoring-readiness refusal is retried briefly; other failures remain
+        terminal, and idle Reset with reload remains the explicit retry path.
         The attempt latch is memory-only: a replacement Headless instance may
         attempt the current initializing Apply again on its next notification.
         """
@@ -1481,20 +1484,62 @@ class HeadlessService:
                 committed["record_digest"],
             )
             with self._apply_scene_completion_lock:
+                current = self.committed_scenario_activation()
+                if (current["apply_id"], current["apply_generation"],
+                    current["record_digest"]) != identity:
+                    return
                 if self._apply_scene_attempted == identity:
                     return
                 self._apply_scene_attempted = identity
-            cycle = self.program_cycle_status()
-            admission = self.authoring_admission()
-            # The existing preparation path rechecks the current selection
-            # and admission before the Runner performs any Scene effect.
-            self.program_scene_prepare(ProgramScenePreparationRequest(
-                request_id="apply-scene." + identity[2][7:],
-                request_owner_epoch=cycle["program_runner_owner_epoch"],
-                source_label="headless_apply_completion",
-                expected_applied_record_digest=identity[2],
-                expected_admission_generation=admission["admission_generation"],
-            ))
+            deadline = time.monotonic() + 30.0
+            last_refusal = None
+            owner_epoch = None
+            while not self._apply_scene_stop.is_set():
+                cycle = self.program_cycle_status()
+                current_owner = cycle["program_runner_owner_epoch"]
+                if owner_epoch is not None and current_owner != owner_epoch:
+                    return
+                owner_epoch = current_owner
+                admission = self.authoring_admission()
+                current = self.committed_scenario_activation()
+                if (current["apply_id"], current["apply_generation"],
+                    current["record_digest"]) != identity:
+                    return
+                with self._apply_scene_completion_lock:
+                    if self._apply_scene_attempted != identity:
+                        return
+                if self._apply_scene_stop.is_set():
+                    return
+                request = ProgramScenePreparationRequest(
+                    request_id="apply-scene." + identity[2][7:],
+                    request_owner_epoch=owner_epoch,
+                    source_label="headless_apply_completion",
+                    expected_applied_record_digest=identity[2],
+                    expected_admission_generation=admission["admission_generation"],
+                )
+                # Readiness checks can be slow; no attempt may start after the bound.
+                if time.monotonic() >= deadline:
+                    if last_refusal is not None:
+                        raise last_refusal
+                    raise HeadlessApiError(
+                        "program_scene_preparation_failed",
+                        "Program scene preparation deadline expired before dispatch",
+                    )
+                try:
+                    # Runner rechecks selection and admission before effects.
+                    self.program_scene_prepare(request)
+                    return
+                except HeadlessApiError as error:
+                    # Only the typed Runner refusal is known to precede effects.
+                    if (error.code != "authoring_not_ready"
+                        or not isinstance(error.__cause__, ProgramRunnerClientError)):
+                        raise
+                    last_refusal = error
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    if self._apply_scene_stop.wait(min(0.25, remaining)):
+                        return
         except (HeadlessApiError, ProgramRunnerClientError) as error:
             logging.getLogger(__name__).warning(
                 "Program scene preparation after committed Apply failed: %s: %s",
