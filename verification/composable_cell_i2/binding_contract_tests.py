@@ -334,6 +334,7 @@ _EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
         "control_domain_id",
         "control_domain_revision",
         "controller_topology_id",
+        "is_provider",
         "topology_revision",
     ),
     "DeploymentApplicabilityInputsDTO": (
@@ -477,6 +478,7 @@ _EXPECTED_UNION_ALIASES: dict[str, tuple[str, ...]] = {
         "CellGlobalCapabilityProviderTargetDTO",
         "TargetBindingCapabilityProviderTargetDTO",
         "ControlDomainCapabilityProviderTargetDTO",
+        "ComponentTargetCapabilityProviderTargetDTO",
     ),
     "CompositionConnectionSource": (
         "CompositionDirectModelAnchor",
@@ -1931,7 +1933,37 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
     }
     for name, kwargs in sorted(dto_fixture["kwargs"].items()):
         value_type = getattr(module, name)
-        parameters, defaults = _documented_constructor_contract(value_type)
+        if name == "ControlDomainCapabilityProviderTargetDTO":
+            contracts = _documented_constructor_contracts(value_type)
+            provider_parameters = (
+                "control_domain_id", "control_domain_revision", "provider"
+            )
+            expected_contracts = (
+                (provider_parameters, ()),
+                (tuple(expected_constructor_parameters[name]), ()),
+            )
+            if contracts != expected_contracts:
+                _fail(f"constructor overloads differ from the C++ binding: {name}: {contracts}")
+            parameters, defaults = contracts[1]
+            provider_kwargs = {
+                "control_domain_id": kwargs["control_domain_id"],
+                "control_domain_revision": kwargs["control_domain_revision"],
+                "provider": module.ProviderControlDomainCapabilityTargetDTO(),
+            }
+            provider = value_type(**provider_kwargs)
+            if not provider.is_provider or value_type(**kwargs).is_provider:
+                _fail("control-domain target variant discriminator drifted")
+            for omitted in provider_parameters:
+                incomplete = dict(provider_kwargs)
+                del incomplete[omitted]
+                try:
+                    value_type(**incomplete)
+                except TypeError:
+                    pass
+                else:
+                    _fail(f"deployment DTO constructor made {name}.{omitted} optional")
+        else:
+            parameters, defaults = _documented_constructor_contract(value_type)
         constructor_parameters[name] = list(parameters)
         constructor_defaults[name] = list(defaults)
         if (

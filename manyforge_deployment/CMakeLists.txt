@@ -1343,6 +1343,10 @@ if(BUILD_TESTING)
 
   add_executable(test_program_binding
     test/test_program_binding.cpp)
+  if(NOT TARGET manyforge_core)
+    target_sources(test_program_binding PRIVATE
+      "${MANYFORGE_CORE_SOURCE_DIR}/src/runtime_participant_binding.cpp")
+  endif()
   target_compile_definitions(test_program_binding PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")

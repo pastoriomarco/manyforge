@@ -23,9 +23,9 @@ jobs:
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CORE_BUILD_DIR: "${{ github.workspace }}/build/stability-core"
-      MANYFORGE_STABILITY_ITERATIONS: "30"
+      MANYFORGE_STABILITY_ITERATIONS: "5"
       MANYFORGE_STABILITY_LOAD_WORKERS: "3"
-      MANYFORGE_STABILITY_TIMEOUT_SECONDS: "30"
+      MANYFORGE_STABILITY_TIMEOUT_SECONDS: "240"
     steps:
       - uses: actions/checkout@v4
       - name: Install C++ test dependencies

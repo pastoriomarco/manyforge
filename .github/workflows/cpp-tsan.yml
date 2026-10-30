@@ -84,7 +84,16 @@ jobs:
       - name: Report free disk before image build
         run: df -h
 
+      - name: Free runner disk before image load
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+          df -h
+          free -h
+
       - uses: docker/setup-buildx-action@v3
+        id: sanitizer_builder
 
       - name: Load development image from cache or rebuild
         uses: docker/build-push-action@v6
@@ -98,6 +107,20 @@ jobs:
       - name: Report image size and free disk after build
         run: |
           docker image inspect "manyforge-tsan-ci:${GITHUB_SHA}" --format 'Image size (bytes): {{.Size}}'
+          df -h
+
+      - name: Prune local builder cache after image load
+        shell: bash
+        env:
+          BUILDER_NAME: ${{ steps.sanitizer_builder.outputs.name }}
+        run: |
+          set -euo pipefail
+          image="manyforge-tsan-ci:${GITHUB_SHA}"
+          image_id="$(docker image inspect "$image" --format '{{.Id}}')"
+          docker buildx du --builder "$BUILDER_NAME"
+          df -h
+          docker buildx prune --builder "$BUILDER_NAME" --all --force
+          test "$(docker image inspect "$image" --format '{{.Id}}')" = "$image_id"
           df -h
 
       - name: Run sanitizer registry in immutable image
@@ -116,7 +139,8 @@ jobs:
             --network none \
             --security-opt seccomp=unconfined \
             -e TSAN_OPTIONS='halt_on_error=1 second_deadlock_stack=1 history_size=7 exitcode=66' \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
+            -e MAKEFLAGS=-j1 \
             -e SANITIZER_SUITE \
             -e BUILD_DIR=/tmp/manyforge-tsan/core \
             -e RELOCATION_PACKAGES_BUILD_ROOT=/tmp/manyforge-tsan/relocation-packages \
@@ -136,6 +160,9 @@ jobs:
               bash "scripts/ci/run-${SANITIZER_SUITE}-tsan.sh"
             '
 
-      - name: Report free disk after sanitizer run
+      - name: Report runner resources after sanitizer run
         if: always()
-        run: df -h
+        run: |
+          df -h
+          free -h
+          dmesg 2>/dev/null | grep -Ei 'out of memory|oom-kill|killed process' || true
