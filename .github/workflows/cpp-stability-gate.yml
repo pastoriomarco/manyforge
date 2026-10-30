@@ -31,7 +31,9 @@ jobs:
       - name: Install C++ test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake g++ libgtest-dev libc6
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ libgtest-dev libc6 pkg-config \
+            libdouble-conversion-dev libutf8proc-dev libssl-dev libsqlite3-dev
       - name: Configure core tests
         run: |
           cmake -S manyforge_core -B "$CORE_BUILD_DIR" \

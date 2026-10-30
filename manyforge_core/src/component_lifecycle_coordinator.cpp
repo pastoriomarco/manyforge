@@ -920,10 +920,10 @@ class ComponentLifecycleCoordinator::Impl final {
                                   ? std::optional(CurrentOwnerEpoch())
                                   : std::nullopt;
     const bool owner_changed = latest_owner && *latest_owner != owner;
-    const auto latest_admission = latest_owner && !owner_changed
-                                      ? std::optional(kernel_cell_admission_port_.GetAuthoringAdmission())
-                                      : std::nullopt;
-    const bool admission_changed = latest_admission && *latest_admission != admission;
+    AuthoringAdmissionDTO latest_admission{};
+    const bool admission_sampled = latest_owner && !owner_changed;
+    if (admission_sampled) latest_admission = kernel_cell_admission_port_.GetAuthoringAdmission();
+    const bool admission_changed = admission_sampled && latest_admission != admission;
     if (snapshot_changed || target_facts_changed || owner_changed || admission_changed) {
       auto error = coordinator_error("component_lifecycle_facts_stale",
           "the current component context changed during its read", "component_read_changed");
@@ -934,7 +934,7 @@ class ComponentLifecycleCoordinator::Impl final {
                             snapshot_changed ? "not_checked" : token(target_facts_changed));
       error.details.emplace("owner_changed", latest_owner ? token(owner_changed) : "not_checked");
       error.details.emplace("admission_changed",
-                            latest_admission ? token(admission_changed) : "not_checked");
+                            admission_sampled ? token(admission_changed) : "not_checked");
       error.details.emplace("snapshot_digest_before", result.snapshot.snapshot_digest.value());
       error.details.emplace("snapshot_digest_after", latest.value().snapshot_digest.value());
       error.details.emplace("component_generation_before",
@@ -946,11 +946,11 @@ class ComponentLifecycleCoordinator::Impl final {
       error.details.emplace("admission_generation_before",
                             std::to_string(admission.admission_generation.value()));
       error.details.emplace("admission_generation_after",
-                            latest_admission ? std::to_string(latest_admission->admission_generation.value())
+                            admission_sampled ? std::to_string(latest_admission.admission_generation.value())
                                              : "not_checked");
       error.details.emplace("authoring_allowed_before", token(admission.authoring_allowed));
       error.details.emplace("authoring_allowed_after",
-                            latest_admission ? token(latest_admission->authoring_allowed) : "not_checked");
+                            admission_sampled ? token(latest_admission.authoring_allowed) : "not_checked");
       return ReadResult::Err(std::move(error));
     }
     {
